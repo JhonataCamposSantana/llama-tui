@@ -1,0 +1,78 @@
+{
+  "llama_server": "/var/home/jcampos/llama.cpp/build/bin/llama-server",
+  "hf_cache_root": "/var/home/jcampos/.cache/huggingface/hub",
+  "opencode": {
+    "path": "",
+    "backup_dir": "/var/home/jcampos/.config/llama-tui/backups",
+    "timeout": 600000,
+    "chunk_timeout": 60000,
+    "instructions": [
+      "./instructions/warm.md"
+    ],
+    "build_prompt": "{file:./prompts/friendly-build.txt}",
+    "plan_prompt": "{file:./prompts/friendly-build.txt}",
+    "default_model_id": "opus",
+    "small_model_id": "gemma_e4b",
+    "build_model_id": "opus",
+    "plan_model_id": "opus"
+  },
+  "models": [
+    {
+      "id": "qwen30b",
+      "name": "Qwen3 30B A3B Instruct 2507 I1 IQ3 S",
+      "path": "/var/home/jcampos/.cache/huggingface/hub/models--mradermacher--Qwen3-30B-A3B-Instruct-2507-i1-GGUF/snapshots/5f50c8eb49a190e2e70935606012c5d08153edbd/Qwen3-30B-A3B-Instruct-2507.i1-IQ3_S.gguf",
+      "alias": "qwen3-30b-a3b-instruct-2507-i1-iq3-s",
+      "port": 8080,
+      "host": "127.0.0.1",
+      "ctx": 8192,
+      "threads": 6,
+      "ngl": 16,
+      "temp": 0.45,
+      "parallel": 1,
+      "cache_ram": 0,
+      "flash_attn": true,
+      "jinja": true,
+      "output": 4096,
+      "enabled": true,
+      "extra_args": []
+    },
+    {
+      "id": "gemma_e4b",
+      "name": "Gemma 4 E4B Q3 K M",
+      "path": "/var/home/jcampos/.cache/huggingface/hub/models--unsloth--gemma-4-E4B-it-GGUF/snapshots/315e03409eb1cdde302488d66e586dea1e82aad1/gemma-4-E4B-it-Q3_K_M.gguf",
+      "alias": "gemma-4-e4b-it-q3-k-m",
+      "port": 8081,
+      "host": "127.0.0.1",
+      "ctx": 8192,
+      "threads": 6,
+      "ngl": 0,
+      "temp": 0.7,
+      "parallel": 1,
+      "cache_ram": 0,
+      "flash_attn": true,
+      "jinja": true,
+      "output": 4096,
+      "enabled": true,
+      "extra_args": []
+    },
+    {
+      "id": "opus",
+      "name": "Qwen3.5 9B Claude 4.6 Opus Reasoning Distilled Q4 K M",
+      "path": "/var/home/jcampos/.cache/huggingface/hub/models--Jackrong--Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-GGUF/snapshots/16ec723dba3609786ce3f0d511e8af7e5d7a7841/Qwen3.5-9B.Q4_K_M.gguf",
+      "alias": "qwen3-5-9b-q4-k-m",
+      "port": 8082,
+      "host": "127.0.0.1",
+      "ctx": 32768,
+      "threads": 6,
+      "ngl": 999,
+      "temp": 0.55,
+      "parallel": 1,
+      "cache_ram": 0,
+      "flash_attn": true,
+      "jinja": true,
+      "output": 4096,
+      "enabled": true,
+      "extra_args": []
+    }
+  ]
+}

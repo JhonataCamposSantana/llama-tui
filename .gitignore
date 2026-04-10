@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+venv/
+
+*.log
+*.pid
+*.tmp
+
+.DS_Store
+Thumbs.db
+
+# Local user config and cache
+models.json
+.cache/
+backups/
+
+# Editor junk
+.vscode/
+.idea/
