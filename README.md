@@ -49,11 +49,11 @@ llama-tui
 
 - `↑ / ↓` or `j / k`: move
 - `Enter`: start or stop selected model
-- `Enter` on a stopped model: choose launch mode (`max context`, `tokens/sec`, `auto best`, or `keep current`)
+- `Enter` on a stopped model: choose launch mode (`max context`, `tokens/sec`, or `keep current`)
 - `a`: add model
 - `e`: edit model
 - `d`: delete model
-- `z`: optimize selected model with auto-best profile and sync `opencode.json`
+- `z`: optimize selected model for a context-friendly run and sync `opencode.json`
 - `x`: detect GGUF models from HF cache
 - `X`: prune missing models
 - `m`: mark selected model as OpenCode main model

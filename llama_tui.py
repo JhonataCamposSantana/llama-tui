@@ -1008,65 +1008,27 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
         return False
 
 
-def prompt_launch_optimization(stdscr, model: ModelConfig, colors) -> str:
-    h, w = stdscr.getmaxyx()
-    box_w = min(68, max(48, w - 8))
-    box_h = 11
-    box_x = max(2, (w - box_w) // 2)
-    box_y = max(2, (h - box_h) // 2)
-
-    options = [
-        ('1', 'Optimize for max context (safe)', 'max_context'),
-        ('2', 'Optimize for tokens/sec', 'tokens_per_sec'),
-        ('3', 'Auto optimize (best)', 'best'),
-        ('4', 'Keep current settings', 'keep'),
-        ('q', 'Cancel', 'cancel'),
-    ]
-
-    stdscr.nodelay(False)
-    while True:
-        draw_box(stdscr, box_y, box_x, box_h, box_w, f'Launch {model.id}', colors['accent'] | curses.A_BOLD, colors['accent'])
-        stdscr.addstr(box_y + 2, box_x + 2, 'Choose launch profile:', colors['panel'] | curses.A_BOLD)
-        for idx, (key, label, _val) in enumerate(options):
-            stdscr.addstr(box_y + 3 + idx, box_x + 4, f'[{key}] {label}'[: box_w - 8], colors['panel'])
-        stdscr.addstr(box_y + box_h - 1, box_x + 2, 'Press key to continue...'[: box_w - 6], colors['muted'])
-        stdscr.refresh()
-        key = stdscr.getch()
-        if key == -1:
-            continue
-        key_str = chr(key).lower() if 0 <= key <= 255 else ''
-        for option_key, _label, value in options:
-            if key_str == option_key:
-                stdscr.nodelay(True)
-                return value
+def prompt_launch_optimization(stdscr, model: ModelConfig) -> str:
+    curses.endwin()
+    print(f'\nLaunch options for {model.id}')
+    print('-----------------------------')
+    print('1) Optimize for max context (safe)')
+    print('2) Optimize for tokens/sec')
+    print('3) Keep current settings')
+    print('q) Cancel')
+    choice = input('Choose [1/2/3/q]: ').strip().lower()
+    stdscr.clear()
+    stdscr.refresh()
+    if choice == '1':
+        return 'max_context'
+    if choice == '2':
+        return 'tokens_per_sec'
+    if choice == '3':
+        return 'keep'
+    return 'cancel'
 
 
 def apply_optimization_preset(model: ModelConfig, preset: str) -> str:
-    runtime = getattr(model, 'runtime', 'llama.cpp')
-    extra_args = list(getattr(model, 'extra_args', []) or [])
-
-    def strip_flags(*flags: str):
-        nonlocal extra_args
-        cleaned: List[str] = []
-        skip_next = False
-        flag_set = set(flags)
-        for token in extra_args:
-            if skip_next:
-                skip_next = False
-                continue
-            if token in flag_set:
-                skip_next = True
-                continue
-            if any(token.startswith(f'{f}=') for f in flag_set):
-                continue
-            cleaned.append(token)
-        extra_args = cleaned
-
-    def set_flag(flag: str, value: str):
-        nonlocal extra_args
-        strip_flags(flag)
-        extra_args += [flag, value]
-
     if preset == 'max_context':
         model.optimize_mode = 'max_context_safe'
         model.parallel = 1
@@ -1074,33 +1036,14 @@ def apply_optimization_preset(model: ModelConfig, preset: str) -> str:
         model.ctx = max(int(getattr(model, 'ctx', 8192)), 32768)
         model.ctx = min(model.ctx, int(getattr(model, 'ctx_max', 131072)))
         model.output = min(max(model.output, 2048), 4096)
-        if runtime == 'llama.cpp':
-            set_flag('--batch-size', '256')
-            set_flag('--ubatch-size', '128')
-            set_flag('--cache-type-k', 'q8_0')
-            set_flag('--cache-type-v', 'q8_0')
-        elif runtime == 'vllm':
-            set_flag('--gpu-memory-utilization', '0.90')
-            set_flag('--max-num-seqs', '2')
-            set_flag('--max-num-batched-tokens', str(max(4096, min(model.ctx, 16384))))
-        model.extra_args = extra_args
-        return f'{model.id}: preset=max_context_safe ({runtime}) ctx={model.ctx} parallel={model.parallel}'
+        return f'{model.id}: preset=max_context_safe ctx={model.ctx} parallel={model.parallel}'
     if preset == 'tokens_per_sec':
         model.optimize_mode = 'max_context_safe'
         model.memory_reserve_percent = max(30, int(getattr(model, 'memory_reserve_percent', 25)))
         model.ctx = max(int(getattr(model, 'ctx_min', 2048)), min(int(getattr(model, 'ctx', 8192)), 8192))
         model.parallel = max(1, min(4, int(getattr(model, 'parallel', 1)) + 1))
         model.output = min(model.output, 2048)
-        if runtime == 'llama.cpp':
-            set_flag('--batch-size', '1024')
-            set_flag('--ubatch-size', '512')
-            strip_flags('--cache-type-k', '--cache-type-v')
-        elif runtime == 'vllm':
-            set_flag('--gpu-memory-utilization', '0.80')
-            set_flag('--max-num-seqs', '8')
-            set_flag('--max-num-batched-tokens', '8192')
-        model.extra_args = extra_args
-        return f'{model.id}: preset=tokens_per_sec ({runtime}) ctx={model.ctx} parallel={model.parallel}'
+        return f'{model.id}: preset=tokens_per_sec ctx={model.ctx} parallel={model.parallel}'
     return f'{model.id}: keeping current settings'
 
 
@@ -1109,20 +1052,6 @@ def sync_opencode_after_tuning(app: AppConfig) -> str:
         return 'opencode.path unset; skipped opencode sync'
     ok, msg = app.generate_opencode()
     return msg if ok else f'opencode sync failed: {msg}'
-
-
-def apply_best_optimization(model: ModelConfig) -> str:
-    runtime = getattr(model, 'runtime', 'llama.cpp')
-    quant = extract_quant(model).lower()
-    model_type = classify_model_type(model)
-    if runtime == 'vllm':
-        # vLLM generally benefits from higher batching; keep contexts reasonable by default.
-        return apply_optimization_preset(model, 'tokens_per_sec')
-    if model_type == 'CPU' or 'q2' in quant or 'q3' in quant:
-        # Heavier/CPU scenarios: prioritize stable context with low contention.
-        return apply_optimization_preset(model, 'max_context')
-    # GPU dense defaults: throughput profile tends to be the best interactive compromise.
-    return apply_optimization_preset(model, 'tokens_per_sec')
 
 
 def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
@@ -1231,10 +1160,6 @@ def ellipsize(text: str, width: int) -> str:
     return text[: width - 3] + '...'
 
 
-def compact_message(text: str) -> str:
-    return ' | '.join(part.strip() for part in str(text).splitlines() if part.strip())
-
-
 
 def tui(stdscr, app: AppConfig):
     colors = init_colors()
@@ -1297,8 +1222,7 @@ def tui(stdscr, app: AppConfig):
             msg_attr = colors['error'] | curses.A_BOLD
         elif message.startswith('⏳'):
             msg_attr = colors['warning'] | curses.A_BOLD
-        header_message = compact_message(message)
-        msg_line = ellipsize(header_message, max(10, w - 4))
+        msg_line = ellipsize(message, max(10, w - 4))
         stdscr.addstr(header_y + 7, 2, msg_line, msg_attr)
 
         chip_y = header_y + 7
@@ -1401,7 +1325,7 @@ def tui(stdscr, app: AppConfig):
                     attr = colors['accent'] | curses.A_BOLD
                 stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
 
-        footer = '[Enter] start/stop  [z] optimize(best)  [x] detect  [X] prune  [g] gen opencode  [o] settings'
+        footer = '[Enter] start/stop  [z] optimize model  [x] detect  [X] prune  [g] gen opencode  [o] settings'
         footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
         stdscr.addstr(h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
         stdscr.addstr(h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
@@ -1434,12 +1358,12 @@ def tui(stdscr, app: AppConfig):
                 ok, msg = app.stop(model)
                 message = f'{model.id}: {msg}'
             else:
-                launch_mode = prompt_launch_optimization(stdscr, model, colors)
+                launch_mode = prompt_launch_optimization(stdscr, model)
                 if launch_mode == 'cancel':
                     message = 'Launch cancelled.'
                     continue
-                if launch_mode in ('max_context', 'tokens_per_sec', 'best'):
-                    tune_msg = apply_best_optimization(model) if launch_mode == 'best' else apply_optimization_preset(model, launch_mode)
+                if launch_mode in ('max_context', 'tokens_per_sec'):
+                    tune_msg = apply_optimization_preset(model, launch_mode)
                     app.add_or_update(model)
                     sync_msg = sync_opencode_after_tuning(app)
                     message = f'{tune_msg} | {sync_msg}'
@@ -1451,7 +1375,7 @@ def tui(stdscr, app: AppConfig):
                     message = msg
         elif key == ord('z') and app.models:
             model = app.models[selected]
-            tune_msg = apply_best_optimization(model)
+            tune_msg = apply_optimization_preset(model, 'max_context')
             app.add_or_update(model)
             sync_msg = sync_opencode_after_tuning(app)
             message = f'{tune_msg} | {sync_msg}'
