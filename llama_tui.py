@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -23,14 +24,16 @@ DEFAULT_CONFIG_PATH = Path(os.environ['LLAMA_TUI_CONFIG']).expanduser() if os.en
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_HF_CACHE = Path('/var/home/jcampos/.cache/huggingface/hub') if Path('/var/home/jcampos/.cache/huggingface/hub').exists() else Path.home() / '.cache' / 'huggingface' / 'hub'
 DEFAULT_LLMFIT_CACHE = Path(os.environ.get('LLMFIT_CACHE_ROOT', Path.home() / '.cache' / 'llmfit' / 'models')).expanduser()
+DEFAULT_LLM_MODELS_CACHE = Path(os.environ.get('LLM_MODELS_CACHE_ROOT', Path.home() / '.cache' / 'llm-models')).expanduser()
 DEFAULT_LLAMA_SERVER = str(Path('/var/home/jcampos/llama.cpp/build/bin/llama-server') if Path('/var/home/jcampos/llama.cpp/build/bin/llama-server').exists() else Path.home() / 'llama.cpp' / 'build' / 'bin' / 'llama-server')
+DEFAULT_VLLM_COMMAND = os.environ.get('VLLM_COMMAND', 'vllm')
 REFRESH_SECONDS = 2.0
 LOGO = [
-    r'  _ _                         _         _       _ ',
-    r' | | | __ _ _ __ ___   __ _  | |_ _   _(_)_   _| |',
-    r' | | |/ _` | \'_ ` _ \\ / _` | | __| | | | | | | |',
-    r' | | | (_| | | | | | | (_| | | |_| |_| | | |_| |_|',
-    r' |_|_|\\__,_|_| |_| |_|\\__,_|  \\__|\\__,_|_|\\__,_(_)',
+    "  _ _                         _         _       _ ",
+    " | | | __ _ _ __ ___   __ _  | |_ _   _(_)_   _| |",
+    " | | |/ _` | '_ ` _ \\ / _` | | __| | | | | | | |",
+    " | | | (_| | | | | | | (_| | | |_| |_| | | |_| |_|",
+    " |_|_|\\__,_|_| |_| |_|\\__,_|  \\__|\\__,_|_|\\__,_(_)",
 ]
 
 
@@ -52,6 +55,8 @@ class ModelConfig:
     jinja: bool = True
     output: int = 4096
     enabled: bool = True
+    runtime: str = 'llama.cpp'
+    source: str = 'manual'
     extra_args: List[str] = field(default_factory=list)
 
 
@@ -74,8 +79,10 @@ class AppConfig:
     def __init__(self, config_path: Path):
         self.config_path = config_path
         self.llama_server = os.environ.get('LLAMA_SERVER', DEFAULT_LLAMA_SERVER)
+        self.vllm_command = DEFAULT_VLLM_COMMAND
         self.hf_cache_root = str(DEFAULT_HF_CACHE)
         self.llmfit_cache_root = str(DEFAULT_LLMFIT_CACHE)
+        self.llm_models_cache_root = str(DEFAULT_LLM_MODELS_CACHE)
         self.opencode = OpencodeSettings(
             path='',
             backup_dir=str(CONFIG_DIR / 'backups'),
@@ -92,16 +99,32 @@ class AppConfig:
             return
         data = json.loads(self.config_path.read_text())
         self.llama_server = data.get('llama_server', self.llama_server)
+        self.vllm_command = data.get('vllm_command', self.vllm_command)
         self.hf_cache_root = data.get('hf_cache_root', self.hf_cache_root)
         self.llmfit_cache_root = data.get('llmfit_cache_root', self.llmfit_cache_root)
+        self.llm_models_cache_root = data.get('llm_models_cache_root', self.llm_models_cache_root)
         self.opencode = OpencodeSettings(**data.get('opencode', {}))
         self.models = [ModelConfig(**item) for item in data.get('models', [])]
+        filtered_models = [m for m in self.models if is_registered_model_entry(m)]
+        roots_changed = False
+        for m in filtered_models:
+            inferred = self.infer_model_source(m)
+            if m.source != inferred:
+                m.source = inferred
+                roots_changed = True
+        if len(filtered_models) != len(self.models) or roots_changed:
+            self.models = filtered_models
+            self.save()
+        else:
+            self.models = filtered_models
 
     def save(self):
         data = {
             'llama_server': self.llama_server,
+            'vllm_command': self.vllm_command,
             'hf_cache_root': self.hf_cache_root,
             'llmfit_cache_root': self.llmfit_cache_root,
+            'llm_models_cache_root': self.llm_models_cache_root,
             'opencode': asdict(self.opencode),
             'models': [asdict(m) for m in self.models],
         }
@@ -117,6 +140,115 @@ class AppConfig:
     def get_model(self, model_id: str) -> Optional[ModelConfig]:
         return next((m for m in self.models if m.id == model_id), None)
 
+
+    def command_prefix(self, command: str) -> List[str]:
+        return shlex.split(command) if command else []
+
+    def command_exists(self, command: str) -> bool:
+        parts = self.command_prefix(command)
+        if not parts:
+            return False
+        first = os.path.expanduser(parts[0])
+        if '/' in first or first.startswith('.') or first.startswith('~'):
+            return Path(first).exists()
+        return shutil.which(first) is not None
+
+    def normalize_model_ref(self, path: str | Path) -> str:
+        raw = str(path).strip()
+        p = Path(raw).expanduser()
+
+        # Keep real local file paths and discovered cache files in the same format,
+        # otherwise detect() will keep re-adding the same model because one side is
+        # stored as "path:/abs/file.gguf" and the other as "/abs/file.gguf".
+        if p.exists() or raw.startswith('~') or '/' in raw or raw.startswith('.'):
+            return str(p.resolve(strict=False))
+
+        # Non-path references (mainly vLLM / HF repo IDs) should remain symbolic.
+        return f'ref:{raw}'
+
+    def validate_model_target(self, model: ModelConfig) -> Tuple[bool, str]:
+        target = (model.path or '').strip()
+        if not target:
+            return False, 'model target is empty'
+        if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
+            p = Path(target).expanduser()
+            if p.exists() or looks_like_model_reference(target):
+                return True, ''
+            return False, f'vLLM model target not found / not a repo id: {target}'
+        p = Path(target).expanduser()
+        if not p.exists():
+            return False, f'model path missing: {target}'
+        if not is_real_model_file(p):
+            return False, f'not a supported GGUF model: {target}'
+        return True, ''
+
+    def _command_matches_runtime(self, parts: List[str], runtime: str) -> bool:
+        if not parts:
+            return False
+        runtime = getattr(runtime, 'strip', lambda: runtime)()
+        if runtime == 'vllm':
+            prefixes = self.command_prefix(self.vllm_command)
+            target = os.path.basename(prefixes[0]) if prefixes else 'vllm'
+            return (
+                any(
+                    os.path.basename(part) == target
+                    or os.path.basename(part).startswith('vllm')
+                    or 'vllm.entrypoints' in part
+                    for part in parts
+                )
+                and ('serve' in parts or any('api_server' in part for part in parts))
+            )
+        prefixes = self.command_prefix(self.llama_server)
+        target = os.path.basename(prefixes[0]) if prefixes else os.path.basename(self.llama_server)
+        return any(os.path.basename(part) == target for part in parts)
+
+    def managed_roots(self) -> Dict[str, Path]:
+        return {
+            'huggingface': Path(self.hf_cache_root).expanduser(),
+            'llmfit': Path(self.llmfit_cache_root).expanduser(),
+            'llm-models': Path(self.llm_models_cache_root).expanduser(),
+        }
+
+    def normalize_model_path(self, path: str | Path) -> Path:
+        return Path(path).expanduser().resolve(strict=False)
+
+    def infer_model_source(self, model: ModelConfig) -> str:
+        if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
+            return 'manual'
+        if getattr(model, 'source', '') in ('manual', 'huggingface', 'llmfit', 'llm-models'):
+            existing = getattr(model, 'source', '')
+            if existing and existing != 'manual':
+                return existing
+        p = self.normalize_model_path(model.path)
+        for source, root in self.managed_roots().items():
+            try:
+                p.relative_to(root.resolve(strict=False))
+                return source
+            except Exception:
+                continue
+        return 'manual'
+
+    def discover_source_files(self) -> Tuple[Dict[str, Tuple[Path, str]], List[str]]:
+        discovered: Dict[str, Tuple[Path, str]] = {}
+        notes: List[str] = []
+
+        for source, root in self.managed_roots().items():
+            if not root.exists():
+                notes.append(f'{source} cache not found: {root}')
+                continue
+
+            if source == 'huggingface':
+                candidates = root.glob('models--*/snapshots/*/*.gguf')
+            else:
+                candidates = root.rglob('*.gguf')
+
+            for gguf in sorted(candidates):
+                if not is_real_model_file(gguf):
+                    continue
+                discovered[str(gguf.resolve(strict=False))] = (gguf, source)
+
+        return discovered, notes
+
     def _proc_state(self, pid: int) -> Optional[str]:
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
@@ -128,22 +260,19 @@ class AppConfig:
         except Exception:
             return None
 
-    def _pid_looks_like_llama(self, pid: int) -> bool:
+    def _pid_looks_like_runtime(self, pid: int, runtime: str) -> bool:
         try:
             raw = Path(f"/proc/{pid}/cmdline").read_bytes()
             parts = [p.decode(errors='ignore') for p in raw.split(b'\x00') if p]
-            if not parts:
-                return False
-            target = os.path.basename(self.llama_server)
-            return any(os.path.basename(part) == target for part in parts)
+            return self._command_matches_runtime(parts, runtime)
         except Exception:
             return False
 
     def _find_model_pid(self, model: ModelConfig) -> Optional[int]:
-        target = os.path.basename(self.llama_server)
         port = str(model.port)
         alias = model.alias
         path = model.path
+        runtime = getattr(model, 'runtime', 'llama.cpp')
         for proc_dir in Path('/proc').iterdir():
             if not proc_dir.name.isdigit():
                 continue
@@ -151,12 +280,16 @@ class AppConfig:
                 pid = int(proc_dir.name)
                 raw = (proc_dir / 'cmdline').read_bytes()
                 parts = [p.decode(errors='ignore') for p in raw.split(b'\x00') if p]
-                if not parts:
-                    continue
-                if not any(os.path.basename(part) == target for part in parts):
+                if not parts or not self._command_matches_runtime(parts, runtime):
                     continue
                 joined = '\x00'.join(parts)
-                if f'\x00--port\x00{port}\x00' in joined or f'\x00--alias\x00{alias}\x00' in joined or path in parts:
+                path_match = path in parts or path in joined
+                if (
+                    f'\x00--port\x00{port}\x00' in joined
+                    or f'\x00--alias\x00{alias}\x00' in joined
+                    or f'\x00--served-model-name\x00{alias}\x00' in joined
+                    or path_match
+                ):
                     state = self._proc_state(pid)
                     if state not in ('Z', 'X'):
                         return pid
@@ -173,7 +306,7 @@ class AppConfig:
                 state = self._proc_state(pid)
                 if state in ('Z', 'X'):
                     pidfile.unlink(missing_ok=True)
-                elif self._pid_looks_like_llama(pid):
+                elif self._pid_looks_like_runtime(pid, getattr(model, 'runtime', 'llama.cpp')):
                     return pid
                 else:
                     pidfile.unlink(missing_ok=True)
@@ -204,8 +337,21 @@ class AppConfig:
             return 'STOPPED', str(e).split(':')[0]
 
     def build_command(self, model: ModelConfig) -> List[str]:
-        cmd = [
-            self.llama_server,
+        runtime = getattr(model, 'runtime', 'llama.cpp')
+        if runtime == 'vllm':
+            cmd = self.command_prefix(self.vllm_command) + [
+                'serve',
+                model.path,
+                '--host', model.host,
+                '--port', str(model.port),
+                '--served-model-name', model.alias,
+            ]
+            if model.ctx > 0:
+                cmd += ['--max-model-len', str(model.ctx)]
+            cmd += model.extra_args
+            return cmd
+
+        cmd = self.command_prefix(self.llama_server) + [
             '-m', model.path,
             '--alias', model.alias,
             '--host', model.host,
@@ -225,10 +371,14 @@ class AppConfig:
         return cmd
 
     def start(self, model: ModelConfig) -> Tuple[bool, str]:
-        if not Path(self.llama_server).exists():
-            return False, f'llama-server not found: {self.llama_server}'
-        if not Path(model.path).exists():
-            return False, f'model path missing: {model.path}'
+        runtime = getattr(model, 'runtime', 'llama.cpp')
+        command = self.vllm_command if runtime == 'vllm' else self.llama_server
+        if not self.command_exists(command):
+            label = 'vLLM command' if runtime == 'vllm' else 'llama-server'
+            return False, f'{label} not found: {command}'
+        valid, reason = self.validate_model_target(model)
+        if not valid:
+            return False, reason
         if self.get_pid(model):
             return True, f'{model.id} already running'
         log_path = self.logfile(model.id)
@@ -313,43 +463,70 @@ class AppConfig:
         return False, 'not found'
 
     def prune_missing_models(self) -> Tuple[int, List[str]]:
+        discovered, _ = self.discover_source_files()
         removed = []
+        changed = False
         for model in list(self.models):
-            if not Path(model.path).exists():
+            source = self.infer_model_source(model)
+            if model.source != source:
+                model.source = source
+                changed = True
+            normalized = str(self.normalize_model_path(model.path))
+            path_exists = Path(model.path).expanduser().exists()
+
+            runtime = getattr(model, 'runtime', 'llama.cpp')
+            if source == 'manual':
+                if runtime == 'vllm':
+                    target = (model.path or '').strip()
+                    should_remove = not target or (not Path(target).expanduser().exists() and not looks_like_model_reference(target))
+                else:
+                    should_remove = (not path_exists) or (not is_real_model_file(Path(model.path)))
+            else:
+                should_remove = normalized not in discovered
+
+            if should_remove:
                 self.delete(model.id)
                 removed.append(model.id)
+                changed = True
+
+        if changed:
+            self.save()
         return len(removed), removed
 
     def detect_models(self) -> Tuple[int, List[str]]:
-        hf_root = Path(self.hf_cache_root).expanduser()
-        llmfit_root = Path(self.llmfit_cache_root).expanduser()
-
-        existing_paths = {str(Path(m.path).resolve()) for m in self.models if Path(m.path).exists()}
+        discovered, notes = self.discover_source_files()
+        existing_paths = {self.normalize_model_ref(m.path): m for m in self.models}
         added = []
-        notes = []
-        candidates: List[Path] = []
+        changed = False
 
-        if hf_root.exists():
-            candidates.extend(sorted(hf_root.glob('models--*/snapshots/*/*.gguf')))
-        else:
-            notes.append(f'HF cache not found: {hf_root}')
-
-        if llmfit_root.exists():
-            candidates.extend(sorted(llmfit_root.glob('*.gguf')))
-        else:
-            notes.append(f'llmfit cache not found: {llmfit_root}')
-
-        for gguf in candidates:
-            resolved = str(gguf.resolve())
+        for resolved, (gguf, source) in discovered.items():
             if resolved in existing_paths:
+                model = existing_paths[resolved]
+                if model.source != source:
+                    model.source = source
+                    changed = True
                 continue
-            model = detected_model_from_path(gguf, self.models)
-            self.add_or_update(model)
-            existing_paths.add(resolved)
-            added.append(model.id)
 
+            model = detected_model_from_path(gguf, self.models, source=source)
+            self.add_or_update(model)
+            existing_paths[resolved] = model
+            added.append(model.id)
+            changed = True
+
+        removed_count, removed = self.prune_missing_models()
+        if changed:
+            self.save()
+
+        parts = []
         if added:
-            return len(added), added
+            parts.append('added: ' + ', '.join(added[:6]))
+        if removed:
+            parts.append('pruned: ' + ', '.join(removed[:6]))
+        if parts:
+            summary = ' | '.join(parts)
+            if len(added) > 6 or len(removed) > 6:
+                summary += ' ...'
+            return len(added), [summary]
         if notes:
             return 0, notes
         return 0, ['No new GGUFs found.']
@@ -421,10 +598,11 @@ class AppConfig:
 
         provider = {}
         for model in enabled_models:
-            provider_key = f'llama-{model.id}'
+            provider_key = f'local-{model.id}'
+            runtime_label = 'vLLM' if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else 'llama.cpp'
             provider[provider_key] = {
                 'npm': '@ai-sdk/openai-compatible',
-                'name': f'llama.cpp {model.name}',
+                'name': f'{runtime_label} {model.name}',
                 'options': {
                     'baseURL': f'http://{model.host}:{model.port}/v1',
                     'timeout': self.opencode.timeout,
@@ -442,7 +620,7 @@ class AppConfig:
             }
 
         def ref(model: ModelConfig) -> str:
-            return f'llama-{model.id}/{model.alias}'
+            return f'local-{model.id}/{model.alias}'
 
         config = {
             '$schema': existing.get('$schema', 'https://opencode.ai/config.json'),
@@ -497,7 +675,87 @@ def choose_defaults(name: str) -> Tuple[int, int, float]:
     return 8192, 999, 0.65
 
 
-def detected_model_from_path(path: Path, existing_models: List[ModelConfig]) -> ModelConfig:
+def is_real_model_file(path: Path) -> bool:
+    name = path.name.lower()
+    if path.suffix.lower() != '.gguf':
+        return False
+    if 'mmproj' in name:
+        return False
+    return True
+
+
+def looks_like_model_reference(value: str) -> bool:
+    value = (value or '').strip()
+    if not value or ' ' in value:
+        return False
+    if value.lower().endswith('.gguf'):
+        return False
+    if value.startswith('hf://'):
+        return True
+    return bool(re.match(r'^[^/\s]+/[^\s]+$', value))
+
+
+def is_registered_model_entry(model: ModelConfig) -> bool:
+    runtime = getattr(model, 'runtime', 'llama.cpp')
+    target = (getattr(model, 'path', '') or '').strip()
+    if runtime == 'vllm':
+        if not target:
+            return False
+        p = Path(target).expanduser()
+        return p.exists() or looks_like_model_reference(target)
+    return is_real_model_file(Path(target))
+
+
+def display_runtime(model: ModelConfig) -> str:
+    runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+    mapping = {
+        'llama.cpp': 'llama.cpp',
+        'vllm': 'vLLM',
+        'ollama': 'Ollama',
+    }
+    return mapping.get(runtime, runtime or 'unknown')
+
+
+def extract_quant(model: ModelConfig) -> str:
+    text = ' '.join([
+        getattr(model, 'name', '') or '',
+        getattr(model, 'alias', '') or '',
+        getattr(model, 'path', '') or '',
+    ])
+    pattern = re.compile(r'(?i)(iq\d+(?:_[a-z0-9]+)+|iq\d+(?:\.\d+)?|q\d+(?:_[a-z0-9]+)+|q\d+(?:\.\d+)?(?:_[a-z0-9]+)*|bf16|fp16|f16|bf8|fp8|f32|fp32|int8|int4)')
+    match = pattern.search(text)
+    if not match:
+        return '-'
+    return match.group(1).upper()
+
+
+def classify_model_type(model: ModelConfig) -> str:
+    text = ' '.join([
+        getattr(model, 'name', '') or '',
+        getattr(model, 'alias', '') or '',
+        getattr(model, 'path', '') or '',
+    ]).lower()
+
+    if (
+        re.search(r'\bmoe\b', text)
+        or re.search(r'\ba\d+b\b', text)
+        or any(token in text for token in ('mixtral', 'switch', 'mixture-of-experts', 'mixture of experts'))
+    ):
+        return 'MoE'
+
+    runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+    if runtime == 'vllm':
+        return 'GPU'
+    if runtime == 'ollama':
+        return 'GPU'
+
+    try:
+        return 'CPU' if int(getattr(model, 'ngl', 0)) == 0 else 'GPU'
+    except Exception:
+        return 'Dense'
+
+
+def detected_model_from_path(path: Path, existing_models: List[ModelConfig], source: str = 'manual') -> ModelConfig:
     stem = path.stem
     name = pretty_name_from_filename(stem)
     repo_dir = path.parts[-4] if len(path.parts) >= 4 else ''
@@ -576,6 +834,7 @@ def prompt_model(stdscr, title: str, initial: Optional[ModelConfig] = None) -> O
     answers = prompt_value(stdscr, title, [
         ('id', initial.id),
         ('name', initial.name),
+        ('runtime (llama.cpp/vllm)', getattr(initial, 'runtime', 'llama.cpp')),
         ('path', initial.path),
         ('alias', initial.alias or initial.id),
         ('port', str(initial.port)),
@@ -610,8 +869,10 @@ def prompt_model(stdscr, title: str, initial: Optional[ModelConfig] = None) -> O
             cache_ram=int(answers['cache_ram']),
             output=int(answers['output']),
             enabled=answers['enabled true/false'].lower() == 'true',
+            runtime=(answers['runtime (llama.cpp/vllm)'].strip().lower() or 'llama.cpp'),
             flash_attn=answers['flash_attn true/false'].lower() == 'true',
             jinja=answers['jinja true/false'].lower() == 'true',
+            source=getattr(initial, 'source', 'manual'),
             extra_args=answers['extra_args (space-separated)'].split() if answers['extra_args (space-separated)'] else [],
         )
     except Exception:
@@ -622,7 +883,9 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
     o = app.opencode
     answers = prompt_value(stdscr, 'Settings', [
         ('llama_server', app.llama_server),
+        ('vllm_command', app.vllm_command),
         ('hf_cache_root', app.hf_cache_root),
+        ('llm_models_cache_root', app.llm_models_cache_root),
         ('llmfit_cache_root', app.llmfit_cache_root),
         ('opencode_path', o.path),
         ('opencode_backup_dir', o.backup_dir),
@@ -640,7 +903,9 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
         return False
     try:
         app.llama_server = answers['llama_server']
+        app.vllm_command = answers['vllm_command']
         app.hf_cache_root = answers['hf_cache_root']
+        app.llm_models_cache_root = answers['llm_models_cache_root']
         app.llmfit_cache_root = answers['llmfit_cache_root']
         o.path = answers['opencode_path']
         o.backup_dir = answers['opencode_backup_dir']
@@ -770,9 +1035,11 @@ def tui(stdscr, app: AppConfig):
 
         stdscr.addstr(header_y, 2, f'config: {app.config_path}', colors['muted'])
         stdscr.addstr(header_y + 1, 2, f'llama-server: {app.llama_server}', colors['muted'])
-        stdscr.addstr(header_y + 2, 2, f'hf-cache: {app.hf_cache_root}', colors['muted'])
-        stdscr.addstr(header_y + 3, 2, f'llmfit-cache: {app.llmfit_cache_root}', colors['muted'])
-        stdscr.addstr(header_y + 4, 2, f'opencode: {app.opencode.path or "<unset>"}', colors['muted'])
+        stdscr.addstr(header_y + 2, 2, f'vllm-command: {app.vllm_command}', colors['muted'])
+        stdscr.addstr(header_y + 3, 2, f'hf-cache: {app.hf_cache_root}', colors['muted'])
+        stdscr.addstr(header_y + 4, 2, f'llm-models-cache: {app.llm_models_cache_root}', colors['muted'])
+        stdscr.addstr(header_y + 5, 2, f'llmfit-cache: {app.llmfit_cache_root}', colors['muted'])
+        stdscr.addstr(header_y + 6, 2, f'opencode: {app.opencode.path or "<unset>"}', colors['muted'])
 
         msg_attr = colors['accent'] | curses.A_BOLD
         if message.startswith('✅'):
@@ -781,10 +1048,10 @@ def tui(stdscr, app: AppConfig):
             msg_attr = colors['error'] | curses.A_BOLD
         elif message.startswith('⏳'):
             msg_attr = colors['warning'] | curses.A_BOLD
-        stdscr.addstr(header_y + 5, 2, message[: max(10, w - 4)], msg_attr)
+        stdscr.addstr(header_y + 7, 2, message[: max(10, w - 4)], msg_attr)
 
-        box_top = header_y + 6
-        left_w = max(56, min(84, w // 2))
+        box_top = header_y + 8
+        left_w = max(76, min(112, (w // 2) + 8))
         right_x = left_w + 2
         right_w = max(38, w - right_x - 2)
         visible_rows = max(8, h - box_top - 6)
@@ -792,7 +1059,7 @@ def tui(stdscr, app: AppConfig):
         draw_box(stdscr, box_top, 1, h - box_top - 4, left_w, 'Models', colors['accent'] | curses.A_BOLD, colors['accent'])
         draw_box(stdscr, box_top, right_x, h - box_top - 4, right_w, 'Details / Logs / Roles', colors['accent'] | curses.A_BOLD, colors['accent'])
 
-        header = ' ID              PRT  ST        RLS  NAME'
+        header = ' ID              PRT  ST        RLS  ENG        QNT      TYPE   NAME'
         stdscr.addstr(box_top + 2, 3, header, colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD)
 
         if app.models:
@@ -802,8 +1069,11 @@ def tui(stdscr, app: AppConfig):
                 model = app.models[idx]
                 status, _ = statuses.get(model.id, ('?', ''))
                 roles = app.role_badges(model.id)
-                name_col_width = max(10, left_w - 41)
-                line = f' {model.id[:14]:14} {model.port:4}  {status[:8]:8}  {roles:3}  {model.name[:name_col_width]}'
+                engine = display_runtime(model)[:10]
+                quant = extract_quant(model)[:8]
+                model_type = classify_model_type(model)[:6]
+                name_col_width = max(10, left_w - 70)
+                line = f' {model.id[:14]:14} {model.port:4}  {status[:8]:8}  {roles:3}  {engine:10} {quant:8} {model_type:6} {model.name[:name_col_width]}'
                 row_y = box_top + 3 + idx - start_idx
                 if idx == selected:
                     try:
@@ -815,7 +1085,7 @@ def tui(stdscr, app: AppConfig):
                     status_x = 3 + 1 + 14 + 1 + 4 + 2
                     stdscr.addstr(row_y, status_x, f'{status[:8]:8}', status_attr(colors, status))
         else:
-            stdscr.addstr(box_top + 3, 3, 'No models yet. Press x to detect from Hugging Face cache or a to add manually.', colors['warning'])
+            stdscr.addstr(box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
 
         if app.models:
             model = app.models[selected]
@@ -825,6 +1095,8 @@ def tui(stdscr, app: AppConfig):
                 f'id: {model.id}',
                 f'path: {model.path}',
                 f'alias: {model.alias}',
+                f'runtime/source: {display_runtime(model)} / {getattr(model, "source", "manual")}',
+                f'quant/type: {extract_quant(model)} / {classify_model_type(model)}',
                 f'bind: {model.host}:{model.port}',
                 f'ctx={model.ctx} threads={model.threads} ngl={model.ngl} temp={model.temp}',
                 f'parallel={model.parallel} cache_ram={model.cache_ram} output={model.output}',
@@ -841,14 +1113,14 @@ def tui(stdscr, app: AppConfig):
             lines.extend(tail_text(app.logfile(model.id), max_lines=max(8, h - box_top - 22)))
             for i, line in enumerate(lines[: h - box_top - 7]):
                 attr = curses.A_NORMAL
-                if i == 8:
+                if i == 10:
                     attr = status_attr(colors, status)
-                elif i in (12, 15):
+                elif i in (14, 17):
                     attr = colors['accent'] | curses.A_BOLD
                 stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
 
         footer = '[Enter] start/stop  [x] detect  [X] prune  [g] gen opencode  [o] settings  [a/e/d] models  [S] stop-all  [q] quit'
-        footer2 = '[m] set main  [s] set small  [b] set build  [p] set plan  [r] refresh'
+        footer2 = '[m] set main  [s] set small  [b] set build  [p] set plan  [r] sync inventory'
         stdscr.addstr(h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
         stdscr.addstr(h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
         stdscr.refresh()
@@ -868,8 +1140,9 @@ def tui(stdscr, app: AppConfig):
         elif key in (curses.KEY_DOWN, ord('j')) and app.models:
             selected = min(len(app.models) - 1, selected + 1)
         elif key == ord('r'):
+            count, items = app.detect_models()
             statuses = {m.id: app.health(m) for m in app.models}
-            message = 'Refreshed.'
+            message = items[0] if items else (f'Synced {count} model(s)' if count else 'Synced.')
         elif key == ord('S'):
             message = '; '.join(app.stop_all())[: max(20, w - 4)]
         elif key in (10, 13, curses.KEY_ENTER) and app.models:
@@ -913,7 +1186,7 @@ def tui(stdscr, app: AppConfig):
                 message = 'Delete cancelled.'
         elif key == ord('x'):
             count, items = app.detect_models()
-            message = f'Detected {count} new model(s): {", ".join(items[:5])}' if count else (items[0] if items else 'No new GGUFs found.')
+            message = items[0] if items else (f'Detected {count} new model(s)' if count else 'No new GGUFs found.')
             selected = min(selected, len(app.models) - 1 if app.models else 0)
         elif key == ord('X'):
             count, removed = app.prune_missing_models()
