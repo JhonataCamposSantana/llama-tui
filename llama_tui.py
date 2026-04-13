@@ -22,6 +22,7 @@ CACHE_DIR = Path.home() / '.cache' / APP_NAME
 DEFAULT_CONFIG_PATH = Path(os.environ['LLAMA_TUI_CONFIG']).expanduser() if os.environ.get('LLAMA_TUI_CONFIG') else (CONFIG_DIR / 'models.json')
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_HF_CACHE = Path('/var/home/jcampos/.cache/huggingface/hub') if Path('/var/home/jcampos/.cache/huggingface/hub').exists() else Path.home() / '.cache' / 'huggingface' / 'hub'
+DEFAULT_LLMFIT_CACHE = Path(os.environ.get('LLMFIT_CACHE_ROOT', Path.home() / '.cache' / 'llmfit' / 'models')).expanduser()
 DEFAULT_LLAMA_SERVER = str(Path('/var/home/jcampos/llama.cpp/build/bin/llama-server') if Path('/var/home/jcampos/llama.cpp/build/bin/llama-server').exists() else Path.home() / 'llama.cpp' / 'build' / 'bin' / 'llama-server')
 REFRESH_SECONDS = 2.0
 LOGO = [
@@ -74,6 +75,7 @@ class AppConfig:
         self.config_path = config_path
         self.llama_server = os.environ.get('LLAMA_SERVER', DEFAULT_LLAMA_SERVER)
         self.hf_cache_root = str(DEFAULT_HF_CACHE)
+        self.llmfit_cache_root = str(DEFAULT_LLMFIT_CACHE)
         self.opencode = OpencodeSettings(
             path='',
             backup_dir=str(CONFIG_DIR / 'backups'),
@@ -91,6 +93,7 @@ class AppConfig:
         data = json.loads(self.config_path.read_text())
         self.llama_server = data.get('llama_server', self.llama_server)
         self.hf_cache_root = data.get('hf_cache_root', self.hf_cache_root)
+        self.llmfit_cache_root = data.get('llmfit_cache_root', self.llmfit_cache_root)
         self.opencode = OpencodeSettings(**data.get('opencode', {}))
         self.models = [ModelConfig(**item) for item in data.get('models', [])]
 
@@ -98,6 +101,7 @@ class AppConfig:
         data = {
             'llama_server': self.llama_server,
             'hf_cache_root': self.hf_cache_root,
+            'llmfit_cache_root': self.llmfit_cache_root,
             'opencode': asdict(self.opencode),
             'models': [asdict(m) for m in self.models],
         }
@@ -135,24 +139,52 @@ class AppConfig:
         except Exception:
             return False
 
+    def _find_model_pid(self, model: ModelConfig) -> Optional[int]:
+        target = os.path.basename(self.llama_server)
+        port = str(model.port)
+        alias = model.alias
+        path = model.path
+        for proc_dir in Path('/proc').iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            try:
+                pid = int(proc_dir.name)
+                raw = (proc_dir / 'cmdline').read_bytes()
+                parts = [p.decode(errors='ignore') for p in raw.split(b'\x00') if p]
+                if not parts:
+                    continue
+                if not any(os.path.basename(part) == target for part in parts):
+                    continue
+                joined = '\x00'.join(parts)
+                if f'\x00--port\x00{port}\x00' in joined or f'\x00--alias\x00{alias}\x00' in joined or path in parts:
+                    state = self._proc_state(pid)
+                    if state not in ('Z', 'X'):
+                        return pid
+            except Exception:
+                continue
+        return None
+
     def get_pid(self, model: ModelConfig) -> Optional[int]:
         pidfile = self.pidfile(model.id)
-        if not pidfile.exists():
-            return None
-        try:
-            pid = int(pidfile.read_text().strip())
-            os.kill(pid, 0)
-            state = self._proc_state(pid)
-            if state in ('Z', 'X'):
+        if pidfile.exists():
+            try:
+                pid = int(pidfile.read_text().strip())
+                os.kill(pid, 0)
+                state = self._proc_state(pid)
+                if state in ('Z', 'X'):
+                    pidfile.unlink(missing_ok=True)
+                elif self._pid_looks_like_llama(pid):
+                    return pid
+                else:
+                    pidfile.unlink(missing_ok=True)
+            except Exception:
                 pidfile.unlink(missing_ok=True)
-                return None
-            if not self._pid_looks_like_llama(pid):
-                pidfile.unlink(missing_ok=True)
-                return None
+
+        pid = self._find_model_pid(model)
+        if pid:
+            pidfile.write_text(str(pid))
             return pid
-        except Exception:
-            pidfile.unlink(missing_ok=True)
-            return None
+        return None
 
     def health(self, model: ModelConfig) -> Tuple[str, str]:
         pid = self.get_pid(model)
@@ -226,7 +258,10 @@ class AppConfig:
     def stop(self, model: ModelConfig) -> Tuple[bool, str]:
         pid = self.get_pid(model)
         if not pid:
+            status, _ = self.health(model)
             self.pidfile(model.id).unlink(missing_ok=True)
+            if status == 'READY':
+                return False, 'running but unmanaged; could not find PID'
             return True, 'already stopped'
         try:
             os.kill(pid, signal.SIGTERM)
@@ -238,6 +273,15 @@ class AppConfig:
             if not self.get_pid(model):
                 self.pidfile(model.id).unlink(missing_ok=True)
                 return True, 'stopped'
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        for _ in range(10):
+            time.sleep(0.1)
+            if not self.get_pid(model):
+                self.pidfile(model.id).unlink(missing_ok=True)
+                return True, 'stopped (forced)'
         return False, 'did not stop cleanly'
 
     def stop_all(self) -> List[str]:
@@ -277,12 +321,25 @@ class AppConfig:
         return len(removed), removed
 
     def detect_models(self) -> Tuple[int, List[str]]:
-        root = Path(self.hf_cache_root).expanduser()
-        if not root.exists():
-            return 0, [f'HF cache not found: {root}']
+        hf_root = Path(self.hf_cache_root).expanduser()
+        llmfit_root = Path(self.llmfit_cache_root).expanduser()
+
         existing_paths = {str(Path(m.path).resolve()) for m in self.models if Path(m.path).exists()}
         added = []
-        for gguf in sorted(root.glob('models--*/snapshots/*/*.gguf')):
+        notes = []
+        candidates: List[Path] = []
+
+        if hf_root.exists():
+            candidates.extend(sorted(hf_root.glob('models--*/snapshots/*/*.gguf')))
+        else:
+            notes.append(f'HF cache not found: {hf_root}')
+
+        if llmfit_root.exists():
+            candidates.extend(sorted(llmfit_root.glob('*.gguf')))
+        else:
+            notes.append(f'llmfit cache not found: {llmfit_root}')
+
+        for gguf in candidates:
             resolved = str(gguf.resolve())
             if resolved in existing_paths:
                 continue
@@ -290,7 +347,12 @@ class AppConfig:
             self.add_or_update(model)
             existing_paths.add(resolved)
             added.append(model.id)
-        return len(added), added
+
+        if added:
+            return len(added), added
+        if notes:
+            return 0, notes
+        return 0, ['No new GGUFs found.']
 
     def next_port(self, start: int = 8080) -> int:
         used = {m.port for m in self.models}
@@ -561,6 +623,7 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
     answers = prompt_value(stdscr, 'Settings', [
         ('llama_server', app.llama_server),
         ('hf_cache_root', app.hf_cache_root),
+        ('llmfit_cache_root', app.llmfit_cache_root),
         ('opencode_path', o.path),
         ('opencode_backup_dir', o.backup_dir),
         ('default_model_id', o.default_model_id),
@@ -578,6 +641,7 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
     try:
         app.llama_server = answers['llama_server']
         app.hf_cache_root = answers['hf_cache_root']
+        app.llmfit_cache_root = answers['llmfit_cache_root']
         o.path = answers['opencode_path']
         o.backup_dir = answers['opencode_backup_dir']
         o.default_model_id = answers['default_model_id']
@@ -707,7 +771,8 @@ def tui(stdscr, app: AppConfig):
         stdscr.addstr(header_y, 2, f'config: {app.config_path}', colors['muted'])
         stdscr.addstr(header_y + 1, 2, f'llama-server: {app.llama_server}', colors['muted'])
         stdscr.addstr(header_y + 2, 2, f'hf-cache: {app.hf_cache_root}', colors['muted'])
-        stdscr.addstr(header_y + 3, 2, f'opencode: {app.opencode.path or "<unset>"}', colors['muted'])
+        stdscr.addstr(header_y + 3, 2, f'llmfit-cache: {app.llmfit_cache_root}', colors['muted'])
+        stdscr.addstr(header_y + 4, 2, f'opencode: {app.opencode.path or "<unset>"}', colors['muted'])
 
         msg_attr = colors['accent'] | curses.A_BOLD
         if message.startswith('✅'):
@@ -716,9 +781,9 @@ def tui(stdscr, app: AppConfig):
             msg_attr = colors['error'] | curses.A_BOLD
         elif message.startswith('⏳'):
             msg_attr = colors['warning'] | curses.A_BOLD
-        stdscr.addstr(header_y + 4, 2, message[: max(10, w - 4)], msg_attr)
+        stdscr.addstr(header_y + 5, 2, message[: max(10, w - 4)], msg_attr)
 
-        box_top = header_y + 5
+        box_top = header_y + 6
         left_w = max(56, min(84, w // 2))
         right_x = left_w + 2
         right_w = max(38, w - right_x - 2)
