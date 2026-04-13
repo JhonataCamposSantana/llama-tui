@@ -15,6 +15,7 @@ A small terminal UI for managing local `llama-server` models, scanning GGUFs fro
   - plan
 - Generate `opencode.json` and archive the old one first
 - View logs and command previews from inside the TUI
+- Safe context auto-tuning mode (`max_context_safe`) to maximize context while reserving system memory
 - Zero-dependency Python: uses only the standard library
 
 ## Recommended local layout
@@ -48,9 +49,11 @@ llama-tui
 
 - `↑ / ↓` or `j / k`: move
 - `Enter`: start or stop selected model
+- `Enter` on a stopped model: choose launch mode (`max context`, `tokens/sec`, `auto best`, or `keep current`)
 - `a`: add model
 - `e`: edit model
 - `d`: delete model
+- `z`: optimize selected model with auto-best profile and sync `opencode.json`
 - `x`: detect GGUF models from HF cache
 - `X`: prune missing models
 - `m`: mark selected model as OpenCode main model
@@ -61,6 +64,19 @@ llama-tui
 - `o`: edit settings
 - `r`: refresh
 - `q`: quit
+
+### Context optimization modes
+
+Each model can choose:
+
+- `max_context_safe` (default): tries to use the requested context window, but auto-caps it at launch time based on current available system memory and a configurable reserve percentage.
+- `manual`: uses the exact configured context and parallel values.
+
+Per-model tuning fields:
+
+- `ctx_min`
+- `ctx_max`
+- `memory_reserve_percent`
 
 ## Notes
 
