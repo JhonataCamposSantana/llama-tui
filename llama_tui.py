@@ -1160,10 +1160,6 @@ def ellipsize(text: str, width: int) -> str:
     return text[: width - 3] + '...'
 
 
-def compact_message(text: str) -> str:
-    return ' | '.join(part.strip() for part in str(text).splitlines() if part.strip())
-
-
 
 def tui(stdscr, app: AppConfig):
     colors = init_colors()
@@ -1226,8 +1222,7 @@ def tui(stdscr, app: AppConfig):
             msg_attr = colors['error'] | curses.A_BOLD
         elif message.startswith('⏳'):
             msg_attr = colors['warning'] | curses.A_BOLD
-        header_message = compact_message(message)
-        msg_line = ellipsize(header_message, max(10, w - 4))
+        msg_line = ellipsize(message, max(10, w - 4))
         stdscr.addstr(header_y + 7, 2, msg_line, msg_attr)
 
         chip_y = header_y + 7
