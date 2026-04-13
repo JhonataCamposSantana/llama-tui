@@ -54,6 +54,12 @@ class ModelConfig:
     flash_attn: bool = True
     jinja: bool = True
     output: int = 4096
+    optimize_mode: str = 'max_context_safe'
+    ctx_min: int = 2048
+    ctx_max: int = 131072
+    memory_reserve_percent: int = 25
+    last_good_ctx: int = 0
+    last_good_parallel: int = 0
     enabled: bool = True
     runtime: str = 'llama.cpp'
     source: str = 'manual'
@@ -202,6 +208,64 @@ class AppConfig:
         target = os.path.basename(prefixes[0]) if prefixes else os.path.basename(self.llama_server)
         return any(os.path.basename(part) == target for part in parts)
 
+    def available_memory_bytes(self) -> int:
+        meminfo = Path('/proc/meminfo')
+        if not meminfo.exists():
+            return 0
+        try:
+            for line in meminfo.read_text().splitlines():
+                if line.startswith('MemAvailable:'):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        return int(parts[1]) * 1024
+        except Exception:
+            return 0
+        return 0
+
+    def _estimate_kv_bytes_per_token(self, model: ModelConfig) -> int:
+        runtime = getattr(model, 'runtime', 'llama.cpp')
+        if runtime == 'vllm':
+            return 32768
+        target = Path(model.path).expanduser()
+        if not target.exists():
+            return 32768
+        size = target.stat().st_size
+        if size < 8 * 1024**3:
+            return 16384
+        if size < 20 * 1024**3:
+            return 32768
+        return 65536
+
+    def safe_launch_profile(self, model: ModelConfig) -> Tuple[bool, Dict[str, int], str]:
+        mode = (getattr(model, 'optimize_mode', 'max_context_safe') or 'max_context_safe').strip().lower()
+        requested_ctx = max(1, int(getattr(model, 'ctx', 8192)))
+        requested_parallel = max(1, int(getattr(model, 'parallel', 1)))
+        if mode == 'manual':
+            return True, {'ctx': requested_ctx, 'parallel': requested_parallel}, 'manual mode'
+
+        mem_available = self.available_memory_bytes()
+        if mem_available <= 0:
+            return True, {'ctx': requested_ctx, 'parallel': requested_parallel}, 'safe mode (memory probe unavailable)'
+
+        reserve_pct = max(5, min(60, int(getattr(model, 'memory_reserve_percent', 25))))
+        usable = int(mem_available * ((100 - reserve_pct) / 100.0))
+        if usable <= 0:
+            return False, {}, f'not enough free memory (reserve={reserve_pct}%)'
+
+        kv_per_token = self._estimate_kv_bytes_per_token(model)
+        cap_parallel = max(1, requested_parallel)
+        safe_ctx_by_mem = max(1, usable // (kv_per_token * cap_parallel))
+        min_ctx = max(256, int(getattr(model, 'ctx_min', 2048)))
+        max_ctx = max(min_ctx, int(getattr(model, 'ctx_max', 131072)))
+        applied_ctx = max(min_ctx, min(requested_ctx, max_ctx, safe_ctx_by_mem))
+        if applied_ctx < min_ctx:
+            return False, {}, f'not enough memory for minimum ctx={min_ctx} (available={mem_available // 1024**2} MiB)'
+
+        notes = [f'safe mode reserve={reserve_pct}%']
+        if applied_ctx != requested_ctx:
+            notes.append(f'ctx {requested_ctx}→{applied_ctx}')
+        return True, {'ctx': applied_ctx, 'parallel': cap_parallel}, ', '.join(notes)
+
     def managed_roots(self) -> Dict[str, Path]:
         return {
             'huggingface': Path(self.hf_cache_root).expanduser(),
@@ -336,8 +400,10 @@ class AppConfig:
                 return 'STARTING', 'process alive, endpoint not ready'
             return 'STOPPED', str(e).split(':')[0]
 
-    def build_command(self, model: ModelConfig) -> List[str]:
+    def build_command(self, model: ModelConfig, ctx_override: Optional[int] = None, parallel_override: Optional[int] = None) -> List[str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
+        ctx_value = int(ctx_override if ctx_override is not None else model.ctx)
+        parallel_value = int(parallel_override if parallel_override is not None else model.parallel)
         if runtime == 'vllm':
             cmd = self.command_prefix(self.vllm_command) + [
                 'serve',
@@ -346,8 +412,8 @@ class AppConfig:
                 '--port', str(model.port),
                 '--served-model-name', model.alias,
             ]
-            if model.ctx > 0:
-                cmd += ['--max-model-len', str(model.ctx)]
+            if ctx_value > 0:
+                cmd += ['--max-model-len', str(ctx_value)]
             cmd += model.extra_args
             return cmd
 
@@ -356,10 +422,10 @@ class AppConfig:
             '--alias', model.alias,
             '--host', model.host,
             '--port', str(model.port),
-            '--ctx-size', str(model.ctx),
+            '--ctx-size', str(ctx_value),
             '--threads', str(model.threads),
             '--n-gpu-layers', str(model.ngl),
-            '--parallel', str(model.parallel),
+            '--parallel', str(parallel_value),
             '--cache-ram', str(model.cache_ram),
             '--temp', str(model.temp),
         ]
@@ -379,19 +445,29 @@ class AppConfig:
         valid, reason = self.validate_model_target(model)
         if not valid:
             return False, reason
+        profile_ok, profile, profile_msg = self.safe_launch_profile(model)
+        if not profile_ok:
+            return False, profile_msg
         if self.get_pid(model):
             return True, f'{model.id} already running'
         log_path = self.logfile(model.id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, 'ab') as log_file:
             proc = subprocess.Popen(
-                self.build_command(model),
+                self.build_command(
+                    model,
+                    ctx_override=profile.get('ctx'),
+                    parallel_override=profile.get('parallel'),
+                ),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         self.pidfile(model.id).write_text(str(proc.pid))
-        return True, f'started PID {proc.pid}'
+        model.last_good_ctx = profile.get('ctx', model.ctx)
+        model.last_good_parallel = profile.get('parallel', model.parallel)
+        self.save()
+        return True, f'started PID {proc.pid} ({profile_msg})'
 
     def wait_until_ready(self, model: ModelConfig, timeout: int = 180) -> Tuple[bool, str]:
         start = time.time()
@@ -835,15 +911,19 @@ def prompt_model(stdscr, title: str, initial: Optional[ModelConfig] = None) -> O
         ('id', initial.id),
         ('name', initial.name),
         ('runtime (llama.cpp/vllm)', getattr(initial, 'runtime', 'llama.cpp')),
+        ('optimize_mode (max_context_safe/manual)', getattr(initial, 'optimize_mode', 'max_context_safe')),
         ('path', initial.path),
         ('alias', initial.alias or initial.id),
         ('port', str(initial.port)),
         ('host', initial.host),
         ('ctx', str(initial.ctx)),
+        ('ctx_min', str(getattr(initial, 'ctx_min', 2048))),
+        ('ctx_max', str(getattr(initial, 'ctx_max', 131072))),
         ('threads', str(initial.threads)),
         ('ngl', str(initial.ngl)),
         ('temp', str(initial.temp)),
         ('parallel', str(initial.parallel)),
+        ('memory_reserve_percent', str(getattr(initial, 'memory_reserve_percent', 25))),
         ('cache_ram', str(initial.cache_ram)),
         ('output', str(initial.output)),
         ('enabled true/false', str(initial.enabled).lower()),
@@ -862,10 +942,14 @@ def prompt_model(stdscr, title: str, initial: Optional[ModelConfig] = None) -> O
             port=int(answers['port']),
             host=answers['host'],
             ctx=int(answers['ctx']),
+            ctx_min=int(answers['ctx_min']),
+            ctx_max=int(answers['ctx_max']),
             threads=int(answers['threads']),
             ngl=int(answers['ngl']),
             temp=float(answers['temp']),
             parallel=int(answers['parallel']),
+            optimize_mode=(answers['optimize_mode (max_context_safe/manual)'].strip() or 'max_context_safe'),
+            memory_reserve_percent=int(answers['memory_reserve_percent']),
             cache_ram=int(answers['cache_ram']),
             output=int(answers['output']),
             enabled=answers['enabled true/false'].lower() == 'true',
@@ -924,6 +1008,52 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
         return False
 
 
+def prompt_launch_optimization(stdscr, model: ModelConfig) -> str:
+    curses.endwin()
+    print(f'\nLaunch options for {model.id}')
+    print('-----------------------------')
+    print('1) Optimize for max context (safe)')
+    print('2) Optimize for tokens/sec')
+    print('3) Keep current settings')
+    print('q) Cancel')
+    choice = input('Choose [1/2/3/q]: ').strip().lower()
+    stdscr.clear()
+    stdscr.refresh()
+    if choice == '1':
+        return 'max_context'
+    if choice == '2':
+        return 'tokens_per_sec'
+    if choice == '3':
+        return 'keep'
+    return 'cancel'
+
+
+def apply_optimization_preset(model: ModelConfig, preset: str) -> str:
+    if preset == 'max_context':
+        model.optimize_mode = 'max_context_safe'
+        model.parallel = 1
+        model.memory_reserve_percent = max(25, int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(int(getattr(model, 'ctx', 8192)), 32768)
+        model.ctx = min(model.ctx, int(getattr(model, 'ctx_max', 131072)))
+        model.output = min(max(model.output, 2048), 4096)
+        return f'{model.id}: preset=max_context_safe ctx={model.ctx} parallel={model.parallel}'
+    if preset == 'tokens_per_sec':
+        model.optimize_mode = 'max_context_safe'
+        model.memory_reserve_percent = max(30, int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(int(getattr(model, 'ctx_min', 2048)), min(int(getattr(model, 'ctx', 8192)), 8192))
+        model.parallel = max(1, min(4, int(getattr(model, 'parallel', 1)) + 1))
+        model.output = min(model.output, 2048)
+        return f'{model.id}: preset=tokens_per_sec ctx={model.ctx} parallel={model.parallel}'
+    return f'{model.id}: keeping current settings'
+
+
+def sync_opencode_after_tuning(app: AppConfig) -> str:
+    if not app.opencode.path:
+        return 'opencode.path unset; skipped opencode sync'
+    ok, msg = app.generate_opencode()
+    return msg if ok else f'opencode sync failed: {msg}'
+
+
 def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
     if h < 2 or w < 4:
         return
@@ -952,6 +1082,10 @@ def init_colors():
         'muted': 0,
         'selection': 0,
         'banner': 0,
+        'panel': 0,
+        'chip_ready': 0,
+        'chip_loading': 0,
+        'chip_stopped': 0,
     }
     if not curses.has_colors():
         return palette
@@ -968,6 +1102,10 @@ def init_colors():
         ('muted', curses.COLOR_BLUE, -1),
         ('selection', curses.COLOR_BLACK, curses.COLOR_CYAN),
         ('banner', curses.COLOR_MAGENTA, -1),
+        ('panel', curses.COLOR_WHITE, -1),
+        ('chip_ready', curses.COLOR_BLACK, curses.COLOR_GREEN),
+        ('chip_loading', curses.COLOR_BLACK, curses.COLOR_YELLOW),
+        ('chip_stopped', curses.COLOR_WHITE, curses.COLOR_BLUE),
     ]
     pair_id = 1
     for name, fg, bg in pairs:
@@ -989,6 +1127,41 @@ def status_attr(colors, status: str):
         'ERROR': colors['error'] | curses.A_BOLD,
     }
     return mapping.get(status, colors['accent'])
+
+
+def status_symbol(status: str) -> str:
+    symbols = {
+        'READY': '●',
+        'LOADING': '◐',
+        'STARTING': '◔',
+        'STOPPED': '○',
+        'ERROR': '✖',
+    }
+    return symbols.get(status, '·')
+
+
+def chip_attr(colors, label: str):
+    mapping = {
+        'READY': colors['chip_ready'] | curses.A_BOLD,
+        'LOADING': colors['chip_loading'] | curses.A_BOLD,
+        'STARTING': colors['chip_loading'] | curses.A_BOLD,
+        'STOPPED': colors['chip_stopped'] | curses.A_BOLD,
+    }
+    return mapping.get(label, colors['accent'] | curses.A_BOLD)
+
+
+def ellipsize(text: str, width: int) -> str:
+    if width <= 0:
+        return ''
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + '...'
+
+
+def compact_message(text: str) -> str:
+    return ' | '.join(part.strip() for part in str(text).splitlines() if part.strip())
 
 
 
@@ -1041,6 +1214,11 @@ def tui(stdscr, app: AppConfig):
         stdscr.addstr(header_y + 5, 2, f'llmfit-cache: {app.llmfit_cache_root}', colors['muted'])
         stdscr.addstr(header_y + 6, 2, f'opencode: {app.opencode.path or "<unset>"}', colors['muted'])
 
+        counts = {'READY': 0, 'LOADING': 0, 'STARTING': 0, 'STOPPED': 0, 'ERROR': 0}
+        for _mid, (st, _detail) in statuses.items():
+            if st in counts:
+                counts[st] += 1
+
         msg_attr = colors['accent'] | curses.A_BOLD
         if message.startswith('✅'):
             msg_attr = colors['success'] | curses.A_BOLD
@@ -1048,7 +1226,22 @@ def tui(stdscr, app: AppConfig):
             msg_attr = colors['error'] | curses.A_BOLD
         elif message.startswith('⏳'):
             msg_attr = colors['warning'] | curses.A_BOLD
-        stdscr.addstr(header_y + 7, 2, message[: max(10, w - 4)], msg_attr)
+        header_message = compact_message(message)
+        msg_line = ellipsize(header_message, max(10, w - 4))
+        stdscr.addstr(header_y + 7, 2, msg_line, msg_attr)
+
+        chip_y = header_y + 7
+        chip_x = min(max(40, len(msg_line) + 6), max(40, w - 34))
+        chips = [
+            ('READY', counts['READY']),
+            ('LOADING', counts['LOADING'] + counts['STARTING']),
+            ('STOPPED', counts['STOPPED']),
+        ]
+        for label, value in chips:
+            text = f' {label}:{value} '
+            if chip_x + len(text) < w - 2:
+                stdscr.addstr(chip_y, chip_x, text, chip_attr(colors, label))
+                chip_x += len(text) + 1
 
         box_top = header_y + 8
         left_w = max(76, min(112, (w // 2) + 8))
@@ -1073,7 +1266,7 @@ def tui(stdscr, app: AppConfig):
                 quant = extract_quant(model)[:8]
                 model_type = classify_model_type(model)[:6]
                 name_col_width = max(10, left_w - 70)
-                line = f' {model.id[:14]:14} {model.port:4}  {status[:8]:8}  {roles:3}  {engine:10} {quant:8} {model_type:6} {model.name[:name_col_width]}'
+                line = f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  {roles:3}  {engine:10} {quant:8} {model_type:6} {model.name[:name_col_width]}'
                 row_y = box_top + 3 + idx - start_idx
                 if idx == selected:
                     try:
@@ -1083,44 +1276,62 @@ def tui(stdscr, app: AppConfig):
                 else:
                     stdscr.addstr(row_y, 3, line[: left_w - 3])
                     status_x = 3 + 1 + 14 + 1 + 4 + 2
-                    stdscr.addstr(row_y, status_x, f'{status[:8]:8}', status_attr(colors, status))
+                    stdscr.addstr(row_y, status_x, f'{status_symbol(status)} {status[:6]:6}', status_attr(colors, status))
+            if len(app.models) > visible_rows:
+                bar_h = max(1, visible_rows)
+                track_x = left_w - 1
+                for i in range(bar_h):
+                    stdscr.addch(box_top + 3 + i, track_x, '│', colors['muted'])
+                thumb_h = max(1, int(bar_h * (visible_rows / max(1, len(app.models)))))
+                thumb_top = int((start_idx / max(1, len(app.models) - visible_rows)) * max(0, bar_h - thumb_h))
+                for i in range(thumb_h):
+                    stdscr.addch(box_top + 3 + thumb_top + i, track_x, '█', colors['accent'] | curses.A_BOLD)
         else:
             stdscr.addstr(box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
 
         if app.models:
             model = app.models[selected]
             status, detail = statuses.get(model.id, ('?', ''))
+            show_alert = message.startswith('❌') or status == 'ERROR'
+            alert_lines = [ellipsize(line.strip(), right_w - 6) for line in str(message).splitlines() if line.strip()][:4] if show_alert else []
             lines = [
                 f'name: {model.name}',
                 f'id: {model.id}',
-                f'path: {model.path}',
+                f'path: {ellipsize(model.path, right_w - 12)}',
                 f'alias: {model.alias}',
                 f'runtime/source: {display_runtime(model)} / {getattr(model, "source", "manual")}',
                 f'quant/type: {extract_quant(model)} / {classify_model_type(model)}',
                 f'bind: {model.host}:{model.port}',
                 f'ctx={model.ctx} threads={model.threads} ngl={model.ngl} temp={model.temp}',
                 f'parallel={model.parallel} cache_ram={model.cache_ram} output={model.output}',
+                f'optimize={getattr(model, "optimize_mode", "max_context_safe")} ctx_range={getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)} reserve={getattr(model, "memory_reserve_percent", 25)}%',
                 f'flags: enabled={model.enabled} flash_attn={model.flash_attn} jinja={model.jinja}',
                 f'status: {status} ({detail})',
                 f'pid: {app.get_pid(model) or "-"}',
                 f'roles: {app.role_badges(model.id)}  [m main] [s small] [b build] [p plan]',
                 f'log: {app.logfile(model.id)}',
                 'command preview:',
-                ' '.join(app.build_command(model))[: right_w - 6],
+                ellipsize(' '.join(app.build_command(model)), right_w - 6),
                 '',
                 'last log lines:',
             ]
+            if alert_lines:
+                lines = ['error alert:', *alert_lines, ''] + lines
             lines.extend(tail_text(app.logfile(model.id), max_lines=max(8, h - box_top - 22)))
             for i, line in enumerate(lines[: h - box_top - 7]):
                 attr = curses.A_NORMAL
-                if i == 10:
+                if alert_lines and i == 0:
+                    attr = colors['error'] | curses.A_BOLD
+                elif alert_lines and i <= len(alert_lines):
+                    attr = colors['error']
+                elif i == 10 + (len(alert_lines) + 2 if alert_lines else 0):
                     attr = status_attr(colors, status)
-                elif i in (14, 17):
+                elif i in (14 + (len(alert_lines) + 2 if alert_lines else 0), 17 + (len(alert_lines) + 2 if alert_lines else 0)):
                     attr = colors['accent'] | curses.A_BOLD
                 stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
 
-        footer = '[Enter] start/stop  [x] detect  [X] prune  [g] gen opencode  [o] settings  [a/e/d] models  [S] stop-all  [q] quit'
-        footer2 = '[m] set main  [s] set small  [b] set build  [p] set plan  [r] sync inventory'
+        footer = '[Enter] start/stop  [z] optimize model  [x] detect  [X] prune  [g] gen opencode  [o] settings'
+        footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
         stdscr.addstr(h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
         stdscr.addstr(h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
         stdscr.refresh()
@@ -1152,12 +1363,27 @@ def tui(stdscr, app: AppConfig):
                 ok, msg = app.stop(model)
                 message = f'{model.id}: {msg}'
             else:
+                launch_mode = prompt_launch_optimization(stdscr, model)
+                if launch_mode == 'cancel':
+                    message = 'Launch cancelled.'
+                    continue
+                if launch_mode in ('max_context', 'tokens_per_sec'):
+                    tune_msg = apply_optimization_preset(model, launch_mode)
+                    app.add_or_update(model)
+                    sync_msg = sync_opencode_after_tuning(app)
+                    message = f'{tune_msg} | {sync_msg}'
                 ok, msg = app.start(model)
                 if ok:
                     ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
                     message = ready_msg
                 else:
                     message = msg
+        elif key == ord('z') and app.models:
+            model = app.models[selected]
+            tune_msg = apply_optimization_preset(model, 'max_context')
+            app.add_or_update(model)
+            sync_msg = sync_opencode_after_tuning(app)
+            message = f'{tune_msg} | {sync_msg}'
         elif key == ord('a'):
             model = prompt_model(stdscr, 'Add model')
             if model:
