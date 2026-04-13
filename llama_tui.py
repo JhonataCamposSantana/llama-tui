@@ -1008,6 +1008,52 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
         return False
 
 
+def prompt_launch_optimization(stdscr, model: ModelConfig) -> str:
+    curses.endwin()
+    print(f'\nLaunch options for {model.id}')
+    print('-----------------------------')
+    print('1) Optimize for max context (safe)')
+    print('2) Optimize for tokens/sec')
+    print('3) Keep current settings')
+    print('q) Cancel')
+    choice = input('Choose [1/2/3/q]: ').strip().lower()
+    stdscr.clear()
+    stdscr.refresh()
+    if choice == '1':
+        return 'max_context'
+    if choice == '2':
+        return 'tokens_per_sec'
+    if choice == '3':
+        return 'keep'
+    return 'cancel'
+
+
+def apply_optimization_preset(model: ModelConfig, preset: str) -> str:
+    if preset == 'max_context':
+        model.optimize_mode = 'max_context_safe'
+        model.parallel = 1
+        model.memory_reserve_percent = max(25, int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(int(getattr(model, 'ctx', 8192)), 32768)
+        model.ctx = min(model.ctx, int(getattr(model, 'ctx_max', 131072)))
+        model.output = min(max(model.output, 2048), 4096)
+        return f'{model.id}: preset=max_context_safe ctx={model.ctx} parallel={model.parallel}'
+    if preset == 'tokens_per_sec':
+        model.optimize_mode = 'max_context_safe'
+        model.memory_reserve_percent = max(30, int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(int(getattr(model, 'ctx_min', 2048)), min(int(getattr(model, 'ctx', 8192)), 8192))
+        model.parallel = max(1, min(4, int(getattr(model, 'parallel', 1)) + 1))
+        model.output = min(model.output, 2048)
+        return f'{model.id}: preset=tokens_per_sec ctx={model.ctx} parallel={model.parallel}'
+    return f'{model.id}: keeping current settings'
+
+
+def sync_opencode_after_tuning(app: AppConfig) -> str:
+    if not app.opencode.path:
+        return 'opencode.path unset; skipped opencode sync'
+    ok, msg = app.generate_opencode()
+    return msg if ok else f'opencode sync failed: {msg}'
+
+
 def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
     if h < 2 or w < 4:
         return
@@ -1241,6 +1287,8 @@ def tui(stdscr, app: AppConfig):
         if app.models:
             model = app.models[selected]
             status, detail = statuses.get(model.id, ('?', ''))
+            show_alert = message.startswith('❌') or status == 'ERROR'
+            alert_lines = [ellipsize(line.strip(), right_w - 6) for line in str(message).splitlines() if line.strip()][:4] if show_alert else []
             lines = [
                 f'name: {model.name}',
                 f'id: {model.id}',
@@ -1262,17 +1310,23 @@ def tui(stdscr, app: AppConfig):
                 '',
                 'last log lines:',
             ]
+            if alert_lines:
+                lines = ['error alert:', *alert_lines, ''] + lines
             lines.extend(tail_text(app.logfile(model.id), max_lines=max(8, h - box_top - 22)))
             for i, line in enumerate(lines[: h - box_top - 7]):
                 attr = curses.A_NORMAL
-                if i == 10:
+                if alert_lines and i == 0:
+                    attr = colors['error'] | curses.A_BOLD
+                elif alert_lines and i <= len(alert_lines):
+                    attr = colors['error']
+                elif i == 10 + (len(alert_lines) + 2 if alert_lines else 0):
                     attr = status_attr(colors, status)
-                elif i in (14, 17):
+                elif i in (14 + (len(alert_lines) + 2 if alert_lines else 0), 17 + (len(alert_lines) + 2 if alert_lines else 0)):
                     attr = colors['accent'] | curses.A_BOLD
                 stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
 
-        footer = '[Enter] start/stop  [x] detect  [X] prune  [g] gen opencode  [o] settings  [a/e/d] models  [S] stop-all  [q] quit'
-        footer2 = '[m] set main  [s] set small  [b] set build  [p] set plan  [r] sync inventory'
+        footer = '[Enter] start/stop  [z] optimize model  [x] detect  [X] prune  [g] gen opencode  [o] settings'
+        footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
         stdscr.addstr(h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
         stdscr.addstr(h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
         stdscr.refresh()
@@ -1304,12 +1358,27 @@ def tui(stdscr, app: AppConfig):
                 ok, msg = app.stop(model)
                 message = f'{model.id}: {msg}'
             else:
+                launch_mode = prompt_launch_optimization(stdscr, model)
+                if launch_mode == 'cancel':
+                    message = 'Launch cancelled.'
+                    continue
+                if launch_mode in ('max_context', 'tokens_per_sec'):
+                    tune_msg = apply_optimization_preset(model, launch_mode)
+                    app.add_or_update(model)
+                    sync_msg = sync_opencode_after_tuning(app)
+                    message = f'{tune_msg} | {sync_msg}'
                 ok, msg = app.start(model)
                 if ok:
                     ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
                     message = ready_msg
                 else:
                     message = msg
+        elif key == ord('z') and app.models:
+            model = app.models[selected]
+            tune_msg = apply_optimization_preset(model, 'max_context')
+            app.add_or_update(model)
+            sync_msg = sync_opencode_after_tuning(app)
+            message = f'{tune_msg} | {sync_msg}'
         elif key == ord('a'):
             model = prompt_model(stdscr, 'Add model')
             if model:
