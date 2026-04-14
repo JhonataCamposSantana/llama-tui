@@ -14,8 +14,9 @@ The project is intentionally small: it uses only the Python standard library, st
 - Probe CPU, RAM, and NVIDIA VRAM with `/proc` and `nvidia-smi`.
 - Read GGUF metadata to estimate KV cache memory and safe context sizes.
 - Auto-tune context size, CPU threads, GPU layer offload, KV cache type, batch size, and vLLM scheduler limits.
-- Benchmark candidate profiles and persist the fastest stable result.
+- Benchmark adaptive profiles and persist measured Fast Chat, Long Context, OpenCode-ready, and Auto results.
 - Benchmark OpenCode coding workflows against disposable fixture projects.
+- Try a model from inside the TUI with a temporary streaming chat console.
 - Assign OpenCode roles: main, small, build, and plan.
 - Generate `opencode.json` with backups.
 - Launch a model with OpenCode, or a full OpenCode + VS Code stack, from model details.
@@ -26,7 +27,8 @@ The project is intentionally small: it uses only the Python standard library, st
 llama_tui.py              compatibility launcher
 llama_tui/
   app.py                  config, model registry, server lifecycle
-  benchmark.py            benchmark prompts, candidate generation, scoring
+  benchmark.py            adaptive profile search, benchmark prompts, scoring
+  chat.py                 OpenAI-compatible streaming chat helper
   constants.py            paths and defaults
   discovery.py            model detection and naming helpers
   gguf.py                 GGUF metadata reader and cache-size estimates
@@ -125,6 +127,7 @@ Useful per-model fields:
 - `optimize_mode`: `max_context_safe` or `manual`.
 - `optimize_tier`: `safe`, `moderate`, or `extreme`.
 - `ctx_min`, `ctx_max`, `memory_reserve_percent`: guardrails for auto tuning.
+- `measured_profiles`: adaptive benchmark winners used by Auto, Fast Chat, Long Context, and OpenCode-ready launches.
 
 ## Controls
 
@@ -132,10 +135,11 @@ Useful per-model fields:
 - `Enter` on the list: open model details.
 - `Enter` or `l` on details: open model actions.
 - `Esc` on details: return to the model list.
-- `B`: benchmark candidate optimization profiles.
+- `T`: open Try it out from model details.
+- `B`: run the adaptive profile benchmark.
 - `O`: benchmark the selected model with an OpenCode workflow from details.
 - `A`: abort the active launch or benchmark action and clean up managed processes.
-- `z`: apply the current best heuristic optimization without benchmarking.
+- `z`: apply the Auto profile without benchmarking.
 - `S`: stop all known models.
 - `x`: detect new GGUF models from configured cache roots.
 - `X`: prune missing models.
@@ -156,14 +160,19 @@ To start a server, select a model, open details with `Enter`, then press `Enter`
 
 If the model is stopped, llama-tui asks how to launch it:
 
-- Best optimization for this PC.
-- Optimize for max context.
-- Optimize for tokens/sec.
+- Auto profile.
+- Balanced chat.
+- Fast chat.
+- Long context.
 - Keep current settings.
+- Advanced profiles.
+- Try it out.
 - Launch model + OpenCode.
 - Launch full-stack: OpenCode + VS Code.
 
-If a model is already running, the details action menu offers stop, OpenCode launch, full-stack launch, or cancel.
+If a model is already running, the details action menu offers stop, Try it out, OpenCode launch, full-stack launch, or cancel.
+
+`Try it out` is available from the action menu and as `T` on model details. It opens an integrated chat console inside llama-tui. The left pane is a temporary transcript plus a five-row wrapped prompt editor; the right pane keeps the active launch profile, server logs, and live stats visible. Press `Enter` to send, `Up / Down` to scroll long prompt text, `Ctrl+U` to clear the input, and `Esc` to leave. Leaving Try-It-Out always stops the selected model, even if it was already running before you entered the console.
 
 For `llama.cpp`, llama-tui builds a command like:
 
@@ -230,9 +239,22 @@ llama-tui reads:
 
 GGUF metadata is used to estimate KV cache bytes per token from layer count, KV heads, key/value dimensions, and cache type. This is much better than estimating from file size alone.
 
-### Tiers
+### Launch Profiles
 
-`safe`, `moderate`, and `extreme` are memory headroom policies:
+The normal model action menu uses intent labels:
+
+- `Auto profile`: use the best saved/measured behavior for this PC, with failsafe fallback.
+- `Balanced chat`: tune for responsive chat without being too aggressive.
+- `Fast chat`: push throughput harder.
+- `Long context`: favor the largest stable context window.
+- `Keep current settings`: start exactly from the saved model settings, still guarded by safe launch checks.
+- `Advanced profiles`: expose the underlying intent and aggression controls.
+
+Internally those choices still map to the persisted `optimize_mode` and `optimize_tier` values so existing configs remain compatible.
+
+### Aggression
+
+`safe`, `moderate`, and `extreme` are memory headroom policies. The UI labels them as Safe, Balanced, and Aggressive:
 
 - `safe`: higher reserve, smaller batches, conservative GPU usage.
 - `moderate`: balanced defaults.
@@ -246,14 +268,14 @@ extreme -> moderate -> safe
 
 ### Presets
 
-`max_context` favors fitting the largest stable context:
+`max_context` is shown as Long Context. Before a benchmark exists it uses conservative estimates; after pressing `B`, llama-tui prefers the measured Long Context profile:
 
 - `parallel = 1`
 - conservative batch sizes
 - q8 KV cache for llama.cpp
 - lower vLLM sequence concurrency
 
-`tokens_per_sec` favors throughput:
+`tokens_per_sec` is shown as Fast Chat. Before a benchmark exists it uses estimated throughput settings; after pressing `B`, llama-tui prefers the measured Fast Chat profile:
 
 - smaller target context
 - higher `parallel`
@@ -276,20 +298,20 @@ If the full model fits, `ngl=999` is still used. If not, llama-tui chooses a par
 
 ## Benchmark Logic
 
-Press `B` on a stopped model to benchmark.
+Press `B` on a stopped model to run the adaptive benchmark. It can take a while by design; the target budget is about 20 minutes per model, and `A` can abort it.
 
 The benchmark runner:
 
 1. Probes current hardware.
-2. Chooses a starting tier and preset.
-3. Builds up to six candidate profiles.
-4. Starts one candidate server at a time.
+2. Estimates a model-specific context ceiling from RAM, VRAM, GGUF metadata, runtime settings, and KV-cache size.
+3. Probes context with exponential growth and binary refinement.
+4. Tests dynamic context, parallel, batch, and KV-cache variants one server at a time.
 5. Waits for `/v1/models` to become ready.
 6. Warms the model with a short completion.
 7. Runs a two-prompt chat-completions suite.
-8. Scores by median generated tokens per second.
-9. Stops the managed server process group.
-10. Saves the fastest successful profile back to `models.json`.
+8. Scores measured candidates by generated tokens per second, context per slot, and headroom.
+9. Stops the managed server process group after every candidate.
+10. Saves measured `Fast Chat`, `Long Context`, `OpenCode-ready`, and `Auto` profiles back to `models.json`.
 
 The prompt suite is intentionally short and stable. It is not a model quality benchmark. It measures local serving throughput for the selected runtime and hardware.
 
@@ -297,14 +319,17 @@ Pressing `A` while a launch or benchmark is running requests cancellation. The a
 
 Saved benchmark rows include:
 
-- preset and tier,
+- measured objective,
 - tokens/sec,
 - elapsed seconds,
 - context,
+- context per slot,
 - parallel,
-- threads,
 - GPU layers,
+- RAM/VRAM headroom,
 - status and detail.
+
+`Auto profile`, `Fast Chat`, `Long Context`, `Try it out`, and OpenCode stack launches use measured profiles when they exist. If no measured profile exists yet, llama-tui falls back to the estimated safe launch path and says so in the action log.
 
 If all candidates fail, the failure details are saved and shown in the model details screen.
 
@@ -318,7 +343,7 @@ llmfit_cache_root
 llm_models_cache_root
 ```
 
-Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. The TUI then queues a safe bootstrap benchmark in the background to replace those starter values with measured settings. Discovery does not special-case model families or filenames.
+Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. Nothing benchmarks automatically in the background; open the model details and press `B` when you want measured settings. Discovery does not special-case model families or filenames.
 
 Press `X` to prune registry entries whose model files disappeared.
 
@@ -378,7 +403,7 @@ import importlib
 
 for name in [
     'constants', 'models', 'hardware', 'gguf', 'discovery',
-    'optimize', 'app', 'benchmark', 'textutil', 'ui', 'main',
+    'optimize', 'app', 'benchmark', 'chat', 'textutil', 'ui', 'main',
 ]:
     importlib.import_module(f'llama_tui.{name}')
 

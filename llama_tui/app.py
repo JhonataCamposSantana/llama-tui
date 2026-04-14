@@ -39,6 +39,9 @@ from .textutil import compact_message, important_log_excerpt
 
 
 TERMINAL_LAUNCHER_ORDER = (
+    'xdg-terminal-exec',
+    'ptyxis',
+    'gnome-console',
     'konsole',
     'gnome-terminal',
     'kgx',
@@ -46,6 +49,9 @@ TERMINAL_LAUNCHER_ORDER = (
     'alacritty',
     'wezterm',
     'foot',
+    'tilix',
+    'terminator',
+    'xfce4-terminal',
     'xterm',
 )
 
@@ -53,6 +59,11 @@ TERMINAL_LAUNCHER_ORDER = (
 def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cmd: str) -> List[str]:
     launcher_name = Path(launcher).name
     cwd_text = str(cwd)
+    cd_shell_cmd = f'cd {shlex.quote(cwd_text)} && {shell_cmd}'
+    if launcher_name == 'xdg-terminal-exec':
+        return [launcher, 'bash', '-lc', cd_shell_cmd]
+    if launcher_name in ('ptyxis', 'gnome-console'):
+        return [launcher, '--working-directory', cwd_text, '--title', title, '--', 'bash', '-lc', shell_cmd]
     if launcher_name == 'konsole':
         return [launcher, '--workdir', cwd_text, '-p', f'tabtitle={title}', '-e', 'bash', '-lc', shell_cmd]
     if launcher_name == 'gnome-terminal':
@@ -67,8 +78,22 @@ def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cm
         return [launcher, 'start', '--cwd', cwd_text, '--', 'bash', '-lc', shell_cmd]
     if launcher_name == 'foot':
         return [launcher, '--title', title, '--working-directory', cwd_text, 'bash', '-lc', shell_cmd]
+    if launcher_name == 'tilix':
+        return [launcher, '--working-directory', cwd_text, '--title', title, '-e', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'terminator':
+        return [launcher, '--working-directory', cwd_text, '-T', title, '-x', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'xfce4-terminal':
+        return [
+            launcher,
+            '--title',
+            title,
+            '--working-directory',
+            cwd_text,
+            '--command',
+            shlex.join(['bash', '-lc', shell_cmd]),
+        ]
     if launcher_name == 'xterm':
-        return [launcher, '-T', title, '-e', 'bash', '-lc', f'cd {shlex.quote(cwd_text)} && {shell_cmd}']
+        return [launcher, '-T', title, '-e', 'bash', '-lc', cd_shell_cmd]
     return [launcher, '-e', 'bash', '-lc', shell_cmd]
 
 
@@ -271,18 +296,27 @@ class AppConfig:
         return None
 
     def build_opencode_shell_command(self, model: ModelConfig, workspace: Path) -> str:
-        env_parts = []
+        env = {
+            'OPENCODE_DISABLE_AUTOUPDATE': 'true',
+            'OPENCODE_DISABLE_PRUNE': 'true',
+            'OPENCODE_DISABLE_MODELS_FETCH': 'true',
+            'OPENCODE_CLIENT': 'llama-tui-stack',
+        }
         if self.opencode.path:
-            env_parts.append(f'OPENCODE_CONFIG={shlex.quote(str(Path(self.opencode.path).expanduser()))}')
-        env_prefix = ' '.join(env_parts)
-        if env_prefix:
-            env_prefix += ' '
+            env['OPENCODE_CONFIG'] = str(Path(self.opencode.path).expanduser())
+        env_prefix = ' '.join(f'{key}={shlex.quote(str(value))}' for key, value in env.items()) + ' '
         command = [
             'opencode',
+            str(workspace),
             '--model', self.opencode_model_ref(model),
             '--agent', 'build',
         ]
-        return f'cd {shlex.quote(str(workspace))} && {env_prefix}exec ' + ' '.join(shlex.quote(part) for part in command)
+        opencode_cmd = env_prefix + ' '.join(shlex.quote(part) for part in command)
+        return (
+            f'cd {shlex.quote(str(workspace))} && {opencode_cmd}; status=$?; '
+            'printf "\\nOpenCode exited with status %s\\n" "$status"; '
+            'printf "Press Enter to close..."; read -r _; exit "$status"'
+        )
 
     def build_terminal_command(self, title: str, workspace: Path, shell_cmd: str) -> Tuple[bool, List[str], str]:
         template = getattr(self.opencode, 'terminal_command', '').strip()
@@ -297,7 +331,7 @@ class AppConfig:
                 False,
                 [],
                 'No terminal launcher found. Set opencode.terminal_command in settings '
-                'using {title}, {cwd}, and {cmd}.'
+                f'using {{title}}, {{cwd}}, and {{cmd}}. Manual command: {shell_cmd}'
             )
         return True, terminal_command_for_launcher(launcher, title, workspace, shell_cmd), Path(launcher).name
 
@@ -467,8 +501,9 @@ class AppConfig:
         mode = (getattr(model, 'optimize_mode', 'max_context_safe') or 'max_context_safe').strip().lower()
         requested_ctx = max(1, int(getattr(model, 'ctx', 8192)))
         requested_parallel = max(1, int(getattr(model, 'parallel', 1)))
-        if mode == 'manual':
-            return True, {'ctx': requested_ctx, 'parallel': requested_parallel}, 'manual mode'
+        if mode == 'manual' or mode.startswith('measured_'):
+            label = 'measured profile' if mode.startswith('measured_') else 'manual mode'
+            return True, {'ctx': requested_ctx, 'parallel': requested_parallel}, label
 
         profile = self.hardware_profile(refresh=True)
         if (profile.memory_available or self.available_memory_bytes()) <= 0 and not profile.has_usable_gpu():

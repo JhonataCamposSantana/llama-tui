@@ -8,10 +8,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib import request
 
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
-from .gguf import set_model_extra_arg
+from .gguf import set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile
 from .models import ModelConfig
 from .optimize import (
+    apply_hardware_baseline,
     apply_best_optimization,
     apply_optimization_preset,
     estimate_safe_context_for_profile,
@@ -31,6 +32,32 @@ SAFE_BOOTSTRAP_PRESETS = (
     ('tokens_per_sec', 'safe'),
 )
 SAFE_BOOTSTRAP_Q8_TARGET_CTX = 4096
+ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS = 20 * 60
+ADAPTIVE_CONTEXT_ROUNDING = 256
+ADAPTIVE_BINARY_STEPS = 4
+ADAPTIVE_MAX_CONTEXT_PROBES = 12
+ADAPTIVE_MAX_MEASUREMENTS = 20
+ADAPTIVE_PROFILE_KEYS = ('fast_chat', 'long_context', 'opencode_ready', 'auto')
+ADAPTIVE_RESERVE_BY_OBJECTIVE = {
+    'fast_chat': 25,
+    'long_context': 35,
+    'opencode_ready': 30,
+    'auto': 30,
+}
+ADAPTIVE_TIER_BY_OBJECTIVE = {
+    'fast_chat': 'extreme',
+    'long_context': 'safe',
+    'opencode_ready': 'moderate',
+    'auto': 'moderate',
+}
+
+SPECTRUM_LABELS = {
+    'possible': 'Possible',
+    'fastest': 'Fastest',
+    'ideal': 'Ideal',
+    'longest': 'Highest Context',
+    'opencode': 'OpenCode-ready',
+}
 
 
 def sync_opencode_after_tuning(app: AppConfig) -> str:
@@ -40,11 +67,331 @@ def sync_opencode_after_tuning(app: AppConfig) -> str:
     return msg if ok else f'opencode sync failed: {msg}'
 def append_model_log(app: AppConfig, model: ModelConfig, text: str):
     app.append_log(model.id, text)
+
+
+def emit_benchmark_event(
+    progress: Optional[Callable[[object], None]],
+    event: str,
+    model: ModelConfig,
+    run_kind: str,
+    message: str = '',
+    phase: str = '',
+    completed: Optional[int] = None,
+    total: Optional[int] = None,
+    candidate: str = '',
+    record: Optional[Dict[str, object]] = None,
+    records: Optional[List[Dict[str, object]]] = None,
+):
+    if not progress:
+        return
+    payload: Dict[str, object] = {
+        'event': event,
+        'run_kind': run_kind,
+        'model_id': model.id,
+        'message': compact_message(message or phase or event),
+    }
+    if phase:
+        payload['phase'] = phase
+    if completed is not None:
+        payload['completed'] = int(completed)
+    if total is not None:
+        payload['total'] = int(total)
+    if candidate:
+        payload['candidate'] = candidate
+    if record is not None:
+        payload['record'] = dict(record)
+    if records is not None:
+        payload['records'] = [dict(item) for item in records]
+    progress(payload)
+
+
 def concise_failure(text: str, limit: int = 320) -> str:
     message = compact_message(text)
     if len(message) <= limit:
         return message
     return message[: max(0, limit - 3)] + '...'
+
+
+def round_context(value: int, step: int = ADAPTIVE_CONTEXT_ROUNDING) -> int:
+    value = max(1, int(value or 1))
+    step = max(1, int(step or 1))
+    return max(step, int(round(value / step) * step))
+
+
+def round_context_down(value: int, step: int = ADAPTIVE_CONTEXT_ROUNDING) -> int:
+    value = max(1, int(value or 1))
+    step = max(1, int(step or 1))
+    return max(step, int(value // step) * step)
+
+
+def ctx_per_slot(model: ModelConfig) -> int:
+    return int(getattr(model, 'ctx', 0) or 0) // max(1, int(getattr(model, 'parallel', 1) or 1))
+
+
+def measured_profile_key_for_launch(mode: str, tier: str = '') -> str:
+    normalized = (mode or '').strip().lower()
+    tier = (tier or '').strip().lower()
+    if normalized in ('tokens_per_sec', 'fast_chat', 'balanced_chat'):
+        return 'fast_chat'
+    if normalized in ('max_context', 'long_context'):
+        return 'long_context'
+    if normalized == 'opencode_ready':
+        return 'opencode_ready'
+    if normalized in ('best', 'auto', 'auto_profile') or tier == 'auto':
+        return 'auto'
+    return ''
+
+
+def get_measured_profile(model: ModelConfig, key: str) -> Dict[str, object]:
+    profiles = getattr(model, 'measured_profiles', {}) or {}
+    profile = profiles.get(key) or {}
+    return profile if isinstance(profile, dict) and profile.get('status', 'ok') == 'ok' else {}
+
+
+def apply_measured_profile(model: ModelConfig, key: str) -> Tuple[bool, str]:
+    profile = get_measured_profile(model, key)
+    if not profile:
+        return False, f'no measured {key} profile'
+    int_fields = ('ctx', 'parallel', 'threads', 'ngl', 'output', 'cache_ram', 'memory_reserve_percent')
+    for field in int_fields:
+        if field in profile:
+            try:
+                setattr(model, field, int(profile[field]))
+            except Exception:
+                pass
+    if 'temp' in profile:
+        try:
+            model.temp = float(profile['temp'])
+        except Exception:
+            pass
+    if 'flash_attn' in profile:
+        model.flash_attn = bool(profile['flash_attn'])
+    if 'jinja' in profile:
+        model.jinja = bool(profile['jinja'])
+    if isinstance(profile.get('extra_args'), list):
+        model.extra_args = [str(item) for item in profile.get('extra_args', [])]
+    model.optimize_mode = f'measured_{key}'
+    model.optimize_tier = 'measured'
+    return True, (
+        f'measured {key}: ctx={model.ctx} parallel={model.parallel} '
+        f'threads={model.threads} ngl={model.ngl} '
+        f'{float(profile.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s'
+    )
+
+
+def model_from_measured_profile(model: ModelConfig, key: str) -> Optional[ModelConfig]:
+    candidate = ModelConfig(**asdict(model))
+    ok, _msg = apply_measured_profile(candidate, key)
+    return candidate if ok else None
+
+
+def measured_profile_ctx_per_slot(model: ModelConfig, key: str) -> int:
+    profile = get_measured_profile(model, key)
+    if not profile:
+        return 0
+    ctx = int(profile.get('ctx', 0) or 0)
+    parallel = max(1, int(profile.get('parallel', 1) or 1))
+    return ctx // parallel
+
+
+def _set_extra_arg(args: List[str], flag: str, value: str) -> List[str]:
+    cleaned = strip_extra_args(args, flag)
+    return cleaned + [flag, value]
+
+
+def _strip_runtime_tuning_args(args: List[str]) -> List[str]:
+    return strip_extra_args(
+        list(args or []),
+        '--batch-size',
+        '--ubatch-size',
+        '--cache-type-k',
+        '--cache-type-v',
+        '--gpu-memory-utilization',
+        '--max-num-seqs',
+        '--max-num-batched-tokens',
+    )
+
+
+def _power_of_two_at_most(value: int, floor: int, ceiling: int) -> int:
+    value = max(floor, min(ceiling, int(value or floor)))
+    power = floor
+    while power * 2 <= value and power * 2 <= ceiling:
+        power *= 2
+    return power
+
+
+def adaptive_batch_sizes(ctx: int, parallel: int, objective: str) -> Tuple[int, int]:
+    ctx = max(1, int(ctx or 1))
+    parallel = max(1, int(parallel or 1))
+    if objective == 'fast_chat':
+        batch = _power_of_two_at_most(max(256, ctx // max(1, parallel)), 256, 2048)
+    else:
+        batch = _power_of_two_at_most(max(128, ctx // 12), 128, 1024)
+    ubatch = _power_of_two_at_most(max(64, batch // 2), 64, batch)
+    return batch, ubatch
+
+
+def configure_adaptive_candidate(
+    model: ModelConfig,
+    profile: HardwareProfile,
+    objective: str,
+    ctx: int,
+    parallel: int,
+    variant: str = 'default',
+) -> ModelConfig:
+    candidate = ModelConfig(**asdict(model))
+    tier = ADAPTIVE_TIER_BY_OBJECTIVE.get(objective, 'moderate')
+    candidate.optimize_tier = tier
+    apply_hardware_baseline(candidate, profile, tier)
+    candidate.optimize_mode = f'measured_{objective}'
+    candidate.parallel = max(1, int(parallel or 1))
+    candidate.ctx = max(1, int(ctx or 1))
+    candidate.memory_reserve_percent = max(
+        ADAPTIVE_RESERVE_BY_OBJECTIVE.get(objective, 30),
+        int(getattr(model, 'memory_reserve_percent', 25) or 25),
+    )
+    if objective == 'fast_chat':
+        candidate.output = max(256, min(int(getattr(candidate, 'output', 2048) or 2048), 2048))
+    else:
+        candidate.output = max(1024, min(max(int(getattr(candidate, 'output', 4096) or 4096), 2048), 4096))
+
+    extra_args = _strip_runtime_tuning_args(list(getattr(candidate, 'extra_args', []) or []))
+    runtime = getattr(candidate, 'runtime', 'llama.cpp')
+    if runtime == 'llama.cpp':
+        batch, ubatch = adaptive_batch_sizes(candidate.ctx, candidate.parallel, objective)
+        extra_args = _set_extra_arg(extra_args, '--batch-size', str(batch))
+        extra_args = _set_extra_arg(extra_args, '--ubatch-size', str(ubatch))
+        if variant == 'q8_kv':
+            extra_args = _set_extra_arg(extra_args, '--cache-type-k', 'q8_0')
+            extra_args = _set_extra_arg(extra_args, '--cache-type-v', 'q8_0')
+    elif runtime == 'vllm':
+        utilization = max(0.65, min(0.94, (100 - candidate.memory_reserve_percent) / 100.0))
+        extra_args = _set_extra_arg(extra_args, '--gpu-memory-utilization', f'{utilization:.2f}')
+        extra_args = _set_extra_arg(extra_args, '--max-num-seqs', str(candidate.parallel))
+        batched = max(1024, min(65536, candidate.ctx * candidate.parallel))
+        extra_args = _set_extra_arg(extra_args, '--max-num-batched-tokens', str(round_context(batched, 512)))
+    candidate.extra_args = extra_args
+    return candidate
+
+
+def adaptive_context_upper_bound(
+    model: ModelConfig,
+    profile: HardwareProfile,
+    objective: str,
+    parallel: int = 1,
+    variant: str = 'default',
+) -> int:
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
+    seed = configure_adaptive_candidate(model, profile, objective, ctx_min, parallel, variant)
+    safe_ctx = estimate_safe_context_for_profile(
+        seed,
+        profile,
+        int(getattr(seed, 'memory_reserve_percent', 30) or 30),
+        max(1, parallel),
+        ctx_min,
+        ctx_max,
+    )
+    if safe_ctx <= 0:
+        return ctx_min
+    return max(ctx_min, min(ctx_max, round_context_down(safe_ctx)))
+
+
+def adaptive_context_search(
+    ctx_min: int,
+    ctx_upper: int,
+    probe: Callable[[int], bool],
+    max_probes: int = ADAPTIVE_MAX_CONTEXT_PROBES,
+) -> Tuple[List[int], List[int]]:
+    ctx_min = round_context(max(256, ctx_min))
+    ctx_upper = max(ctx_min, round_context_down(ctx_upper))
+    successes: List[int] = []
+    failures: List[int] = []
+    seen = set()
+
+    def run_probe(value: int) -> bool:
+        value = max(ctx_min, min(ctx_upper, round_context(value)))
+        if value in seen or len(seen) >= max_probes:
+            return value in successes
+        seen.add(value)
+        ok = bool(probe(value))
+        (successes if ok else failures).append(value)
+        return ok
+
+    current = ctx_min
+    last_success = 0
+    first_failure = 0
+    while len(seen) < max_probes:
+        ok = run_probe(current)
+        if ok:
+            last_success = current
+            if current >= ctx_upper:
+                break
+            current = min(ctx_upper, max(current + ADAPTIVE_CONTEXT_ROUNDING, current * 2))
+            continue
+        first_failure = current
+        break
+
+    if last_success and not first_failure and last_success < ctx_upper and len(seen) < max_probes:
+        if run_probe(ctx_upper):
+            last_success = ctx_upper
+        else:
+            first_failure = ctx_upper
+
+    if last_success and first_failure:
+        low = min(last_success, first_failure)
+        high = max(last_success, first_failure)
+        for _ in range(ADAPTIVE_BINARY_STEPS):
+            if len(seen) >= max_probes:
+                break
+            midpoint = round_context((low + high) // 2)
+            if midpoint <= low or midpoint >= high:
+                break
+            if run_probe(midpoint):
+                low = midpoint
+            else:
+                high = midpoint
+
+    while len(seen) < max_probes and len(successes) >= 2:
+        ordered = sorted(set(successes))
+        gaps = [(ordered[idx + 1] - ordered[idx], ordered[idx], ordered[idx + 1]) for idx in range(len(ordered) - 1)]
+        gaps = [gap for gap in sorted(gaps, reverse=True) if gap[0] > ADAPTIVE_CONTEXT_ROUNDING * 2]
+        if not gaps:
+            break
+        _gap, low, high = gaps[0]
+        midpoint = round_context((low + high) // 2)
+        if midpoint in seen:
+            break
+        run_probe(midpoint)
+
+    return sorted(set(successes)), sorted(set(failures))
+
+
+def adaptive_parallel_values(model: ModelConfig, profile: HardwareProfile, objective: str, ctx: int, variant: str) -> List[int]:
+    if objective != 'fast_chat':
+        return [1]
+    max_cpu = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 8)))
+    values = []
+    parallel = 1
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
+    while parallel <= max_cpu:
+        candidate = configure_adaptive_candidate(model, profile, objective, ctx, parallel, variant)
+        safe_ctx = estimate_safe_context_for_profile(
+            candidate,
+            profile,
+            int(getattr(candidate, 'memory_reserve_percent', 30) or 30),
+            parallel,
+            ctx_min,
+            ctx_max,
+        )
+        if safe_ctx >= min(ctx, ctx_max):
+            values.append(parallel)
+            parallel *= 2
+            continue
+        break
+    return values or [1]
+
 def fallback_tiers(selected_tier: str) -> List[str]:
     order = ['extreme', 'moderate', 'safe']
     selected = (selected_tier or 'moderate').strip().lower()
@@ -63,6 +410,37 @@ def launch_with_failsafe(
 ) -> Tuple[bool, str]:
     attempts = []
     profile = app.hardware_profile(refresh=True)
+    measured_key = measured_profile_key_for_launch(mode, tier)
+    if measured_key:
+        ok, measured_msg = apply_measured_profile(model, measured_key)
+        if ok:
+            if progress:
+                progress(f'trying measured {measured_key} profile: {measured_msg}')
+            app.add_or_update(model)
+            sync_msg = sync_opencode_after_tuning(app)
+            ok, msg = app.start(model)
+            if ok:
+                try:
+                    ready_ok, ready_msg = app.wait_until_ready(model, timeout=120, cancel_token=cancel_token)
+                except CancelledError:
+                    app.stop(model, managed_only=True)
+                    raise
+                if ready_ok:
+                    if progress:
+                        progress(f'measured {measured_key} ready: {ready_msg}')
+                    return True, f'{ready_msg} [measured {measured_key}] | {measured_msg} | {sync_msg}'
+                app.stop(model, managed_only=True)
+                attempts.append(f'measured {measured_key}: not ready ({concise_failure(ready_msg)})')
+                if progress:
+                    progress(f'measured {measured_key} was not ready; falling back to estimated profiles.')
+            else:
+                attempts.append(f'measured {measured_key}: start failed ({concise_failure(msg)})')
+                if progress:
+                    progress(f'measured {measured_key} failed to start: {concise_failure(msg)}')
+        elif progress:
+            progress(f'{model.id}: {measured_msg}; using estimated launch profile.')
+    if mode == 'opencode_ready':
+        mode = 'best'
     if tier == 'auto':
         tier = select_best_tier(model, profile)
     if progress:
@@ -157,8 +535,8 @@ def launch_opencode_stack(
             return False, concise_failure(ready_msg)
     else:
         if progress:
-            progress(f'{model.id} is stopped; launching best profile before OpenCode...')
-        ready_ok, ready_msg = launch_with_failsafe(app, model, 'best', 'auto', progress=progress, cancel_token=cancel_token)
+            progress(f'{model.id} is stopped; launching OpenCode-ready profile before OpenCode...')
+        ready_ok, ready_msg = launch_with_failsafe(app, model, 'opencode_ready', 'auto', progress=progress, cancel_token=cancel_token)
         if not ready_ok:
             return False, concise_failure(ready_msg)
         started_for_stack = True
@@ -602,23 +980,638 @@ def _run_server_benchmark_candidates(
     return True, msg
 
 
+def adaptive_profile_dict(
+    key: str,
+    candidate: ModelConfig,
+    record: Dict[str, object],
+    profile: HardwareProfile,
+) -> Dict[str, object]:
+    return {
+        'status': 'ok',
+        'objective': key,
+        'ctx': int(getattr(candidate, 'ctx', 0) or 0),
+        'ctx_per_slot': ctx_per_slot(candidate),
+        'parallel': int(getattr(candidate, 'parallel', 1) or 1),
+        'threads': int(getattr(candidate, 'threads', 0) or 0),
+        'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+        'output': int(getattr(candidate, 'output', 0) or 0),
+        'cache_ram': int(getattr(candidate, 'cache_ram', 0) or 0),
+        'temp': float(getattr(candidate, 'temp', 0.7) or 0.7),
+        'flash_attn': bool(getattr(candidate, 'flash_attn', True)),
+        'jinja': bool(getattr(candidate, 'jinja', True)),
+        'memory_reserve_percent': int(getattr(candidate, 'memory_reserve_percent', 25) or 25),
+        'extra_args': list(getattr(candidate, 'extra_args', []) or []),
+        'tokens_per_sec': round(float(record.get('tokens_per_sec', 0.0) or 0.0), 2),
+        'seconds': round(float(record.get('seconds', 0.0) or 0.0), 2),
+        'ram_available': int(record.get('ram_available', 0) or 0),
+        'gpu_memory_free': int(record.get('gpu_memory_free', 0) or 0),
+        'detail': str(record.get('detail', '')),
+        'benchmarked_at': str(record.get('benchmarked_at') or datetime.now().isoformat(timespec='seconds')),
+        'hardware': profile.short_summary(),
+    }
+
+
+def chat_min_ctx_per_slot(model: ModelConfig) -> int:
+    prompt_tokens = max(estimate_text_tokens(prompt) for prompt in BENCHMARK_PROMPTS)
+    output = max(256, min(2048, int(getattr(model, 'output', 2048) or 2048)))
+    return max(int(getattr(model, 'ctx_min', 2048) or 2048), prompt_tokens + output + 512)
+
+
+def parse_context_requirement(text: str) -> int:
+    patterns = (
+        r'request\s*\((\d+)\s*tokens?\)\s*exceeds',
+        r'(\d+)\s*tokens?\s*exceeds',
+        r'needs?\s+(?:about\s+)?(\d+)\s*(?:ctx|context|tokens?)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, str(text or ''), re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                continue
+    return 0
+
+
+def observed_opencode_context_floor(model: ModelConfig) -> int:
+    floor = 0
+    for row in getattr(model, 'last_opencode_benchmark_results', []) or []:
+        floor = max(floor, parse_context_requirement(str(row.get('detail', ''))))
+        for task in row.get('task_details', []) or []:
+            if isinstance(task, dict):
+                floor = max(floor, parse_context_requirement(str(task.get('detail', ''))))
+                floor = max(floor, parse_context_requirement(' '.join(str(x) for x in task.get('stderr_tail', []) or [])))
+                floor = max(floor, parse_context_requirement(' '.join(str(x) for x in task.get('stdout_tail', []) or [])))
+    return floor
+
+
+def select_measured_profiles(
+    model: ModelConfig,
+    measured: List[Dict[str, object]],
+    profile: HardwareProfile,
+) -> Dict[str, Dict[str, object]]:
+    successful = [item for item in measured if item.get('status') == 'ok']
+    if not successful:
+        return {}
+    max_tps = max(float(item.get('tokens_per_sec', 0.0) or 0.0) for item in successful) or 1.0
+    max_ctx = max(int(item.get('ctx_per_slot', 0) or 0) for item in successful) or 1
+    fast_floor = chat_min_ctx_per_slot(model)
+    opencode_floor = observed_opencode_context_floor(model)
+
+    fast_pool = [item for item in successful if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or successful
+    long_pool = successful
+    opencode_pool = [
+        item for item in successful
+        if int(item.get('parallel', 1) or 1) == 1 and int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor
+    ] or [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
+
+    fast = max(fast_pool, key=lambda item: (float(item.get('tokens_per_sec', 0.0) or 0.0), int(item.get('ctx_per_slot', 0) or 0)))
+    long = max(long_pool, key=lambda item: (int(item.get('ctx_per_slot', 0) or 0), float(item.get('tokens_per_sec', 0.0) or 0.0)))
+    opencode = max(opencode_pool, key=lambda item: (int(item.get('ctx_per_slot', 0) or 0), float(item.get('tokens_per_sec', 0.0) or 0.0)))
+
+    def auto_score(item: Dict[str, object]) -> float:
+        tps_norm = float(item.get('tokens_per_sec', 0.0) or 0.0) / max_tps
+        ctx_norm = int(item.get('ctx_per_slot', 0) or 0) / max_ctx
+        ram = int(item.get('ram_available', 0) or 0)
+        vram = int(item.get('gpu_memory_free', 0) or 0)
+        headroom = min(1.0, (ram / 1024**3) / 8.0)
+        if vram:
+            headroom = max(headroom, min(1.0, (vram / 1024**3) / 2.0))
+        return 0.55 * tps_norm + 0.35 * ctx_norm + 0.10 * headroom
+
+    auto = max(successful, key=auto_score)
+    winners = {
+        'fast_chat': fast,
+        'long_context': long,
+        'opencode_ready': opencode,
+        'auto': auto,
+    }
+    return {
+        key: adaptive_profile_dict(key, item['model'], item, profile)
+        for key, item in winners.items()
+    }
+
+
+def record_matches_profile(record: Dict[str, object], profile: Dict[str, object]) -> bool:
+    if not record or not profile:
+        return False
+    record_ctx = int(record.get('ctx', 0) or 0)
+    profile_ctx = int(profile.get('ctx', 0) or 0)
+    record_parallel = int(record.get('parallel', 1) or 1)
+    profile_parallel = int(profile.get('parallel', 1) or 1)
+    if record_ctx != profile_ctx or record_parallel != profile_parallel:
+        return False
+    record_tps = float(record.get('tokens_per_sec', 0.0) or 0.0)
+    profile_tps = float(profile.get('tokens_per_sec', 0.0) or 0.0)
+    return abs(record_tps - profile_tps) < 0.05 or profile_tps <= 0
+
+
+def add_spectrum_label(record: Dict[str, object], label: str):
+    current = str(record.get('spectrum_label', '') or '').strip()
+    labels = [item.strip() for item in current.split(',') if item.strip()]
+    display = SPECTRUM_LABELS.get(label, label)
+    if display not in labels:
+        labels.append(display)
+    record['spectrum_label'] = ', '.join(labels)
+
+
+def annotate_spectrum_records(
+    records: List[Dict[str, object]],
+    winners: Dict[str, Dict[str, object]],
+) -> List[Dict[str, object]]:
+    successful = [record for record in records if record.get('status') == 'ok']
+    if not successful:
+        return records
+    possible = min(
+        successful,
+        key=lambda item: (
+            int(item.get('ctx_per_slot', 0) or 0),
+            -float(item.get('tokens_per_sec', 0.0) or 0.0),
+        ),
+    )
+    add_spectrum_label(possible, 'possible')
+    winner_labels = {
+        'fast_chat': 'fastest',
+        'auto': 'ideal',
+        'long_context': 'longest',
+        'opencode_ready': 'opencode',
+    }
+    for key, label in winner_labels.items():
+        profile = winners.get(key) or {}
+        for record in successful:
+            if record_matches_profile(record, profile):
+                add_spectrum_label(record, label)
+                break
+    return records
+
+
+def adaptive_record_from_candidate(
+    candidate: ModelConfig,
+    objective: str,
+    status: str,
+    tokens_per_sec: float = 0.0,
+    seconds: float = 0.0,
+    detail: str = '',
+    ram_available: int = 0,
+    gpu_memory_free: int = 0,
+) -> Dict[str, object]:
+    return {
+        'objective': objective,
+        'preset': objective,
+        'tier': 'measured',
+        'status': status,
+        'tokens_per_sec': round(float(tokens_per_sec), 2),
+        'seconds': round(float(seconds), 2),
+        'ctx': int(getattr(candidate, 'ctx', 0) or 0),
+        'ctx_per_slot': ctx_per_slot(candidate),
+        'parallel': int(getattr(candidate, 'parallel', 0) or 0),
+        'threads': int(getattr(candidate, 'threads', 0) or 0),
+        'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+        'ram_available': int(ram_available or 0),
+        'gpu_memory_free': int(gpu_memory_free or 0),
+        'detail': concise_failure(detail, limit=500),
+        'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+    }
+
+
+def benchmark_adaptive_candidate(
+    app: AppConfig,
+    candidate: ModelConfig,
+    objective: str,
+    progress: Optional[Callable[[str], None]],
+    cancel_token: Optional[CancelToken],
+) -> Tuple[Dict[str, object], Optional[Dict[str, object]]]:
+    check_cancelled(cancel_token)
+    ok, msg = app.start(candidate)
+    if not ok:
+        record = adaptive_record_from_candidate(candidate, objective, 'start failed', detail=msg)
+        return record, None
+    try:
+        ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
+        if not ready_ok:
+            return adaptive_record_from_candidate(candidate, objective, 'not ready', detail=ready_msg), None
+        if int(getattr(candidate, 'last_good_ctx', 0) or 0) > 0:
+            candidate.ctx = int(candidate.last_good_ctx)
+        if int(getattr(candidate, 'last_good_parallel', 0) or 0) > 0:
+            candidate.parallel = int(candidate.last_good_parallel)
+        if progress:
+            progress(
+                f'adaptive {objective} ready: ctx={candidate.ctx} slot={ctx_per_slot(candidate)} '
+                f'parallel={candidate.parallel}; measuring...'
+            )
+        benchmark_completion(
+            candidate,
+            max_tokens=BENCHMARK_WARMUP_TOKENS,
+            timeout=BENCHMARK_WARMUP_TIMEOUT,
+            cancel_token=cancel_token,
+        )
+        bench_ok, bench = benchmark_completion_suite(
+            candidate,
+            max_tokens=BENCHMARK_SAMPLE_TOKENS,
+            timeout=BENCHMARK_SAMPLE_TIMEOUT,
+            cancel_token=cancel_token,
+        )
+        if not bench_ok:
+            return adaptive_record_from_candidate(candidate, objective, 'benchmark failed', detail=str(bench.get('error', 'unknown error'))), None
+        snap = app.hardware_profile(refresh=True)
+        score = float(bench.get('tokens_per_sec', 0.0) or 0.0)
+        elapsed = float(bench.get('elapsed', 0.0) or 0.0)
+        record = adaptive_record_from_candidate(
+            candidate,
+            objective,
+            'ok',
+            tokens_per_sec=score,
+            seconds=elapsed,
+            detail=f'{int(bench.get("sample_count", 1) or 1)} samples',
+            ram_available=int(getattr(snap, 'memory_available', 0) or 0),
+            gpu_memory_free=int(getattr(snap, 'gpu_memory_free', 0) or 0),
+        )
+        measured = dict(record)
+        measured['model'] = ModelConfig(**asdict(candidate))
+        return record, measured
+    finally:
+        app.stop(candidate, managed_only=True)
+        sleep_with_cancel(0.5, cancel_token)
+
+
+def select_adaptive_candidate_mix(
+    candidates: List[Tuple[str, ModelConfig, str]],
+    limit: int = ADAPTIVE_MAX_MEASUREMENTS,
+) -> List[Tuple[str, ModelConfig, str]]:
+    limit = max(1, int(limit or 1))
+    selected: List[Tuple[str, ModelConfig, str]] = []
+    seen = set()
+
+    def key(item: Tuple[str, ModelConfig, str]):
+        objective, candidate, _label = item
+        return (
+            objective,
+            int(getattr(candidate, 'ctx', 0) or 0),
+            int(getattr(candidate, 'parallel', 1) or 1),
+            tuple(getattr(candidate, 'extra_args', []) or []),
+        )
+
+    def add(item: Tuple[str, ModelConfig, str]):
+        if len(selected) >= limit:
+            return
+        item_key = key(item)
+        if item_key in seen:
+            return
+        seen.add(item_key)
+        selected.append(item)
+
+    buckets: Dict[str, List[Tuple[str, ModelConfig, str]]] = {}
+    for item in candidates:
+        buckets.setdefault(item[0], []).append(item)
+
+    for objective in ('long_context', 'fast_chat', 'opencode_ready'):
+        bucket = buckets.get(objective, [])
+        if not bucket:
+            continue
+        ordered = sorted(
+            bucket,
+            key=lambda item: (
+                ctx_per_slot(item[1]),
+                int(getattr(item[1], 'parallel', 1) or 1),
+            ),
+        )
+        add(ordered[0])
+        add(ordered[-1])
+        if objective == 'fast_chat':
+            add(max(ordered, key=lambda item: int(getattr(item[1], 'parallel', 1) or 1)))
+
+    remaining = sorted(
+        candidates,
+        key=lambda item: (
+            {'fast_chat': 0, 'long_context': 1, 'opencode_ready': 2}.get(item[0], 9),
+            -ctx_per_slot(item[1]),
+            -int(getattr(item[1], 'parallel', 1) or 1),
+        ),
+    )
+    for item in remaining:
+        add(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def adaptive_benchmark_candidates(
+    app: AppConfig,
+    model: ModelConfig,
+    profile: HardwareProfile,
+    progress: Optional[Callable[[str], None]],
+    cancel_token: Optional[CancelToken],
+    deadline: float,
+) -> List[Tuple[str, ModelConfig, str]]:
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    variants = ['default']
+    if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' and profile.has_usable_gpu():
+        variants.append('q8_kv')
+    contexts_by_variant: Dict[str, List[int]] = {}
+    probe_completed = 0
+    probe_total = max(1, len(variants) * ADAPTIVE_MAX_CONTEXT_PROBES)
+    for variant in variants:
+        if time.monotonic() >= deadline:
+            break
+        upper = adaptive_context_upper_bound(model, profile, 'long_context', parallel=1, variant=variant)
+        if progress:
+            progress(f'adaptive context search {variant}: estimated upper ctx={upper}')
+        emit_benchmark_event(
+            progress,
+            'benchmark_phase',
+            model,
+            'server',
+            message=f'context search {variant}: estimated upper ctx={upper}',
+            phase='context search',
+            completed=probe_completed,
+            total=probe_total,
+            candidate=f'{variant} ctx<= {upper}',
+        )
+
+        def probe(value: int, variant=variant) -> bool:
+            nonlocal probe_completed
+            if time.monotonic() >= deadline:
+                return False
+            candidate = configure_adaptive_candidate(model, profile, 'long_context', value, 1, variant)
+            ok, msg = app.start(candidate)
+            if not ok:
+                if progress:
+                    progress(f'context probe {variant} ctx={value} start failed: {concise_failure(msg)}')
+                probe_completed += 1
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_probe',
+                    model,
+                    'server',
+                    message=f'context probe {variant} ctx={value}: start failed',
+                    phase='context search',
+                    completed=probe_completed,
+                    total=probe_total,
+                    candidate=f'{variant} ctx={value}',
+                    record=adaptive_record_from_candidate(candidate, 'long_context', 'start failed', detail=msg),
+                )
+                return False
+            try:
+                ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
+                if progress:
+                    state = 'ready' if ready_ok else 'not ready'
+                    progress(f'context probe {variant} ctx={value}: {state} {concise_failure(ready_msg)}')
+                probe_completed += 1
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_probe',
+                    model,
+                    'server',
+                    message=f'context probe {variant} ctx={value}: {"ready" if ready_ok else "not ready"}',
+                    phase='context search',
+                    completed=probe_completed,
+                    total=probe_total,
+                    candidate=f'{variant} ctx={value}',
+                    record=adaptive_record_from_candidate(
+                        candidate,
+                        'long_context',
+                        'probe ok' if ready_ok else 'probe failed',
+                        detail=ready_msg,
+                    ),
+                )
+                return ready_ok
+            finally:
+                app.stop(candidate, managed_only=True)
+                sleep_with_cancel(0.25, cancel_token)
+
+        successes, _failures = adaptive_context_search(ctx_min, upper, probe, max_probes=ADAPTIVE_MAX_CONTEXT_PROBES)
+        contexts_by_variant[variant] = successes or [ctx_min]
+
+    candidates: List[Tuple[str, ModelConfig, str]] = []
+    seen = set()
+
+    def add(objective: str, ctx: int, parallel: int, variant: str):
+        key = (objective, round_context(ctx), parallel, variant)
+        if key in seen:
+            return
+        seen.add(key)
+        candidate = configure_adaptive_candidate(model, profile, objective, ctx, parallel, variant)
+        label = f'{objective}/{variant}'
+        candidates.append((objective, candidate, label))
+
+    for variant, contexts in contexts_by_variant.items():
+        ordered = sorted(set(contexts))
+        spectrum_contexts = sorted(set(ordered[:1] + ordered[-4:]))
+        for ctx in spectrum_contexts:
+            add('long_context', ctx, 1, variant)
+            add('opencode_ready', ctx, 1, variant)
+        for ctx in ordered:
+            for parallel in adaptive_parallel_values(model, profile, 'fast_chat', ctx, variant):
+                add('fast_chat', ctx, parallel, variant)
+
+    candidates.sort(
+        key=lambda item: (
+            {'fast_chat': 0, 'long_context': 1, 'opencode_ready': 2}.get(item[0], 9),
+            -ctx_per_slot(item[1]),
+            int(getattr(item[1], 'parallel', 1) or 1),
+        )
+    )
+    return select_adaptive_candidate_mix(candidates, ADAPTIVE_MAX_MEASUREMENTS)
+
+
+def benchmark_adaptive_profiles(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+    time_budget_seconds: int = ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS,
+) -> Tuple[bool, str]:
+    status, _detail = app.health(model)
+    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
+        return False, '❌ Stop the model before running adaptive benchmark profiles.'
+    profile = app.hardware_profile(refresh=True)
+    deadline = time.monotonic() + max(60, int(time_budget_seconds or ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS))
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    running_model = ModelConfig(**asdict(model))
+    running_model.default_benchmark_status = 'running'
+    app.add_or_update(running_model)
+    if progress:
+        progress(f'adaptive benchmark started: budget≈{int(time_budget_seconds // 60)}m, {profile.short_summary()}')
+    emit_benchmark_event(
+        progress,
+        'benchmark_started',
+        model,
+        'server',
+        message=f'adaptive benchmark started: budget≈{int(time_budget_seconds // 60)}m, {profile.short_summary()}',
+        phase='starting',
+        completed=0,
+        total=0,
+    )
+
+    current: Optional[ModelConfig] = None
+    try:
+        candidates = adaptive_benchmark_candidates(app, model, profile, progress, cancel_token, deadline)
+        if progress:
+            progress(f'adaptive benchmark measuring {len(candidates)} profile candidate(s)')
+        emit_benchmark_event(
+            progress,
+            'benchmark_phase',
+            model,
+            'server',
+            message=f'measuring {len(candidates)} adaptive profile candidate(s)',
+            phase='measuring candidates',
+            completed=0,
+            total=len(candidates),
+        )
+        for idx, (objective, candidate, label) in enumerate(candidates, start=1):
+            check_cancelled(cancel_token)
+            if time.monotonic() >= deadline:
+                record = adaptive_record_from_candidate(candidate, objective, 'time budget exhausted', detail='adaptive benchmark budget reached')
+                records.append(record)
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_result',
+                    model,
+                    'server',
+                    message='adaptive benchmark budget reached',
+                    phase='measuring candidates',
+                    completed=idx,
+                    total=len(candidates),
+                    candidate=label,
+                    record=record,
+                )
+                break
+            current = candidate
+            if progress:
+                progress(
+                    f'adaptive candidate {idx}/{len(candidates)} {label}: '
+                    f'ctx={candidate.ctx} slot={ctx_per_slot(candidate)} parallel={candidate.parallel}'
+                )
+            emit_benchmark_event(
+                progress,
+                'benchmark_candidate',
+                model,
+                'server',
+                message=(
+                    f'adaptive candidate {idx}/{len(candidates)} {label}: '
+                    f'ctx={candidate.ctx} slot={ctx_per_slot(candidate)} parallel={candidate.parallel}'
+                ),
+                phase='measuring candidates',
+                completed=idx - 1,
+                total=len(candidates),
+                candidate=label,
+            )
+            record, measured_item = benchmark_adaptive_candidate(app, candidate, objective, progress, cancel_token)
+            records.append(record)
+            if measured_item:
+                measured.append(measured_item)
+                if progress:
+                    progress(
+                        f'adaptive {objective} scored {float(record.get("tokens_per_sec", 0.0)):.2f} tok/s '
+                        f'ctx={record.get("ctx")} slot={record.get("ctx_per_slot")}'
+                    )
+            elif progress:
+                progress(f'adaptive {objective} failed: {record.get("status")} {record.get("detail")}')
+            emit_benchmark_event(
+                progress,
+                'benchmark_result',
+                model,
+                'server',
+                message=(
+                    f'adaptive {objective} {record.get("status")}: '
+                    f'{float(record.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s '
+                    f'ctx={record.get("ctx")} slot={record.get("ctx_per_slot")}'
+                ),
+                phase='measuring candidates',
+                completed=idx,
+                total=len(candidates),
+                candidate=label,
+                record=record,
+            )
+    except CancelledError:
+        if current is not None:
+            app.stop(current, managed_only=True)
+            records.append(adaptive_record_from_candidate(current, 'adaptive', 'aborted', detail='user requested abort'))
+        aborted_model = ModelConfig(**asdict(model))
+        aborted_model.last_benchmark_results = records
+        aborted_model.default_benchmark_status = 'aborted'
+        aborted_model.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
+        app.add_or_update(aborted_model)
+        msg = '⚠ aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_aborted',
+            model,
+            'server',
+            message=msg,
+            phase='aborted',
+            records=records,
+        )
+        return False, msg
+
+    winners = select_measured_profiles(model, measured, profile)
+    annotate_spectrum_records(records, winners)
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    saved.measured_profiles = winners
+    saved.benchmark_fingerprint = app.model_fingerprint(saved)
+    saved.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
+    if not winners:
+        saved.default_benchmark_status = 'failed'
+        app.add_or_update(saved)
+        msg = '❌ adaptive benchmark failed: no measured candidates completed'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_error',
+            model,
+            'server',
+            message=msg,
+            phase='failed',
+            records=records,
+        )
+        return False, msg
+
+    auto_profile = winners['auto']
+    apply_measured_profile(saved, 'auto')
+    saved.measured_profiles = winners
+    saved.last_benchmark_tokens_per_sec = round(float(auto_profile.get('tokens_per_sec', 0.0) or 0.0), 2)
+    saved.last_benchmark_seconds = round(float(auto_profile.get('seconds', 0.0) or 0.0), 2)
+    saved.last_benchmark_profile = (
+        f'auto/measured {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
+        f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
+    )
+    saved.default_benchmark_status = 'done'
+    app.add_or_update(saved)
+    sync_msg = sync_opencode_after_tuning(app)
+    msg = (
+        f'✅ adaptive profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
+        f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
+        f'opencode ctx/slot={winners["opencode_ready"]["ctx_per_slot"]}, '
+        f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
+    )
+    if progress:
+        progress(msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_done',
+        saved,
+        'server',
+        message=msg,
+        phase='complete',
+        completed=len(records),
+        total=len(records),
+        records=records,
+    )
+    return True, msg
+
+
 def benchmark_best_optimization(
     app: AppConfig,
     model: ModelConfig,
     progress: Optional[Callable[[str], None]] = None,
     cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
-    profile = app.hardware_profile(refresh=True)
-    return _run_server_benchmark_candidates(
-        app,
-        model,
-        benchmark_candidate_models(model, profile),
-        profile,
-        'benchmark optimization',
-        progress=progress,
-        cancel_token=cancel_token,
-        update_default_status=True,
-    )
+    return benchmark_adaptive_profiles(app, model, progress=progress, cancel_token=cancel_token)
 
 
 def safe_bootstrap_benchmark(

@@ -7,12 +7,29 @@ import unittest
 from pathlib import Path
 
 from llama_tui.app import AppConfig, render_terminal_template, terminal_command_for_launcher
-from llama_tui.benchmark import safe_bootstrap_candidate_models
+from llama_tui.benchmark import (
+    adaptive_context_search,
+    annotate_spectrum_records,
+    apply_measured_profile,
+    model_from_measured_profile,
+    parse_context_requirement,
+    safe_bootstrap_candidate_models,
+    select_adaptive_candidate_mix,
+    select_measured_profiles,
+)
 from llama_tui.control import CancelToken
 from llama_tui.discovery import detected_model_from_path
 from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
-from llama_tui.opencode_benchmark import build_opencode_run_command, run_process_with_metrics, score_opencode_samples
+from llama_tui.opencode_benchmark import (
+    build_opencode_run_command,
+    ctx_per_slot,
+    detected_unittest_command,
+    isolated_opencode_env,
+    opencode_candidate_models,
+    run_process_with_metrics,
+    score_opencode_samples,
+)
 
 
 def process_active(pid: int) -> bool:
@@ -68,6 +85,15 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(command[:4], ['xterm', '-T', 'OpenCode Tiny', '-e'])
         self.assertIn('cd /tmp/project && echo hello', command)
 
+    def test_extra_terminal_launchers(self):
+        ptyxis = terminal_command_for_launcher('ptyxis', 'OpenCode Tiny', Path('/tmp/project'), 'echo hello')
+        self.assertEqual(ptyxis[:3], ['ptyxis', '--working-directory', '/tmp/project'])
+        self.assertIn('bash', ptyxis)
+
+        xdg = terminal_command_for_launcher('xdg-terminal-exec', 'OpenCode Tiny', Path('/tmp/project'), 'echo hello')
+        self.assertEqual(xdg[:3], ['xdg-terminal-exec', 'bash', '-lc'])
+        self.assertIn('cd /tmp/project && echo hello', xdg)
+
     def test_terminal_template_quotes_command(self):
         command = render_terminal_template(
             'xterm -T {title} -e bash -lc {cmd}',
@@ -81,8 +107,14 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.app.opencode.path = '/tmp/opencode.json'
         command = self.app.build_opencode_shell_command(self.model, Path('/tmp/project'))
         self.assertIn('OPENCODE_CONFIG=/tmp/opencode.json', command)
+        self.assertIn('OPENCODE_DISABLE_AUTOUPDATE=true', command)
+        self.assertIn('OPENCODE_DISABLE_PRUNE=true', command)
+        self.assertIn('OPENCODE_DISABLE_MODELS_FETCH=true', command)
+        self.assertIn('opencode /tmp/project', command)
         self.assertIn("--model local-tiny/tiny-local", command)
         self.assertIn('cd /tmp/project', command)
+        self.assertIn('OpenCode exited with status', command)
+        self.assertIn('Press Enter to close', command)
 
     def test_opencode_run_command_shape(self):
         command = build_opencode_run_command(self.app, self.model, Path('/tmp/project'), 'fix it')
@@ -94,6 +126,20 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertIn('--format', command)
         self.assertIn('json', command)
         self.assertIn('--dir', command)
+        self.assertIn('--dangerously-skip-permissions', command)
+        self.assertIn('--print-logs', command)
+        self.assertIn('--log-level', command)
+
+    def test_isolated_opencode_env(self):
+        home = Path(self.tmp.name) / 'home'
+        config = home / '.config' / 'opencode' / 'opencode.json'
+        env = isolated_opencode_env(home, config)
+        self.assertEqual(env['HOME'], str(home))
+        self.assertEqual(env['XDG_CONFIG_HOME'], str(home / '.config'))
+        self.assertEqual(env['OPENCODE_CONFIG'], str(config))
+        self.assertEqual(env['OPENCODE_DISABLE_AUTOUPDATE'], 'true')
+        self.assertEqual(env['OPENCODE_DISABLE_PRUNE'], 'true')
+        self.assertEqual(env['OPENCODE_DISABLE_MODELS_FETCH'], 'true')
 
     def test_persistence_fields_round_trip(self):
         model = ModelConfig(
@@ -114,6 +160,59 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(loaded.benchmark_fingerprint, 'abc123')
         self.assertEqual(loaded.default_benchmark_status, 'done')
         self.assertEqual(loaded.default_benchmark_at, '2026-04-14T12:00:00')
+
+    def test_measured_profiles_round_trip_and_apply(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny Model',
+            path='example/tiny-model',
+            alias='tiny-local',
+            port=18080,
+            runtime='vllm',
+            measured_profiles={
+                'auto': {
+                    'status': 'ok',
+                    'ctx': 12345,
+                    'parallel': 3,
+                    'threads': 7,
+                    'ngl': 99,
+                    'output': 1024,
+                    'cache_ram': 0,
+                    'extra_args': ['--batch-size', '512'],
+                    'tokens_per_sec': 42.0,
+                }
+            },
+        )
+        self.app.add_or_update(model)
+
+        loaded = AppConfig(self.config_path).get_model('tiny')
+        self.assertIsNotNone(loaded)
+        self.assertIn('auto', loaded.measured_profiles)
+        ok, msg = apply_measured_profile(loaded, 'auto')
+        self.assertTrue(ok)
+        self.assertIn('42.00 tok/s', msg)
+        self.assertEqual(loaded.ctx, 12345)
+        self.assertEqual(loaded.parallel, 3)
+        self.assertEqual(loaded.extra_args, ['--batch-size', '512'])
+
+    def test_measured_mode_launch_profile_uses_saved_values(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny Model',
+            path=__file__,
+            alias='tiny-local',
+            port=18080,
+            ctx=999999,
+            parallel=7,
+            optimize_mode='measured_auto',
+        )
+
+        ok, profile, msg = self.app.safe_launch_profile(model)
+
+        self.assertTrue(ok)
+        self.assertEqual(profile['ctx'], 999999)
+        self.assertEqual(profile['parallel'], 7)
+        self.assertIn('measured profile', msg)
 
 
 class OpencodeWorkflowScoreTests(unittest.TestCase):
@@ -144,6 +243,135 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             }
         ])
         self.assertGreater(good, bad)
+
+    def test_opencode_candidates_prefer_measured_profiles(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='bigctx',
+            name='Big Context',
+            path=__file__,
+            alias='bigctx',
+            port=18180,
+            ctx_max=32768,
+            parallel=8,
+            measured_profiles={
+                'opencode_ready': {
+                    'status': 'ok',
+                    'ctx': 20000,
+                    'parallel': 1,
+                    'threads': 6,
+                    'ngl': 0,
+                    'output': 2048,
+                    'extra_args': [],
+                    'tokens_per_sec': 12.0,
+                }
+            },
+        )
+        candidates = opencode_candidate_models(model, profile)
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], 'opencode_ready')
+        self.assertEqual(ctx_per_slot(candidates[0][2]), 20000)
+
+    def test_opencode_candidates_are_dynamic_for_tiny_context(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='smallctx', name='Small Context', path=__file__, alias='smallctx', port=18181, ctx_max=4096, parallel=1)
+
+        candidates = opencode_candidate_models(model, profile)
+        self.assertTrue(candidates)
+        self.assertTrue(all(ctx_per_slot(candidate) <= 4096 for _preset, _tier, candidate, _msg in candidates))
+
+    def test_detects_visible_unittest_command(self):
+        self.assertTrue(detected_unittest_command(['running python -m unittest -q now']))
+        self.assertTrue(detected_unittest_command(['python3 -m unittest']))
+        self.assertFalse(detected_unittest_command(['pytest -q']))
+
+    def test_context_requirement_parser(self):
+        self.assertEqual(parse_context_requirement('request (9616 tokens) exceeds the available context size'), 9616)
+        self.assertEqual(parse_context_requirement('needs about 14000 ctx'), 14000)
+        self.assertEqual(parse_context_requirement('all good'), 0)
+
+    def test_adaptive_context_search_binary_refines_failure_band(self):
+        probed = []
+
+        def probe(ctx):
+            probed.append(ctx)
+            return ctx <= 10000
+
+        successes, failures = adaptive_context_search(2048, 20000, probe, max_probes=10)
+
+        self.assertTrue(successes)
+        self.assertTrue(failures)
+        self.assertLessEqual(max(successes), 10000)
+        self.assertGreater(min(failures), max(successes))
+        self.assertGreater(len(probed), 3)
+
+    def test_adaptive_candidate_mix_keeps_each_spectrum_objective(self):
+        items = []
+        for ctx in (2048, 4096, 8192, 16384):
+            items.append(('fast_chat', ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=ctx, parallel=2), f'fast/{ctx}'))
+        items.append(('long_context', ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=32768, parallel=1), 'long/32768'))
+        items.append(('opencode_ready', ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=24000, parallel=1), 'opencode/24000'))
+
+        selected = select_adaptive_candidate_mix(items, limit=4)
+        objectives = {item[0] for item in selected}
+
+        self.assertIn('fast_chat', objectives)
+        self.assertIn('long_context', objectives)
+        self.assertIn('opencode_ready', objectives)
+
+    def test_select_measured_profiles_picks_distinct_winners(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200)
+        fast_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=8192, parallel=2)
+        long_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=32000, parallel=1)
+        measured = [
+            {'status': 'ok', 'objective': 'fast_chat', 'model': fast_model, 'tokens_per_sec': 60.0, 'seconds': 2.0, 'ctx_per_slot': 4096, 'parallel': 2, 'ram_available': 8 * 1024**3},
+            {'status': 'ok', 'objective': 'long_context', 'model': long_model, 'tokens_per_sec': 20.0, 'seconds': 3.0, 'ctx_per_slot': 32000, 'parallel': 1, 'ram_available': 8 * 1024**3},
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertEqual(winners['fast_chat']['tokens_per_sec'], 60.0)
+        self.assertEqual(winners['long_context']['ctx_per_slot'], 32000)
+        self.assertEqual(winners['opencode_ready']['ctx_per_slot'], 32000)
+        self.assertIn('auto', winners)
+
+    def test_annotates_spectrum_tradeoff_rows(self):
+        records = [
+            {'status': 'ok', 'objective': 'fast_chat', 'tokens_per_sec': 80.0, 'ctx': 4096, 'ctx_per_slot': 2048, 'parallel': 2},
+            {'status': 'ok', 'objective': 'long_context', 'tokens_per_sec': 20.0, 'ctx': 32768, 'ctx_per_slot': 32768, 'parallel': 1},
+            {'status': 'ok', 'objective': 'auto', 'tokens_per_sec': 50.0, 'ctx': 12000, 'ctx_per_slot': 12000, 'parallel': 1},
+        ]
+        winners = {
+            'fast_chat': {'tokens_per_sec': 80.0, 'ctx': 4096, 'parallel': 2},
+            'long_context': {'tokens_per_sec': 20.0, 'ctx': 32768, 'parallel': 1},
+            'opencode_ready': {'tokens_per_sec': 20.0, 'ctx': 32768, 'parallel': 1},
+            'auto': {'tokens_per_sec': 50.0, 'ctx': 12000, 'parallel': 1},
+        }
+
+        annotate_spectrum_records(records, winners)
+        labels = '\n'.join(str(row.get('spectrum_label', '')) for row in records)
+
+        self.assertIn('Possible', labels)
+        self.assertIn('Fastest', labels)
+        self.assertIn('Ideal', labels)
+        self.assertIn('Highest Context', labels)
+        self.assertIn('OpenCode-ready', labels)
+
+    def test_model_from_measured_profile(self):
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path=__file__,
+            alias='m',
+            port=18201,
+            measured_profiles={'fast_chat': {'status': 'ok', 'ctx': 8192, 'parallel': 2, 'threads': 4, 'ngl': 0, 'output': 1024, 'extra_args': []}},
+        )
+        candidate = model_from_measured_profile(model, 'fast_chat')
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.ctx, 8192)
+        self.assertEqual(candidate.parallel, 2)
 
 
 class DiscoveryDefaultsTests(unittest.TestCase):
@@ -210,6 +438,35 @@ class ProcessLifecycleTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertTrue(result['timed_out'])
         self.assertFalse(process_active(child_pid))
+
+    def test_no_output_timeout_kills_process(self):
+        result = run_process_with_metrics(
+            [sys.executable, '-c', 'import time; time.sleep(60)'],
+            Path(self.tmp.name),
+            os.environ.copy(),
+            timeout=10,
+            app=self.app,
+            no_output_timeout=0.2,
+            idle_output_timeout=0,
+        )
+        self.assertTrue(result['timed_out'])
+        self.assertTrue(result['no_output_timeout'])
+        self.assertEqual(result['stdout'], [])
+        self.assertEqual(result['stderr'], [])
+
+    def test_stdout_stderr_tails_are_persisted(self):
+        code = 'import sys; print("{\\"event\\":\\"ok\\"}"); print("python -m unittest -q", file=sys.stderr)'
+        result = run_process_with_metrics(
+            [sys.executable, '-c', code],
+            Path(self.tmp.name),
+            os.environ.copy(),
+            timeout=10,
+            app=self.app,
+        )
+        self.assertEqual(result['returncode'], 0)
+        self.assertIn('{"event":"ok"}', result['stdout'])
+        self.assertIn('python -m unittest -q', result['stderr'])
+        self.assertTrue(result['json_event_tail'])
 
     def test_abort_kills_process_group_children(self):
         pidfile = Path(self.tmp.name) / 'child-abort.pid'
