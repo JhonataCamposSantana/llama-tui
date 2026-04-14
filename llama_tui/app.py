@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import shlex
 import shutil
@@ -29,7 +30,8 @@ from .discovery import (
     is_registered_model_entry,
     looks_like_model_reference,
 )
-from .gguf import estimate_kv_bytes_per_token
+from .control import CancelToken, check_cancelled, sleep_with_cancel
+from .gguf import estimate_kv_bytes_per_token, read_gguf_metadata
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
 from .models import ModelConfig, OpencodeSettings
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
@@ -121,6 +123,13 @@ class AppConfig:
             if m.source != inferred:
                 m.source = inferred
                 roots_changed = True
+            if not getattr(m, 'benchmark_fingerprint', '') and float(getattr(m, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0:
+                m.benchmark_fingerprint = self.model_fingerprint(m)
+                if not getattr(m, 'default_benchmark_status', ''):
+                    m.default_benchmark_status = 'done'
+                if not getattr(m, 'default_benchmark_at', ''):
+                    m.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
+                roots_changed = True
         if len(filtered_models) != len(self.models) or roots_changed:
             self.models = filtered_models
             self.save()
@@ -165,6 +174,65 @@ class AppConfig:
             self._hardware_profile = benchmark_current_hardware()
             self._hardware_profile_at = now
         return self._hardware_profile
+
+    def model_fingerprint(self, model: ModelConfig) -> str:
+        target = (getattr(model, 'path', '') or '').strip()
+        path = Path(target).expanduser()
+        stat_data: Dict[str, object] = {}
+        if path.exists():
+            try:
+                stat = path.stat()
+                stat_data = {
+                    'path': str(path.resolve(strict=False)),
+                    'size': stat.st_size,
+                    'mtime_ns': stat.st_mtime_ns,
+                }
+            except OSError:
+                stat_data = {'path': str(path.resolve(strict=False))}
+        else:
+            stat_data = {'ref': target}
+
+        metadata = read_gguf_metadata(path) if path.exists() and path.suffix.lower() == '.gguf' else {}
+        arch = str(metadata.get('general.architecture') or '')
+        metadata_keys = [
+            'general.architecture',
+            'general.name',
+            'general.file_type',
+        ]
+        if arch:
+            metadata_keys.extend([
+                f'{arch}.block_count',
+                f'{arch}.context_length',
+                f'{arch}.embedding_length',
+                f'{arch}.attention.head_count',
+                f'{arch}.attention.head_count_kv',
+                f'{arch}.attention.key_length',
+                f'{arch}.attention.value_length',
+            ])
+        payload = {
+            'runtime': getattr(model, 'runtime', 'llama.cpp'),
+            'target': stat_data,
+            'metadata': {key: metadata.get(key) for key in metadata_keys if key in metadata},
+        }
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()[:24]
+
+    def models_needing_default_benchmark(self) -> List[ModelConfig]:
+        needed: List[ModelConfig] = []
+        for model in self.models:
+            if not getattr(model, 'enabled', True):
+                continue
+            status = (getattr(model, 'default_benchmark_status', '') or '').strip().lower()
+            current_fingerprint = self.model_fingerprint(model)
+            saved_fingerprint = getattr(model, 'benchmark_fingerprint', '') or ''
+            has_benchmark = float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0
+            if status == 'pending':
+                needed.append(model)
+            elif saved_fingerprint and saved_fingerprint != current_fingerprint:
+                needed.append(model)
+            elif not saved_fingerprint and not has_benchmark and status not in ('failed', 'aborted', 'running'):
+                needed.append(model)
+        return needed
 
     def command_prefix(self, command: str) -> List[str]:
         return shlex.split(command) if command else []
@@ -656,6 +724,50 @@ class AppConfig:
         os.kill(pid, sig)
         return pgid, False
 
+    def terminate_process_group(self, pid: int, grace_seconds: float = 3.0) -> Tuple[bool, str]:
+        if not pid:
+            return True, 'no pid'
+        if not self._pid_alive(pid, include_zombie=True):
+            self._reap_pid(pid)
+            return True, 'already stopped'
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            pgid = None
+        use_group = pgid is not None and pgid != os.getpgrp()
+
+        try:
+            if use_group and pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            if not self._pid_alive(pid, include_zombie=True):
+                self._reap_pid(pid)
+                return True, 'already stopped'
+            return False, str(exc)
+
+        deadline = time.time() + max(0.1, grace_seconds)
+        while time.time() < deadline:
+            if self._process_gone(pid, pgid if use_group else None):
+                return True, 'stopped'
+            time.sleep(0.1)
+
+        try:
+            if use_group and pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            if self._process_gone(pid, pgid if use_group else None):
+                return True, 'stopped (forced)'
+            time.sleep(0.1)
+        return False, 'did not stop cleanly'
+
     def _stop_pid(self, model_id: str, pid: int, use_group: bool) -> Tuple[bool, str]:
         if not self._pid_alive(pid):
             self._clear_pid_tracking(model_id, pid)
@@ -829,16 +941,22 @@ class AppConfig:
         self.save()
         return True, f'started PID {proc.pid} ({profile_msg})'
 
-    def wait_until_ready(self, model: ModelConfig, timeout: int = 180) -> Tuple[bool, str]:
+    def wait_until_ready(
+        self,
+        model: ModelConfig,
+        timeout: int = 180,
+        cancel_token: Optional[CancelToken] = None,
+    ) -> Tuple[bool, str]:
         start = time.time()
         while time.time() - start < timeout:
+            check_cancelled(cancel_token)
             status, detail = self.health(model)
             if status == 'READY':
                 return True, f'✅ {model.id} is ready on http://{model.host}:{model.port}'
             if status == 'STOPPED' and not self.get_pid(model):
                 excerpt = '\n'.join(important_log_excerpt(self.logfile(model.id), 24, after_last_launch=True))
                 return False, f'❌ {model.id} crashed during startup (log: {self.logfile(model.id)})\n{excerpt}'
-            time.sleep(0.5)
+            sleep_with_cancel(0.5, cancel_token)
         return False, f'⏳ {model.id} is still loading'
 
     def stop(self, model: ModelConfig, managed_only: bool = False) -> Tuple[bool, str]:

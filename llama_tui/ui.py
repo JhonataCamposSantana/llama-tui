@@ -12,10 +12,12 @@ from .benchmark import (
     benchmark_best_optimization,
     launch_opencode_stack,
     launch_with_failsafe,
+    safe_bootstrap_benchmark,
     start_model_with_progress,
     sync_opencode_after_tuning,
 )
 from .constants import LOGO, REFRESH_SECONDS
+from .control import CancelToken, CancelledError
 from .discovery import classify_model_type, display_runtime, extract_quant
 from .hardware import HardwareProfile
 from .models import ModelConfig
@@ -309,12 +311,15 @@ def tui(stdscr, app: AppConfig):
     view_mode = 'list'
     detail_model_id = ''
     auto_benchmark_started: set[str] = set()
+    default_benchmark_queue: List[str] = []
+    default_benchmark_queued: set[str] = set()
     message = 'Ready.'
     last_error_message = ''
     last_refresh = 0.0
     external_stack_launched = False
     statuses: Dict[str, Tuple[str, str]] = {}
     action_thread: Optional[threading.Thread] = None
+    action_token: Optional[CancelToken] = None
     action_queue: Queue = Queue()
 
     def action_running() -> bool:
@@ -323,13 +328,15 @@ def tui(stdscr, app: AppConfig):
     def start_background_action(
         model: ModelConfig,
         label: str,
-        worker: Callable[[Callable[[str], None]], Tuple[bool, str]],
+        worker: Callable[[Callable[[str], None], CancelToken], Tuple[bool, str]],
         done_event: str = 'done',
     ):
-        nonlocal action_thread, message
+        nonlocal action_thread, action_token, message
         if action_running():
             message = '⏳ Another optimization is still running. Watch the log window for progress.'
             return
+        token = CancelToken()
+        action_token = token
 
         def progress(text: str):
             line = compact_message(text)
@@ -339,7 +346,10 @@ def tui(stdscr, app: AppConfig):
         def runner():
             try:
                 progress(f'{label} started for {model.id}')
-                _ok, result = worker(progress)
+                _ok, result = worker(progress, token)
+            except CancelledError:
+                result = '⚠ aborted; managed processes stopped'
+                progress(result)
             except Exception as exc:
                 result = f'❌ {label} failed: {exc}'
                 progress(result)
@@ -370,6 +380,45 @@ def tui(stdscr, app: AppConfig):
     def has_benchmark(model: ModelConfig) -> bool:
         return float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0
 
+    def queue_default_benchmark(model_id: str):
+        if model_id in default_benchmark_queued:
+            return
+        default_benchmark_queue.append(model_id)
+        default_benchmark_queued.add(model_id)
+
+    def queue_models_needing_default_benchmark():
+        for pending_model in app.models_needing_default_benchmark():
+            queue_default_benchmark(pending_model.id)
+
+    def maybe_start_default_benchmark():
+        nonlocal message
+        if action_running() or not default_benchmark_queue:
+            return
+        while default_benchmark_queue:
+            model_id = default_benchmark_queue.pop(0)
+            default_benchmark_queued.discard(model_id)
+            pending_model = app.get_model(model_id)
+            if not pending_model or pending_model.id in auto_benchmark_started:
+                continue
+            if not pending_model.enabled:
+                continue
+            if model_is_running(pending_model):
+                queue_default_benchmark(pending_model.id)
+                return
+            auto_benchmark_started.add(pending_model.id)
+            start_background_action(
+                pending_model,
+                'safe bootstrap benchmark',
+                lambda progress, token, model=pending_model: safe_bootstrap_benchmark(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
+            )
+            message = f'⏳ Safe bootstrap benchmark queued for {pending_model.id}. Watch the log window.'
+            return
+
     def maybe_auto_benchmark(model: ModelConfig):
         nonlocal message
         if has_benchmark(model) or model.id in auto_benchmark_started or action_running():
@@ -377,13 +426,8 @@ def tui(stdscr, app: AppConfig):
         if model_is_running(model):
             message = f'{model.id}: no benchmark yet. Stop it and press B from details to benchmark.'
             return
-        auto_benchmark_started.add(model.id)
-        start_background_action(
-            model,
-            'auto benchmark optimization',
-            lambda progress, model=model: benchmark_best_optimization(app, model, progress=progress),
-        )
-        message = f'⏳ No benchmark found for {model.id}; auto benchmark started. Watch the log window.'
+        queue_default_benchmark(model.id)
+        message = f'⏳ No benchmark found for {model.id}; safe bootstrap queued.'
 
     def open_model_details(model: ModelConfig):
         nonlocal view_mode, detail_model_id, message
@@ -418,12 +462,13 @@ def tui(stdscr, app: AppConfig):
             start_background_action(
                 model,
                 label,
-                lambda progress, model=model, workspace=workspace, include_vscode=include_vscode: launch_opencode_stack(
+                lambda progress, token, model=model, workspace=workspace, include_vscode=include_vscode: launch_opencode_stack(
                     app,
                     model,
                     workspace,
                     include_vscode=include_vscode,
                     progress=progress,
+                    cancel_token=token,
                 ),
                 done_event='stack_done',
             )
@@ -432,7 +477,14 @@ def tui(stdscr, app: AppConfig):
             start_background_action(
                 model,
                 'best launch optimization',
-                lambda progress, model=model, launch_mode=launch_mode: launch_with_failsafe(app, model, launch_mode, 'auto', progress=progress),
+                lambda progress, token, model=model, launch_mode=launch_mode: launch_with_failsafe(
+                    app,
+                    model,
+                    launch_mode,
+                    'auto',
+                    progress=progress,
+                    cancel_token=token,
+                ),
             )
         elif launch_mode in ('max_context', 'tokens_per_sec'):
             tier = prompt_optimization_tier(stdscr, colors)
@@ -442,14 +494,23 @@ def tui(stdscr, app: AppConfig):
             start_background_action(
                 model,
                 f'{launch_mode}/{tier} launch optimization',
-                lambda progress, model=model, launch_mode=launch_mode, tier=tier: launch_with_failsafe(app, model, launch_mode, tier, progress=progress),
+                lambda progress, token, model=model, launch_mode=launch_mode, tier=tier: launch_with_failsafe(
+                    app,
+                    model,
+                    launch_mode,
+                    tier,
+                    progress=progress,
+                    cancel_token=token,
+                ),
             )
         else:
             start_background_action(
                 model,
                 'model launch',
-                lambda progress, model=model: start_model_with_progress(app, model, progress=progress),
+                lambda progress, token, model=model: start_model_with_progress(app, model, progress=progress, cancel_token=token),
             )
+
+    queue_models_needing_default_benchmark()
 
     while True:
         while True:
@@ -464,7 +525,10 @@ def tui(stdscr, app: AppConfig):
             message = text
             if event in ('done', 'stack_done'):
                 action_thread = None
+                action_token = None
                 last_refresh = 0.0
+
+        maybe_start_default_benchmark()
 
         now = time.time()
         if now - last_refresh > REFRESH_SECONDS:
@@ -765,6 +829,8 @@ def tui(stdscr, app: AppConfig):
         else:
             footer = '[Enter] details  [z] best optimization  [B] benchmark best  [x] detect  [X] prune'
             footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
+        if action_running():
+            footer = '[A] abort active action   ' + footer
         stdscr.addstr(h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
         stdscr.addstr(h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
         stdscr.refresh()
@@ -776,6 +842,11 @@ def tui(stdscr, app: AppConfig):
 
         if key == -1:
             time.sleep(0.05)
+            continue
+        if action_running() and key == ord('A'):
+            if action_token is not None:
+                action_token.cancel('user requested abort')
+            message = '⏳ Aborting active action and cleaning up managed processes...'
             continue
         if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, ord('j'), ord('k'), 27, curses.KEY_BACKSPACE, 127, 8):
             message = '⏳ Action is running. Watch the log window; controls unlock when it finishes.'
@@ -801,6 +872,7 @@ def tui(stdscr, app: AppConfig):
             selected = min(len(app.models) - 1, selected + 1)
         elif key == ord('r'):
             count, items = app.detect_models()
+            queue_models_needing_default_benchmark()
             statuses = {m.id: app.health(m) for m in app.models}
             message = items[0] if items else (f'Synced {count} model(s)' if count else 'Synced.')
         elif key == ord('S'):
@@ -834,7 +906,12 @@ def tui(stdscr, app: AppConfig):
             start_background_action(
                 model,
                 'benchmark optimization',
-                lambda progress, model=model: benchmark_best_optimization(app, model, progress=progress),
+                lambda progress, token, model=model: benchmark_best_optimization(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
             )
         elif key == ord('O') and app.models and view_mode == 'detail':
             model = active_detail_model()
@@ -843,12 +920,20 @@ def tui(stdscr, app: AppConfig):
             start_background_action(
                 model,
                 'opencode workflow benchmark',
-                lambda progress, model=model: benchmark_opencode_workflow(app, model, progress=progress),
+                lambda progress, token, model=model: benchmark_opencode_workflow(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
             )
         elif key == ord('a'):
             model = prompt_model(stdscr, 'Add model')
             if model:
+                if not getattr(model, 'default_benchmark_status', ''):
+                    model.default_benchmark_status = 'pending'
                 app.add_or_update(model)
+                queue_default_benchmark(model.id)
                 selected = len(app.models) - 1
                 message = f'Added {model.id}.'
         elif key == ord('e') and app.models:
@@ -857,7 +942,10 @@ def tui(stdscr, app: AppConfig):
             if updated:
                 if updated.id != current.id:
                     app.delete(current.id)
+                if not getattr(updated, 'default_benchmark_status', ''):
+                    updated.default_benchmark_status = 'pending'
                 app.add_or_update(updated)
+                queue_models_needing_default_benchmark()
                 selected = min(selected, len(app.models) - 1)
                 if view_mode == 'detail':
                     detail_model_id = updated.id
@@ -879,10 +967,12 @@ def tui(stdscr, app: AppConfig):
                 message = 'Delete cancelled.'
         elif key == ord('x'):
             count, items = app.detect_models()
+            queue_models_needing_default_benchmark()
             message = items[0] if items else (f'Detected {count} new model(s)' if count else 'No new GGUFs found.')
             selected = min(selected, len(app.models) - 1 if app.models else 0)
         elif key == ord('X'):
             count, removed = app.prune_missing_models()
+            queue_models_needing_default_benchmark()
             message = f'Pruned {count}: {", ".join(removed[:5])}' if count else 'No missing models to prune.'
             selected = max(0, min(selected, len(app.models) - 1))
         elif key == ord('g'):

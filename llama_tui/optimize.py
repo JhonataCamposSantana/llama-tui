@@ -12,6 +12,92 @@ from .gguf import (
 from .hardware import HardwareProfile
 from .models import ModelConfig
 
+GPU_WEIGHT_BUDGET_BY_TIER = {
+    'safe': 0.70,
+    'moderate': 0.80,
+    'extreme': 0.88,
+}
+GPU_RESERVE_BY_TIER = {
+    'safe': 20,
+    'moderate': 15,
+    'extreme': 10,
+}
+GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER = {
+    'safe': 0.45,
+    'moderate': 0.58,
+    'extreme': 0.70,
+}
+MAX_CONTEXT_RESERVE_BY_TIER = {
+    'safe': 35,
+    'moderate': 25,
+    'extreme': 15,
+}
+MAX_CONTEXT_TARGET_BY_TIER = {
+    'safe': 16384,
+    'moderate': 32768,
+    'extreme': 65536,
+}
+MAX_CONTEXT_BATCH_BY_TIER = {
+    'safe': '128',
+    'moderate': '256',
+    'extreme': '512',
+}
+MAX_CONTEXT_UBATCH_BY_TIER = {
+    'safe': '64',
+    'moderate': '128',
+    'extreme': '256',
+}
+MAX_CONTEXT_VLLM_UTIL_BY_TIER = {
+    'safe': '0.75',
+    'moderate': '0.88',
+    'extreme': '0.92',
+}
+MAX_CONTEXT_VLLM_SEQS_BY_TIER = {
+    'safe': '1',
+    'moderate': '2',
+    'extreme': '3',
+}
+TOKENS_PER_SEC_RESERVE_BY_TIER = {
+    'safe': 40,
+    'moderate': 30,
+    'extreme': 20,
+}
+TOKENS_PER_SEC_CONTEXT_BY_TIER = {
+    'safe': 4096,
+    'moderate': 8192,
+    'extreme': 12288,
+}
+TOKENS_PER_SEC_PARALLEL_BY_TIER = {
+    'safe': 2,
+    'moderate': 4,
+    'extreme': 8,
+}
+TOKENS_PER_SEC_BATCH_BY_TIER = {
+    'safe': '512',
+    'moderate': '1024',
+    'extreme': '2048',
+}
+TOKENS_PER_SEC_UBATCH_BY_TIER = {
+    'safe': '256',
+    'moderate': '512',
+    'extreme': '1024',
+}
+TOKENS_PER_SEC_VLLM_UTIL_BY_TIER = {
+    'safe': '0.70',
+    'moderate': '0.80',
+    'extreme': '0.90',
+}
+TOKENS_PER_SEC_VLLM_SEQS_BY_TIER = {
+    'safe': '4',
+    'moderate': '8',
+    'extreme': '16',
+}
+TOKENS_PER_SEC_VLLM_BATCHED_TOKENS_BY_TIER = {
+    'safe': '4096',
+    'moderate': '8192',
+    'extreme': '16384',
+}
+
 
 def model_likely_fits_gpu(model: ModelConfig, profile: Optional[HardwareProfile], tier: str) -> bool:
     if not profile or not profile.has_usable_gpu():
@@ -19,18 +105,10 @@ def model_likely_fits_gpu(model: ModelConfig, profile: Optional[HardwareProfile]
     size = model_file_size(model)
     if size <= 0:
         return False
-    gpu_weight_budget = {
-        'safe': 0.70,
-        'moderate': 0.80,
-        'extreme': 0.88,
-    }.get(tier, 0.80)
+    gpu_weight_budget = GPU_WEIGHT_BUDGET_BY_TIER.get(tier, GPU_WEIGHT_BUDGET_BY_TIER['moderate'])
     return size <= int(profile.gpu_memory_free * gpu_weight_budget)
 def gpu_reserve_percent_for_tier(tier: str) -> int:
-    return {
-        'safe': 20,
-        'moderate': 15,
-        'extreme': 10,
-    }.get(tier, 15)
+    return GPU_RESERVE_BY_TIER.get(tier, GPU_RESERVE_BY_TIER['moderate'])
 def effective_gpu_reserve_percent(reserve_pct: int, tier: str) -> int:
     requested = max(5, min(80, int(reserve_pct or gpu_reserve_percent_for_tier(tier))))
     return min(requested, gpu_reserve_percent_for_tier(tier))
@@ -90,11 +168,10 @@ def estimate_gpu_weight_bytes(model: ModelConfig, profile: HardwareProfile, tier
         return min(int(size * (ngl / layer_count) * 1.15), int(usable_gpu * 0.85))
     if model_likely_fits_gpu(model, profile, tier):
         return min(int(size * 1.08), int(usable_gpu * 0.85))
-    offload_fraction = {
-        'safe': 0.45,
-        'moderate': 0.58,
-        'extreme': 0.70,
-    }.get(tier, 0.58)
+    offload_fraction = GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER.get(
+        tier,
+        GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER['moderate'],
+    )
     return min(int(usable_gpu * offload_fraction), int(size * 0.95))
 def estimate_gpu_context_for_profile(
     model: ModelConfig,
@@ -278,24 +355,18 @@ def apply_optimization_preset(
     if preset == 'max_context':
         model.optimize_mode = 'max_context_safe'
         model.parallel = 1
-        reserve_by_tier = {'safe': 35, 'moderate': 25, 'extreme': 15}
-        min_ctx_by_tier = {'safe': 16384, 'moderate': 32768, 'extreme': 65536}
-        model.memory_reserve_percent = max(reserve_by_tier[tier], int(getattr(model, 'memory_reserve_percent', 25)))
-        model.ctx = max(int(getattr(model, 'ctx', 8192)), min_ctx_by_tier[tier])
+        model.memory_reserve_percent = max(MAX_CONTEXT_RESERVE_BY_TIER[tier], int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(int(getattr(model, 'ctx', 8192)), MAX_CONTEXT_TARGET_BY_TIER[tier])
         model.ctx = max(ctx_min, min(model.ctx, ctx_max))
         model.output = min(max(model.output, 2048), 4096)
         if runtime == 'llama.cpp':
-            batch_by_tier = {'safe': '128', 'moderate': '256', 'extreme': '512'}
-            ubatch_by_tier = {'safe': '64', 'moderate': '128', 'extreme': '256'}
-            set_flag('--batch-size', batch_by_tier[tier])
-            set_flag('--ubatch-size', ubatch_by_tier[tier])
+            set_flag('--batch-size', MAX_CONTEXT_BATCH_BY_TIER[tier])
+            set_flag('--ubatch-size', MAX_CONTEXT_UBATCH_BY_TIER[tier])
             set_flag('--cache-type-k', 'q8_0')
             set_flag('--cache-type-v', 'q8_0')
         elif runtime == 'vllm':
-            util_by_tier = {'safe': '0.75', 'moderate': '0.88', 'extreme': '0.92'}
-            seqs_by_tier = {'safe': '1', 'moderate': '2', 'extreme': '3'}
-            set_flag('--gpu-memory-utilization', util_by_tier[tier])
-            set_flag('--max-num-seqs', seqs_by_tier[tier])
+            set_flag('--gpu-memory-utilization', MAX_CONTEXT_VLLM_UTIL_BY_TIER[tier])
+            set_flag('--max-num-seqs', MAX_CONTEXT_VLLM_SEQS_BY_TIER[tier])
             set_flag('--max-num-batched-tokens', str(max(4096, min(model.ctx, 24576))))
         model.extra_args = extra_args
         safe_ctx = estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max)
@@ -308,26 +379,18 @@ def apply_optimization_preset(
 
     if preset == 'tokens_per_sec':
         model.optimize_mode = 'max_context_safe'
-        reserve_by_tier = {'safe': 40, 'moderate': 30, 'extreme': 20}
-        target_ctx_by_tier = {'safe': 4096, 'moderate': 8192, 'extreme': 12288}
-        par_by_tier = {'safe': 2, 'moderate': 4, 'extreme': 8}
-        model.memory_reserve_percent = max(reserve_by_tier[tier], int(getattr(model, 'memory_reserve_percent', 25)))
-        model.ctx = max(ctx_min, min(target_ctx_by_tier[tier], ctx_max))
-        model.parallel = max(1, min(par_by_tier[tier], int(getattr(model, 'parallel', 1)) + 1))
+        model.memory_reserve_percent = max(TOKENS_PER_SEC_RESERVE_BY_TIER[tier], int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(ctx_min, min(TOKENS_PER_SEC_CONTEXT_BY_TIER[tier], ctx_max))
+        model.parallel = max(1, min(TOKENS_PER_SEC_PARALLEL_BY_TIER[tier], int(getattr(model, 'parallel', 1)) + 1))
         model.output = min(model.output, 2048)
         if runtime == 'llama.cpp':
-            batch_by_tier = {'safe': '512', 'moderate': '1024', 'extreme': '2048'}
-            ubatch_by_tier = {'safe': '256', 'moderate': '512', 'extreme': '1024'}
-            set_flag('--batch-size', batch_by_tier[tier])
-            set_flag('--ubatch-size', ubatch_by_tier[tier])
+            set_flag('--batch-size', TOKENS_PER_SEC_BATCH_BY_TIER[tier])
+            set_flag('--ubatch-size', TOKENS_PER_SEC_UBATCH_BY_TIER[tier])
             strip_flags('--cache-type-k', '--cache-type-v')
         elif runtime == 'vllm':
-            util_by_tier = {'safe': '0.70', 'moderate': '0.80', 'extreme': '0.90'}
-            seqs_by_tier = {'safe': '4', 'moderate': '8', 'extreme': '16'}
-            btok_by_tier = {'safe': '4096', 'moderate': '8192', 'extreme': '16384'}
-            set_flag('--gpu-memory-utilization', util_by_tier[tier])
-            set_flag('--max-num-seqs', seqs_by_tier[tier])
-            set_flag('--max-num-batched-tokens', btok_by_tier[tier])
+            set_flag('--gpu-memory-utilization', TOKENS_PER_SEC_VLLM_UTIL_BY_TIER[tier])
+            set_flag('--max-num-seqs', TOKENS_PER_SEC_VLLM_SEQS_BY_TIER[tier])
+            set_flag('--max-num-batched-tokens', TOKENS_PER_SEC_VLLM_BATCHED_TOKENS_BY_TIER[tier])
         model.extra_args = extra_args
         safe_ctx = estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max)
         model.ctx = min(model.ctx, safe_ctx) if safe_ctx >= ctx_min else ctx_min

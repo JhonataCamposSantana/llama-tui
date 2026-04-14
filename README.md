@@ -134,6 +134,7 @@ Useful per-model fields:
 - `Esc` on details: return to the model list.
 - `B`: benchmark candidate optimization profiles.
 - `O`: benchmark the selected model with an OpenCode workflow from details.
+- `A`: abort the active launch or benchmark action and clean up managed processes.
 - `z`: apply the current best heuristic optimization without benchmarking.
 - `S`: stop all known models.
 - `x`: detect new GGUF models from configured cache roots.
@@ -292,6 +293,8 @@ The benchmark runner:
 
 The prompt suite is intentionally short and stable. It is not a model quality benchmark. It measures local serving throughput for the selected runtime and hardware.
 
+Pressing `A` while a launch or benchmark is running requests cancellation. The active candidate server is stopped after the current blocking operation unwinds, and benchmark-launched OpenCode subprocess groups are terminated.
+
 Saved benchmark rows include:
 
 - preset and tier,
@@ -315,7 +318,7 @@ llmfit_cache_root
 llm_models_cache_root
 ```
 
-Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and starter defaults based on filename hints.
+Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. The TUI then queues a safe bootstrap benchmark in the background to replace those starter values with measured settings. Discovery does not special-case model families or filenames.
 
 Press `X` to prune registry entries whose model files disappeared.
 
@@ -333,6 +336,8 @@ llama-tui writes OpenAI-compatible providers for enabled local models and maps:
 Existing config files are backed up under `opencode.backup_dir` before writing.
 
 The OpenCode launch actions use `opencode.terminal_command` if set. The command is a template with `{title}`, `{cwd}`, and `{cmd}` placeholders. If unset, llama-tui tries common terminal launchers such as `konsole`, `gnome-terminal`, `kgx`, `kitty`, `alacritty`, `wezterm`, `foot`, and `xterm`.
+
+The `O` benchmark is different from those launch actions: it runs `opencode run --agent build --model ... --dir ...` headlessly inside disposable fixture repos so timing, test success, and cleanup can be measured. Benchmark-launched OpenCode process groups are terminated at the end of each task, on timeout, or when aborted.
 
 For full-stack launches, llama-tui opens VS Code with:
 

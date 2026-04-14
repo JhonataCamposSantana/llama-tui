@@ -1,8 +1,13 @@
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
+from .gguf import read_gguf_metadata
 from .models import ModelConfig
+
+GENERIC_DISCOVERY_CTX = 2048
+GENERIC_DISCOVERY_CTX_MAX = 131072
+GENERIC_DISCOVERY_MEMORY_RESERVE = 40
 
 
 def slugify(text: str) -> str:
@@ -15,17 +20,20 @@ def pretty_name_from_filename(stem: str) -> str:
     text = re.sub(r'\bq(\d(?:\.\d+)?)\b', lambda m: f'Q{m.group(1)}', text, flags=re.I)
     text = re.sub(r'\biq(\d(?:\.\d+)?)\b', lambda m: f'IQ{m.group(1)}', text, flags=re.I)
     return ' '.join(part if part.isupper() else part.capitalize() for part in text.split())
-def choose_defaults(name: str) -> Tuple[int, int, float]:
-    low = name.lower()
-    if '30b-a3b' in low or 'a3b' in low:
-        return 8192, 16, 0.45
-    if 'gemma' in low and 'e4b' in low:
-        return 8192, 0, 0.70
-    if '9b' in low or 'opus' in low:
-        return 32768, 999, 0.55
-    if 'coder' in low:
-        return 16384, 999, 0.45
-    return 8192, 999, 0.65
+def gguf_context_max(path: Path) -> int:
+    metadata = read_gguf_metadata(path)
+    arch = str(metadata.get('general.architecture') or '')
+    keys = ['general.context_length']
+    if arch:
+        keys.append(f'{arch}.context_length')
+    for key in keys:
+        try:
+            value = int(metadata.get(key) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return max(GENERIC_DISCOVERY_CTX, value)
+    return GENERIC_DISCOVERY_CTX_MAX
 def is_real_model_file(path: Path) -> bool:
     name = path.name.lower()
     if path.suffix.lower() != '.gguf':
@@ -97,15 +105,7 @@ def classify_model_type(model: ModelConfig) -> str:
 def detected_model_from_path(path: Path, existing_models: List[ModelConfig], source: str = 'manual') -> ModelConfig:
     stem = path.stem
     name = pretty_name_from_filename(stem)
-    repo_dir = path.parts[-4] if len(path.parts) >= 4 else ''
-    repo_hint = repo_dir.replace('models--', '').replace('--', '-')
     base_id = slugify(name)
-    if 'qwen3-30b-a3b' in stem.lower():
-        base_id = 'qwen30b'
-    elif 'gemma' in stem.lower() and 'e4b' in stem.lower():
-        base_id = 'gemma_e4b'
-    elif 'opus' in stem.lower() or 'claude-4-6-opus' in repo_hint.lower():
-        base_id = 'opus'
     ids = {m.id for m in existing_models}
     model_id = base_id
     i = 2
@@ -116,21 +116,27 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
     port = 8080
     while port in ports:
         port += 1
-    ctx, ngl, temp = choose_defaults(stem)
+    ctx_max = gguf_context_max(path)
     return ModelConfig(
         id=model_id,
         name=name,
         path=str(path),
         alias=slugify(stem),
         port=port,
-        ctx=ctx,
-        ngl=ngl,
-        temp=temp,
+        ctx=GENERIC_DISCOVERY_CTX,
+        ctx_min=GENERIC_DISCOVERY_CTX,
+        ctx_max=ctx_max,
+        ngl=0,
+        temp=0.7,
         threads=6,
         parallel=1,
         cache_ram=0,
         flash_attn=True,
         jinja=True,
-        output=4096,
+        output=2048,
+        optimize_mode='max_context_safe',
+        optimize_tier='safe',
+        memory_reserve_percent=GENERIC_DISCOVERY_MEMORY_RESERVE,
+        default_benchmark_status='pending',
         extra_args=[],
     )

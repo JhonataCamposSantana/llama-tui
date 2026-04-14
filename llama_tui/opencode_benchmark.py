@@ -17,9 +17,14 @@ from .benchmark import (
     concise_failure,
     sync_opencode_after_tuning,
 )
+from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .hardware import read_meminfo_bytes
 from .models import ModelConfig
 from .textutil import compact_message
+
+OPENCODE_PREFLIGHT_TIMEOUT = 8
+OPENCODE_TASK_TIMEOUT = 300
+OPENCODE_BENCHMARK_CANDIDATES = 4
 
 
 @dataclass
@@ -191,7 +196,52 @@ def isolated_opencode_env(home: Path, config_path: Path) -> Dict[str, str]:
     env['XDG_DATA_HOME'] = str(home / '.local' / 'share')
     env['XDG_STATE_HOME'] = str(home / '.local' / 'state')
     env['OPENCODE_CONFIG'] = str(config_path)
+    env['OPENCODE_DISABLE_AUTOUPDATE'] = 'true'
+    env['OPENCODE_DISABLE_PRUNE'] = 'true'
+    env['OPENCODE_DISABLE_MODELS_FETCH'] = 'true'
+    env['OPENCODE_CLIENT'] = 'llama-tui-benchmark'
     return env
+
+
+def opencode_cli_preflight(timeout: int = OPENCODE_PREFLIGHT_TIMEOUT) -> Tuple[bool, str]:
+    checks = [
+        ['opencode', '--version'],
+        ['opencode', 'run', '--help'],
+    ]
+    details = []
+    for command in checks:
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f'{" ".join(command)} did not return within {timeout}s'
+        except OSError as exc:
+            return False, str(exc)
+        output = compact_message((result.stdout or result.stderr or '').strip())
+        if result.returncode != 0:
+            return False, f'{" ".join(command)} failed ({result.returncode}): {output}'
+        if output:
+            details.append(output.split()[0])
+    return True, 'opencode CLI ready' + (f' ({", ".join(details)})' if details else '')
+
+
+def build_opencode_run_command(app, model: ModelConfig, workspace: Path, prompt: str) -> List[str]:
+    return [
+        'opencode',
+        'run',
+        '--pure',
+        '--model', app.opencode_model_ref(model),
+        '--agent', 'build',
+        '--format', 'json',
+        '--dir', str(workspace),
+        prompt,
+    ]
 
 
 def sample_memory(app) -> Dict[str, int]:
@@ -209,7 +259,9 @@ def run_process_with_metrics(
     env: Dict[str, str],
     timeout: int,
     app,
+    cancel_token: Optional[CancelToken] = None,
 ) -> Dict[str, object]:
+    check_cancelled(cancel_token)
     started = time.monotonic()
     first_output: Optional[float] = None
     stdout_lines: List[str] = []
@@ -217,6 +269,7 @@ def run_process_with_metrics(
     min_ram = 0
     min_vram = 0
     timed_out = False
+    aborted = False
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -225,6 +278,7 @@ def run_process_with_metrics(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     selector = selectors.DefaultSelector()
     if proc.stdout:
@@ -244,10 +298,14 @@ def run_process_with_metrics(
     remember_memory()
     try:
         while True:
+            if cancel_token is not None and cancel_token.is_cancelled():
+                aborted = True
+                app.terminate_process_group(proc.pid)
+                break
             elapsed = time.monotonic() - started
             if elapsed > timeout and proc.poll() is None:
                 timed_out = True
-                proc.kill()
+                app.terminate_process_group(proc.pid)
                 break
             events = selector.select(timeout=0.25)
             for key, _mask in events:
@@ -283,17 +341,22 @@ def run_process_with_metrics(
                 selector.unregister(stream)
             except Exception:
                 pass
+            try:
+                stream.close()
+            except Exception:
+                pass
         selector.close()
 
     try:
         returncode = proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        app.terminate_process_group(proc.pid)
         returncode = -9
     elapsed = max(0.001, time.monotonic() - started)
     return {
         'returncode': returncode,
         'timed_out': timed_out,
+        'aborted': aborted,
         'elapsed': elapsed,
         'first_output': first_output if first_output is not None else elapsed,
         'stdout': stdout_lines[-40:],
@@ -319,25 +382,38 @@ def verify_fixture(workspace: Path) -> Tuple[bool, str]:
     return result.returncode == 0, compact_message(result.stdout[-1200:])
 
 
-def run_opencode_task(app, model: ModelConfig, task: WorkflowTask, timeout: int = 300) -> Dict[str, object]:
+def run_opencode_task(
+    app,
+    model: ModelConfig,
+    task: WorkflowTask,
+    timeout: int = OPENCODE_TASK_TIMEOUT,
+    cancel_token: Optional[CancelToken] = None,
+) -> Dict[str, object]:
     with tempfile.TemporaryDirectory(prefix='llama-tui-opencode-work-') as workspace_raw:
         with tempfile.TemporaryDirectory(prefix='llama-tui-opencode-home-') as home_raw:
+            check_cancelled(cancel_token)
             workspace = Path(workspace_raw)
             home = Path(home_raw)
             write_fixture(workspace, task)
             config_path = write_temp_opencode_config(app, model, home)
             env = isolated_opencode_env(home, config_path)
-            command = [
-                'opencode',
-                'run',
-                '--pure',
-                '--model', app.opencode_model_ref(model),
-                '--agent', 'build',
-                '--format', 'json',
-                '--dir', str(workspace),
-                task.prompt,
-            ]
-            run = run_process_with_metrics(command, workspace, env, timeout, app)
+            command = build_opencode_run_command(app, model, workspace, task.prompt)
+            run = run_process_with_metrics(command, workspace, env, timeout, app, cancel_token=cancel_token)
+            if run.get('aborted'):
+                return {
+                    'task': task.name,
+                    'ok': False,
+                    'tests_ok': False,
+                    'exit_code': int(run.get('returncode', -1)),
+                    'timed_out': bool(run.get('timed_out')),
+                    'aborted': True,
+                    'elapsed': float(run.get('elapsed', 0.0) or 0.0),
+                    'first_output': float(run.get('first_output', 0.0) or 0.0),
+                    'min_ram_available': int(run.get('min_ram_available', 0) or 0),
+                    'min_gpu_memory_free': int(run.get('min_gpu_memory_free', 0) or 0),
+                    'detail': 'user requested abort',
+                }
+            check_cancelled(cancel_token)
             tests_ok, test_detail = verify_fixture(workspace)
             stderr = ' | '.join(str(line) for line in run.get('stderr', [])[-8:])
             stdout = ' | '.join(str(line) for line in run.get('stdout', [])[-8:])
@@ -348,6 +424,7 @@ def run_opencode_task(app, model: ModelConfig, task: WorkflowTask, timeout: int 
                 'tests_ok': tests_ok,
                 'exit_code': int(run.get('returncode', -1)),
                 'timed_out': bool(run.get('timed_out')),
+                'aborted': bool(run.get('aborted')),
                 'elapsed': float(run.get('elapsed', 0.0) or 0.0),
                 'first_output': float(run.get('first_output', 0.0) or 0.0),
                 'min_ram_available': int(run.get('min_ram_available', 0) or 0),
@@ -388,15 +465,22 @@ def benchmark_opencode_workflow(
     app,
     model: ModelConfig,
     progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
+    check_cancelled(cancel_token)
     if not app.command_exists('opencode'):
         return False, '❌ opencode command not found in PATH.'
+    cli_ok, cli_msg = opencode_cli_preflight()
+    if not cli_ok:
+        return False, f'❌ opencode preflight failed: {cli_msg}'
+    if progress:
+        progress(cli_msg)
     status, _detail = app.health(model)
     if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
         return False, '❌ Stop the model before running opencode workflow benchmark.'
 
     profile = app.hardware_profile(refresh=True)
-    candidates = benchmark_candidate_models(model, profile)[:4]
+    candidates = benchmark_candidate_models(model, profile)[:OPENCODE_BENCHMARK_CANDIDATES]
     vscode = detect_vscode_pressure()
     records: List[Dict[str, object]] = []
     results: List[Dict[str, object]] = []
@@ -406,95 +490,129 @@ def benchmark_opencode_workflow(
             f'vscode={vscode["processes"]} proc/{vscode["rss_mib"]} MiB, {profile.short_summary()}'
         )
 
-    for attempt, (preset, tier, candidate, tune_msg) in enumerate(candidates, start=1):
-        if progress:
-            progress(f'opencode candidate {attempt}/{len(candidates)} {preset}/{tier}: {tune_msg}')
-        ok, msg = app.start(candidate)
-        if not ok:
-            records.append({
-                'preset': preset,
-                'tier': tier,
-                'status': 'start failed',
-                'score': 0.0,
-                'seconds': 0.0,
-                'passed': 0,
-                'tasks': len(OPENCODE_WORKFLOW_TASKS),
-                'detail': concise_failure(msg, limit=500),
-                'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
-            })
+    current: Optional[Tuple[str, str, ModelConfig]] = None
+    try:
+        for attempt, (preset, tier, candidate, tune_msg) in enumerate(candidates, start=1):
+            check_cancelled(cancel_token)
+            current = (preset, tier, candidate)
             if progress:
-                progress(f'opencode candidate {attempt}/{len(candidates)} failed to start: {concise_failure(msg)}')
-            continue
-
-        samples: List[Dict[str, object]] = []
-        try:
-            ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=180)
-            if not ready_ok:
+                progress(f'opencode candidate {attempt}/{len(candidates)} {preset}/{tier}: {tune_msg}')
+            ok, msg = app.start(candidate)
+            if not ok:
                 records.append({
                     'preset': preset,
                     'tier': tier,
-                    'status': 'not ready',
+                    'status': 'start failed',
                     'score': 0.0,
                     'seconds': 0.0,
                     'passed': 0,
                     'tasks': len(OPENCODE_WORKFLOW_TASKS),
-                    'detail': concise_failure(ready_msg, limit=500),
+                    'detail': concise_failure(msg, limit=500),
                     'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                 })
                 if progress:
-                    progress(f'opencode candidate {attempt}/{len(candidates)} not ready: {concise_failure(ready_msg)}')
+                    progress(f'opencode candidate {attempt}/{len(candidates)} failed to start: {concise_failure(msg)}')
                 continue
 
-            for task in OPENCODE_WORKFLOW_TASKS:
-                if progress:
-                    progress(f'opencode candidate {attempt}/{len(candidates)} running task {task.name}...')
-                sample = run_opencode_task(app, candidate, task)
-                samples.append(sample)
-                if progress:
-                    state = 'passed' if sample.get('ok') else 'failed'
-                    progress(f'opencode task {task.name} {state} in {float(sample.get("elapsed", 0.0)):.1f}s')
+            samples: List[Dict[str, object]] = []
+            try:
+                ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=180, cancel_token=cancel_token)
+                if not ready_ok:
+                    records.append({
+                        'preset': preset,
+                        'tier': tier,
+                        'status': 'not ready',
+                        'score': 0.0,
+                        'seconds': 0.0,
+                        'passed': 0,
+                        'tasks': len(OPENCODE_WORKFLOW_TASKS),
+                        'detail': concise_failure(ready_msg, limit=500),
+                        'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+                    })
+                    if progress:
+                        progress(f'opencode candidate {attempt}/{len(candidates)} not ready: {concise_failure(ready_msg)}')
+                    continue
 
-            score = score_opencode_samples(samples)
-            passed = sum(1 for sample in samples if sample.get('ok'))
-            elapsed = sum(float(sample.get('elapsed', 0.0) or 0.0) for sample in samples)
-            status_text = 'ok' if passed == len(samples) else ('partial' if passed else 'failed')
-            detail = '; '.join(str(sample.get('detail', '')) for sample in samples if not sample.get('ok')) or 'all tasks passed'
-            record = {
-                'preset': preset,
-                'tier': tier,
-                'status': status_text,
-                'score': score,
-                'seconds': round(elapsed, 2),
-                'first_output': round(statistics.median([float(sample.get('first_output', 0.0) or 0.0) for sample in samples]), 2),
-                'passed': passed,
-                'tasks': len(samples),
-                'ctx': int(getattr(candidate, 'ctx', 0) or 0),
-                'parallel': int(getattr(candidate, 'parallel', 0) or 0),
-                'threads': int(getattr(candidate, 'threads', 0) or 0),
-                'ngl': int(getattr(candidate, 'ngl', 0) or 0),
-                'vscode_processes': vscode['processes'],
-                'vscode_rss_mib': vscode['rss_mib'],
-                'detail': concise_failure(detail, limit=500),
-                'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
-            }
-            records.append(record)
-            if score > 0:
-                results.append({
-                    'score': score,
+                for task in OPENCODE_WORKFLOW_TASKS:
+                    check_cancelled(cancel_token)
+                    if progress:
+                        progress(f'opencode candidate {attempt}/{len(candidates)} running task {task.name}...')
+                    sample = run_opencode_task(app, candidate, task, cancel_token=cancel_token)
+                    samples.append(sample)
+                    check_cancelled(cancel_token)
+                    if progress:
+                        state = 'passed' if sample.get('ok') else 'failed'
+                        progress(
+                            f'opencode task {task.name} {state} in {float(sample.get("elapsed", 0.0)):.1f}s '
+                            f'exit={int(sample.get("exit_code", -1))} '
+                            f'timeout={bool(sample.get("timed_out"))} abort={bool(sample.get("aborted"))}'
+                        )
+                        if not sample.get('ok') and sample.get('detail'):
+                            progress(f'opencode task {task.name} detail: {concise_failure(str(sample.get("detail")), limit=500)}')
+
+                score = score_opencode_samples(samples)
+                passed = sum(1 for sample in samples if sample.get('ok'))
+                elapsed = sum(float(sample.get('elapsed', 0.0) or 0.0) for sample in samples)
+                status_text = 'ok' if passed == len(samples) else ('partial' if passed else 'failed')
+                detail = '; '.join(str(sample.get('detail', '')) for sample in samples if not sample.get('ok')) or 'all tasks passed'
+                record = {
                     'preset': preset,
                     'tier': tier,
-                    'model': candidate,
-                    'elapsed': elapsed,
-                    'record': record,
-                    'tune_msg': tune_msg,
-                })
-            if progress:
-                progress(f'opencode candidate {attempt}/{len(candidates)} scored {score:.2f} ({passed}/{len(samples)} tasks)')
-        finally:
+                    'status': status_text,
+                    'score': score,
+                    'seconds': round(elapsed, 2),
+                    'first_output': round(statistics.median([float(sample.get('first_output', 0.0) or 0.0) for sample in samples]), 2),
+                    'passed': passed,
+                    'tasks': len(samples),
+                    'ctx': int(getattr(candidate, 'ctx', 0) or 0),
+                    'parallel': int(getattr(candidate, 'parallel', 0) or 0),
+                    'threads': int(getattr(candidate, 'threads', 0) or 0),
+                    'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+                    'vscode_processes': vscode['processes'],
+                    'vscode_rss_mib': vscode['rss_mib'],
+                    'detail': concise_failure(detail, limit=500),
+                    'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+                }
+                records.append(record)
+                if score > 0:
+                    results.append({
+                        'score': score,
+                        'preset': preset,
+                        'tier': tier,
+                        'model': candidate,
+                        'elapsed': elapsed,
+                        'record': record,
+                        'tune_msg': tune_msg,
+                    })
+                if progress:
+                    progress(f'opencode candidate {attempt}/{len(candidates)} scored {score:.2f} ({passed}/{len(samples)} tasks)')
+            finally:
+                app.stop(candidate, managed_only=True)
+                if progress:
+                    progress(f'opencode candidate {attempt}/{len(candidates)} stopped.')
+                sleep_with_cancel(0.5, cancel_token)
+    except CancelledError:
+        if current is not None:
+            preset, tier, candidate = current
             app.stop(candidate, managed_only=True)
-            if progress:
-                progress(f'opencode candidate {attempt}/{len(candidates)} stopped.')
-            time.sleep(0.5)
+            records.append({
+                'preset': preset,
+                'tier': tier,
+                'status': 'aborted',
+                'score': 0.0,
+                'seconds': 0.0,
+                'passed': 0,
+                'tasks': len(OPENCODE_WORKFLOW_TASKS),
+                'detail': 'user requested abort',
+                'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+            })
+        recorded_model = clone_model_config(model)
+        recorded_model.last_opencode_benchmark_results = records
+        app.add_or_update(recorded_model)
+        msg = '⚠ aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        return False, msg
 
     recorded_model = clone_model_config(model)
     recorded_model.last_opencode_benchmark_results = records

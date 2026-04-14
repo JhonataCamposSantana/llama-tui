@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib import request
 
+from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .gguf import set_model_extra_arg
 from .hardware import HardwareProfile
 from .models import ModelConfig
@@ -18,6 +19,18 @@ from .optimize import (
     select_best_tier,
 )
 from .textutil import compact_message
+
+BENCHMARK_MAX_CANDIDATES = 6
+BENCHMARK_WARMUP_TOKENS = 16
+BENCHMARK_SAMPLE_TOKENS = 96
+BENCHMARK_WARMUP_TIMEOUT = 120
+BENCHMARK_SAMPLE_TIMEOUT = 240
+BENCHMARK_READY_TIMEOUT = 180
+SAFE_BOOTSTRAP_PRESETS = (
+    ('max_context', 'safe'),
+    ('tokens_per_sec', 'safe'),
+)
+SAFE_BOOTSTRAP_Q8_TARGET_CTX = 4096
 
 
 def sync_opencode_after_tuning(app: AppConfig) -> str:
@@ -46,6 +59,7 @@ def launch_with_failsafe(
     mode: str,
     tier: str,
     progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
     attempts = []
     profile = app.hardware_profile(refresh=True)
@@ -54,6 +68,7 @@ def launch_with_failsafe(
     if progress:
         progress(f'launch optimization started: mode={mode} tier={tier} {profile.short_summary()}')
     for current_tier in fallback_tiers(tier):
+        check_cancelled(cancel_token)
         if mode == 'best':
             tune_msg = apply_best_optimization(model, tier=current_tier, profile=profile)
         else:
@@ -70,7 +85,11 @@ def launch_with_failsafe(
             continue
         if progress:
             progress(f'launch profile {mode}/{current_tier} started; waiting for readiness...')
-        ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
+        try:
+            ready_ok, ready_msg = app.wait_until_ready(model, timeout=120, cancel_token=cancel_token)
+        except CancelledError:
+            app.stop(model, managed_only=True)
+            raise
         if ready_ok:
             if progress:
                 progress(f'launch profile {mode}/{current_tier} ready: {ready_msg}')
@@ -87,7 +106,9 @@ def start_model_with_progress(
     app: AppConfig,
     model: ModelConfig,
     progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
+    check_cancelled(cancel_token)
     if progress:
         progress(f'starting {model.id} with current settings...')
     ok, msg = app.start(model)
@@ -97,7 +118,11 @@ def start_model_with_progress(
         return False, msg
     if progress:
         progress(f'{model.id} started; waiting for readiness...')
-    ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
+    try:
+        ready_ok, ready_msg = app.wait_until_ready(model, timeout=120, cancel_token=cancel_token)
+    except CancelledError:
+        app.stop(model, managed_only=True)
+        raise
     if progress:
         progress(ready_msg if ready_ok else concise_failure(ready_msg))
     return ready_ok, ready_msg
@@ -107,7 +132,9 @@ def launch_opencode_stack(
     workspace: str,
     include_vscode: bool = False,
     progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
+    check_cancelled(cancel_token)
     valid, workspace_path, reason = app.validate_workspace_path(workspace)
     if not valid or workspace_path is None:
         return False, f'❌ {reason}'
@@ -117,6 +144,7 @@ def launch_opencode_stack(
     app.opencode.last_workspace_path = str(workspace_path)
     app.save()
 
+    started_for_stack = False
     status, _detail = app.health(model)
     if status == 'READY':
         if progress:
@@ -124,16 +152,21 @@ def launch_opencode_stack(
     elif status in ('LOADING', 'STARTING') or app.get_pid(model):
         if progress:
             progress(f'{model.id} is starting; waiting for readiness before OpenCode launch...')
-        ready_ok, ready_msg = app.wait_until_ready(model, timeout=180)
+        ready_ok, ready_msg = app.wait_until_ready(model, timeout=180, cancel_token=cancel_token)
         if not ready_ok:
             return False, concise_failure(ready_msg)
     else:
         if progress:
             progress(f'{model.id} is stopped; launching best profile before OpenCode...')
-        ready_ok, ready_msg = launch_with_failsafe(app, model, 'best', 'auto', progress=progress)
+        ready_ok, ready_msg = launch_with_failsafe(app, model, 'best', 'auto', progress=progress, cancel_token=cancel_token)
         if not ready_ok:
             return False, concise_failure(ready_msg)
+        started_for_stack = True
 
+    if cancel_token is not None and cancel_token.is_cancelled():
+        if started_for_stack:
+            app.stop(model, managed_only=True)
+        check_cancelled(cancel_token)
     if not (getattr(app.opencode, 'path', '') or '').strip():
         return False, '❌ Set opencode.path first in settings.'
     sync_ok, sync_msg = app.generate_opencode()
@@ -153,6 +186,10 @@ def launch_opencode_stack(
         return False, f'❌ {terminal_msg}'
 
     warnings = []
+    if cancel_token is not None and cancel_token.is_cancelled():
+        if started_for_stack:
+            app.stop(model, managed_only=True)
+        check_cancelled(cancel_token)
     if include_vscode:
         code_ok, code_msg = app.launch_vscode_workspace(workspace_path)
         if progress:
@@ -160,6 +197,10 @@ def launch_opencode_stack(
         if not code_ok:
             warnings.append(code_msg)
 
+    if cancel_token is not None and cancel_token.is_cancelled():
+        if started_for_stack:
+            app.stop(model, managed_only=True)
+        check_cancelled(cancel_token)
     open_ok, open_msg = app.launch_opencode_terminal(model, workspace_path)
     if not open_ok:
         detail = f'❌ {open_msg}'
@@ -219,7 +260,9 @@ def benchmark_completion(
     max_tokens: int = 64,
     timeout: int = 180,
     prompt: Optional[str] = None,
+    cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, Dict]:
+    check_cancelled(cancel_token)
     prompt = prompt or BENCHMARK_PROMPTS[0]
     payload = {
         'model': model.alias,
@@ -237,6 +280,7 @@ def benchmark_completion(
         data = post_json(url, payload, timeout=timeout)
     except Exception as exc:
         return False, {'error': str(exc)}
+    check_cancelled(cancel_token)
     elapsed = max(0.001, time.time() - started)
     usage = data.get('usage') or {}
     text = completion_text_from_response(data)
@@ -253,11 +297,17 @@ def benchmark_completion(
         'tokens_per_sec': completion_tokens / elapsed,
         'text': text,
     }
-def benchmark_completion_suite(model: ModelConfig, max_tokens: int = 96, timeout: int = 240) -> Tuple[bool, Dict]:
+def benchmark_completion_suite(
+    model: ModelConfig,
+    max_tokens: int = BENCHMARK_SAMPLE_TOKENS,
+    timeout: int = BENCHMARK_SAMPLE_TIMEOUT,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, Dict]:
     samples = []
     failures = []
     for prompt in BENCHMARK_PROMPTS:
-        ok, bench = benchmark_completion(model, max_tokens=max_tokens, timeout=timeout, prompt=prompt)
+        check_cancelled(cancel_token)
+        ok, bench = benchmark_completion(model, max_tokens=max_tokens, timeout=timeout, prompt=prompt, cancel_token=cancel_token)
         if ok:
             samples.append(bench)
         else:
@@ -337,27 +387,65 @@ def benchmark_candidate_models(model: ModelConfig, profile: HardwareProfile) -> 
                     candidate.ctx = max(ctx_min, min(target_ctx, ctx_max, safe_ctx))
                 tune_msg += ' kv=q8_0'
             candidates.append((label, tier, candidate, tune_msg))
-            if len(candidates) >= 6:
+            if len(candidates) >= BENCHMARK_MAX_CANDIDATES:
                 break
-        if len(candidates) >= 6:
+        if len(candidates) >= BENCHMARK_MAX_CANDIDATES:
             break
     return candidates
-def benchmark_best_optimization(
+def safe_bootstrap_candidate_models(model: ModelConfig, profile: HardwareProfile) -> List[Tuple[str, str, ModelConfig, str]]:
+    candidates: List[Tuple[str, str, ModelConfig, str]] = []
+    for preset, tier in SAFE_BOOTSTRAP_PRESETS:
+        candidate = clone_model_config(model)
+        tune_msg = apply_optimization_preset(candidate, preset, tier=tier, profile=profile)
+        candidates.append((preset, tier, candidate, tune_msg))
+        if (
+            preset == 'tokens_per_sec'
+            and getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp'
+            and profile.has_usable_gpu()
+        ):
+            q8_candidate = clone_model_config(model)
+            q8_msg = apply_optimization_preset(q8_candidate, preset, tier=tier, profile=profile)
+            set_model_extra_arg(q8_candidate, '--cache-type-k', 'q8_0')
+            set_model_extra_arg(q8_candidate, '--cache-type-v', 'q8_0')
+            ctx_min = max(256, int(getattr(q8_candidate, 'ctx_min', 2048)))
+            ctx_max = max(ctx_min, int(getattr(q8_candidate, 'ctx_max', 131072)))
+            safe_ctx = estimate_safe_context_for_profile(
+                q8_candidate,
+                profile,
+                int(getattr(q8_candidate, 'memory_reserve_percent', 40) or 40),
+                int(getattr(q8_candidate, 'parallel', 1) or 1),
+                ctx_min,
+                ctx_max,
+            )
+            if safe_ctx >= ctx_min:
+                q8_candidate.ctx = max(ctx_min, min(SAFE_BOOTSTRAP_Q8_TARGET_CTX, ctx_max, safe_ctx))
+                candidates.append((f'{preset}_q8_kv', tier, q8_candidate, f'{q8_msg} kv=q8_0'))
+    return candidates[:3]
+
+
+def _run_server_benchmark_candidates(
     app: AppConfig,
     model: ModelConfig,
+    candidates: List[Tuple[str, str, ModelConfig, str]],
+    profile: HardwareProfile,
+    label: str,
     progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+    update_default_status: bool = False,
 ) -> Tuple[bool, str]:
     status, _detail = app.health(model)
     if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
-        return False, '❌ Stop the model before running benchmark optimization.'
+        return False, f'❌ Stop the model before running {label}.'
 
-    profile = app.hardware_profile(refresh=True)
-    candidates = benchmark_candidate_models(model, profile)
     results = []
     failures = []
     benchmark_records: List[Dict[str, object]] = []
     if progress:
-        progress(f'benchmark optimization started: {len(candidates)} candidate(s), {profile.short_summary()}')
+        progress(f'{label} started: {len(candidates)} candidate(s), {profile.short_summary()}')
+    if update_default_status:
+        running_model = clone_model_config(model)
+        running_model.default_benchmark_status = 'running'
+        app.add_or_update(running_model)
 
     def add_benchmark_record(
         preset: str,
@@ -382,70 +470,107 @@ def benchmark_best_optimization(
             'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
         })
 
-    for attempt, (preset, tier, candidate, tune_msg) in enumerate(candidates, start=1):
-        if progress:
-            progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier}: {tune_msg}')
-        ok, msg = app.start(candidate)
-        if not ok:
+    current: Optional[Tuple[str, str, ModelConfig]] = None
+    try:
+        for attempt, (preset, tier, candidate, tune_msg) in enumerate(candidates, start=1):
+            check_cancelled(cancel_token)
+            current = (preset, tier, candidate)
             if progress:
-                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} failed to start: {concise_failure(msg)}')
-            add_benchmark_record(preset, tier, candidate, 'start failed', detail=msg)
-            failures.append(f'{preset}/{tier}: start failed ({concise_failure(msg)})')
-            continue
-
-        try:
-            if progress:
-                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} started; waiting for readiness...')
-            ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=180)
-            if not ready_ok:
+                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier}: {tune_msg}')
+            ok, msg = app.start(candidate)
+            if not ok:
                 if progress:
-                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} not ready: {concise_failure(ready_msg)}')
-                add_benchmark_record(preset, tier, candidate, 'not ready', detail=ready_msg)
-                failures.append(f'{preset}/{tier}: {concise_failure(ready_msg)}')
+                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} failed to start: {concise_failure(msg)}')
+                add_benchmark_record(preset, tier, candidate, 'start failed', detail=msg)
+                failures.append(f'{preset}/{tier}: start failed ({concise_failure(msg)})')
                 continue
 
-            if progress:
-                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} ready; warming benchmark prompt...')
-            benchmark_completion(candidate, max_tokens=16, timeout=120)
-            if progress:
-                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} measuring 2x96-token completion suite...')
-            bench_ok, bench = benchmark_completion_suite(candidate, max_tokens=96, timeout=240)
-            if not bench_ok:
+            try:
                 if progress:
-                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} benchmark failed: {bench.get("error", "unknown error")}')
-                add_benchmark_record(preset, tier, candidate, 'benchmark failed', detail=str(bench.get('error', 'unknown error')))
-                failures.append(f'{preset}/{tier}: benchmark failed ({bench.get("error", "unknown error")})')
-                continue
+                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} started; waiting for readiness...')
+                ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
+                if not ready_ok:
+                    if progress:
+                        progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} not ready: {concise_failure(ready_msg)}')
+                    add_benchmark_record(preset, tier, candidate, 'not ready', detail=ready_msg)
+                    failures.append(f'{preset}/{tier}: {concise_failure(ready_msg)}')
+                    continue
 
-            score = float(bench['tokens_per_sec'])
-            elapsed = float(bench['elapsed'])
-            if progress:
-                progress(
-                    f'candidate {attempt}/{len(candidates)} {preset}/{tier} '
-                    f'scored median {score:.2f} tok/s across {int(bench.get("sample_count", 1))} sample(s)'
+                if progress:
+                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} ready; warming benchmark prompt...')
+                benchmark_completion(
+                    candidate,
+                    max_tokens=BENCHMARK_WARMUP_TOKENS,
+                    timeout=BENCHMARK_WARMUP_TIMEOUT,
+                    cancel_token=cancel_token,
                 )
-            add_benchmark_record(preset, tier, candidate, 'ok', score=score, elapsed=elapsed)
-            results.append({
-                'score': score,
-                'preset': preset,
-                'tier': tier,
-                'model': candidate,
-                'elapsed': elapsed,
-                'completion_tokens': int(bench['completion_tokens']),
-                'prompt_tokens': int(bench['prompt_tokens']),
-                'tune_msg': tune_msg,
-            })
-        finally:
+                if progress:
+                    progress(
+                        f'candidate {attempt}/{len(candidates)} {preset}/{tier} '
+                        f'measuring {len(BENCHMARK_PROMPTS)}x{BENCHMARK_SAMPLE_TOKENS}-token completion suite...'
+                    )
+                bench_ok, bench = benchmark_completion_suite(
+                    candidate,
+                    max_tokens=BENCHMARK_SAMPLE_TOKENS,
+                    timeout=BENCHMARK_SAMPLE_TIMEOUT,
+                    cancel_token=cancel_token,
+                )
+                if not bench_ok:
+                    if progress:
+                        progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} benchmark failed: {bench.get("error", "unknown error")}')
+                    add_benchmark_record(preset, tier, candidate, 'benchmark failed', detail=str(bench.get('error', 'unknown error')))
+                    failures.append(f'{preset}/{tier}: benchmark failed ({bench.get("error", "unknown error")})')
+                    continue
+
+                score = float(bench['tokens_per_sec'])
+                elapsed = float(bench['elapsed'])
+                if progress:
+                    progress(
+                        f'candidate {attempt}/{len(candidates)} {preset}/{tier} '
+                        f'scored median {score:.2f} tok/s across {int(bench.get("sample_count", 1))} sample(s)'
+                    )
+                add_benchmark_record(preset, tier, candidate, 'ok', score=score, elapsed=elapsed)
+                results.append({
+                    'score': score,
+                    'preset': preset,
+                    'tier': tier,
+                    'model': candidate,
+                    'elapsed': elapsed,
+                    'completion_tokens': int(bench['completion_tokens']),
+                    'prompt_tokens': int(bench['prompt_tokens']),
+                    'tune_msg': tune_msg,
+                })
+            finally:
+                app.stop(candidate, managed_only=True)
+                if progress:
+                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} stopped.')
+                sleep_with_cancel(0.5, cancel_token)
+    except CancelledError:
+        if current is not None:
+            preset, tier, candidate = current
+            add_benchmark_record(preset, tier, candidate, 'aborted', detail='user requested abort')
             app.stop(candidate, managed_only=True)
-            if progress:
-                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} stopped.')
-            time.sleep(0.5)
+        recorded_model = clone_model_config(model)
+        recorded_model.last_benchmark_results = benchmark_records
+        if update_default_status:
+            recorded_model.benchmark_fingerprint = app.model_fingerprint(recorded_model)
+            recorded_model.default_benchmark_status = 'aborted'
+            recorded_model.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
+        app.add_or_update(recorded_model)
+        msg = '⚠ aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        return False, msg
 
     if not results:
         details = '; '.join(failures[:3]) if failures else 'no candidates completed'
-        msg = f'❌ benchmark failed: {details}'
+        msg = f'❌ {label} failed: {details}'
         recorded_model = clone_model_config(model)
         recorded_model.last_benchmark_results = benchmark_records
+        if update_default_status:
+            recorded_model.benchmark_fingerprint = app.model_fingerprint(recorded_model)
+            recorded_model.default_benchmark_status = 'failed'
+            recorded_model.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
         app.add_or_update(recorded_model)
         if progress:
             progress(msg)
@@ -461,13 +586,55 @@ def benchmark_best_optimization(
         f'{profile.short_summary()}'
     )
     best_model.last_benchmark_results = benchmark_records
+    if update_default_status:
+        best_model.benchmark_fingerprint = app.model_fingerprint(best_model)
+        best_model.default_benchmark_status = 'done'
+        best_model.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
     app.add_or_update(best_model)
     sync_msg = sync_opencode_after_tuning(app)
     msg = (
-        f'✅ benchmark winner: {best_model.id} {best["preset"]}/{best["tier"]} '
+        f'✅ {label} winner: {best_model.id} {best["preset"]}/{best["tier"]} '
         f'{best["score"]:.2f} tok/s ctx={best_model.ctx} parallel={best_model.parallel} '
         f'threads={best_model.threads} ngl={best_model.ngl} | {sync_msg}'
     )
     if progress:
         progress(msg)
     return True, msg
+
+
+def benchmark_best_optimization(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    profile = app.hardware_profile(refresh=True)
+    return _run_server_benchmark_candidates(
+        app,
+        model,
+        benchmark_candidate_models(model, profile),
+        profile,
+        'benchmark optimization',
+        progress=progress,
+        cancel_token=cancel_token,
+        update_default_status=True,
+    )
+
+
+def safe_bootstrap_benchmark(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    profile = app.hardware_profile(refresh=True)
+    return _run_server_benchmark_candidates(
+        app,
+        model,
+        safe_bootstrap_candidate_models(model, profile),
+        profile,
+        'safe bootstrap benchmark',
+        progress=progress,
+        cancel_token=cancel_token,
+        update_default_status=True,
+    )
