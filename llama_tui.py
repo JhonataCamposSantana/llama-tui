@@ -8,11 +8,13 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
+from queue import Empty, Queue
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib import request, error
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1420,6 +1422,14 @@ def sync_opencode_after_tuning(app: AppConfig) -> str:
     return msg if ok else f'opencode sync failed: {msg}'
 
 
+def append_model_log(app: AppConfig, model: ModelConfig, text: str):
+    log_path = app.logfile(model.id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%H:%M:%S')
+    with open(log_path, 'a', encoding='utf-8') as log_file:
+        log_file.write(f'[{stamp}] llama-tui: {compact_message(text)}\n')
+
+
 def apply_best_optimization(
     model: ModelConfig,
     tier: str = 'moderate',
@@ -1441,28 +1451,69 @@ def fallback_tiers(selected_tier: str) -> List[str]:
     return order[order.index(selected):]
 
 
-def launch_with_failsafe(app: AppConfig, model: ModelConfig, mode: str, tier: str) -> Tuple[bool, str]:
+def launch_with_failsafe(
+    app: AppConfig,
+    model: ModelConfig,
+    mode: str,
+    tier: str,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
     attempts = []
     profile = app.hardware_profile(refresh=True)
     if tier == 'auto':
         tier = select_best_tier(model, profile)
+    if progress:
+        progress(f'launch optimization started: mode={mode} tier={tier} {profile.short_summary()}')
     for current_tier in fallback_tiers(tier):
         if mode == 'best':
             tune_msg = apply_best_optimization(model, tier=current_tier, profile=profile)
         else:
             tune_msg = apply_optimization_preset(model, mode, tier=current_tier, profile=profile)
+        if progress:
+            progress(f'trying launch profile {mode}/{current_tier}: {tune_msg}')
         app.add_or_update(model)
         sync_msg = sync_opencode_after_tuning(app)
         ok, msg = app.start(model)
         if not ok:
+            if progress:
+                progress(f'launch profile {mode}/{current_tier} failed to start: {msg}')
             attempts.append(f'{current_tier}: start failed ({msg})')
             continue
+        if progress:
+            progress(f'launch profile {mode}/{current_tier} started; waiting for readiness...')
         ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
         if ready_ok:
+            if progress:
+                progress(f'launch profile {mode}/{current_tier} ready: {ready_msg}')
             return True, f'{ready_msg} [{current_tier}] | {tune_msg} | {sync_msg}'
         app.stop(model)
+        if progress:
+            progress(f'launch profile {mode}/{current_tier} was not ready; stopped and trying fallback.')
         attempts.append(f'{current_tier}: not ready')
-    return False, '❌ optimization failed; fallback exhausted -> ' + '; '.join(attempts[:3])
+    msg = '❌ optimization failed; fallback exhausted -> ' + '; '.join(attempts[:3])
+    if progress:
+        progress(msg)
+    return False, msg
+
+
+def start_model_with_progress(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    if progress:
+        progress(f'starting {model.id} with current settings...')
+    ok, msg = app.start(model)
+    if not ok:
+        if progress:
+            progress(f'{model.id} failed to start: {msg}')
+        return False, msg
+    if progress:
+        progress(f'{model.id} started; waiting for readiness...')
+    ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
+    if progress:
+        progress(ready_msg)
+    return ready_ok, ready_msg
 
 
 def clone_model_config(model: ModelConfig) -> ModelConfig:
@@ -1574,7 +1625,11 @@ def benchmark_candidate_models(model: ModelConfig, profile: HardwareProfile) -> 
     return candidates
 
 
-def benchmark_best_optimization(app: AppConfig, model: ModelConfig) -> Tuple[bool, str]:
+def benchmark_best_optimization(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
     status, _detail = app.health(model)
     if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
         return False, '❌ Stop the model before running benchmark optimization.'
@@ -1583,26 +1638,47 @@ def benchmark_best_optimization(app: AppConfig, model: ModelConfig) -> Tuple[boo
     candidates = benchmark_candidate_models(model, profile)
     results = []
     failures = []
+    if progress:
+        progress(f'benchmark optimization started: {len(candidates)} candidate(s), {profile.short_summary()}')
 
-    for preset, tier, candidate, tune_msg in candidates:
+    for attempt, (preset, tier, candidate, tune_msg) in enumerate(candidates, start=1):
+        if progress:
+            progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier}: {tune_msg}')
         ok, msg = app.start(candidate)
         if not ok:
+            if progress:
+                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} failed to start: {msg}')
             failures.append(f'{preset}/{tier}: start failed ({msg})')
             continue
 
         try:
+            if progress:
+                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} started; waiting for readiness...')
             ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=180)
             if not ready_ok:
+                if progress:
+                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} not ready: {compact_message(ready_msg)}')
                 failures.append(f'{preset}/{tier}: {compact_message(ready_msg)}')
                 continue
 
+            if progress:
+                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} ready; warming benchmark prompt...')
             benchmark_completion(candidate, max_tokens=16, timeout=120)
+            if progress:
+                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} measuring 64-token completion...')
             bench_ok, bench = benchmark_completion(candidate, max_tokens=64, timeout=180)
             if not bench_ok:
+                if progress:
+                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} benchmark failed: {bench.get("error", "unknown error")}')
                 failures.append(f'{preset}/{tier}: benchmark failed ({bench.get("error", "unknown error")})')
                 continue
 
             score = float(bench['tokens_per_sec'])
+            if progress:
+                progress(
+                    f'candidate {attempt}/{len(candidates)} {preset}/{tier} '
+                    f'scored {score:.2f} tok/s in {float(bench["elapsed"]):.2f}s'
+                )
             results.append({
                 'score': score,
                 'preset': preset,
@@ -1615,11 +1691,16 @@ def benchmark_best_optimization(app: AppConfig, model: ModelConfig) -> Tuple[boo
             })
         finally:
             app.stop(candidate)
+            if progress:
+                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} stopped.')
             time.sleep(0.5)
 
     if not results:
         details = '; '.join(failures[:3]) if failures else 'no candidates completed'
-        return False, f'❌ benchmark failed: {details}'
+        msg = f'❌ benchmark failed: {details}'
+        if progress:
+            progress(msg)
+        return False, msg
 
     best = max(results, key=lambda item: item['score'])
     best_model = best['model']
@@ -1632,11 +1713,14 @@ def benchmark_best_optimization(app: AppConfig, model: ModelConfig) -> Tuple[boo
     )
     app.add_or_update(best_model)
     sync_msg = sync_opencode_after_tuning(app)
-    return True, (
+    msg = (
         f'✅ benchmark winner: {best_model.id} {best["preset"]}/{best["tier"]} '
         f'{best["score"]:.2f} tok/s ctx={best_model.ctx} parallel={best_model.parallel} '
         f'threads={best_model.threads} ngl={best_model.ngl} | {sync_msg}'
     )
+    if progress:
+        progress(msg)
+    return True, msg
 
 
 def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
@@ -1758,8 +1842,47 @@ def tui(stdscr, app: AppConfig):
     message = 'Ready.'
     last_refresh = 0.0
     statuses: Dict[str, Tuple[str, str]] = {}
+    action_thread: Optional[threading.Thread] = None
+    action_queue: Queue = Queue()
+
+    def action_running() -> bool:
+        return action_thread is not None and action_thread.is_alive()
+
+    def start_background_action(model: ModelConfig, label: str, worker: Callable[[Callable[[str], None]], Tuple[bool, str]]):
+        nonlocal action_thread, message
+        if action_running():
+            message = '⏳ Another optimization is still running. Watch the log window for progress.'
+            return
+
+        def progress(text: str):
+            line = compact_message(text)
+            append_model_log(app, model, line)
+            action_queue.put(('progress', line))
+
+        def runner():
+            try:
+                progress(f'{label} started for {model.id}')
+                _ok, result = worker(progress)
+            except Exception as exc:
+                result = f'❌ {label} failed: {exc}'
+                progress(result)
+            action_queue.put(('done', compact_message(result)))
+
+        action_thread = threading.Thread(target=runner, daemon=True)
+        action_thread.start()
+        message = f'⏳ {label} started for {model.id}. Progress is in the log window.'
 
     while True:
+        while True:
+            try:
+                event, text = action_queue.get_nowait()
+            except Empty:
+                break
+            message = text
+            if event == 'done':
+                action_thread = None
+                last_refresh = 0.0
+
         now = time.time()
         if now - last_refresh > REFRESH_SECONDS:
             statuses = {m.id: app.health(m) for m in app.models}
@@ -1929,6 +2052,9 @@ def tui(stdscr, app: AppConfig):
         if key == -1:
             time.sleep(0.05)
             continue
+        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, ord('j'), ord('k')):
+            message = '⏳ Optimization is running. Watch the log window; controls unlock when it finishes.'
+            continue
         if key in (ord('q'), 27):
             break
         if key in (curses.KEY_UP, ord('k')) and app.models:
@@ -1953,22 +2079,27 @@ def tui(stdscr, app: AppConfig):
                     message = 'Launch cancelled.'
                     continue
                 if launch_mode == 'best':
-                    ok, msg = launch_with_failsafe(app, model, launch_mode, 'auto')
-                    message = msg
+                    start_background_action(
+                        model,
+                        'best launch optimization',
+                        lambda progress, model=model, launch_mode=launch_mode: launch_with_failsafe(app, model, launch_mode, 'auto', progress=progress),
+                    )
                 elif launch_mode in ('max_context', 'tokens_per_sec'):
                     tier = prompt_optimization_tier(stdscr, colors)
                     if tier == 'cancel':
                         message = 'Launch cancelled.'
                         continue
-                    ok, msg = launch_with_failsafe(app, model, launch_mode, tier)
-                    message = msg
+                    start_background_action(
+                        model,
+                        f'{launch_mode}/{tier} launch optimization',
+                        lambda progress, model=model, launch_mode=launch_mode, tier=tier: launch_with_failsafe(app, model, launch_mode, tier, progress=progress),
+                    )
                 else:
-                    ok, msg = app.start(model)
-                    if ok:
-                        ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
-                        message = ready_msg
-                    else:
-                        message = msg
+                    start_background_action(
+                        model,
+                        'model launch',
+                        lambda progress, model=model: start_model_with_progress(app, model, progress=progress),
+                    )
         elif key == ord('z') and app.models:
             model = app.models[selected]
             profile = app.hardware_profile(refresh=True)
@@ -1979,11 +2110,11 @@ def tui(stdscr, app: AppConfig):
             message = f'{tune_msg} | {sync_msg}'
         elif key == ord('B') and app.models:
             model = app.models[selected]
-            message = f'⏳ benchmarking {model.id}; this can take a few minutes...'
-            stdscr.addstr(header_y + 7, 2, ellipsize(message, max(10, w - 4)), colors['warning'] | curses.A_BOLD)
-            stdscr.refresh()
-            ok, msg = benchmark_best_optimization(app, model)
-            message = msg
+            start_background_action(
+                model,
+                'benchmark optimization',
+                lambda progress, model=model: benchmark_best_optimization(app, model, progress=progress),
+            )
         elif key == ord('a'):
             model = prompt_model(stdscr, 'Add model')
             if model:

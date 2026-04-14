@@ -67,6 +67,8 @@ llama-tui
 - `r`: refresh
 - `q`: quit
 
+Long-running launches and benchmarks close the chooser immediately. Progress is written to the selected model log and appears in the right-side log tail while the action runs.
+
 ### Context optimization modes
 
 Each model can choose:
