@@ -55,11 +55,15 @@ class ModelConfig:
     jinja: bool = True
     output: int = 4096
     optimize_mode: str = 'max_context_safe'
+    optimize_tier: str = 'moderate'
     ctx_min: int = 2048
     ctx_max: int = 131072
     memory_reserve_percent: int = 25
     last_good_ctx: int = 0
     last_good_parallel: int = 0
+    last_benchmark_tokens_per_sec: float = 0.0
+    last_benchmark_seconds: float = 0.0
+    last_benchmark_profile: str = ''
     enabled: bool = True
     runtime: str = 'llama.cpp'
     source: str = 'manual'
@@ -81,6 +85,36 @@ class OpencodeSettings:
     plan_model_id: str = ''
 
 
+@dataclass
+class HardwareProfile:
+    cpu_logical: int = 0
+    cpu_physical: int = 0
+    memory_total: int = 0
+    memory_available: int = 0
+    gpu_name: str = ''
+    gpu_memory_total: int = 0
+    gpu_memory_free: int = 0
+    gpu_error: str = ''
+
+    def has_usable_gpu(self) -> bool:
+        return self.gpu_memory_free > 0
+
+    def short_summary(self) -> str:
+        total_gib = bytes_to_gib(self.memory_total)
+        avail_gib = bytes_to_gib(self.memory_available)
+        cpu = f'cpu={self.cpu_physical or "?"}c/{self.cpu_logical or "?"}t'
+        ram = f'ram={avail_gib:.1f}/{total_gib:.1f}GiB'
+        if self.has_usable_gpu():
+            gpu_free = bytes_to_gib(self.gpu_memory_free)
+            gpu_total = bytes_to_gib(self.gpu_memory_total)
+            gpu = f'gpu={self.gpu_name or "detected"} {gpu_free:.1f}/{gpu_total:.1f}GiB'
+        elif self.gpu_error:
+            gpu = 'gpu=unavailable'
+        else:
+            gpu = 'gpu=none'
+        return f'{cpu} {ram} {gpu}'
+
+
 class AppConfig:
     def __init__(self, config_path: Path):
         self.config_path = config_path
@@ -94,6 +128,8 @@ class AppConfig:
             backup_dir=str(CONFIG_DIR / 'backups'),
         )
         self.models: List[ModelConfig] = []
+        self._hardware_profile: Optional[HardwareProfile] = None
+        self._hardware_profile_at = 0.0
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,6 +182,13 @@ class AppConfig:
     def get_model(self, model_id: str) -> Optional[ModelConfig]:
         return next((m for m in self.models if m.id == model_id), None)
 
+
+    def hardware_profile(self, refresh: bool = False) -> HardwareProfile:
+        now = time.time()
+        if refresh or self._hardware_profile is None or now - self._hardware_profile_at > 30:
+            self._hardware_profile = benchmark_current_hardware()
+            self._hardware_profile_at = now
+        return self._hardware_profile
 
     def command_prefix(self, command: str) -> List[str]:
         return shlex.split(command) if command else []
@@ -209,32 +252,10 @@ class AppConfig:
         return any(os.path.basename(part) == target for part in parts)
 
     def available_memory_bytes(self) -> int:
-        meminfo = Path('/proc/meminfo')
-        if not meminfo.exists():
-            return 0
-        try:
-            for line in meminfo.read_text().splitlines():
-                if line.startswith('MemAvailable:'):
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        return int(parts[1]) * 1024
-        except Exception:
-            return 0
-        return 0
+        return read_meminfo_bytes().get('MemAvailable', 0)
 
     def _estimate_kv_bytes_per_token(self, model: ModelConfig) -> int:
-        runtime = getattr(model, 'runtime', 'llama.cpp')
-        if runtime == 'vllm':
-            return 32768
-        target = Path(model.path).expanduser()
-        if not target.exists():
-            return 32768
-        size = target.stat().st_size
-        if size < 8 * 1024**3:
-            return 16384
-        if size < 20 * 1024**3:
-            return 32768
-        return 65536
+        return estimate_kv_bytes_per_token(model)
 
     def safe_launch_profile(self, model: ModelConfig) -> Tuple[bool, Dict[str, int], str]:
         mode = (getattr(model, 'optimize_mode', 'max_context_safe') or 'max_context_safe').strip().lower()
@@ -243,7 +264,8 @@ class AppConfig:
         if mode == 'manual':
             return True, {'ctx': requested_ctx, 'parallel': requested_parallel}, 'manual mode'
 
-        mem_available = self.available_memory_bytes()
+        profile = self.hardware_profile(refresh=True)
+        mem_available = profile.memory_available or self.available_memory_bytes()
         if mem_available <= 0:
             return True, {'ctx': requested_ctx, 'parallel': requested_parallel}, 'safe mode (memory probe unavailable)'
 
@@ -722,6 +744,242 @@ class AppConfig:
         return True, f'Generated {path}'
 
 
+# ---------- hardware helpers ----------
+
+def bytes_to_gib(value: int) -> float:
+    return float(value or 0) / float(1024**3)
+
+
+def read_meminfo_bytes() -> Dict[str, int]:
+    meminfo = Path('/proc/meminfo')
+    values: Dict[str, int] = {}
+    if not meminfo.exists():
+        return values
+    try:
+        for line in meminfo.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                values[parts[0].rstrip(':')] = int(parts[1]) * 1024
+    except Exception:
+        return {}
+    return values
+
+
+def detect_cpu_counts() -> Tuple[int, int]:
+    logical = os.cpu_count() or 1
+    cpuinfo = Path('/proc/cpuinfo')
+    if not cpuinfo.exists():
+        return logical, max(1, logical // 2)
+
+    physical_cores = set()
+    current_physical = ''
+    current_core = ''
+    try:
+        for line in cpuinfo.read_text(errors='replace').splitlines() + ['']:
+            if not line.strip():
+                if current_core:
+                    physical_cores.add((current_physical or '0', current_core))
+                current_physical = ''
+                current_core = ''
+                continue
+            if ':' not in line:
+                continue
+            key, value = [part.strip() for part in line.split(':', 1)]
+            if key == 'physical id':
+                current_physical = value
+            elif key == 'core id':
+                current_core = value
+    except Exception:
+        return logical, max(1, logical // 2)
+
+    physical = len(physical_cores) if physical_cores else max(1, logical // 2)
+    return logical, max(1, min(physical, logical))
+
+
+def probe_nvidia_gpu() -> Tuple[str, int, int, str]:
+    nvidia_smi = shutil.which('nvidia-smi')
+    if not nvidia_smi:
+        return '', 0, 0, ''
+    try:
+        result = subprocess.run(
+            [
+                nvidia_smi,
+                '--query-gpu=name,memory.total,memory.free',
+                '--format=csv,noheader,nounits',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception as exc:
+        return '', 0, 0, f'nvidia-smi failed: {exc}'
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or '').strip().splitlines()
+        return '', 0, 0, detail[0] if detail else 'nvidia-smi failed'
+
+    best_name = ''
+    best_total = 0
+    best_free = 0
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(',')]
+        if len(parts) < 3:
+            continue
+        try:
+            total = int(float(parts[1])) * 1024**2
+            free = int(float(parts[2])) * 1024**2
+        except ValueError:
+            continue
+        if free > best_free:
+            best_name = parts[0]
+            best_total = total
+            best_free = free
+    return best_name, best_total, best_free, ''
+
+
+def benchmark_current_hardware() -> HardwareProfile:
+    logical, physical = detect_cpu_counts()
+    mem = read_meminfo_bytes()
+    gpu_name, gpu_total, gpu_free, gpu_error = probe_nvidia_gpu()
+    return HardwareProfile(
+        cpu_logical=logical,
+        cpu_physical=physical,
+        memory_total=mem.get('MemTotal', 0),
+        memory_available=mem.get('MemAvailable', 0),
+        gpu_name=gpu_name,
+        gpu_memory_total=gpu_total,
+        gpu_memory_free=gpu_free,
+        gpu_error=gpu_error,
+    )
+
+
+def model_file_size(model: ModelConfig) -> int:
+    target = Path(getattr(model, 'path', '') or '').expanduser()
+    try:
+        return target.stat().st_size if target.exists() else 0
+    except Exception:
+        return 0
+
+
+def estimate_kv_bytes_per_token(model: ModelConfig) -> int:
+    runtime = getattr(model, 'runtime', 'llama.cpp')
+    if runtime == 'vllm':
+        return 32768
+    size = model_file_size(model)
+    if size <= 0:
+        return 32768
+    if size < 8 * 1024**3:
+        return 16384
+    if size < 20 * 1024**3:
+        return 32768
+    return 65536
+
+
+def model_likely_fits_gpu(model: ModelConfig, profile: Optional[HardwareProfile], tier: str) -> bool:
+    if not profile or not profile.has_usable_gpu():
+        return False
+    size = model_file_size(model)
+    if size <= 0:
+        return False
+    gpu_weight_budget = {
+        'safe': 0.70,
+        'moderate': 0.80,
+        'extreme': 0.88,
+    }.get(tier, 0.80)
+    return size <= int(profile.gpu_memory_free * gpu_weight_budget)
+
+
+def choose_threads_for_profile(model: ModelConfig, profile: Optional[HardwareProfile], tier: str) -> int:
+    logical = (profile.cpu_logical if profile else 0) or (os.cpu_count() or 1)
+    physical = (profile.cpu_physical if profile else 0) or max(1, logical // 2)
+    tier = tier if tier in ('safe', 'moderate', 'extreme') else 'moderate'
+    if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
+        return int(getattr(model, 'threads', 1) or 1)
+
+    if model_likely_fits_gpu(model, profile, tier):
+        return max(2, min(physical, 8))
+    if tier == 'safe':
+        return max(2, min(logical, max(2, physical - 2)))
+    if tier == 'extreme':
+        return max(2, min(logical, max(physical, logical - 1)))
+    return max(2, min(logical, physical))
+
+
+def estimate_safe_context_for_profile(
+    model: ModelConfig,
+    profile: Optional[HardwareProfile],
+    reserve_pct: int,
+    parallel: int,
+    ctx_min: int,
+    ctx_max: int,
+) -> int:
+    if not profile or profile.memory_available <= 0:
+        return ctx_max
+
+    reserve_pct = max(5, min(70, reserve_pct))
+    usable = int(profile.memory_available * ((100 - reserve_pct) / 100.0))
+    if getattr(model, 'runtime', 'llama.cpp') != 'vllm' and not model_likely_fits_gpu(model, profile, getattr(model, 'optimize_tier', 'moderate')):
+        usable -= model_file_size(model)
+    if usable <= 0:
+        return ctx_min
+
+    kv_per_token = max(1, estimate_kv_bytes_per_token(model))
+    safe_ctx = usable // (kv_per_token * max(1, parallel))
+    return max(ctx_min, min(ctx_max, int(safe_ctx)))
+
+
+def select_best_tier(model: ModelConfig, profile: Optional[HardwareProfile]) -> str:
+    if not profile:
+        return 'moderate'
+
+    size = model_file_size(model)
+    available = profile.memory_available
+    total = profile.memory_total
+    if model_likely_fits_gpu(model, profile, 'extreme'):
+        return 'extreme'
+    if model_likely_fits_gpu(model, profile, 'moderate'):
+        return 'moderate'
+    if available and size and size > int(available * 0.65):
+        return 'safe'
+    if total and total < 18 * 1024**3:
+        return 'moderate' if available >= 7 * 1024**3 else 'safe'
+    if available >= 20 * 1024**3:
+        return 'extreme'
+    if available >= 8 * 1024**3:
+        return 'moderate'
+    return 'safe'
+
+
+def choose_best_preset(model: ModelConfig, profile: Optional[HardwareProfile]) -> str:
+    runtime = getattr(model, 'runtime', 'llama.cpp')
+    quant = extract_quant(model).lower()
+    model_type = classify_model_type(model)
+    size = model_file_size(model)
+    available = profile.memory_available if profile else 0
+    if runtime == 'vllm':
+        return 'tokens_per_sec'
+    if profile and profile.has_usable_gpu() and model_likely_fits_gpu(model, profile, 'moderate'):
+        return 'tokens_per_sec'
+    if size and available and size > int(available * 0.55):
+        return 'max_context'
+    if model_type == 'CPU' or 'q2' in quant or 'q3' in quant:
+        return 'max_context'
+    return 'tokens_per_sec'
+
+
+def apply_hardware_baseline(model: ModelConfig, profile: Optional[HardwareProfile], tier: str):
+    if not profile:
+        return
+    runtime = getattr(model, 'runtime', 'llama.cpp')
+    if runtime != 'vllm':
+        model.threads = choose_threads_for_profile(model, profile, tier)
+        if model_likely_fits_gpu(model, profile, tier):
+            model.ngl = 999
+            model.flash_attn = True
+        elif not profile.has_usable_gpu():
+            model.ngl = 0
+
+
 # ---------- detection helpers ----------
 
 def slugify(text: str) -> str:
@@ -912,6 +1170,7 @@ def prompt_model(stdscr, title: str, initial: Optional[ModelConfig] = None) -> O
         ('name', initial.name),
         ('runtime (llama.cpp/vllm)', getattr(initial, 'runtime', 'llama.cpp')),
         ('optimize_mode (max_context_safe/manual)', getattr(initial, 'optimize_mode', 'max_context_safe')),
+        ('optimize_tier (safe/moderate/extreme)', getattr(initial, 'optimize_tier', 'moderate')),
         ('path', initial.path),
         ('alias', initial.alias or initial.id),
         ('port', str(initial.port)),
@@ -949,6 +1208,7 @@ def prompt_model(stdscr, title: str, initial: Optional[ModelConfig] = None) -> O
             temp=float(answers['temp']),
             parallel=int(answers['parallel']),
             optimize_mode=(answers['optimize_mode (max_context_safe/manual)'].strip() or 'max_context_safe'),
+            optimize_tier=(answers['optimize_tier (safe/moderate/extreme)'].strip() or 'moderate'),
             memory_reserve_percent=int(answers['memory_reserve_percent']),
             cache_ram=int(answers['cache_ram']),
             output=int(answers['output']),
@@ -1008,42 +1268,148 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
         return False
 
 
-def prompt_launch_optimization(stdscr, model: ModelConfig) -> str:
-    curses.endwin()
-    print(f'\nLaunch options for {model.id}')
-    print('-----------------------------')
-    print('1) Optimize for max context (safe)')
-    print('2) Optimize for tokens/sec')
-    print('3) Keep current settings')
-    print('q) Cancel')
-    choice = input('Choose [1/2/3/q]: ').strip().lower()
-    stdscr.clear()
-    stdscr.refresh()
-    if choice == '1':
-        return 'max_context'
-    if choice == '2':
-        return 'tokens_per_sec'
-    if choice == '3':
-        return 'keep'
-    return 'cancel'
+def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str, str]]) -> str:
+    h, w = stdscr.getmaxyx()
+    box_w = min(68, max(48, w - 8))
+    box_h = max(8, len(options) + 6)
+    if h < box_h + 4 or w < box_w + 4:
+        return 'cancel'
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(2, (h - box_h) // 2)
+    modal = curses.newwin(box_h + 1, box_w, box_y, box_x)
+    modal.keypad(True)
+    stdscr.nodelay(False)
+    while True:
+        modal.erase()
+        draw_box(modal, 0, 0, box_h - 1, box_w, title, colors['accent'] | curses.A_BOLD, colors['accent'])
+        modal.addstr(2, 2, 'Choose an option:', colors['panel'] | curses.A_BOLD)
+        for idx, (key, label, _val) in enumerate(options):
+            modal.addstr(3 + idx, 4, f'[{key}] {label}'[: box_w - 8], colors['panel'])
+        modal.addstr(box_h - 1, 2, 'Press key to continue...'[: box_w - 6], colors['muted'])
+        modal.refresh()
+        key = modal.getch()
+        if key == -1:
+            continue
+        key_str = chr(key).lower() if 0 <= key <= 255 else ''
+        for option_key, _label, value in options:
+            if key_str == option_key:
+                stdscr.touchwin()
+                stdscr.nodelay(True)
+                return value
 
 
-def apply_optimization_preset(model: ModelConfig, preset: str) -> str:
+def prompt_launch_optimization(stdscr, model: ModelConfig, colors) -> str:
+    return prompt_modal_choice(stdscr, colors, f'Launch {model.id}', [
+        ('1', 'Best optimization for this PC', 'best'),
+        ('2', 'Optimize for max context', 'max_context'),
+        ('3', 'Optimize for tokens/sec', 'tokens_per_sec'),
+        ('4', 'Keep current settings', 'keep'),
+        ('q', 'Cancel', 'cancel'),
+    ])
+
+
+def prompt_optimization_tier(stdscr, colors) -> str:
+    return prompt_modal_choice(stdscr, colors, 'Optimization tier', [
+        ('1', 'Safe (most stable)', 'safe'),
+        ('2', 'Moderate (balanced)', 'moderate'),
+        ('3', 'Extreme (aggressive)', 'extreme'),
+        ('q', 'Cancel', 'cancel'),
+    ])
+
+
+def apply_optimization_preset(
+    model: ModelConfig,
+    preset: str,
+    tier: str = 'moderate',
+    profile: Optional[HardwareProfile] = None,
+) -> str:
+    runtime = getattr(model, 'runtime', 'llama.cpp')
+    tier = (tier or getattr(model, 'optimize_tier', 'moderate')).strip().lower()
+    if tier not in ('safe', 'moderate', 'extreme'):
+        tier = 'moderate'
+    model.optimize_tier = tier
+    apply_hardware_baseline(model, profile, tier)
+    extra_args = list(getattr(model, 'extra_args', []) or [])
+
+    def strip_flags(*flags: str):
+        nonlocal extra_args
+        cleaned: List[str] = []
+        skip_next = False
+        flag_set = set(flags)
+        for token in extra_args:
+            if skip_next:
+                skip_next = False
+                continue
+            if token in flag_set:
+                skip_next = True
+                continue
+            if any(token.startswith(f'{f}=') for f in flag_set):
+                continue
+            cleaned.append(token)
+        extra_args = cleaned
+
+    def set_flag(flag: str, value: str):
+        nonlocal extra_args
+        strip_flags(flag)
+        extra_args += [flag, value]
+
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048)))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072)))
+
     if preset == 'max_context':
         model.optimize_mode = 'max_context_safe'
         model.parallel = 1
-        model.memory_reserve_percent = max(25, int(getattr(model, 'memory_reserve_percent', 25)))
-        model.ctx = max(int(getattr(model, 'ctx', 8192)), 32768)
-        model.ctx = min(model.ctx, int(getattr(model, 'ctx_max', 131072)))
+        reserve_by_tier = {'safe': 35, 'moderate': 25, 'extreme': 15}
+        min_ctx_by_tier = {'safe': 16384, 'moderate': 32768, 'extreme': 65536}
+        model.memory_reserve_percent = max(reserve_by_tier[tier], int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(int(getattr(model, 'ctx', 8192)), min_ctx_by_tier[tier])
+        model.ctx = max(ctx_min, min(model.ctx, ctx_max))
         model.output = min(max(model.output, 2048), 4096)
-        return f'{model.id}: preset=max_context_safe ctx={model.ctx} parallel={model.parallel}'
+        model.ctx = min(model.ctx, estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max))
+        if runtime == 'llama.cpp':
+            batch_by_tier = {'safe': '128', 'moderate': '256', 'extreme': '512'}
+            ubatch_by_tier = {'safe': '64', 'moderate': '128', 'extreme': '256'}
+            set_flag('--batch-size', batch_by_tier[tier])
+            set_flag('--ubatch-size', ubatch_by_tier[tier])
+            set_flag('--cache-type-k', 'q8_0')
+            set_flag('--cache-type-v', 'q8_0')
+        elif runtime == 'vllm':
+            util_by_tier = {'safe': '0.75', 'moderate': '0.88', 'extreme': '0.92'}
+            seqs_by_tier = {'safe': '1', 'moderate': '2', 'extreme': '3'}
+            set_flag('--gpu-memory-utilization', util_by_tier[tier])
+            set_flag('--max-num-seqs', seqs_by_tier[tier])
+            set_flag('--max-num-batched-tokens', str(max(4096, min(model.ctx, 24576))))
+        model.extra_args = extra_args
+        hw_note = f' | {profile.short_summary()}' if profile else ''
+        return f'{model.id}: preset=max_context_safe/{tier} ({runtime}) ctx={model.ctx} parallel={model.parallel} threads={model.threads} ngl={model.ngl}{hw_note}'
+
     if preset == 'tokens_per_sec':
         model.optimize_mode = 'max_context_safe'
-        model.memory_reserve_percent = max(30, int(getattr(model, 'memory_reserve_percent', 25)))
-        model.ctx = max(int(getattr(model, 'ctx_min', 2048)), min(int(getattr(model, 'ctx', 8192)), 8192))
-        model.parallel = max(1, min(4, int(getattr(model, 'parallel', 1)) + 1))
+        reserve_by_tier = {'safe': 40, 'moderate': 30, 'extreme': 20}
+        target_ctx_by_tier = {'safe': 4096, 'moderate': 8192, 'extreme': 12288}
+        par_by_tier = {'safe': 2, 'moderate': 4, 'extreme': 8}
+        model.memory_reserve_percent = max(reserve_by_tier[tier], int(getattr(model, 'memory_reserve_percent', 25)))
+        model.ctx = max(ctx_min, min(target_ctx_by_tier[tier], ctx_max))
+        model.parallel = max(1, min(par_by_tier[tier], int(getattr(model, 'parallel', 1)) + 1))
         model.output = min(model.output, 2048)
-        return f'{model.id}: preset=tokens_per_sec ctx={model.ctx} parallel={model.parallel}'
+        model.ctx = min(model.ctx, estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max))
+        if runtime == 'llama.cpp':
+            batch_by_tier = {'safe': '512', 'moderate': '1024', 'extreme': '2048'}
+            ubatch_by_tier = {'safe': '256', 'moderate': '512', 'extreme': '1024'}
+            set_flag('--batch-size', batch_by_tier[tier])
+            set_flag('--ubatch-size', ubatch_by_tier[tier])
+            strip_flags('--cache-type-k', '--cache-type-v')
+        elif runtime == 'vllm':
+            util_by_tier = {'safe': '0.70', 'moderate': '0.80', 'extreme': '0.90'}
+            seqs_by_tier = {'safe': '4', 'moderate': '8', 'extreme': '16'}
+            btok_by_tier = {'safe': '4096', 'moderate': '8192', 'extreme': '16384'}
+            set_flag('--gpu-memory-utilization', util_by_tier[tier])
+            set_flag('--max-num-seqs', seqs_by_tier[tier])
+            set_flag('--max-num-batched-tokens', btok_by_tier[tier])
+        model.extra_args = extra_args
+        hw_note = f' | {profile.short_summary()}' if profile else ''
+        return f'{model.id}: preset=tokens_per_sec/{tier} ({runtime}) ctx={model.ctx} parallel={model.parallel} threads={model.threads} ngl={model.ngl}{hw_note}'
+
     return f'{model.id}: keeping current settings'
 
 
@@ -1052,6 +1418,225 @@ def sync_opencode_after_tuning(app: AppConfig) -> str:
         return 'opencode.path unset; skipped opencode sync'
     ok, msg = app.generate_opencode()
     return msg if ok else f'opencode sync failed: {msg}'
+
+
+def apply_best_optimization(
+    model: ModelConfig,
+    tier: str = 'moderate',
+    profile: Optional[HardwareProfile] = None,
+) -> str:
+    if tier == 'auto':
+        tier = select_best_tier(model, profile)
+    preset = choose_best_preset(model, profile)
+    return apply_optimization_preset(model, preset, tier=tier, profile=profile)
+
+
+def fallback_tiers(selected_tier: str) -> List[str]:
+    order = ['extreme', 'moderate', 'safe']
+    selected = (selected_tier or 'moderate').strip().lower()
+    if selected == 'auto':
+        selected = 'moderate'
+    if selected not in order:
+        selected = 'moderate'
+    return order[order.index(selected):]
+
+
+def launch_with_failsafe(app: AppConfig, model: ModelConfig, mode: str, tier: str) -> Tuple[bool, str]:
+    attempts = []
+    profile = app.hardware_profile(refresh=True)
+    if tier == 'auto':
+        tier = select_best_tier(model, profile)
+    for current_tier in fallback_tiers(tier):
+        if mode == 'best':
+            tune_msg = apply_best_optimization(model, tier=current_tier, profile=profile)
+        else:
+            tune_msg = apply_optimization_preset(model, mode, tier=current_tier, profile=profile)
+        app.add_or_update(model)
+        sync_msg = sync_opencode_after_tuning(app)
+        ok, msg = app.start(model)
+        if not ok:
+            attempts.append(f'{current_tier}: start failed ({msg})')
+            continue
+        ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
+        if ready_ok:
+            return True, f'{ready_msg} [{current_tier}] | {tune_msg} | {sync_msg}'
+        app.stop(model)
+        attempts.append(f'{current_tier}: not ready')
+    return False, '❌ optimization failed; fallback exhausted -> ' + '; '.join(attempts[:3])
+
+
+def clone_model_config(model: ModelConfig) -> ModelConfig:
+    return ModelConfig(**asdict(model))
+
+
+def estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(re.findall(r"\w+|[^\s\w]", text)))
+
+
+def completion_text_from_response(data: Dict) -> str:
+    choices = data.get('choices') or []
+    if not choices:
+        return ''
+    first = choices[0] or {}
+    message = first.get('message') or {}
+    content = message.get('content')
+    if isinstance(content, list):
+        return ' '.join(str(item.get('text', item)) if isinstance(item, dict) else str(item) for item in content)
+    if content is not None:
+        return str(content)
+    return str(first.get('text', ''))
+
+
+def post_json(url: str, payload: Dict, timeout: int) -> Dict:
+    body = json.dumps(payload).encode('utf-8')
+    req = request.Request(
+        url,
+        data=body,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    with request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8', errors='replace'))
+
+
+def benchmark_completion(model: ModelConfig, max_tokens: int = 64, timeout: int = 180) -> Tuple[bool, Dict]:
+    prompt = (
+        'Write a concise technical checklist for keeping a local language model '
+        'server fast and stable. Use short bullet points.'
+    )
+    payload = {
+        'model': model.alias,
+        'messages': [
+            {'role': 'system', 'content': 'You are a concise local model benchmark assistant.'},
+            {'role': 'user', 'content': prompt},
+        ],
+        'max_tokens': max_tokens,
+        'temperature': 0,
+        'stream': False,
+    }
+    url = f'http://{model.host}:{model.port}/v1/chat/completions'
+    started = time.time()
+    try:
+        data = post_json(url, payload, timeout=timeout)
+    except Exception as exc:
+        return False, {'error': str(exc)}
+    elapsed = max(0.001, time.time() - started)
+    usage = data.get('usage') or {}
+    text = completion_text_from_response(data)
+    completion_tokens = int(usage.get('completion_tokens') or usage.get('output_tokens') or 0)
+    prompt_tokens = int(usage.get('prompt_tokens') or usage.get('input_tokens') or 0)
+    if completion_tokens <= 0:
+        completion_tokens = estimate_text_tokens(text)
+    if prompt_tokens <= 0:
+        prompt_tokens = estimate_text_tokens(prompt)
+    return True, {
+        'elapsed': elapsed,
+        'completion_tokens': completion_tokens,
+        'prompt_tokens': prompt_tokens,
+        'tokens_per_sec': completion_tokens / elapsed,
+        'text': text,
+    }
+
+
+def benchmark_candidate_models(model: ModelConfig, profile: HardwareProfile) -> List[Tuple[str, str, ModelConfig, str]]:
+    selected_tier = select_best_tier(model, profile)
+    selected_preset = choose_best_preset(model, profile)
+    alternate_preset = 'max_context' if selected_preset == 'tokens_per_sec' else 'tokens_per_sec'
+    tier_order = ['safe', 'moderate', 'extreme']
+    selected_idx = tier_order.index(selected_tier)
+    neighbor_tiers = [selected_tier]
+    if selected_idx > 0:
+        neighbor_tiers.append(tier_order[selected_idx - 1])
+    if selected_idx < len(tier_order) - 1:
+        neighbor_tiers.append(tier_order[selected_idx + 1])
+
+    requested: List[Tuple[str, str]] = []
+    for tier in neighbor_tiers:
+        requested.append((selected_preset, tier))
+    requested.append((alternate_preset, selected_tier))
+    if selected_tier != 'safe':
+        requested.append((alternate_preset, 'safe'))
+
+    candidates = []
+    seen = set()
+    for preset, tier in requested:
+        key = (preset, tier)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidate = clone_model_config(model)
+        tune_msg = apply_optimization_preset(candidate, preset, tier=tier, profile=profile)
+        candidates.append((preset, tier, candidate, tune_msg))
+        if len(candidates) >= 5:
+            break
+    return candidates
+
+
+def benchmark_best_optimization(app: AppConfig, model: ModelConfig) -> Tuple[bool, str]:
+    status, _detail = app.health(model)
+    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
+        return False, '❌ Stop the model before running benchmark optimization.'
+
+    profile = app.hardware_profile(refresh=True)
+    candidates = benchmark_candidate_models(model, profile)
+    results = []
+    failures = []
+
+    for preset, tier, candidate, tune_msg in candidates:
+        ok, msg = app.start(candidate)
+        if not ok:
+            failures.append(f'{preset}/{tier}: start failed ({msg})')
+            continue
+
+        try:
+            ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=180)
+            if not ready_ok:
+                failures.append(f'{preset}/{tier}: {compact_message(ready_msg)}')
+                continue
+
+            benchmark_completion(candidate, max_tokens=16, timeout=120)
+            bench_ok, bench = benchmark_completion(candidate, max_tokens=64, timeout=180)
+            if not bench_ok:
+                failures.append(f'{preset}/{tier}: benchmark failed ({bench.get("error", "unknown error")})')
+                continue
+
+            score = float(bench['tokens_per_sec'])
+            results.append({
+                'score': score,
+                'preset': preset,
+                'tier': tier,
+                'model': candidate,
+                'elapsed': float(bench['elapsed']),
+                'completion_tokens': int(bench['completion_tokens']),
+                'prompt_tokens': int(bench['prompt_tokens']),
+                'tune_msg': tune_msg,
+            })
+        finally:
+            app.stop(candidate)
+            time.sleep(0.5)
+
+    if not results:
+        details = '; '.join(failures[:3]) if failures else 'no candidates completed'
+        return False, f'❌ benchmark failed: {details}'
+
+    best = max(results, key=lambda item: item['score'])
+    best_model = best['model']
+    best_model.last_benchmark_tokens_per_sec = round(best['score'], 2)
+    best_model.last_benchmark_seconds = round(best['elapsed'], 2)
+    best_model.last_benchmark_profile = (
+        f'{best["preset"]}/{best["tier"]} '
+        f'{best["score"]:.2f} tok/s '
+        f'{profile.short_summary()}'
+    )
+    app.add_or_update(best_model)
+    sync_msg = sync_opencode_after_tuning(app)
+    return True, (
+        f'✅ benchmark winner: {best_model.id} {best["preset"]}/{best["tier"]} '
+        f'{best["score"]:.2f} tok/s ctx={best_model.ctx} parallel={best_model.parallel} '
+        f'threads={best_model.threads} ngl={best_model.ngl} | {sync_msg}'
+    )
 
 
 def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
@@ -1160,6 +1745,9 @@ def ellipsize(text: str, width: int) -> str:
     return text[: width - 3] + '...'
 
 
+def compact_message(text: str) -> str:
+    return ' | '.join(part.strip() for part in str(text).splitlines() if part.strip())
+
 
 def tui(stdscr, app: AppConfig):
     colors = init_colors()
@@ -1222,7 +1810,8 @@ def tui(stdscr, app: AppConfig):
             msg_attr = colors['error'] | curses.A_BOLD
         elif message.startswith('⏳'):
             msg_attr = colors['warning'] | curses.A_BOLD
-        msg_line = ellipsize(message, max(10, w - 4))
+        header_message = compact_message(message)
+        msg_line = ellipsize(header_message, max(10, w - 4))
         stdscr.addstr(header_y + 7, 2, msg_line, msg_attr)
 
         chip_y = header_y + 7
@@ -1299,7 +1888,8 @@ def tui(stdscr, app: AppConfig):
                 f'bind: {model.host}:{model.port}',
                 f'ctx={model.ctx} threads={model.threads} ngl={model.ngl} temp={model.temp}',
                 f'parallel={model.parallel} cache_ram={model.cache_ram} output={model.output}',
-                f'optimize={getattr(model, "optimize_mode", "max_context_safe")} ctx_range={getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)} reserve={getattr(model, "memory_reserve_percent", 25)}%',
+                f'optimize={getattr(model, "optimize_mode", "max_context_safe")}/{getattr(model, "optimize_tier", "moderate")} ctx_range={getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)} reserve={getattr(model, "memory_reserve_percent", 25)}%',
+                f'benchmark={getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}',
                 f'flags: enabled={model.enabled} flash_attn={model.flash_attn} jinja={model.jinja}',
                 f'status: {status} ({detail})',
                 f'pid: {app.get_pid(model) or "-"}',
@@ -1319,13 +1909,13 @@ def tui(stdscr, app: AppConfig):
                     attr = colors['error'] | curses.A_BOLD
                 elif alert_lines and i <= len(alert_lines):
                     attr = colors['error']
-                elif i == 10 + (len(alert_lines) + 2 if alert_lines else 0):
+                elif line.startswith('status:'):
                     attr = status_attr(colors, status)
-                elif i in (14 + (len(alert_lines) + 2 if alert_lines else 0), 17 + (len(alert_lines) + 2 if alert_lines else 0)):
+                elif line in ('command preview:', 'last log lines:'):
                     attr = colors['accent'] | curses.A_BOLD
                 stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
 
-        footer = '[Enter] start/stop  [z] optimize model  [x] detect  [X] prune  [g] gen opencode  [o] settings'
+        footer = '[Enter] start/stop  [z] best optimization  [B] benchmark best  [x] detect  [X] prune'
         footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
         stdscr.addstr(h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
         stdscr.addstr(h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
@@ -1358,27 +1948,42 @@ def tui(stdscr, app: AppConfig):
                 ok, msg = app.stop(model)
                 message = f'{model.id}: {msg}'
             else:
-                launch_mode = prompt_launch_optimization(stdscr, model)
+                launch_mode = prompt_launch_optimization(stdscr, model, colors)
                 if launch_mode == 'cancel':
                     message = 'Launch cancelled.'
                     continue
-                if launch_mode in ('max_context', 'tokens_per_sec'):
-                    tune_msg = apply_optimization_preset(model, launch_mode)
-                    app.add_or_update(model)
-                    sync_msg = sync_opencode_after_tuning(app)
-                    message = f'{tune_msg} | {sync_msg}'
-                ok, msg = app.start(model)
-                if ok:
-                    ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
-                    message = ready_msg
-                else:
+                if launch_mode == 'best':
+                    ok, msg = launch_with_failsafe(app, model, launch_mode, 'auto')
                     message = msg
+                elif launch_mode in ('max_context', 'tokens_per_sec'):
+                    tier = prompt_optimization_tier(stdscr, colors)
+                    if tier == 'cancel':
+                        message = 'Launch cancelled.'
+                        continue
+                    ok, msg = launch_with_failsafe(app, model, launch_mode, tier)
+                    message = msg
+                else:
+                    ok, msg = app.start(model)
+                    if ok:
+                        ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
+                        message = ready_msg
+                    else:
+                        message = msg
         elif key == ord('z') and app.models:
             model = app.models[selected]
-            tune_msg = apply_optimization_preset(model, 'max_context')
+            profile = app.hardware_profile(refresh=True)
+            tier = select_best_tier(model, profile)
+            tune_msg = apply_best_optimization(model, tier=tier, profile=profile)
             app.add_or_update(model)
             sync_msg = sync_opencode_after_tuning(app)
             message = f'{tune_msg} | {sync_msg}'
+        elif key == ord('B') and app.models:
+            model = app.models[selected]
+            message = f'⏳ benchmarking {model.id}; this can take a few minutes...'
+            stdscr.addstr(header_y + 7, 2, ellipsize(message, max(10, w - 4)), colors['warning'] | curses.A_BOLD)
+            stdscr.refresh()
+            ok, msg = benchmark_best_optimization(app, model)
+            message = msg
         elif key == ord('a'):
             model = prompt_model(stdscr, 'Add model')
             if model:

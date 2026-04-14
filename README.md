@@ -16,6 +16,7 @@ A small terminal UI for managing local `llama-server` models, scanning GGUFs fro
 - Generate `opencode.json` and archive the old one first
 - View logs and command previews from inside the TUI
 - Safe context auto-tuning mode (`max_context_safe`) to maximize context while reserving system memory
+- Hardware-aware best optimization using CPU cores, available RAM, and usable NVIDIA VRAM
 - Zero-dependency Python: uses only the standard library
 
 ## Recommended local layout
@@ -49,11 +50,12 @@ llama-tui
 
 - `↑ / ↓` or `j / k`: move
 - `Enter`: start or stop selected model
-- `Enter` on a stopped model: choose launch mode (`max context`, `tokens/sec`, or `keep current`)
+- `Enter` on a stopped model: choose launch mode (`best optimization`, `max context`, `tokens/sec`, or `keep current`)
 - `a`: add model
 - `e`: edit model
 - `d`: delete model
-- `z`: optimize selected model for a context-friendly run and sync `opencode.json`
+- `z`: apply best optimization for this PC and sync `opencode.json`
+- `B`: benchmark candidate optimizations, keep the fastest stable profile, and sync `opencode.json`
 - `x`: detect GGUF models from HF cache
 - `X`: prune missing models
 - `m`: mark selected model as OpenCode main model
@@ -74,9 +76,29 @@ Each model can choose:
 
 Per-model tuning fields:
 
+- `optimize_tier` (`safe` / `moderate` / `extreme`)
 - `ctx_min`
 - `ctx_max`
 - `memory_reserve_percent`
+
+Launch-time failsafe:
+
+- When launching with an optimization mode, llama-tui can step down tiers automatically (`extreme -> moderate -> safe`) if startup/readiness fails.
+
+Best optimization:
+
+- Probes the current PC profile each time it runs.
+- Uses CPU core count to set `threads`.
+- Uses available RAM and model size to cap context safely.
+- Uses NVIDIA VRAM when `nvidia-smi` reports a working GPU; otherwise it avoids GPU offload for llama.cpp.
+- Chooses `safe`, `moderate`, or `extreme` automatically for the selected model.
+
+Benchmark optimization:
+
+- Starts candidate profiles one at a time for the selected stopped model.
+- Waits for the local OpenAI-compatible endpoint to become ready.
+- Sends a fixed chat-completions prompt and measures generated tokens per second.
+- Persists the fastest successful profile back into the model registry.
 
 ## Notes
 
