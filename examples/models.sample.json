@@ -14,7 +14,9 @@
     "default_model_id": "opus",
     "small_model_id": "gemma_e4b",
     "build_model_id": "opus",
-    "plan_model_id": "opus"
+    "plan_model_id": "opus",
+    "terminal_command": "",
+    "last_workspace_path": ""
   },
   "models": [
     {

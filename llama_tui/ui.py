@@ -2,6 +2,7 @@ import curses
 import textwrap
 import threading
 import time
+from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -9,6 +10,7 @@ from .app import AppConfig
 from .benchmark import (
     append_model_log,
     benchmark_best_optimization,
+    launch_opencode_stack,
     launch_with_failsafe,
     start_model_with_progress,
     sync_opencode_after_tuning,
@@ -17,8 +19,9 @@ from .constants import LOGO, REFRESH_SECONDS
 from .discovery import classify_model_type, display_runtime, extract_quant
 from .hardware import HardwareProfile
 from .models import ModelConfig
+from .opencode_benchmark import benchmark_opencode_workflow
 from .optimize import apply_best_optimization, select_best_tier
-from .textutil import compact_message, ellipsize, is_error_message, tail_text, wrap_display_lines
+from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, tail_text, wrap_display_lines
 
 
 def prompt_value(stdscr, title: str, fields: List[Tuple[str, str]]) -> Optional[Dict[str, str]]:
@@ -116,6 +119,8 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
         ('plan_prompt', o.plan_prompt),
         ('timeout', str(o.timeout)),
         ('chunk_timeout', str(o.chunk_timeout)),
+        ('terminal_command', getattr(o, 'terminal_command', '')),
+        ('last_workspace_path', getattr(o, 'last_workspace_path', '')),
     ])
     if not answers:
         return False
@@ -136,10 +141,22 @@ def prompt_settings(stdscr, app: AppConfig) -> bool:
         o.plan_prompt = answers['plan_prompt']
         o.timeout = int(answers['timeout'])
         o.chunk_timeout = int(answers['chunk_timeout'])
+        o.terminal_command = answers['terminal_command']
+        o.last_workspace_path = answers['last_workspace_path']
         app.save()
         return True
     except Exception:
         return False
+def prompt_workspace(stdscr, app: AppConfig) -> Optional[str]:
+    curses.endwin()
+    default = getattr(app.opencode, 'last_workspace_path', '') or str(Path.cwd())
+    try:
+        value = input(f'\nWorkspace path [{default}]: ').strip()
+    except KeyboardInterrupt:
+        value = ''
+    stdscr.clear()
+    stdscr.refresh()
+    return value or default
 def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str, str]]) -> str:
     h, w = stdscr.getmaxyx()
     box_w = min(68, max(48, w - 8))
@@ -174,6 +191,15 @@ def prompt_launch_optimization(stdscr, model: ModelConfig, colors) -> str:
         ('2', 'Optimize for max context', 'max_context'),
         ('3', 'Optimize for tokens/sec', 'tokens_per_sec'),
         ('4', 'Keep current settings', 'keep'),
+        ('5', 'Launch model + OpenCode', 'opencode'),
+        ('6', 'Launch full-stack: OpenCode + VS Code', 'full_stack'),
+        ('q', 'Cancel', 'cancel'),
+    ])
+def prompt_running_model_action(stdscr, model: ModelConfig, colors) -> str:
+    return prompt_modal_choice(stdscr, colors, f'{model.id} is running', [
+        ('1', 'Stop model', 'stop'),
+        ('2', 'Launch OpenCode', 'opencode'),
+        ('3', 'Launch full-stack: OpenCode + VS Code', 'full_stack'),
         ('q', 'Cancel', 'cancel'),
     ])
 def prompt_optimization_tier(stdscr, colors) -> str:
@@ -181,6 +207,12 @@ def prompt_optimization_tier(stdscr, colors) -> str:
         ('1', 'Safe (most stable)', 'safe'),
         ('2', 'Moderate (balanced)', 'moderate'),
         ('3', 'Extreme (aggressive)', 'extreme'),
+        ('q', 'Cancel', 'cancel'),
+    ])
+def prompt_quit_policy(stdscr, colors) -> str:
+    return prompt_modal_choice(stdscr, colors, 'Quit llama-tui', [
+        ('1', 'Stop managed servers and quit', 'stop'),
+        ('2', 'Leave servers running and quit', 'leave'),
         ('q', 'Cancel', 'cancel'),
     ])
 def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
@@ -280,6 +312,7 @@ def tui(stdscr, app: AppConfig):
     message = 'Ready.'
     last_error_message = ''
     last_refresh = 0.0
+    external_stack_launched = False
     statuses: Dict[str, Tuple[str, str]] = {}
     action_thread: Optional[threading.Thread] = None
     action_queue: Queue = Queue()
@@ -287,7 +320,12 @@ def tui(stdscr, app: AppConfig):
     def action_running() -> bool:
         return action_thread is not None and action_thread.is_alive()
 
-    def start_background_action(model: ModelConfig, label: str, worker: Callable[[Callable[[str], None]], Tuple[bool, str]]):
+    def start_background_action(
+        model: ModelConfig,
+        label: str,
+        worker: Callable[[Callable[[str], None]], Tuple[bool, str]],
+        done_event: str = 'done',
+    ):
         nonlocal action_thread, message
         if action_running():
             message = '⏳ Another optimization is still running. Watch the log window for progress.'
@@ -305,7 +343,7 @@ def tui(stdscr, app: AppConfig):
             except Exception as exc:
                 result = f'❌ {label} failed: {exc}'
                 progress(result)
-            action_queue.put(('done', compact_message(result)))
+            action_queue.put((done_event, compact_message(result)))
 
         action_thread = threading.Thread(target=runner, daemon=True)
         action_thread.start()
@@ -325,6 +363,9 @@ def tui(stdscr, app: AppConfig):
     def model_is_running(model: ModelConfig) -> bool:
         status, _detail = app.health(model)
         return status in ('READY', 'LOADING', 'STARTING') or bool(app.get_pid(model))
+
+    def managed_server_running() -> bool:
+        return any(app.get_pid(model, discover=False, managed_only=True) for model in app.models)
 
     def has_benchmark(model: ModelConfig) -> bool:
         return float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0
@@ -354,14 +395,38 @@ def tui(stdscr, app: AppConfig):
     def begin_model_launch(model: ModelConfig):
         nonlocal message
         status, _detail = app.health(model)
-        if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
+        running = status in ('READY', 'LOADING', 'STARTING') or bool(app.get_pid(model))
+        if running:
+            launch_mode = prompt_running_model_action(stdscr, model, colors)
+        else:
+            launch_mode = prompt_launch_optimization(stdscr, model, colors)
+
+        if launch_mode == 'stop':
             ok, msg = app.stop(model)
             message = f'{model.id}: {msg}'
             return
-
-        launch_mode = prompt_launch_optimization(stdscr, model, colors)
         if launch_mode == 'cancel':
             message = 'Launch cancelled.'
+            return
+        if launch_mode in ('opencode', 'full_stack'):
+            workspace = prompt_workspace(stdscr, app)
+            if not workspace:
+                message = 'OpenCode launch cancelled.'
+                return
+            label = 'full-stack launch' if launch_mode == 'full_stack' else 'OpenCode launch'
+            include_vscode = launch_mode == 'full_stack'
+            start_background_action(
+                model,
+                label,
+                lambda progress, model=model, workspace=workspace, include_vscode=include_vscode: launch_opencode_stack(
+                    app,
+                    model,
+                    workspace,
+                    include_vscode=include_vscode,
+                    progress=progress,
+                ),
+                done_event='stack_done',
+            )
             return
         if launch_mode == 'best':
             start_background_action(
@@ -392,10 +457,12 @@ def tui(stdscr, app: AppConfig):
                 event, text = action_queue.get_nowait()
             except Empty:
                 break
+            if event == 'stack_done' and text.startswith('✅'):
+                external_stack_launched = True
             if is_error_message(text):
                 last_error_message = text
             message = text
-            if event == 'done':
+            if event in ('done', 'stack_done'):
                 action_thread = None
                 last_refresh = 0.0
 
@@ -493,7 +560,7 @@ def tui(stdscr, app: AppConfig):
         error_text = last_error_message or status_error
         error_lines = wrap_display_lines(error_text, right_w - 4) if error_text else ['No errors captured.']
         if right_total_h >= 14:
-            desired_error_h = min(max(5, len(error_lines) + 3), 10)
+            desired_error_h = min(max(5, len(error_lines) + 3), 14)
             error_box_h = min(desired_error_h, max(5, right_total_h - 8))
         else:
             error_box_h = 0
@@ -511,13 +578,19 @@ def tui(stdscr, app: AppConfig):
             status, detail = statuses.get(model.id, ('?', ''))
             benchmark_score = float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0)
             benchmark_seconds = float(getattr(model, 'last_benchmark_seconds', 0.0) or 0.0)
+            opencode_score = float(getattr(model, 'last_opencode_benchmark_score', 0.0) or 0.0)
+            opencode_seconds = float(getattr(model, 'last_opencode_benchmark_seconds', 0.0) or 0.0)
             if benchmark_score > 0:
                 benchmark_summary = f'{benchmark_score:.2f} tok/s in {benchmark_seconds:.2f}s'
             else:
                 benchmark_summary = 'not run yet; auto-benchmark starts here when safe'
+            if opencode_score > 0:
+                opencode_summary = f'{opencode_score:.2f} score in {opencode_seconds:.2f}s'
+            else:
+                opencode_summary = 'not run yet; press O for opencode workflow'
             hardware = app.hardware_profile().short_summary()
             detail_rows = [
-                ('[Esc] back to models   [Enter/l] start or stop   [B] benchmark   [z] best optimize', colors['accent'] | curses.A_BOLD),
+                ('[Esc] back   [Enter/l] actions   [B] server bench   [O] opencode bench   [z] optimize', colors['accent'] | curses.A_BOLD),
                 ('', curses.A_NORMAL),
                 (f'name: {model.name}', curses.A_BOLD),
                 (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
@@ -529,10 +602,11 @@ def tui(stdscr, app: AppConfig):
                 (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
                 (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
                 (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
-                (f'optimization: {getattr(model, "optimize_mode", "max_context_safe")}/{getattr(model, "optimize_tier", "moderate")} reserve={getattr(model, "memory_reserve_percent", 25)}%', curses.A_NORMAL),
+                (f'optimization: {getattr(model, "optimize_mode", "max_context_safe")}/{getattr(model, "optimize_tier", "moderate")} ram_reserve={getattr(model, "memory_reserve_percent", 25)}%', curses.A_NORMAL),
                 (f'ctx range: {getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)}', curses.A_NORMAL),
                 (f'hardware: {hardware}', curses.A_NORMAL),
                 (f'last benchmark: {benchmark_summary}', colors['warning'] if benchmark_score <= 0 else colors['success'] | curses.A_BOLD),
+                (f'opencode benchmark: {opencode_summary}', colors['warning'] if opencode_score <= 0 else colors['success'] | curses.A_BOLD),
                 ('command preview:', colors['accent'] | curses.A_BOLD),
                 (ellipsize(' '.join(app.build_command(model)), left_w - 6), curses.A_NORMAL),
                 ('', curses.A_NORMAL),
@@ -578,6 +652,34 @@ def tui(stdscr, app: AppConfig):
             if not benchmark_rows:
                 detail_rows.append((' no benchmark rows yet; auto benchmark will fill this table', colors['warning']))
 
+            opencode_rows = list(getattr(model, 'last_opencode_benchmark_results', []) or [])
+            detail_rows.extend([
+                ('', curses.A_NORMAL),
+                ('opencode workflow table:', colors['accent'] | curses.A_BOLD),
+                (f' {"OPTIMIZATION":18} {"TIER":8} {"SCORE":>8} {"SEC":>6} {"PASS":>5} {"CTX":>7} STATUS', colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD),
+            ])
+            if opencode_rows:
+                opencode_rows = sorted(
+                    opencode_rows,
+                    key=lambda row: float(row.get('score', 0.0) or 0.0),
+                    reverse=True,
+                )
+            for row in opencode_rows:
+                row_score = float(row.get('score', 0.0) or 0.0)
+                row_seconds = float(row.get('seconds', 0.0) or 0.0)
+                preset = str(row.get('preset', '-'))[:18]
+                tier = str(row.get('tier', '-'))[:8]
+                status_text = str(row.get('status', '-'))
+                pass_text = f'{int(row.get("passed", 0) or 0)}/{int(row.get("tasks", 0) or 0)}'
+                line = (
+                    f' {preset:18} {tier:8} {row_score:8.2f} {row_seconds:6.1f} '
+                    f'{pass_text:>5} {int(row.get("ctx", 0) or 0):7} {status_text}'
+                )
+                attr = colors['success'] | curses.A_BOLD if status_text == 'ok' else colors['warning'] if status_text == 'partial' else colors['error']
+                detail_rows.append((ellipsize(line, left_w - 5), attr))
+            if not opencode_rows:
+                detail_rows.append((' no opencode workflow rows yet; press O to run', colors['warning']))
+
             for i, (line, attr) in enumerate(detail_rows[: h - box_top - 7]):
                 stdscr.addstr(box_top + 2 + i, 3, line[: left_w - 4], attr)
         elif app.models:
@@ -621,32 +723,34 @@ def tui(stdscr, app: AppConfig):
             status, detail = statuses.get(model.id, ('?', ''))
             lines = [
                 f'name: {model.name}',
-                f'id: {model.id}',
+                f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}',
                 f'path: {ellipsize(model.path, right_w - 12)}',
-                f'alias: {model.alias}',
-                f'runtime/source: {display_runtime(model)} / {getattr(model, "source", "manual")}',
+                f'alias/bind: {model.alias} / {model.host}:{model.port}',
                 f'quant/type: {extract_quant(model)} / {classify_model_type(model)}',
-                f'bind: {model.host}:{model.port}',
-                f'ctx={model.ctx} threads={model.threads} ngl={model.ngl} temp={model.temp}',
-                f'parallel={model.parallel} cache_ram={model.cache_ram} output={model.output}',
-                f'optimize={getattr(model, "optimize_mode", "max_context_safe")}/{getattr(model, "optimize_tier", "moderate")} ctx_range={getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)} reserve={getattr(model, "memory_reserve_percent", 25)}%',
+                f'ctx/output: {model.ctx} / {model.output}  threads/ngl/par: {model.threads}/{model.ngl}/{model.parallel}',
+                f'temp/cache_ram: {model.temp} / {model.cache_ram}',
+                f'optimize={getattr(model, "optimize_mode", "max_context_safe")}/{getattr(model, "optimize_tier", "moderate")} ctx_range={getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)} ram_reserve={getattr(model, "memory_reserve_percent", 25)}%',
                 f'benchmark={getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}',
+                f'opencode_bench={getattr(model, "last_opencode_benchmark_score", 0.0):.2f} score {getattr(model, "last_opencode_benchmark_profile", "")}',
                 f'flags: enabled={model.enabled} flash_attn={model.flash_attn} jinja={model.jinja}',
                 f'status: {status} ({detail})',
-                f'pid: {app.get_pid(model) or "-"}',
-                f'roles: {app.role_badges(model.id)}  [m main] [s small] [b build] [p plan]',
+                f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}  [m main] [s small] [b build] [p plan]',
                 f'log: {app.logfile(model.id)}',
                 'command preview:',
                 ellipsize(' '.join(app.build_command(model)), right_w - 6),
                 '',
-                'last log lines:',
+                'last important log lines:' if status in ('ERROR', 'STOPPED') and error_text else 'last log lines:',
             ]
-            lines.extend(tail_text(app.logfile(model.id), max_lines=max(4, logs_box_h - 17)))
+            if status in ('ERROR', 'STOPPED') and error_text:
+                log_lines = important_log_excerpt(app.logfile(model.id), max_lines=max(12, logs_box_h), after_last_launch=True)
+            else:
+                log_lines = tail_text(app.logfile(model.id), max_lines=max(12, logs_box_h))
+            lines.extend(log_lines)
             for i, line in enumerate(lines[: max(1, logs_box_h - 3)]):
                 attr = curses.A_NORMAL
                 if line.startswith('status:'):
                     attr = status_attr(colors, status)
-                elif line in ('command preview:', 'last log lines:'):
+                elif line in ('command preview:', 'last log lines:', 'last important log lines:'):
                     attr = colors['accent'] | curses.A_BOLD
                 stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
 
@@ -656,8 +760,8 @@ def tui(stdscr, app: AppConfig):
                 stdscr.addstr(error_box_y + 2 + i, right_x + 2, line[: right_w - 4], error_attr)
 
         if view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] start/stop  [B] benchmark best  [z] best optimization'
-            footer2 = '[m/s/b/p] roles  [g] generate opencode  [S] stop-all  [q] quit'
+            footer = '[Esc] models  [Enter/l] actions  [B] server bench  [O] opencode bench  [z] optimize'
+            footer2 = '[m/s/b/p] roles  [g] gen opencode  [S] stop-all  [q] quit'
         else:
             footer = '[Enter] details  [z] best optimization  [B] benchmark best  [x] detect  [X] prune'
             footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
@@ -682,6 +786,14 @@ def tui(stdscr, app: AppConfig):
             message = 'Back to model list.'
             continue
         if key in (ord('q'), 27):
+            if external_stack_launched and managed_server_running():
+                quit_policy = prompt_quit_policy(stdscr, colors)
+                if quit_policy == 'cancel':
+                    message = 'Quit cancelled.'
+                    continue
+                if quit_policy == 'leave':
+                    app.leave_managed_processes_running()
+                    message = 'Leaving managed model servers running.'
             break
         if key in (curses.KEY_UP, ord('k')) and app.models and view_mode == 'list':
             selected = max(0, selected - 1)
@@ -723,6 +835,15 @@ def tui(stdscr, app: AppConfig):
                 model,
                 'benchmark optimization',
                 lambda progress, model=model: benchmark_best_optimization(app, model, progress=progress),
+            )
+        elif key == ord('O') and app.models and view_mode == 'detail':
+            model = active_detail_model()
+            if not model:
+                continue
+            start_background_action(
+                model,
+                'opencode workflow benchmark',
+                lambda progress, model=model: benchmark_opencode_workflow(app, model, progress=progress),
             )
         elif key == ord('a'):
             model = prompt_model(stdscr, 'Add model')

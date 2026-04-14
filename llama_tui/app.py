@@ -32,8 +32,51 @@ from .discovery import (
 from .gguf import estimate_kv_bytes_per_token
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
 from .models import ModelConfig, OpencodeSettings
-from .optimize import choose_gpu_layers_for_profile, estimate_safe_context_for_profile
-from .textutil import tail_text
+from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
+from .textutil import compact_message, important_log_excerpt
+
+
+TERMINAL_LAUNCHER_ORDER = (
+    'konsole',
+    'gnome-terminal',
+    'kgx',
+    'kitty',
+    'alacritty',
+    'wezterm',
+    'foot',
+    'xterm',
+)
+
+
+def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cmd: str) -> List[str]:
+    launcher_name = Path(launcher).name
+    cwd_text = str(cwd)
+    if launcher_name == 'konsole':
+        return [launcher, '--workdir', cwd_text, '-p', f'tabtitle={title}', '-e', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'gnome-terminal':
+        return [launcher, '--title', title, '--working-directory', cwd_text, '--', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'kgx':
+        return [launcher, '--title', title, '--working-directory', cwd_text, '--', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'kitty':
+        return [launcher, '--title', title, '--directory', cwd_text, 'bash', '-lc', shell_cmd]
+    if launcher_name == 'alacritty':
+        return [launcher, '--title', title, '--working-directory', cwd_text, '-e', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'wezterm':
+        return [launcher, 'start', '--cwd', cwd_text, '--', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'foot':
+        return [launcher, '--title', title, '--working-directory', cwd_text, 'bash', '-lc', shell_cmd]
+    if launcher_name == 'xterm':
+        return [launcher, '-T', title, '-e', 'bash', '-lc', f'cd {shlex.quote(cwd_text)} && {shell_cmd}']
+    return [launcher, '-e', 'bash', '-lc', shell_cmd]
+
+
+def render_terminal_template(template: str, title: str, cwd: Path, shell_cmd: str) -> List[str]:
+    rendered = template.format(
+        title=shlex.quote(title),
+        cwd=shlex.quote(str(cwd)),
+        cmd=shlex.quote(shell_cmd),
+    )
+    return shlex.split(rendered)
 
 
 class AppConfig:
@@ -52,6 +95,7 @@ class AppConfig:
         self._hardware_profile: Optional[HardwareProfile] = None
         self._hardware_profile_at = 0.0
         self._owned_pids: set[int] = set()
+        self._runtime_check_cache: Dict[str, Tuple[bool, str]] = {}
         self._shutdown_cleanup_done = False
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -108,6 +152,12 @@ class AppConfig:
     def get_model(self, model_id: str) -> Optional[ModelConfig]:
         return next((m for m in self.models if m.id == model_id), None)
 
+    def append_log(self, model_id: str, text: str):
+        log_path = self.logfile(model_id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime('%H:%M:%S')
+        with open(log_path, 'a', encoding='utf-8') as log_file:
+            log_file.write(f'[{stamp}] llama-tui: {compact_message(text)}\n')
 
     def hardware_profile(self, refresh: bool = False) -> HardwareProfile:
         now = time.time()
@@ -127,6 +177,168 @@ class AppConfig:
         if '/' in first or first.startswith('.') or first.startswith('~'):
             return Path(first).exists()
         return shutil.which(first) is not None
+
+    def validate_workspace_path(self, workspace: str | Path) -> Tuple[bool, Optional[Path], str]:
+        raw = str(workspace or '').strip()
+        if not raw:
+            return False, None, 'workspace path is empty'
+        path = Path(raw).expanduser().resolve(strict=False)
+        if not path.exists():
+            return False, None, f'workspace does not exist: {path}'
+        if not path.is_dir():
+            return False, None, f'workspace is not a directory: {path}'
+        return True, path, ''
+
+    def opencode_provider_key(self, model: ModelConfig) -> str:
+        return f'local-{model.id}'
+
+    def opencode_model_ref(self, model: ModelConfig) -> str:
+        return f'{self.opencode_provider_key(model)}/{model.alias}'
+
+    def detect_terminal_launcher(self) -> Optional[str]:
+        for launcher in TERMINAL_LAUNCHER_ORDER:
+            resolved = shutil.which(launcher)
+            if resolved:
+                return resolved
+        return None
+
+    def build_opencode_shell_command(self, model: ModelConfig, workspace: Path) -> str:
+        env_parts = []
+        if self.opencode.path:
+            env_parts.append(f'OPENCODE_CONFIG={shlex.quote(str(Path(self.opencode.path).expanduser()))}')
+        env_prefix = ' '.join(env_parts)
+        if env_prefix:
+            env_prefix += ' '
+        command = [
+            'opencode',
+            '--model', self.opencode_model_ref(model),
+            '--agent', 'build',
+        ]
+        return f'cd {shlex.quote(str(workspace))} && {env_prefix}exec ' + ' '.join(shlex.quote(part) for part in command)
+
+    def build_terminal_command(self, title: str, workspace: Path, shell_cmd: str) -> Tuple[bool, List[str], str]:
+        template = getattr(self.opencode, 'terminal_command', '').strip()
+        if template:
+            try:
+                return True, render_terminal_template(template, title, workspace, shell_cmd), 'custom terminal command'
+            except Exception as exc:
+                return False, [], f'invalid opencode.terminal_command: {exc}'
+        launcher = self.detect_terminal_launcher()
+        if not launcher:
+            return (
+                False,
+                [],
+                'No terminal launcher found. Set opencode.terminal_command in settings '
+                'using {title}, {cwd}, and {cmd}.'
+            )
+        return True, terminal_command_for_launcher(launcher, title, workspace, shell_cmd), Path(launcher).name
+
+    def launch_opencode_terminal(self, model: ModelConfig, workspace: str | Path) -> Tuple[bool, str]:
+        if not shutil.which('opencode'):
+            return False, 'opencode command not found in PATH'
+        valid, workspace_path, reason = self.validate_workspace_path(workspace)
+        if not valid or workspace_path is None:
+            return False, reason
+        shell_cmd = self.build_opencode_shell_command(model, workspace_path)
+        ok, terminal_cmd, terminal_label = self.build_terminal_command(
+            f'OpenCode {model.id}',
+            workspace_path,
+            shell_cmd,
+        )
+        if not ok:
+            return False, terminal_label
+        try:
+            proc = subprocess.Popen(
+                terminal_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return False, f'failed to launch OpenCode terminal: {exc}'
+        self.append_log(model.id, f'OpenCode terminal launched pid={proc.pid} workspace={workspace_path} via {terminal_label}')
+        return True, f'OpenCode terminal launched for {model.id} in {workspace_path}'
+
+    def launch_vscode_workspace(self, workspace: str | Path) -> Tuple[bool, str]:
+        resolved_code = shutil.which('code')
+        if not resolved_code:
+            return False, 'VS Code command not found; skipped code --new-window'
+        valid, workspace_path, reason = self.validate_workspace_path(workspace)
+        if not valid or workspace_path is None:
+            return False, reason
+        try:
+            proc = subprocess.Popen(
+                [resolved_code, '--new-window', str(workspace_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return False, f'failed to launch VS Code: {exc}'
+        return True, f'VS Code launched pid={proc.pid} workspace={workspace_path}'
+
+    def runtime_command_ready(self, runtime: str, command: str) -> Tuple[bool, str]:
+        if runtime != 'llama.cpp':
+            return True, ''
+        parts = self.command_prefix(command)
+        if not parts:
+            return False, 'empty llama-server command'
+        cache_key = '\0'.join(parts)
+        if cache_key in self._runtime_check_cache:
+            return self._runtime_check_cache[cache_key]
+
+        binary = os.path.expanduser(parts[0])
+        if Path(binary).exists() and shutil.which('ldd'):
+            try:
+                ldd_result = subprocess.run(
+                    ['ldd', binary],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=4,
+                    check=False,
+                )
+                ldd_output = compact_message(f'{ldd_result.stdout}\n{ldd_result.stderr}')
+                ldd_low = ldd_output.lower()
+                if 'not found' in ldd_low and any(
+                    marker in ldd_low
+                    for marker in ('libcuda', 'libcudart', 'libcublas', 'libggml', 'libllama')
+                ):
+                    outcome = (False, ldd_output[:800])
+                    self._runtime_check_cache[cache_key] = outcome
+                    return outcome
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        try:
+            result = subprocess.run(
+                parts + ['--help'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            outcome = (True, '')
+        except OSError as exc:
+            outcome = (False, compact_message(str(exc)))
+        else:
+            output = compact_message(f'{result.stderr}\n{result.stdout}')
+            low = output.lower()
+            fatal_markers = (
+                'error while loading shared libraries',
+                'cannot open shared object file',
+                'libcudart.so',
+                'libcuda.so',
+            )
+            if any(marker in low for marker in fatal_markers):
+                outcome = (False, output[:800])
+            else:
+                outcome = (True, '')
+
+        self._runtime_check_cache[cache_key] = outcome
+        return outcome
 
     def normalize_model_ref(self, path: str | Path) -> str:
         raw = str(path).strip()
@@ -215,7 +427,9 @@ class AppConfig:
             )
         applied_ctx = max(min_ctx, min(requested_ctx, max_ctx, safe_ctx))
 
-        notes = [f'safe mode reserve={reserve_pct}%']
+        notes = [f'safe mode ram reserve={reserve_pct}%']
+        if profile.has_usable_gpu() and getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp':
+            notes.append(f'gpu reserve≈{effective_gpu_reserve_percent(reserve_pct, tier)}%')
         if applied_ctx != requested_ctx:
             notes.append(f'ctx {requested_ctx}→{applied_ctx}')
         if 'ngl' in launch_profile and launch_profile['ngl'] != int(getattr(model, 'ngl', 0) or 0):
@@ -569,9 +783,13 @@ class AppConfig:
     def start(self, model: ModelConfig) -> Tuple[bool, str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
         command = self.vllm_command if runtime == 'vllm' else self.llama_server
+        label = 'vLLM command' if runtime == 'vllm' else 'llama-server'
         if not self.command_exists(command):
-            label = 'vLLM command' if runtime == 'vllm' else 'llama-server'
             return False, f'{label} not found: {command}'
+        runtime_ok, runtime_msg = self.runtime_command_ready(runtime, command)
+        if not runtime_ok:
+            self.append_log(model.id, f'{label} runtime check failed: {runtime_msg}')
+            return False, f'{label} cannot run: {runtime_msg}'
         valid, reason = self.validate_model_target(model)
         if not valid:
             return False, reason
@@ -591,14 +809,20 @@ class AppConfig:
         env = os.environ.copy()
         env['LLAMA_TUI_MODEL_ID'] = model.id
         env['LLAMA_TUI_OWNER_PID'] = str(os.getpid())
-        with open(log_path, 'ab') as log_file:
-            proc = subprocess.Popen(
-                command,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=env,
-            )
+        self.append_log(model.id, f'launch profile: {profile_msg}')
+        self.append_log(model.id, f'launch command: {shlex.join(command)}')
+        try:
+            with open(log_path, 'ab') as log_file:
+                proc = subprocess.Popen(
+                    command,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    env=env,
+                )
+        except OSError as exc:
+            self.append_log(model.id, f'launch failed before PID: {exc}')
+            return False, f'failed to launch {label}: {exc}'
         self._write_pid_tracking(model, proc.pid, command)
         model.last_good_ctx = profile.get('ctx', model.ctx)
         model.last_good_parallel = profile.get('parallel', model.parallel)
@@ -612,8 +836,8 @@ class AppConfig:
             if status == 'READY':
                 return True, f'✅ {model.id} is ready on http://{model.host}:{model.port}'
             if status == 'STOPPED' and not self.get_pid(model):
-                tail = '\n'.join(tail_text(self.logfile(model.id), 8))
-                return False, f'❌ {model.id} crashed during startup\n{tail}'
+                excerpt = '\n'.join(important_log_excerpt(self.logfile(model.id), 24, after_last_launch=True))
+                return False, f'❌ {model.id} crashed during startup (log: {self.logfile(model.id)})\n{excerpt}'
             time.sleep(0.5)
         return False, f'⏳ {model.id} is still loading'
 
@@ -663,6 +887,9 @@ class AppConfig:
             ok, msg = self._stop_pid(model_id, target_pid, use_group=True)
             msgs.append(f'{model_id}: {msg}')
         return msgs
+
+    def leave_managed_processes_running(self):
+        self._shutdown_cleanup_done = True
 
     def add_or_update(self, model: ModelConfig):
         for idx, existing in enumerate(self.models):
@@ -821,7 +1048,7 @@ class AppConfig:
 
         provider = {}
         for model in enabled_models:
-            provider_key = f'local-{model.id}'
+            provider_key = self.opencode_provider_key(model)
             runtime_label = 'vLLM' if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else 'llama.cpp'
             provider[provider_key] = {
                 'npm': '@ai-sdk/openai-compatible',
@@ -843,7 +1070,7 @@ class AppConfig:
             }
 
         def ref(model: ModelConfig) -> str:
-            return f'local-{model.id}/{model.alias}'
+            return self.opencode_model_ref(model)
 
         config = {
             '$schema': existing.get('$schema', 'https://opencode.ai/config.json'),

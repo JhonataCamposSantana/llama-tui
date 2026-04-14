@@ -25,6 +25,15 @@ def model_likely_fits_gpu(model: ModelConfig, profile: Optional[HardwareProfile]
         'extreme': 0.88,
     }.get(tier, 0.80)
     return size <= int(profile.gpu_memory_free * gpu_weight_budget)
+def gpu_reserve_percent_for_tier(tier: str) -> int:
+    return {
+        'safe': 20,
+        'moderate': 15,
+        'extreme': 10,
+    }.get(tier, 15)
+def effective_gpu_reserve_percent(reserve_pct: int, tier: str) -> int:
+    requested = max(5, min(80, int(reserve_pct or gpu_reserve_percent_for_tier(tier))))
+    return min(requested, gpu_reserve_percent_for_tier(tier))
 def choose_gpu_layers_for_profile(model: ModelConfig, profile: Optional[HardwareProfile], tier: str) -> int:
     if getattr(model, 'runtime', 'llama.cpp') != 'llama.cpp':
         return int(getattr(model, 'ngl', 0) or 0)
@@ -38,8 +47,7 @@ def choose_gpu_layers_for_profile(model: ModelConfig, profile: Optional[Hardware
     if layer_count <= 0 or size <= 0:
         return 0
 
-    reserve_by_tier = {'safe': 35, 'moderate': 25, 'extreme': 15}
-    reserve_pct = reserve_by_tier.get(tier, 25)
+    reserve_pct = gpu_reserve_percent_for_tier(tier)
     usable_gpu = int(profile.gpu_memory_free * ((100 - reserve_pct) / 100.0))
     workspace = estimate_gpu_workspace_bytes(profile)
     min_ctx = max(256, int(getattr(model, 'ctx_min', 2048)))
@@ -96,11 +104,11 @@ def estimate_gpu_context_for_profile(
 ) -> Optional[int]:
     if not profile or not kv_cache_uses_gpu(model, profile):
         return None
-    reserve_pct = max(5, min(80, reserve_pct))
+    tier = getattr(model, 'optimize_tier', 'moderate')
+    reserve_pct = effective_gpu_reserve_percent(reserve_pct, tier)
     usable_gpu = int(profile.gpu_memory_free * ((100 - reserve_pct) / 100.0))
     if usable_gpu <= 0:
         return 0
-    tier = getattr(model, 'optimize_tier', 'moderate')
     workspace = estimate_gpu_workspace_bytes(profile)
     weights = estimate_gpu_weight_bytes(model, profile, tier, usable_gpu)
     kv_budget = usable_gpu - workspace - weights
@@ -293,7 +301,10 @@ def apply_optimization_preset(
         safe_ctx = estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max)
         model.ctx = min(model.ctx, safe_ctx) if safe_ctx >= ctx_min else ctx_min
         hw_note = f' | {profile.short_summary()}' if profile else ''
-        return f'{model.id}: preset=max_context_safe/{tier} ({runtime}) ctx={model.ctx} parallel={model.parallel} threads={model.threads} ngl={model.ngl}{hw_note}'
+        gpu_note = ''
+        if profile and profile.has_usable_gpu() and runtime == 'llama.cpp':
+            gpu_note = f' gpu_reserve~{effective_gpu_reserve_percent(model.memory_reserve_percent, tier)}%'
+        return f'{model.id}: preset=max_context_safe/{tier} ({runtime}) ctx={model.ctx} parallel={model.parallel} threads={model.threads} ngl={model.ngl}{gpu_note}{hw_note}'
 
     if preset == 'tokens_per_sec':
         model.optimize_mode = 'max_context_safe'
@@ -321,7 +332,10 @@ def apply_optimization_preset(
         safe_ctx = estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max)
         model.ctx = min(model.ctx, safe_ctx) if safe_ctx >= ctx_min else ctx_min
         hw_note = f' | {profile.short_summary()}' if profile else ''
-        return f'{model.id}: preset=tokens_per_sec/{tier} ({runtime}) ctx={model.ctx} parallel={model.parallel} threads={model.threads} ngl={model.ngl}{hw_note}'
+        gpu_note = ''
+        if profile and profile.has_usable_gpu() and runtime == 'llama.cpp':
+            gpu_note = f' gpu_reserve~{effective_gpu_reserve_percent(model.memory_reserve_percent, tier)}%'
+        return f'{model.id}: preset=tokens_per_sec/{tier} ({runtime}) ctx={model.ctx} parallel={model.parallel} threads={model.threads} ngl={model.ngl}{gpu_note}{hw_note}'
 
     return f'{model.id}: keeping current settings'
 def apply_best_optimization(

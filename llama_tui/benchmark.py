@@ -26,11 +26,12 @@ def sync_opencode_after_tuning(app: AppConfig) -> str:
     ok, msg = app.generate_opencode()
     return msg if ok else f'opencode sync failed: {msg}'
 def append_model_log(app: AppConfig, model: ModelConfig, text: str):
-    log_path = app.logfile(model.id)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime('%H:%M:%S')
-    with open(log_path, 'a', encoding='utf-8') as log_file:
-        log_file.write(f'[{stamp}] llama-tui: {compact_message(text)}\n')
+    app.append_log(model.id, text)
+def concise_failure(text: str, limit: int = 320) -> str:
+    message = compact_message(text)
+    if len(message) <= limit:
+        return message
+    return message[: max(0, limit - 3)] + '...'
 def fallback_tiers(selected_tier: str) -> List[str]:
     order = ['extreme', 'moderate', 'safe']
     selected = (selected_tier or 'moderate').strip().lower()
@@ -64,8 +65,8 @@ def launch_with_failsafe(
         ok, msg = app.start(model)
         if not ok:
             if progress:
-                progress(f'launch profile {mode}/{current_tier} failed to start: {msg}')
-            attempts.append(f'{current_tier}: start failed ({msg})')
+                progress(f'launch profile {mode}/{current_tier} failed to start: {concise_failure(msg)}')
+            attempts.append(f'{current_tier}: start failed ({concise_failure(msg)})')
             continue
         if progress:
             progress(f'launch profile {mode}/{current_tier} started; waiting for readiness...')
@@ -77,7 +78,7 @@ def launch_with_failsafe(
         app.stop(model, managed_only=True)
         if progress:
             progress(f'launch profile {mode}/{current_tier} was not ready; stopped and trying fallback.')
-        attempts.append(f'{current_tier}: not ready')
+        attempts.append(f'{current_tier}: not ready ({concise_failure(ready_msg)})')
     msg = '❌ optimization failed; fallback exhausted -> ' + '; '.join(attempts[:3])
     if progress:
         progress(msg)
@@ -98,8 +99,81 @@ def start_model_with_progress(
         progress(f'{model.id} started; waiting for readiness...')
     ready_ok, ready_msg = app.wait_until_ready(model, timeout=120)
     if progress:
-        progress(ready_msg)
+        progress(ready_msg if ready_ok else concise_failure(ready_msg))
     return ready_ok, ready_msg
+def launch_opencode_stack(
+    app: AppConfig,
+    model: ModelConfig,
+    workspace: str,
+    include_vscode: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    valid, workspace_path, reason = app.validate_workspace_path(workspace)
+    if not valid or workspace_path is None:
+        return False, f'❌ {reason}'
+    if not getattr(model, 'enabled', True):
+        return False, f'❌ {model.id} is disabled; enable it before launching OpenCode.'
+
+    app.opencode.last_workspace_path = str(workspace_path)
+    app.save()
+
+    status, _detail = app.health(model)
+    if status == 'READY':
+        if progress:
+            progress(f'{model.id} already ready; using current server for OpenCode.')
+    elif status in ('LOADING', 'STARTING') or app.get_pid(model):
+        if progress:
+            progress(f'{model.id} is starting; waiting for readiness before OpenCode launch...')
+        ready_ok, ready_msg = app.wait_until_ready(model, timeout=180)
+        if not ready_ok:
+            return False, concise_failure(ready_msg)
+    else:
+        if progress:
+            progress(f'{model.id} is stopped; launching best profile before OpenCode...')
+        ready_ok, ready_msg = launch_with_failsafe(app, model, 'best', 'auto', progress=progress)
+        if not ready_ok:
+            return False, concise_failure(ready_msg)
+
+    if not (getattr(app.opencode, 'path', '') or '').strip():
+        return False, '❌ Set opencode.path first in settings.'
+    sync_ok, sync_msg = app.generate_opencode()
+    if not sync_ok:
+        return False, f'❌ {sync_msg}'
+    if progress:
+        progress(sync_msg)
+
+    if not app.command_exists('opencode'):
+        return False, '❌ opencode command not found in PATH.'
+    terminal_ok, _terminal_cmd, terminal_msg = app.build_terminal_command(
+        f'OpenCode {model.id}',
+        workspace_path,
+        app.build_opencode_shell_command(model, workspace_path),
+    )
+    if not terminal_ok:
+        return False, f'❌ {terminal_msg}'
+
+    warnings = []
+    if include_vscode:
+        code_ok, code_msg = app.launch_vscode_workspace(workspace_path)
+        if progress:
+            progress(code_msg if code_ok else f'VS Code warning: {code_msg}')
+        if not code_ok:
+            warnings.append(code_msg)
+
+    open_ok, open_msg = app.launch_opencode_terminal(model, workspace_path)
+    if not open_ok:
+        detail = f'❌ {open_msg}'
+        if warnings:
+            detail += ' | warnings: ' + '; '.join(warnings)
+        return False, detail
+    if progress:
+        progress(open_msg)
+
+    stack_label = 'full-stack' if include_vscode else 'OpenCode'
+    detail = f'✅ launched {stack_label} for {model.id} in {workspace_path}'
+    if warnings:
+        detail += ' | warnings: ' + '; '.join(warnings)
+    return True, detail
 def clone_model_config(model: ModelConfig) -> ModelConfig:
     return ModelConfig(**asdict(model))
 def estimate_text_tokens(text: str) -> int:
@@ -304,7 +378,7 @@ def benchmark_best_optimization(
             'parallel': int(getattr(candidate, 'parallel', 0) or 0),
             'threads': int(getattr(candidate, 'threads', 0) or 0),
             'ngl': int(getattr(candidate, 'ngl', 0) or 0),
-            'detail': compact_message(detail),
+            'detail': concise_failure(detail, limit=500),
             'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
         })
 
@@ -314,9 +388,9 @@ def benchmark_best_optimization(
         ok, msg = app.start(candidate)
         if not ok:
             if progress:
-                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} failed to start: {msg}')
+                progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} failed to start: {concise_failure(msg)}')
             add_benchmark_record(preset, tier, candidate, 'start failed', detail=msg)
-            failures.append(f'{preset}/{tier}: start failed ({msg})')
+            failures.append(f'{preset}/{tier}: start failed ({concise_failure(msg)})')
             continue
 
         try:
@@ -325,9 +399,9 @@ def benchmark_best_optimization(
             ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=180)
             if not ready_ok:
                 if progress:
-                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} not ready: {compact_message(ready_msg)}')
+                    progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} not ready: {concise_failure(ready_msg)}')
                 add_benchmark_record(preset, tier, candidate, 'not ready', detail=ready_msg)
-                failures.append(f'{preset}/{tier}: {compact_message(ready_msg)}')
+                failures.append(f'{preset}/{tier}: {concise_failure(ready_msg)}')
                 continue
 
             if progress:

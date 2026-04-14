@@ -32,6 +32,10 @@ class ModelConfig:
     last_benchmark_seconds: float = 0.0
     last_benchmark_profile: str = ''
     last_benchmark_results: List[Dict[str, object]] = field(default_factory=list)
+    last_opencode_benchmark_score: float = 0.0
+    last_opencode_benchmark_seconds: float = 0.0
+    last_opencode_benchmark_profile: str = ''
+    last_opencode_benchmark_results: List[Dict[str, object]] = field(default_factory=list)
     enabled: bool = True
     runtime: str = 'llama.cpp'
     source: str = 'manual'
@@ -50,3 +54,5 @@ class OpencodeSettings:
     small_model_id: str = ''
     build_model_id: str = ''
     plan_model_id: str = ''
+    terminal_command: str = ''
+    last_workspace_path: str = ''

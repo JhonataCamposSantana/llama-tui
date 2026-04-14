@@ -15,8 +15,10 @@ The project is intentionally small: it uses only the Python standard library, st
 - Read GGUF metadata to estimate KV cache memory and safe context sizes.
 - Auto-tune context size, CPU threads, GPU layer offload, KV cache type, batch size, and vLLM scheduler limits.
 - Benchmark candidate profiles and persist the fastest stable result.
+- Benchmark OpenCode coding workflows against disposable fixture projects.
 - Assign OpenCode roles: main, small, build, and plan.
 - Generate `opencode.json` with backups.
+- Launch a model with OpenCode, or a full OpenCode + VS Code stack, from model details.
 
 ## Project Layout
 
@@ -31,6 +33,7 @@ llama_tui/
   hardware.py             CPU/RAM/GPU probes
   main.py                 entrypoint and shutdown cleanup
   models.py               dataclasses
+  opencode_benchmark.py   OpenCode workflow benchmark fixtures and scoring
   optimize.py             tuning heuristics
   textutil.py             display/text helpers
   ui.py                   curses interface
@@ -127,9 +130,10 @@ Useful per-model fields:
 
 - `Up / Down` or `j / k`: move in the model list.
 - `Enter` on the list: open model details.
-- `Enter` or `l` on details: start or stop the selected server.
+- `Enter` or `l` on details: open model actions.
 - `Esc` on details: return to the model list.
 - `B`: benchmark candidate optimization profiles.
+- `O`: benchmark the selected model with an OpenCode workflow from details.
 - `z`: apply the current best heuristic optimization without benchmarking.
 - `S`: stop all known models.
 - `x`: detect new GGUF models from configured cache roots.
@@ -155,6 +159,10 @@ If the model is stopped, llama-tui asks how to launch it:
 - Optimize for max context.
 - Optimize for tokens/sec.
 - Keep current settings.
+- Launch model + OpenCode.
+- Launch full-stack: OpenCode + VS Code.
+
+If a model is already running, the details action menu offers stop, OpenCode launch, full-stack launch, or cancel.
 
 For `llama.cpp`, llama-tui builds a command like:
 
@@ -324,6 +332,16 @@ llama-tui writes OpenAI-compatible providers for enabled local models and maps:
 
 Existing config files are backed up under `opencode.backup_dir` before writing.
 
+The OpenCode launch actions use `opencode.terminal_command` if set. The command is a template with `{title}`, `{cwd}`, and `{cmd}` placeholders. If unset, llama-tui tries common terminal launchers such as `konsole`, `gnome-terminal`, `kgx`, `kitty`, `alacritty`, `wezterm`, `foot`, and `xterm`.
+
+For full-stack launches, llama-tui opens VS Code with:
+
+```bash
+code --new-window WORKSPACE
+```
+
+If VS Code is unavailable, it still launches the model + OpenCode path and reports a warning.
+
 ## Safety Notes
 
 - `manual` optimization mode uses the configured values exactly.
@@ -339,6 +357,12 @@ Run syntax checks:
 
 ```bash
 python3 -m py_compile llama_tui.py llama_tui/*.py
+```
+
+Run tests:
+
+```bash
+python3 -m unittest discover -s tests
 ```
 
 Run import smoke checks:
