@@ -42,6 +42,7 @@ TERMINAL_LAUNCHER_ORDER = (
     'xdg-terminal-exec',
     'ptyxis',
     'gnome-console',
+    'ghostty',
     'konsole',
     'gnome-terminal',
     'kgx',
@@ -52,11 +53,41 @@ TERMINAL_LAUNCHER_ORDER = (
     'tilix',
     'terminator',
     'xfce4-terminal',
+    'qterminal',
+    'lxterminal',
+    'mate-terminal',
+    'deepin-terminal',
+    'terminology',
     'xterm',
+)
+
+FLATPAK_TERMINAL_APP_IDS = (
+    'com.mitchellh.ghostty',
+    'org.gnome.Console',
+    'org.gnome.Terminal',
+    'org.wezfurlong.wezterm',
+    'com.raggesilver.BlackBox',
+)
+
+HOST_TERMINAL_BRIDGES = (
+    'host-spawn',
+    'distrobox-host-exec',
 )
 
 
 def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cmd: str) -> List[str]:
+    if launcher.startswith('flatpak:'):
+        app_id = launcher.split(':', 1)[1]
+        cwd_text = str(cwd)
+        if app_id == 'com.mitchellh.ghostty':
+            return ['flatpak', 'run', app_id, '--title', title, '--working-directory', cwd_text, '-e', 'bash', '-lc', shell_cmd]
+        if app_id in ('org.gnome.Console', 'org.gnome.Terminal'):
+            return ['flatpak', 'run', app_id, '--working-directory', cwd_text, '--', 'bash', '-lc', shell_cmd]
+        if app_id == 'org.wezfurlong.wezterm':
+            return ['flatpak', 'run', app_id, 'start', '--cwd', cwd_text, '--', 'bash', '-lc', shell_cmd]
+        if app_id == 'com.raggesilver.BlackBox':
+            return ['flatpak', 'run', app_id, '--working-directory', cwd_text, '--command', shlex.join(['bash', '-lc', shell_cmd])]
+        return ['flatpak', 'run', app_id, 'bash', '-lc', shell_cmd]
     launcher_name = Path(launcher).name
     cwd_text = str(cwd)
     cd_shell_cmd = f'cd {shlex.quote(cwd_text)} && {shell_cmd}'
@@ -66,8 +97,10 @@ def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cm
         return [launcher, '--working-directory', cwd_text, '--title', title, '--', 'bash', '-lc', shell_cmd]
     if launcher_name == 'konsole':
         return [launcher, '--workdir', cwd_text, '-p', f'tabtitle={title}', '-e', 'bash', '-lc', shell_cmd]
-    if launcher_name == 'gnome-terminal':
+    if launcher_name in ('gnome-terminal', 'mate-terminal'):
         return [launcher, '--title', title, '--working-directory', cwd_text, '--', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'ghostty':
+        return [launcher, '--title', title, '--working-directory', cwd_text, '-e', 'bash', '-lc', shell_cmd]
     if launcher_name == 'kgx':
         return [launcher, '--title', title, '--working-directory', cwd_text, '--', 'bash', '-lc', shell_cmd]
     if launcher_name == 'kitty':
@@ -92,6 +125,14 @@ def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cm
             '--command',
             shlex.join(['bash', '-lc', shell_cmd]),
         ]
+    if launcher_name == 'qterminal':
+        return [launcher, '--workdir', cwd_text, '-T', title, '-e', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'lxterminal':
+        return [launcher, '--title', title, '--working-directory', cwd_text, '-e', shlex.join(['bash', '-lc', shell_cmd])]
+    if launcher_name == 'deepin-terminal':
+        return [launcher, '--workdir', cwd_text, '-e', 'bash', '-lc', shell_cmd]
+    if launcher_name == 'terminology':
+        return [launcher, '-T', title, '-d', cwd_text, '-e', 'bash', '-lc', shell_cmd]
     if launcher_name == 'xterm':
         return [launcher, '-T', title, '-e', 'bash', '-lc', cd_shell_cmd]
     return [launcher, '-e', 'bash', '-lc', shell_cmd]
@@ -104,6 +145,60 @@ def render_terminal_template(template: str, title: str, cwd: Path, shell_cmd: st
         cmd=shlex.quote(shell_cmd),
     )
     return shlex.split(rendered)
+
+
+def terminal_launcher_label(launcher: str) -> str:
+    if launcher.startswith('flatpak:'):
+        return launcher
+    return Path(launcher).name
+
+
+def host_bridge_command(bridge: str, command: List[str]) -> List[str]:
+    bridge_name = Path(bridge).name
+    if bridge_name == 'host-spawn':
+        return [bridge, '-no-pty', *command]
+    return [bridge, *command]
+
+
+def container_environment_detected() -> bool:
+    if os.environ.get('container') or os.environ.get('DISTROBOX_ENTER_PATH'):
+        return True
+    return Path('/run/.containerenv').exists() or Path('/.dockerenv').exists()
+
+
+def current_container_name() -> str:
+    for key in ('DISTROBOX_CONTAINER_NAME', 'CONTAINER_NAME'):
+        value = (os.environ.get(key) or '').strip()
+        if value:
+            return value
+    containerenv = Path('/run/.containerenv')
+    if containerenv.exists():
+        try:
+            for raw_line in containerenv.read_text(errors='replace').splitlines():
+                key, sep, value = raw_line.partition('=')
+                if sep and key.strip() == 'name':
+                    return value.strip().strip('"').strip("'")
+        except Exception:
+            return ''
+    return ''
+
+
+def desktop_terminal_guess() -> str:
+    desktop_text = ' '.join(
+        value.lower()
+        for value in (
+            os.environ.get('XDG_CURRENT_DESKTOP', ''),
+            os.environ.get('DESKTOP_SESSION', ''),
+        )
+        if value
+    )
+    if 'kde' in desktop_text or 'plasma' in desktop_text:
+        return 'konsole'
+    if 'gnome' in desktop_text:
+        return 'ptyxis'
+    if 'xfce' in desktop_text:
+        return 'xfce4-terminal'
+    return ''
 
 
 class AppConfig:
@@ -293,7 +388,77 @@ class AppConfig:
             resolved = shutil.which(launcher)
             if resolved:
                 return resolved
+        if shutil.which('flatpak'):
+            for app_id in FLATPAK_TERMINAL_APP_IDS:
+                try:
+                    result = subprocess.run(
+                        ['flatpak', 'info', app_id],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                        check=False,
+                    )
+                except Exception:
+                    continue
+                if result.returncode == 0:
+                    return f'flatpak:{app_id}'
         return None
+
+    def detect_host_terminal_bridge(self) -> Optional[str]:
+        for bridge in HOST_TERMINAL_BRIDGES:
+            resolved = shutil.which(bridge)
+            if resolved:
+                return resolved
+        return None
+
+    def host_command_available(self, bridge: str, shell_check: str, timeout: float = 2.0) -> bool:
+        try:
+            result = subprocess.run(
+                host_bridge_command(bridge, ['sh', '-lc', shell_check]),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def detect_host_terminal_launcher(self) -> Tuple[Optional[str], Optional[str]]:
+        bridge = self.detect_host_terminal_bridge()
+        if not bridge:
+            return None, None
+        for launcher in TERMINAL_LAUNCHER_ORDER:
+            if self.host_command_available(bridge, f'command -v {shlex.quote(launcher)} >/dev/null 2>&1'):
+                return bridge, launcher
+        for app_id in FLATPAK_TERMINAL_APP_IDS:
+            if self.host_command_available(bridge, f'command -v flatpak >/dev/null 2>&1 && flatpak info {shlex.quote(app_id)} >/dev/null 2>&1'):
+                return bridge, f'flatpak:{app_id}'
+        guessed = desktop_terminal_guess()
+        if guessed:
+            return bridge, guessed
+        return bridge, None
+
+    def build_container_reentry_shell_command(self, shell_cmd: str) -> Tuple[bool, str, str]:
+        container_name = current_container_name()
+        if not container_name:
+            return False, '', (
+                'Detected a container session, but could not determine its distrobox/container name. '
+                'Set opencode.terminal_command to a terminal command that re-enters this environment.'
+            )
+        return True, f'distrobox enter {shlex.quote(container_name)} -- bash -lc {shlex.quote(shell_cmd)}', ''
+
+    def terminal_setup_error(self, shell_cmd: str, host_detail: str = '') -> str:
+        container_note = 'detected container session' if container_environment_detected() else 'no container session detected'
+        detail = f'No terminal launcher was visible from llama-tui ({container_note}).'
+        if host_detail:
+            detail += f' {host_detail}'
+        detail += (
+            ' Set opencode.terminal_command in settings using {title}, {cwd}, and {cmd}. '
+            'Example: konsole --workdir {cwd} -p tabtitle={title} -e bash -lc {cmd}. '
+            f'Manual OpenCode command: {shell_cmd}'
+        )
+        return detail
 
     def build_opencode_shell_command(self, model: ModelConfig, workspace: Path) -> str:
         env = {
@@ -322,18 +487,27 @@ class AppConfig:
         template = getattr(self.opencode, 'terminal_command', '').strip()
         if template:
             try:
-                return True, render_terminal_template(template, title, workspace, shell_cmd), 'custom terminal command'
+                return True, render_terminal_template(template, title, workspace, shell_cmd), 'custom'
             except Exception as exc:
                 return False, [], f'invalid opencode.terminal_command: {exc}'
         launcher = self.detect_terminal_launcher()
-        if not launcher:
-            return (
-                False,
-                [],
-                'No terminal launcher found. Set opencode.terminal_command in settings '
-                f'using {{title}}, {{cwd}}, and {{cmd}}. Manual command: {shell_cmd}'
-            )
-        return True, terminal_command_for_launcher(launcher, title, workspace, shell_cmd), Path(launcher).name
+        if launcher:
+            return True, terminal_command_for_launcher(launcher, title, workspace, shell_cmd), f'local:{terminal_launcher_label(launcher)}'
+        if container_environment_detected():
+            bridge, host_launcher = self.detect_host_terminal_launcher()
+            if bridge and host_launcher:
+                reentry_ok, reentry_cmd, reentry_msg = self.build_container_reentry_shell_command(shell_cmd)
+                if not reentry_ok:
+                    return False, [], reentry_msg
+                terminal_cmd = terminal_command_for_launcher(host_launcher, title, workspace, reentry_cmd)
+                label = f'host:{Path(bridge).name}/{terminal_launcher_label(host_launcher)}'
+                return True, host_bridge_command(bridge, terminal_cmd), label
+            if bridge:
+                return False, [], self.terminal_setup_error(
+                    shell_cmd,
+                    f'Host bridge {Path(bridge).name} is available, but no host terminal launcher was detected.',
+                )
+        return False, [], self.terminal_setup_error(shell_cmd)
 
     def launch_opencode_terminal(self, model: ModelConfig, workspace: str | Path) -> Tuple[bool, str]:
         if not shutil.which('opencode'):
@@ -349,6 +523,7 @@ class AppConfig:
         )
         if not ok:
             return False, terminal_label
+        self.append_log(model.id, f'OpenCode terminal command ({terminal_label}): {shlex.join(terminal_cmd)}')
         try:
             proc = subprocess.Popen(
                 terminal_cmd,
@@ -358,6 +533,13 @@ class AppConfig:
             )
         except OSError as exc:
             return False, f'failed to launch OpenCode terminal: {exc}'
+        time.sleep(0.15)
+        returncode = proc.poll()
+        if returncode not in (None, 0):
+            return False, (
+                f'OpenCode terminal launcher exited immediately with status {returncode}. '
+                f'Command: {shlex.join(terminal_cmd)}'
+            )
         self.append_log(model.id, f'OpenCode terminal launched pid={proc.pid} workspace={workspace_path} via {terminal_label}')
         return True, f'OpenCode terminal launched for {model.id} in {workspace_path}'
 

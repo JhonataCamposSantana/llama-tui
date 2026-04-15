@@ -9,6 +9,8 @@ from llama_tui.ui import (
     adjust_scroll_offset,
     build_benchmark_progress_items,
     build_logs_errors_items,
+    latest_error_view_items,
+    logs_errors_split_rows,
     benchmark_elapsed_text,
     benchmark_progress_fraction,
     benchmark_ranking_rows,
@@ -245,6 +247,27 @@ class ProfileUiTests(unittest.TestCase):
         self.assertIn(('boom', 1), items)
         self.assertIn(('logs:', 3), items)
         self.assertIn(('server line', 2), items)
+
+    def test_logs_errors_split_reserves_error_rows_and_gives_logs_more_space(self):
+        error_rows, log_rows = logs_errors_split_rows(18, 20)
+
+        self.assertGreaterEqual(error_rows, 3)
+        self.assertGreater(log_rows, error_rows)
+
+        no_error_rows, no_error_log_rows = logs_errors_split_rows(18, 0)
+        self.assertLessEqual(no_error_rows, 2)
+        self.assertGreater(no_error_log_rows, no_error_rows)
+
+    def test_latest_error_view_keeps_newest_error_visible(self):
+        errors = [f'error {idx}' for idx in range(10)]
+        visible, has_older, total = latest_error_view_items(errors, 80, 3, error_attr=1, muted_attr=2)
+        lines = [line for line, _attr in visible]
+
+        self.assertTrue(has_older)
+        self.assertEqual(total, 10)
+        self.assertIn('error 9', lines)
+        self.assertNotIn('error 0', lines)
+        self.assertEqual(lines[0], '^ older errors above')
 
     def test_benchmark_progress_content_builder_includes_runtime_fields(self):
         model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)

@@ -304,6 +304,46 @@ def build_logs_errors_items(
     return items
 
 
+def logs_errors_split_rows(total_rows: int, wrapped_error_count: int) -> Tuple[int, int]:
+    rows = max(1, int(total_rows or 1))
+    has_errors = int(wrapped_error_count or 0) > 0
+    if not has_errors:
+        error_rows = 2 if rows >= 5 else 1
+        return error_rows, max(0, rows - error_rows)
+    if rows <= 3:
+        error_rows = max(1, rows - 1) if rows > 1 else 1
+        return error_rows, max(0, rows - error_rows)
+    error_cap = min(max(3, rows // 3), 8, rows - 2)
+    error_rows = min(error_cap, max(2, int(wrapped_error_count or 0) + 1))
+    return error_rows, max(0, rows - error_rows)
+
+
+def latest_error_view_items(
+    error_lines: List[str],
+    width: int,
+    rows: int,
+    error_attr: int = 0,
+    muted_attr: int = 0,
+) -> Tuple[List[Tuple[str, int]], bool, int]:
+    visible_rows = max(0, int(rows or 0))
+    if visible_rows <= 0:
+        return [], bool(error_lines), 0
+    if not error_lines:
+        items = [('none captured', muted_attr)]
+    else:
+        items = [(str(line), error_attr) for line in error_lines]
+    visible, _clamped, has_older, _has_newer, total = scrollable_pane_item_view(
+        items,
+        width,
+        visible_rows,
+        0,
+        default_attr=muted_attr,
+    )
+    if has_older and visible:
+        visible[0] = ('^ older errors above', muted_attr)
+    return visible, has_older, total
+
+
 def build_benchmark_progress_items(
     model: ModelConfig,
     state: Dict[str, object],
@@ -1019,6 +1059,72 @@ def draw_scrollable_items(
     for idx, (line, attr) in enumerate(visible[:rows]):
         safe_addstr(stdscr, y + 2 + idx, x + 2, str(line)[:width], attr)
     return clamped, total, rows
+
+
+def draw_logs_errors_split_tab(
+    stdscr,
+    y: int,
+    x: int,
+    h: int,
+    w: int,
+    error_lines: List[str],
+    log_lines: List[str],
+    log_scroll: int,
+    colors: Dict[str, int],
+) -> Tuple[int, int, int]:
+    rows = max(1, h - 3)
+    width = max(1, w - 4)
+    wrapped_errors = scrollable_pane_wrapped_items(
+        [(str(line), colors['error']) for line in error_lines],
+        width,
+        colors['error'],
+    ) if error_lines else []
+    error_rows, log_rows = logs_errors_split_rows(rows, len(wrapped_errors))
+
+    cursor_y = y + 2
+    if error_rows > 0:
+        if error_rows == 1:
+            latest = str(error_lines[-1]) if error_lines else 'Errors: none captured'
+            attr = colors['error'] if error_lines else colors['muted']
+            safe_addstr(stdscr, cursor_y, x + 2, ellipsize(latest, width), attr)
+        else:
+            title_attr = colors['error'] | curses.A_BOLD if error_lines else colors['muted']
+            safe_addstr(stdscr, cursor_y, x + 2, 'Errors', title_attr)
+            visible_errors, _has_older, _total_errors = latest_error_view_items(
+                error_lines,
+                width,
+                error_rows - 1,
+                error_attr=colors['error'],
+                muted_attr=colors['muted'],
+            )
+            for idx, (line, attr) in enumerate(visible_errors[: max(0, error_rows - 1)]):
+                safe_addstr(stdscr, cursor_y + 1 + idx, x + 2, str(line)[:width], attr)
+        cursor_y += error_rows
+
+    log_content_rows = max(0, log_rows - 1)
+    if log_rows <= 0:
+        return 0, 0, 1
+    safe_addstr(stdscr, cursor_y, x + 2, 'Logs', colors['accent'] | curses.A_BOLD)
+    log_items = [(str(line), curses.A_NORMAL) for line in log_lines] if log_lines else [('<no log lines>', colors['muted'])]
+    visible_logs, clamped, has_older, has_newer, total = scrollable_pane_item_view(
+        log_items,
+        width,
+        max(1, log_content_rows),
+        log_scroll,
+        default_attr=curses.A_NORMAL,
+    )
+    if log_content_rows <= 0:
+        return clamped, total, 1
+    if log_content_rows == 1 and has_older and has_newer:
+        visible_logs[0] = ('^ older / v newer', colors['muted'])
+    else:
+        if has_older and visible_logs:
+            visible_logs[0] = ('^ older log lines above', colors['muted'])
+        if has_newer and visible_logs:
+            visible_logs[-1] = ('v newer log lines below', colors['muted'])
+    for idx, (line, attr) in enumerate(visible_logs[:log_content_rows]):
+        safe_addstr(stdscr, cursor_y + 1 + idx, x + 2, str(line)[:width], attr)
+    return clamped, total, max(1, log_content_rows)
 
 
 def draw_tabbed_panel(
@@ -2051,6 +2157,7 @@ def tui(stdscr, app: AppConfig):
             if view_mode == 'detail' and status in ('ERROR', 'STOPPED') and error_text:
                 log_lines = important_log_excerpt(app.logfile(model.id), max_lines=400, after_last_launch=True)
             right_items: List[Tuple[str, int]] = []
+            right_logs_errors: Optional[Tuple[List[str], List[str]]] = None
 
             if view_mode == 'detail':
                 benchmark_score = float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0)
@@ -2071,14 +2178,7 @@ def tui(stdscr, app: AppConfig):
                         (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
                     ]
                 elif right_active_tab == 'logs_errors':
-                    right_items = build_logs_errors_items(
-                        error_source_lines,
-                        log_lines,
-                        error_attr=colors['error'],
-                        log_attr=curses.A_NORMAL,
-                        heading_attr=colors['accent'] | curses.A_BOLD,
-                        muted_attr=colors['muted'],
-                    )
+                    right_logs_errors = (error_source_lines, log_lines)
                 elif right_active_tab == 'command':
                     right_items = [
                         ('command preview:', colors['accent'] | curses.A_BOLD),
@@ -2155,14 +2255,7 @@ def tui(stdscr, app: AppConfig):
                         for line, kind in benchmark_command_lines(benchmark_state, right_content_w, BENCHMARK_COMMAND_LIMIT + 1)
                     ]
                 elif right_active_tab == 'logs_errors':
-                    right_items = build_logs_errors_items(
-                        error_source_lines,
-                        log_lines,
-                        error_attr=colors['error'],
-                        log_attr=curses.A_NORMAL,
-                        heading_attr=colors['accent'] | curses.A_BOLD,
-                        muted_attr=colors['muted'],
-                    )
+                    right_logs_errors = (error_source_lines, log_lines)
 
             elif view_mode == 'try':
                 if right_active_tab == 'profile':
@@ -2183,14 +2276,7 @@ def tui(stdscr, app: AppConfig):
                     if try_error:
                         right_items.append((f'error: {try_error}', colors['error'] | curses.A_BOLD))
                 elif right_active_tab == 'logs_errors':
-                    right_items = build_logs_errors_items(
-                        error_source_lines,
-                        log_lines,
-                        error_attr=colors['error'],
-                        log_attr=curses.A_NORMAL,
-                        heading_attr=colors['accent'] | curses.A_BOLD,
-                        muted_attr=colors['muted'],
-                    )
+                    right_logs_errors = (error_source_lines, log_lines)
                 elif right_active_tab == 'stats':
                     right_items = [
                         (line, colors['accent'] | curses.A_BOLD if line.startswith(('benchmark:', 'live:', 'last:')) else curses.A_NORMAL)
@@ -2241,20 +2327,34 @@ def tui(stdscr, app: AppConfig):
                     else:
                         right_items = [('No failures or break points in this run.', colors['success'] | curses.A_BOLD)]
 
-            if not right_items:
-                right_items = [(f'{RIGHT_TAB_LABELS.get(right_active_tab, "Tab")}: no content yet.', colors['muted'])]
-            right_scroll, right_tab_scroll_total, right_tab_scroll_rows = draw_scrollable_items(
-                stdscr,
-                box_top,
-                right_x,
-                right_panel_h,
-                right_w,
-                right_items,
-                right_scroll,
-                colors,
-                curses.A_NORMAL,
-            )
-            right_tab_scrolls[right_tab_key] = right_scroll
+            if right_logs_errors is not None:
+                right_scroll, right_tab_scroll_total, right_tab_scroll_rows = draw_logs_errors_split_tab(
+                    stdscr,
+                    box_top,
+                    right_x,
+                    right_panel_h,
+                    right_w,
+                    right_logs_errors[0],
+                    right_logs_errors[1],
+                    right_scroll,
+                    colors,
+                )
+                right_tab_scrolls[right_tab_key] = right_scroll
+            else:
+                if not right_items:
+                    right_items = [(f'{RIGHT_TAB_LABELS.get(right_active_tab, "Tab")}: no content yet.', colors['muted'])]
+                right_scroll, right_tab_scroll_total, right_tab_scroll_rows = draw_scrollable_items(
+                    stdscr,
+                    box_top,
+                    right_x,
+                    right_panel_h,
+                    right_w,
+                    right_items,
+                    right_scroll,
+                    colors,
+                    curses.A_NORMAL,
+                )
+                right_tab_scrolls[right_tab_key] = right_scroll
         elif active_model:
             model = active_model
             status, detail = statuses.get(model.id, ('?', ''))

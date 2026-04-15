@@ -119,6 +119,10 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(xdg[:3], ['xdg-terminal-exec', 'bash', '-lc'])
         self.assertIn('cd /tmp/project && echo hello', xdg)
 
+        ghostty = terminal_command_for_launcher('ghostty', 'OpenCode Tiny', Path('/tmp/project'), 'echo hello')
+        self.assertEqual(ghostty[:3], ['ghostty', '--title', 'OpenCode Tiny'])
+        self.assertIn('--working-directory', ghostty)
+
     def test_terminal_template_quotes_command(self):
         command = render_terminal_template(
             'xterm -T {title} -e bash -lc {cmd}',
@@ -127,6 +131,47 @@ class OpencodeStackHelperTests(unittest.TestCase):
             'echo hello && sleep 1',
         )
         self.assertEqual(command, ['xterm', '-T', 'OpenCode Tiny', '-e', 'bash', '-lc', 'echo hello && sleep 1'])
+
+    def test_custom_terminal_command_wins(self):
+        self.app.opencode.terminal_command = 'xterm -T {title} -e bash -lc {cmd}'
+        with patch.object(self.app, 'detect_terminal_launcher', return_value='/usr/bin/konsole'):
+            ok, command, label = self.app.build_terminal_command('OpenCode Tiny', Path('/tmp/project'), 'echo hello')
+
+        self.assertTrue(ok)
+        self.assertEqual(label, 'custom')
+        self.assertEqual(command[:4], ['xterm', '-T', 'OpenCode Tiny', '-e'])
+
+    def test_local_terminal_route(self):
+        with patch.object(self.app, 'detect_terminal_launcher', return_value='/usr/bin/konsole'):
+            ok, command, label = self.app.build_terminal_command('OpenCode Tiny', Path('/tmp/project'), 'echo hello')
+
+        self.assertTrue(ok)
+        self.assertEqual(label, 'local:konsole')
+        self.assertEqual(command[:2], ['/usr/bin/konsole', '--workdir'])
+
+    def test_host_terminal_route_reenters_container(self):
+        with patch.object(self.app, 'detect_terminal_launcher', return_value=None):
+            with patch.object(self.app, 'detect_host_terminal_launcher', return_value=('/usr/bin/host-spawn', 'konsole')):
+                with patch('llama_tui.app.container_environment_detected', return_value=True):
+                    with patch('llama_tui.app.current_container_name', return_value='my-distrobox'):
+                        ok, command, label = self.app.build_terminal_command('OpenCode Tiny', Path('/tmp/project'), 'echo hello')
+
+        self.assertTrue(ok)
+        self.assertEqual(label, 'host:host-spawn/konsole')
+        self.assertEqual(command[:3], ['/usr/bin/host-spawn', '-no-pty', 'konsole'])
+        self.assertIn('distrobox enter my-distrobox', ' '.join(command))
+
+    def test_host_terminal_failure_is_explicit(self):
+        with patch.object(self.app, 'detect_terminal_launcher', return_value=None):
+            with patch.object(self.app, 'detect_host_terminal_launcher', return_value=('/usr/bin/host-spawn', None)):
+                with patch('llama_tui.app.container_environment_detected', return_value=True):
+                    ok, command, message = self.app.build_terminal_command('OpenCode Tiny', Path('/tmp/project'), 'echo hello')
+
+        self.assertFalse(ok)
+        self.assertEqual(command, [])
+        self.assertIn('No terminal launcher was visible', message)
+        self.assertIn('Host bridge host-spawn is available', message)
+        self.assertIn('opencode.terminal_command', message)
 
     def test_opencode_shell_command_uses_config_and_model(self):
         self.app.opencode.path = '/tmp/opencode.json'
