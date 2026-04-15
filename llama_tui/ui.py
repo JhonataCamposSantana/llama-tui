@@ -288,10 +288,86 @@ def benchmark_row_text(record: Dict[str, object]) -> str:
     parallel = int(record.get('parallel', 0) or 0)
     slot = int(record.get('ctx_per_slot', 0) or 0) or (ctx // max(1, parallel or 1))
     status = str(record.get('status', '-') or '-')
+    suffix_parts = []
+    scan_level = str(record.get('scan_level', '') or '')
+    if scan_level:
+        suffix_parts.append(scan_level)
+    if 'exit_code' in record:
+        suffix_parts.append(f'exit={int(record.get("exit_code", -1) or -1)}')
+    timeout_type = str(record.get('timeout_type', '') or '')
+    if timeout_type:
+        suffix_parts.append(f'timeout={timeout_type}')
+    context_required = int(record.get('context_required', 0) or 0)
+    if context_required:
+        suffix_parts.append(f'needs~{context_required}tok')
+    suffix = (' ' + ' '.join(suffix_parts)) if suffix_parts else ''
     return (
         f'{label[:18]:18} {score:7.2f} {score_label:5} {seconds:6.1f}s '
-        f'ctx={ctx:<6} slot={slot:<6} par={parallel:<2} {status}'
+        f'ctx={ctx:<6} slot={slot:<6} par={parallel:<2} {status}{suffix}'
     )
+
+
+def benchmark_runs_for_model(model: ModelConfig) -> List[Dict[str, object]]:
+    runs = list(getattr(model, 'benchmark_runs', []) or [])
+    if runs:
+        return runs
+    rows = list(getattr(model, 'last_benchmark_results', []) or [])
+    if not rows:
+        return []
+    return [{
+        'id': 'legacy-latest',
+        'kind': 'server',
+        'status': getattr(model, 'default_benchmark_status', '') or 'done',
+        'summary': getattr(model, 'last_benchmark_profile', '') or 'legacy benchmark',
+        'records': rows,
+        'winners': getattr(model, 'measured_profiles', {}) or {},
+        'started_at': getattr(model, 'default_benchmark_at', '') or '',
+        'ended_at': getattr(model, 'default_benchmark_at', '') or '',
+        'elapsed_seconds': float(getattr(model, 'last_benchmark_seconds', 0.0) or 0.0),
+    }]
+
+
+def benchmark_run_line(run: Dict[str, object], index: int, selected: bool = False) -> str:
+    marker = '>' if selected else ' '
+    status = str(run.get('status', '-') or '-')[:8]
+    run_id = str(run.get('id', f'run-{index + 1}') or f'run-{index + 1}')
+    summary = str(run.get('summary', '') or 'no summary')
+    return f'{marker} {index + 1:02d} {status:8} {run_id[:18]:18} {summary}'
+
+
+def benchmark_ranking_rows(run: Dict[str, object]) -> List[str]:
+    winners = run.get('winners') or {}
+    records = list(run.get('records', []) or [])
+    lines: List[str] = []
+    for key, title in (
+        ('fast_chat', 'Fast Chat'),
+        ('long_context', 'Long Context'),
+        ('opencode_ready', 'OpenCode-ready'),
+        ('auto', 'Auto'),
+    ):
+        winner = winners.get(key) if isinstance(winners, dict) else {}
+        if isinstance(winner, dict) and winner:
+            lines.append(
+                f'{title}: ctx={int(winner.get("ctx", 0) or 0)} '
+                f'slot={int(winner.get("ctx_per_slot", 0) or 0)} '
+                f'par={int(winner.get("parallel", 0) or 0)} '
+                f'{float(winner.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s'
+            )
+        else:
+            lines.append(f'{title}: not measured')
+    failed = [row for row in records if row.get('status') != 'ok']
+    if failed:
+        lines.append('')
+        lines.append('Failed / break points:')
+        for row in failed[:8]:
+            status = str(row.get('status', '-') or '-')
+            marker = 'break' if row.get('break_point') else 'fail'
+            detail = compact_message(str(row.get('detail', '') or ''))
+            lines.append(
+                f'{marker}: {row.get("objective", "-")} {row.get("variant", "-")} '
+                f'ctx={row.get("ctx", 0)} par={row.get("parallel", 0)} {status} {detail}'
+            )
+    return lines
 
 
 def reduce_benchmark_event(
@@ -670,6 +746,7 @@ def tui(stdscr, app: AppConfig):
     try_live_metrics = new_try_live_metrics()
     try_input_scroll = 0
     benchmark_state = new_benchmark_run_state()
+    results_run_index = 0
 
     def action_running() -> bool:
         return action_thread is not None and action_thread.is_alive()
@@ -756,7 +833,7 @@ def tui(stdscr, app: AppConfig):
         return app.models[idx]
 
     def active_detail_model() -> Optional[ModelConfig]:
-        if view_mode in ('detail', 'try', 'benchmark') and detail_model_id:
+        if view_mode in ('detail', 'try', 'benchmark', 'results') and detail_model_id:
             return app.get_model(detail_model_id) or selected_model()
         return selected_model()
 
@@ -843,6 +920,14 @@ def tui(stdscr, app: AppConfig):
 
         try_thread = threading.Thread(target=runner, daemon=True)
         try_thread.start()
+
+    def open_results_view(model: ModelConfig):
+        nonlocal view_mode, detail_model_id, message, results_run_index
+        view_mode = 'results'
+        detail_model_id = model.id
+        results_run_index = 0
+        run_count = len(benchmark_runs_for_model(model))
+        message = f'{model.id}: {run_count} benchmark result run(s).'
 
     def start_try_chat_send():
         nonlocal message, try_thread, try_token, try_input, try_input_scroll, try_status, try_error, try_response_index, try_messages
@@ -1083,7 +1168,7 @@ def tui(stdscr, app: AppConfig):
 
         if app.models:
             selected = max(0, min(selected, len(app.models) - 1))
-            if view_mode in ('detail', 'try', 'benchmark'):
+            if view_mode in ('detail', 'try', 'benchmark', 'results'):
                 current_detail = app.get_model(detail_model_id)
                 if not current_detail:
                     detail_model_id = app.models[selected].id
@@ -1174,6 +1259,7 @@ def tui(stdscr, app: AppConfig):
         status_error = f'{active_model.id}: status ERROR ({active_status[1]})' if active_model and active_status[0] == 'ERROR' else ''
         try_mode = view_mode == 'try'
         benchmark_mode = view_mode == 'benchmark'
+        results_mode = view_mode == 'results'
         benchmark_errors = list(benchmark_state.get('errors', []) or [])
         error_text = '\n'.join(str(item) for item in benchmark_errors[-6:]) if benchmark_mode and benchmark_errors else (last_error_message or status_error)
         error_lines = wrap_display_lines(error_text, right_w - 4) if error_text else ['No errors captured.']
@@ -1181,6 +1267,8 @@ def tui(stdscr, app: AppConfig):
             error_box_h = 0
         elif benchmark_mode:
             error_box_h = max(4, min(8, right_total_h // 4)) if right_total_h >= 14 else 0
+        elif results_mode:
+            error_box_h = 0
         elif right_total_h >= 14:
             desired_error_h = min(max(5, len(error_lines) + 3), 14)
             error_box_h = min(desired_error_h, max(5, right_total_h - 8))
@@ -1227,7 +1315,7 @@ def tui(stdscr, app: AppConfig):
             logs_box_y = box_top
             error_box_y = box_top + logs_box_h + 1
 
-        left_title = 'Try It Out' if try_mode else 'Benchmark' if benchmark_mode else 'Model Details' if view_mode == 'detail' else 'Models'
+        left_title = 'Try It Out' if try_mode else 'Benchmark' if benchmark_mode else 'Results' if results_mode else 'Model Details' if view_mode == 'detail' else 'Models'
         draw_box(stdscr, box_top, 1, h - box_top - 4, left_w, left_title, colors['accent'] | curses.A_BOLD, colors['accent'])
         if try_mode:
             draw_box(stdscr, box_top, right_x, profile_box_h, right_w, 'Active Test Profile', colors['accent'] | curses.A_BOLD, colors['accent'])
@@ -1237,12 +1325,41 @@ def tui(stdscr, app: AppConfig):
         elif benchmark_mode:
             draw_box(stdscr, box_top, right_x, profile_box_h, right_w, 'Benchmark Progress', colors['accent'] | curses.A_BOLD, colors['accent'])
             draw_box(stdscr, logs_box_y, right_x, logs_box_h, right_w, 'Benchmark Logs', colors['accent'] | curses.A_BOLD, colors['accent'])
+        elif results_mode:
+            draw_box(stdscr, box_top, right_x, logs_box_h, right_w, 'Run Rankings', colors['accent'] | curses.A_BOLD, colors['accent'])
         else:
             draw_box(stdscr, box_top, right_x, logs_box_h, right_w, 'Details / Logs / Roles', colors['accent'] | curses.A_BOLD, colors['accent'])
         if error_box_h:
             draw_box(stdscr, error_box_y, right_x, error_box_h, right_w, 'Errors', colors['error'] | curses.A_BOLD, colors['error'])
 
-        if view_mode == 'benchmark' and active_model:
+        if view_mode == 'results' and active_model:
+            model = active_model
+            runs = benchmark_runs_for_model(model)
+            if runs:
+                results_run_index = max(0, min(results_run_index, len(runs) - 1))
+            content_h = max(1, h - box_top - 7)
+            header_lines = [
+                (f'model: {model.name or model.id}', curses.A_BOLD),
+                (f'runs: {len(runs)} latest benchmark run(s)', colors['accent'] | curses.A_BOLD),
+                ('[Up/Down] select run   [Esc] details', colors['muted']),
+                ('', curses.A_NORMAL),
+            ]
+            y_cursor = box_top + 2
+            for line, attr in header_lines[:content_h]:
+                stdscr.addstr(y_cursor, 3, line[: left_w - 5], attr)
+                y_cursor += 1
+            if not runs:
+                stdscr.addstr(y_cursor, 3, 'No benchmark history yet. Press B from details to run one.', colors['warning'])
+            else:
+                visible = runs[: max(1, content_h - len(header_lines))]
+                for idx, run in enumerate(visible):
+                    if y_cursor >= box_top + 2 + content_h:
+                        break
+                    line = benchmark_run_line(run, idx, selected=(idx == results_run_index))
+                    attr = colors['selection'] | curses.A_BOLD if idx == results_run_index else curses.A_NORMAL
+                    stdscr.addstr(y_cursor, 3, ellipsize(line, left_w - 5), attr)
+                    y_cursor += 1
+        elif view_mode == 'benchmark' and active_model:
             model = active_model
             run_kind = str(benchmark_state.get('run_kind') or 'server')
             status_text = str(benchmark_state.get('status') or 'idle')
@@ -1384,7 +1501,7 @@ def tui(stdscr, app: AppConfig):
                 opencode_summary = 'not run yet; press O for opencode workflow'
             hardware = app.hardware_profile().short_summary()
             detail_rows = [
-                ('[Esc] back   [Enter/l] actions   [T] try   [B] server bench   [O] opencode bench   [z] auto profile', colors['accent'] | curses.A_BOLD),
+                ('[Esc] back   [Enter/l] actions   [T] try   [B] server bench   [O] opencode bench   [R] results   [z] auto profile', colors['accent'] | curses.A_BOLD),
                 ('', curses.A_NORMAL),
                 (f'name: {model.name}', curses.A_BOLD),
                 (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
@@ -1522,7 +1639,35 @@ def tui(stdscr, app: AppConfig):
         else:
             stdscr.addstr(box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
 
-        if active_model and view_mode == 'benchmark':
+        if active_model and view_mode == 'results':
+            model = active_model
+            runs = benchmark_runs_for_model(model)
+            if runs:
+                results_run_index = max(0, min(results_run_index, len(runs) - 1))
+                run = runs[results_run_index]
+                lines = [
+                    f'run: {run.get("id", "-")}',
+                    f'status: {run.get("status", "-")}  kind: {run.get("kind", "-")}',
+                    f'started: {run.get("started_at", "-")}',
+                    f'ended: {run.get("ended_at", "-")}',
+                    f'elapsed: {float(run.get("elapsed_seconds", 0.0) or 0.0):.1f}s',
+                    f'summary: {run.get("summary", "no summary")}',
+                    '',
+                    'winners and ranking:',
+                ]
+                lines.extend(benchmark_ranking_rows(run))
+            else:
+                lines = ['No benchmark run selected.']
+            for i, line in enumerate(lines[: max(1, logs_box_h - 3)]):
+                attr = curses.A_NORMAL
+                if line.startswith(('run:', 'winners')):
+                    attr = colors['accent'] | curses.A_BOLD
+                elif line.startswith(('Fast Chat:', 'Long Context:', 'OpenCode-ready:', 'Auto:')):
+                    attr = colors['success'] | curses.A_BOLD if 'not measured' not in line else colors['warning']
+                elif line.startswith(('break:', 'fail:')):
+                    attr = colors['error']
+                stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
+        elif active_model and view_mode == 'benchmark':
             model = active_model
             status, detail = statuses.get(model.id, ('?', ''))
             completed = int(benchmark_state.get('completed', 0) or 0)
@@ -1634,10 +1779,13 @@ def tui(stdscr, app: AppConfig):
             footer = '[Enter] send  [Up/Down] scroll input  [Ctrl+U] clear  [Esc] stop model + exit'
             footer2 = 'Prompt editor shows 5 wrapped rows. Transcript is temporary.'
         elif view_mode == 'benchmark':
-            footer = '[Esc] details  [A] abort active benchmark'
+            footer = '[Esc] details  [R] results  [A] abort active benchmark'
             footer2 = 'Dashboard shows measured tradeoffs: possible, fastest, ideal, highest context, and OpenCode-ready.'
+        elif view_mode == 'results':
+            footer = '[Esc] details  [Up/Down] select benchmark run'
+            footer2 = 'Results keep the latest 10 runs with winners, runner-ups, failures, and break points.'
         elif view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] actions  [T] try it out  [B] server bench  [O] opencode bench  [z] auto profile'
+            footer = '[Esc] models  [Enter/l] actions  [T] try  [B] server bench  [O] opencode bench  [R] results  [z] auto'
             footer2 = '[m/s/b/p] roles  [g] gen opencode  [S] stop-all  [q] quit'
         else:
             footer = '[Enter] details  [z] auto profile  [B] benchmark best  [x] detect  [X] prune'
@@ -1699,7 +1847,21 @@ def tui(stdscr, app: AppConfig):
                 action_token.cancel('user requested abort')
             message = '⏳ Aborting active action and cleaning up managed processes...'
             continue
-        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, ord('j'), ord('k'), 27, curses.KEY_BACKSPACE, 127, 8):
+        if view_mode == 'results':
+            if key in (27, curses.KEY_BACKSPACE, 127, 8):
+                view_mode = 'detail'
+                message = 'Back to model details.'
+                continue
+            if key in (curses.KEY_UP, ord('k'), curses.KEY_DOWN, ord('j')):
+                model = active_detail_model()
+                runs = benchmark_runs_for_model(model) if model else []
+                if runs:
+                    if key in (curses.KEY_UP, ord('k')):
+                        results_run_index = max(0, results_run_index - 1)
+                    else:
+                        results_run_index = min(len(runs) - 1, results_run_index + 1)
+                continue
+        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, ord('j'), ord('k'), ord('R'), 27, curses.KEY_BACKSPACE, 127, 8):
             message = '⏳ Action is running. Watch the log window; controls unlock when it finishes.'
             continue
         if view_mode == 'benchmark' and key in (27, curses.KEY_BACKSPACE, 127, 8):
@@ -1747,6 +1909,10 @@ def tui(stdscr, app: AppConfig):
             model = active_detail_model()
             if model:
                 open_try_view(model)
+        elif key == ord('R') and app.models and view_mode in ('detail', 'benchmark', 'results'):
+            model = active_detail_model()
+            if model:
+                open_results_view(model)
         elif key == ord('z') and app.models:
             model = active_detail_model()
             if not model:
@@ -1767,7 +1933,7 @@ def tui(stdscr, app: AppConfig):
                 continue
             start_background_action(
                 model,
-                'adaptive benchmark profiles',
+                'coarse-to-fine benchmark profiles',
                 lambda progress, token, model=model: benchmark_best_optimization(
                     app,
                     model,

@@ -7,7 +7,10 @@ from llama_tui.models import ModelConfig
 from llama_tui.ui import (
     benchmark_elapsed_text,
     benchmark_progress_fraction,
+    benchmark_ranking_rows,
     benchmark_row_text,
+    benchmark_run_line,
+    benchmark_runs_for_model,
     build_try_live_stat_lines,
     finish_try_live_metrics,
     new_try_live_metrics,
@@ -261,6 +264,9 @@ class BenchmarkDashboardTests(unittest.TestCase):
             'ctx_per_slot': 32768,
             'parallel': 1,
             'status': 'ok',
+            'scan_level': 'knee_refine',
+            'exit_code': 0,
+            'context_required': 9616,
         })
 
         self.assertIn('Highest Context', row)
@@ -268,6 +274,56 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('ctx=32768', row)
         self.assertIn('slot=32768', row)
         self.assertIn('ok', row)
+        self.assertIn('knee_refine', row)
+        self.assertIn('needs~9616tok', row)
+
+    def test_benchmark_runs_for_model_falls_back_to_legacy_rows(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny',
+            path='tiny.gguf',
+            alias='tiny',
+            port=18080,
+            last_benchmark_profile='auto/exhaustive 12 tok/s',
+            last_benchmark_results=[{'status': 'ok', 'ctx': 2048}],
+        )
+
+        runs = benchmark_runs_for_model(model)
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]['id'], 'legacy-latest')
+        self.assertIn('auto/exhaustive', runs[0]['summary'])
+
+    def test_results_run_line_and_ranking_rows(self):
+        run = {
+            'id': 'server-1',
+            'status': 'done',
+            'summary': 'fast=12.00 tok/s',
+            'winners': {
+                'fast_chat': {'ctx': 4096, 'ctx_per_slot': 2048, 'parallel': 2, 'tokens_per_sec': 40.0},
+                'long_context': {'ctx': 32768, 'ctx_per_slot': 32768, 'parallel': 1, 'tokens_per_sec': 12.0},
+            },
+            'records': [
+                {'status': 'ok', 'objective': 'fast_chat', 'ctx': 4096, 'parallel': 2},
+                {
+                    'status': 'start failed',
+                    'objective': 'long_context',
+                    'variant': 'default',
+                    'ctx': 34816,
+                    'parallel': 1,
+                    'break_point': True,
+                    'detail': 'oom',
+                },
+            ],
+        }
+
+        self.assertIn('server-1', benchmark_run_line(run, 0, selected=True))
+        lines = '\n'.join(benchmark_ranking_rows(run))
+
+        self.assertIn('Fast Chat:', lines)
+        self.assertIn('Long Context:', lines)
+        self.assertIn('Failed / break points:', lines)
+        self.assertIn('break:', lines)
 
 
 if __name__ == '__main__':

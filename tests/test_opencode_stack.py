@@ -4,18 +4,31 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from llama_tui.app import AppConfig, render_terminal_template, terminal_command_for_launcher
 from llama_tui.benchmark import (
     adaptive_context_search,
+    adaptive_record_from_candidate,
     annotate_spectrum_records,
     apply_measured_profile,
+    benchmark_exhaustive_candidate_with_retry,
+    benchmark_exhaustive_profiles,
+    break_refinement_contexts,
+    build_benchmark_run,
+    context_knee_refinement_contexts,
+    exhaustive_context_ladder,
+    exhaustive_parallel_values,
     model_from_measured_profile,
+    parallel_refinement_values,
     parse_context_requirement,
     safe_bootstrap_candidate_models,
     select_adaptive_candidate_mix,
     select_measured_profiles,
+    upsert_benchmark_run,
 )
 from llama_tui.control import CancelToken
 from llama_tui.discovery import detected_model_from_path
@@ -23,11 +36,13 @@ from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
 from llama_tui.opencode_benchmark import (
     build_opencode_run_command,
+    compact_sample_details,
     ctx_per_slot,
     detected_unittest_command,
     isolated_opencode_env,
     opencode_candidate_models,
     run_process_with_metrics,
+    sample_timeout_type,
     score_opencode_samples,
 )
 
@@ -60,6 +75,7 @@ class OpencodeStackHelperTests(unittest.TestCase):
             path=__file__,
             alias='tiny-local',
             port=18080,
+            runtime='vllm',
         )
 
     def tearDown(self):
@@ -129,6 +145,33 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertIn('--dangerously-skip-permissions', command)
         self.assertIn('--print-logs', command)
         self.assertIn('--log-level', command)
+        self.assertNotIn('xterm', command)
+
+    def test_opencode_sample_details_keep_headless_process_diagnostics(self):
+        sample = {
+            'task': 'fix_calc',
+            'command_preview': 'opencode run --pure --dir /tmp/work fix',
+            'status': 'opencode no output timeout',
+            'ok': False,
+            'tests_ok': False,
+            'exit_code': -9,
+            'timed_out': True,
+            'no_output_timeout': True,
+            'idle_output_timeout': False,
+            'unittest_command_seen': False,
+            'context_required': 9616,
+            'stdout_tail': ['stdout line'],
+            'stderr_tail': ['stderr line'],
+        }
+
+        details = compact_sample_details([sample])
+
+        self.assertEqual(sample_timeout_type(sample), 'no_output')
+        self.assertEqual(details[0]['command_preview'], sample['command_preview'])
+        self.assertEqual(details[0]['exit_code'], -9)
+        self.assertEqual(details[0]['timeout_type'], 'no_output')
+        self.assertEqual(details[0]['context_required'], 9616)
+        self.assertEqual(details[0]['stderr_tail'], ['stderr line'])
 
     def test_isolated_opencode_env(self):
         home = Path(self.tmp.name) / 'home'
@@ -160,6 +203,37 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(loaded.benchmark_fingerprint, 'abc123')
         self.assertEqual(loaded.default_benchmark_status, 'done')
         self.assertEqual(loaded.default_benchmark_at, '2026-04-14T12:00:00')
+        self.assertEqual(loaded.benchmark_runs, [])
+
+    def test_benchmark_runs_round_trip_and_trim(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny Model',
+            path=__file__,
+            alias='tiny-local',
+            port=18080,
+            runtime='vllm',
+        )
+        for idx in range(12):
+            upsert_benchmark_run(
+                model,
+                build_benchmark_run(
+                    f'run-{idx}',
+                    'server',
+                    'done',
+                    [],
+                    {},
+                    f'2026-04-14T12:00:{idx:02d}',
+                ),
+            )
+        self.app.add_or_update(model)
+
+        loaded = AppConfig(self.config_path).get_model('tiny')
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(len(loaded.benchmark_runs), 10)
+        self.assertEqual(loaded.benchmark_runs[0]['id'], 'run-11')
+        self.assertEqual(loaded.benchmark_runs[-1]['id'], 'run-2')
 
     def test_measured_profiles_round_trip_and_apply(self):
         model = ModelConfig(
@@ -306,6 +380,136 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertGreater(min(failures), max(successes))
         self.assertGreater(len(probed), 3)
 
+    def test_exhaustive_context_ladder_uses_tiered_steps(self):
+        self.assertEqual(exhaustive_context_ladder(2048, 8192), [2048, 4096, 6144, 8192])
+        self.assertEqual(
+            exhaustive_context_ladder(2048, 81920),
+            [
+                2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384,
+                20480, 24576, 28672, 32768, 36864, 40960, 45056, 49152,
+                53248, 57344, 61440, 65536, 73728, 81920,
+            ],
+        )
+        self.assertEqual(exhaustive_context_ladder(3000, 7600), [3000, 5048, 7096, 7600])
+
+    def test_break_and_knee_context_refinement_helpers(self):
+        self.assertEqual(break_refinement_contexts(20480, 32768, {20480, 32768}), [22528, 24576, 26624, 28672, 30720])
+        records = [
+            {'status': 'ok', 'ctx': 2048, 'ctx_per_slot': 2048, 'tokens_per_sec': 80.0},
+            {'status': 'ok', 'ctx': 8192, 'ctx_per_slot': 8192, 'tokens_per_sec': 40.0},
+        ]
+        self.assertEqual(context_knee_refinement_contexts(records, {2048, 8192}, 8192), [5120])
+
+    def test_exhaustive_parallel_values_are_power_of_two_and_refined(self):
+        profile = HardwareProfile(cpu_logical=20, cpu_physical=10, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        self.assertEqual(exhaustive_parallel_values(profile), [1, 2, 4, 8, 16])
+        self.assertEqual(parallel_refinement_values(profile, 4, {1, 2, 4, 8, 16}), [3, 5])
+
+    def test_exhaustive_candidate_retries_and_marks_break_point(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx_max=8192)
+
+        class FakeApp:
+            def __init__(self):
+                self.starts = 0
+
+            def start(self, _candidate):
+                self.starts += 1
+                return False, 'boom'
+
+            def stop(self, _candidate, managed_only=True):
+                return True, 'stopped'
+
+            def hardware_profile(self, refresh=False):
+                return profile
+
+        ok, broke, records, measured, completed = benchmark_exhaustive_candidate_with_retry(
+            FakeApp(),
+            model,
+            profile,
+            'long_context',
+            4096,
+            1,
+            'default',
+            None,
+            None,
+            0,
+            10,
+        )
+
+        self.assertFalse(ok)
+        self.assertTrue(broke)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(measured, [])
+        self.assertEqual(completed, 2)
+        self.assertFalse(records[0]['break_point'])
+        self.assertTrue(records[1]['break_point'])
+
+    def test_exhaustive_profiles_keep_long_and_fast_after_opencode_break(self):
+        profile = HardwareProfile(cpu_logical=2, cpu_physical=1, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path=__file__,
+            alias='m',
+            port=18200,
+            runtime='vllm',
+            ctx_min=2048,
+            ctx_max=6144,
+            output=256,
+        )
+        calls = []
+
+        class FakeApp:
+            opencode = SimpleNamespace(path='')
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return profile
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, model):
+                self.saved.append(model)
+
+        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token):
+            calls.append((objective, candidate.ctx, candidate.parallel))
+            if objective == 'opencode_ready':
+                return adaptive_record_from_candidate(candidate, objective, 'start failed', detail='context too small'), None
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=100.0 / max(1, candidate.parallel),
+                seconds=1.0,
+            )
+            measured = dict(record)
+            measured['model'] = ModelConfig(**asdict(candidate))
+            return record, measured
+
+        with patch('llama_tui.benchmark.benchmark_adaptive_candidate', side_effect=fake_benchmark):
+            ok, msg = benchmark_exhaustive_profiles(FakeApp(), model)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(
+            [ctx for objective, ctx, _parallel in calls if objective == 'long_context'],
+            [2048, 4096, 6144],
+        )
+        self.assertEqual(
+            [ctx for objective, ctx, _parallel in calls if objective == 'opencode_ready'],
+            [2048, 2048],
+        )
+        self.assertIn(('fast_chat', 6144, 1), calls)
+
     def test_adaptive_candidate_mix_keeps_each_spectrum_objective(self):
         items = []
         for ctx in (2048, 4096, 8192, 16384):
@@ -358,6 +562,23 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertIn('Ideal', labels)
         self.assertIn('Highest Context', labels)
         self.assertIn('OpenCode-ready', labels)
+        self.assertIn('Winner', labels)
+
+    def test_annotates_failed_and_breakpoint_rows(self):
+        records = [
+            {'status': 'ok', 'objective': 'fast_chat', 'tokens_per_sec': 80.0, 'ctx': 4096, 'ctx_per_slot': 4096, 'parallel': 1},
+            {'status': 'start failed', 'objective': 'long_context', 'tokens_per_sec': 0.0, 'ctx': 6144, 'ctx_per_slot': 6144, 'parallel': 1, 'break_point': True},
+        ]
+
+        annotate_spectrum_records(records, {
+            'fast_chat': {'tokens_per_sec': 80.0, 'ctx': 4096, 'parallel': 1},
+            'long_context': {'tokens_per_sec': 80.0, 'ctx': 4096, 'parallel': 1},
+            'opencode_ready': {'tokens_per_sec': 80.0, 'ctx': 4096, 'parallel': 1},
+            'auto': {'tokens_per_sec': 80.0, 'ctx': 4096, 'parallel': 1},
+        })
+
+        self.assertIn('Failed', records[1]['spectrum_label'])
+        self.assertIn('Break Point', records[1]['spectrum_label'])
 
     def test_model_from_measured_profile(self):
         model = ModelConfig(

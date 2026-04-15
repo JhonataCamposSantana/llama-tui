@@ -37,6 +37,15 @@ ADAPTIVE_CONTEXT_ROUNDING = 256
 ADAPTIVE_BINARY_STEPS = 4
 ADAPTIVE_MAX_CONTEXT_PROBES = 12
 ADAPTIVE_MAX_MEASUREMENTS = 20
+EXHAUSTIVE_CONTEXT_STEP = 2048
+COARSE_CONTEXT_LOW_LIMIT = 16_384
+COARSE_CONTEXT_MID_LIMIT = 65_536
+COARSE_CONTEXT_LOW_STEP = 2_048
+COARSE_CONTEXT_MID_STEP = 4_096
+COARSE_CONTEXT_HIGH_STEP = 8_192
+CONTEXT_REFINE_STEP = 2_048
+CONTEXT_KNEE_ROUNDING = 1_024
+BENCHMARK_HISTORY_LIMIT = 10
 ADAPTIVE_PROFILE_KEYS = ('fast_chat', 'long_context', 'opencode_ready', 'auto')
 ADAPTIVE_RESERVE_BY_OBJECTIVE = {
     'fast_chat': 25,
@@ -57,6 +66,10 @@ SPECTRUM_LABELS = {
     'ideal': 'Ideal',
     'longest': 'Highest Context',
     'opencode': 'OpenCode-ready',
+    'winner': 'Winner',
+    'runner_up': 'Runner-up',
+    'failed': 'Failed',
+    'break_point': 'Break Point',
 }
 
 
@@ -365,6 +378,95 @@ def adaptive_context_search(
         run_probe(midpoint)
 
     return sorted(set(successes)), sorted(set(failures))
+
+
+def coarse_context_step(ctx: int) -> int:
+    ctx = max(1, int(ctx or 1))
+    if ctx < COARSE_CONTEXT_LOW_LIMIT:
+        return COARSE_CONTEXT_LOW_STEP
+    if ctx < COARSE_CONTEXT_MID_LIMIT:
+        return COARSE_CONTEXT_MID_STEP
+    return COARSE_CONTEXT_HIGH_STEP
+
+
+def exhaustive_context_ladder(ctx_min: int, ctx_max: int, step: int = EXHAUSTIVE_CONTEXT_STEP) -> List[int]:
+    ctx_min = max(1, int(ctx_min or 1))
+    ctx_max = max(ctx_min, int(ctx_max or ctx_min))
+    values = [ctx_min]
+    current = ctx_min
+    while current < ctx_max:
+        current = min(ctx_max, current + coarse_context_step(current))
+        if current != values[-1]:
+            values.append(current)
+    if values[-1] != ctx_max:
+        values.append(ctx_max)
+    return values
+
+
+def break_refinement_contexts(last_success_ctx: int, break_ctx: int, tested: set) -> List[int]:
+    last_success_ctx = int(last_success_ctx or 0)
+    break_ctx = int(break_ctx or 0)
+    if last_success_ctx <= 0 or break_ctx <= last_success_ctx + CONTEXT_REFINE_STEP:
+        return []
+    values = []
+    current = last_success_ctx + CONTEXT_REFINE_STEP
+    while current < break_ctx:
+        if current not in tested:
+            values.append(current)
+        current += CONTEXT_REFINE_STEP
+    return values
+
+
+def context_knee_refinement_contexts(
+    records: List[Dict[str, object]],
+    tested: set,
+    ctx_max: int,
+) -> List[int]:
+    successful = sorted(
+        [record for record in records if record.get('status') == 'ok'],
+        key=lambda record: int(record.get('ctx', 0) or 0),
+    )
+    if len(successful) < 2:
+        return []
+    ctx_max = max(1, int(ctx_max or 1))
+    max_tps = max(float(record.get('tokens_per_sec', 0.0) or 0.0) for record in successful) or 1.0
+    max_ctx = max(int(record.get('ctx_per_slot', 0) or record.get('ctx', 0) or 0) for record in successful) or 1
+    candidates = set()
+    scored = []
+    for idx in range(len(successful) - 1):
+        left = successful[idx]
+        right = successful[idx + 1]
+        left_ctx = int(left.get('ctx', 0) or 0)
+        right_ctx = int(right.get('ctx', 0) or 0)
+        gap = right_ctx - left_ctx
+        if gap <= CONTEXT_REFINE_STEP:
+            continue
+        left_tps = float(left.get('tokens_per_sec', 0.0) or 0.0)
+        right_tps = float(right.get('tokens_per_sec', 0.0) or 0.0)
+        drop = max(0.0, left_tps - right_tps) / max(left_tps, 1.0)
+        ctx_gain = gap / max(ctx_max, 1)
+        midpoint = round_context((left_ctx + right_ctx) // 2, CONTEXT_KNEE_ROUNDING)
+        if left_ctx < midpoint < right_ctx and midpoint not in tested:
+            if drop >= 0.18 or (drop >= 0.05 and ctx_gain >= 0.20):
+                candidates.add(midpoint)
+        left_score = 0.55 * (left_tps / max_tps) + 0.45 * (int(left.get('ctx_per_slot', left_ctx) or left_ctx) / max_ctx)
+        scored.append((left_score, idx))
+    last = successful[-1]
+    last_score = 0.55 * (float(last.get('tokens_per_sec', 0.0) or 0.0) / max_tps) + 0.45 * (
+        int(last.get('ctx_per_slot', last.get('ctx', 0)) or 0) / max_ctx
+    )
+    scored.append((last_score, len(successful) - 1))
+    if scored:
+        _score, best_idx = max(scored)
+        for neighbor_idx in (best_idx - 1, best_idx):
+            if 0 <= neighbor_idx < len(successful) - 1:
+                left_ctx = int(successful[neighbor_idx].get('ctx', 0) or 0)
+                right_ctx = int(successful[neighbor_idx + 1].get('ctx', 0) or 0)
+                if right_ctx - left_ctx > CONTEXT_REFINE_STEP:
+                    midpoint = round_context((left_ctx + right_ctx) // 2, CONTEXT_KNEE_ROUNDING)
+                    if left_ctx < midpoint < right_ctx and midpoint not in tested:
+                        candidates.add(midpoint)
+    return sorted(candidates)
 
 
 def adaptive_parallel_values(model: ModelConfig, profile: HardwareProfile, objective: str, ctx: int, variant: str) -> List[int]:
@@ -1001,6 +1103,7 @@ def adaptive_profile_dict(
         'jinja': bool(getattr(candidate, 'jinja', True)),
         'memory_reserve_percent': int(getattr(candidate, 'memory_reserve_percent', 25) or 25),
         'extra_args': list(getattr(candidate, 'extra_args', []) or []),
+        'variant': str(record.get('variant', '') or 'default'),
         'tokens_per_sec': round(float(record.get('tokens_per_sec', 0.0) or 0.0), 2),
         'seconds': round(float(record.get('seconds', 0.0) or 0.0), 2),
         'ram_available': int(record.get('ram_available', 0) or 0),
@@ -1101,6 +1204,9 @@ def record_matches_profile(record: Dict[str, object], profile: Dict[str, object]
     profile_parallel = int(profile.get('parallel', 1) or 1)
     if record_ctx != profile_ctx or record_parallel != profile_parallel:
         return False
+    profile_variant = str(profile.get('variant', '') or '')
+    if profile_variant and str(record.get('variant', '') or 'default') != profile_variant:
+        return False
     record_tps = float(record.get('tokens_per_sec', 0.0) or 0.0)
     profile_tps = float(profile.get('tokens_per_sec', 0.0) or 0.0)
     return abs(record_tps - profile_tps) < 0.05 or profile_tps <= 0
@@ -1119,6 +1225,11 @@ def annotate_spectrum_records(
     records: List[Dict[str, object]],
     winners: Dict[str, Dict[str, object]],
 ) -> List[Dict[str, object]]:
+    for record in records:
+        if record.get('status') != 'ok':
+            add_spectrum_label(record, 'failed')
+        if record.get('break_point'):
+            add_spectrum_label(record, 'break_point')
     successful = [record for record in records if record.get('status') == 'ok']
     if not successful:
         return records
@@ -1140,9 +1251,101 @@ def annotate_spectrum_records(
         profile = winners.get(key) or {}
         for record in successful:
             if record_matches_profile(record, profile):
+                add_spectrum_label(record, 'winner')
                 add_spectrum_label(record, label)
                 break
+    max_tps = max(float(item.get('tokens_per_sec', 0.0) or 0.0) for item in successful) or 1.0
+    max_ctx = max(int(item.get('ctx_per_slot', 0) or 0) for item in successful) or 1
+
+    def runner_pool(key: str) -> List[Dict[str, object]]:
+        if key == 'fast_chat':
+            return sorted(
+                [item for item in successful if item.get('objective') == 'fast_chat'],
+                key=lambda item: (float(item.get('tokens_per_sec', 0.0) or 0.0), int(item.get('ctx_per_slot', 0) or 0)),
+                reverse=True,
+            )
+        if key == 'long_context':
+            return sorted(
+                [item for item in successful if item.get('objective') == 'long_context'],
+                key=lambda item: (int(item.get('ctx_per_slot', 0) or 0), float(item.get('tokens_per_sec', 0.0) or 0.0)),
+                reverse=True,
+            )
+        if key == 'opencode_ready':
+            return sorted(
+                [item for item in successful if item.get('objective') == 'opencode_ready'],
+                key=lambda item: (int(item.get('ctx_per_slot', 0) or 0), float(item.get('tokens_per_sec', 0.0) or 0.0)),
+                reverse=True,
+            )
+        return sorted(
+            successful,
+            key=lambda item: (
+                0.55 * (float(item.get('tokens_per_sec', 0.0) or 0.0) / max_tps)
+                + 0.35 * (int(item.get('ctx_per_slot', 0) or 0) / max_ctx)
+            ),
+            reverse=True,
+        )
+
+    for key in ('fast_chat', 'long_context', 'opencode_ready', 'auto'):
+        profile = winners.get(key) or {}
+        runner_candidates = [item for item in runner_pool(key) if not record_matches_profile(item, profile)]
+        if runner_candidates:
+            add_spectrum_label(runner_candidates[0], 'runner_up')
     return records
+
+
+def benchmark_run_summary(winners: Dict[str, Dict[str, object]]) -> str:
+    if not winners:
+        return 'no winners'
+    parts = []
+    fast = winners.get('fast_chat') or {}
+    long = winners.get('long_context') or {}
+    auto = winners.get('auto') or {}
+    if fast:
+        parts.append(f'fast={float(fast.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s')
+    if long:
+        parts.append(f'long={int(long.get("ctx_per_slot", 0) or 0)} ctx/slot')
+    if auto:
+        parts.append(f'auto={int(auto.get("ctx", 0) or 0)} ctx')
+    return ', '.join(parts) if parts else 'no winners'
+
+
+def upsert_benchmark_run(model: ModelConfig, run: Dict[str, object], limit: int = BENCHMARK_HISTORY_LIMIT):
+    run_id = str(run.get('id', '') or '')
+    existing = list(getattr(model, 'benchmark_runs', []) or [])
+    filtered = [item for item in existing if str(item.get('id', '') or '') != run_id]
+    filtered.insert(0, dict(run))
+    model.benchmark_runs = filtered[: max(1, int(limit or BENCHMARK_HISTORY_LIMIT))]
+
+
+def build_benchmark_run(
+    run_id: str,
+    kind: str,
+    status: str,
+    records: List[Dict[str, object]],
+    winners: Dict[str, Dict[str, object]],
+    started_at: str,
+    ended_at: str = '',
+    hardware: str = '',
+) -> Dict[str, object]:
+    successful = [row for row in records if row.get('status') == 'ok']
+    failed = [row for row in records if row.get('status') != 'ok']
+    elapsed = 0.0
+    for row in records:
+        elapsed += float(row.get('seconds', 0.0) or 0.0)
+    return {
+        'id': run_id,
+        'kind': kind,
+        'status': status,
+        'started_at': started_at,
+        'ended_at': ended_at,
+        'elapsed_seconds': round(elapsed, 2),
+        'records': [dict(row) for row in records],
+        'winners': {key: dict(value) for key, value in winners.items()},
+        'summary': benchmark_run_summary(winners),
+        'successful': len(successful),
+        'failed': len(failed),
+        'hardware': hardware,
+    }
 
 
 def adaptive_record_from_candidate(
@@ -1167,6 +1370,11 @@ def adaptive_record_from_candidate(
         'parallel': int(getattr(candidate, 'parallel', 0) or 0),
         'threads': int(getattr(candidate, 'threads', 0) or 0),
         'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+        'output': int(getattr(candidate, 'output', 0) or 0),
+        'cache_ram': int(getattr(candidate, 'cache_ram', 0) or 0),
+        'temp': float(getattr(candidate, 'temp', 0.7) or 0.7),
+        'memory_reserve_percent': int(getattr(candidate, 'memory_reserve_percent', 0) or 0),
+        'extra_args': list(getattr(candidate, 'extra_args', []) or []),
         'ram_available': int(ram_available or 0),
         'gpu_memory_free': int(gpu_memory_free or 0),
         'detail': concise_failure(detail, limit=500),
@@ -1414,6 +1622,543 @@ def adaptive_benchmark_candidates(
     return select_adaptive_candidate_mix(candidates, ADAPTIVE_MAX_MEASUREMENTS)
 
 
+def exhaustive_variants(model: ModelConfig, profile: HardwareProfile) -> List[str]:
+    variants = ['default']
+    if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' and profile.has_usable_gpu():
+        variants.append('q8_kv')
+    return variants
+
+
+def exhaustive_parallel_values(profile: HardwareProfile) -> List[int]:
+    max_parallel = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 1)))
+    values = []
+    parallel = 1
+    while parallel <= max_parallel:
+        values.append(parallel)
+        parallel *= 2
+    return values or [1]
+
+
+def parallel_refinement_values(profile: HardwareProfile, best_parallel: int, tested: set) -> List[int]:
+    max_parallel = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 1)))
+    best_parallel = max(1, int(best_parallel or 1))
+    values = []
+    for parallel in (best_parallel - 1, best_parallel + 1):
+        if 1 <= parallel <= max_parallel and parallel not in tested:
+            values.append(parallel)
+    return sorted(values)
+
+
+def candidate_safe_context_estimate(candidate: ModelConfig, profile: HardwareProfile) -> int:
+    ctx_min = max(256, int(getattr(candidate, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(candidate, 'ctx_max', 131072) or 131072))
+    return estimate_safe_context_for_profile(
+        candidate,
+        profile,
+        int(getattr(candidate, 'memory_reserve_percent', 30) or 30),
+        max(1, int(getattr(candidate, 'parallel', 1) or 1)),
+        ctx_min,
+        ctx_max,
+    )
+
+
+def enrich_exhaustive_record(
+    record: Dict[str, object],
+    candidate: ModelConfig,
+    variant: str,
+    retry_attempt: int,
+    estimated_safe_ctx: int,
+    scan_level: str = 'broad',
+    break_point: bool = False,
+) -> Dict[str, object]:
+    record['variant'] = variant
+    record['retry_attempt'] = retry_attempt
+    record['scan_level'] = scan_level
+    record['break_point'] = bool(break_point)
+    record['estimated_safe_ctx'] = int(estimated_safe_ctx or 0)
+    if estimated_safe_ctx and estimated_safe_ctx < int(getattr(candidate, 'ctx', 0) or 0):
+        detail = str(record.get('detail', '') or '')
+        suffix = f'estimate warned safe_ctx={estimated_safe_ctx}'
+        record['detail'] = concise_failure(f'{detail}; {suffix}' if detail else suffix, limit=500)
+    return record
+
+
+def emit_exhaustive_result(
+    progress: Optional[Callable[[object], None]],
+    model: ModelConfig,
+    record: Dict[str, object],
+    completed: int,
+    total: int,
+    candidate_label: str,
+):
+    emit_benchmark_event(
+        progress,
+        'benchmark_result',
+        model,
+        'server',
+        message=(
+            f'coarse-to-fine {record.get("objective")} {record.get("status")}: '
+            f'{float(record.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s '
+            f'ctx={record.get("ctx")} slot={record.get("ctx_per_slot")} '
+            f'par={record.get("parallel")} variant={record.get("variant")}'
+        ),
+        phase='measuring coarse-to-fine candidates',
+        completed=completed,
+        total=total,
+        candidate=candidate_label,
+        record=record,
+    )
+
+
+def benchmark_exhaustive_candidate_with_retry(
+    app: AppConfig,
+    base_model: ModelConfig,
+    profile: HardwareProfile,
+    objective: str,
+    ctx: int,
+    parallel: int,
+    variant: str,
+    progress: Optional[Callable[[object], None]],
+    cancel_token: Optional[CancelToken],
+    completed: int,
+    total: int,
+    scan_level: str = 'broad',
+) -> Tuple[bool, bool, List[Dict[str, object]], List[Dict[str, object]], int]:
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    candidate_label = f'{objective}/{variant}/{scan_level} ctx={ctx} par={parallel}'
+    for attempt in (1, 2):
+        check_cancelled(cancel_token)
+        candidate = configure_adaptive_candidate(base_model, profile, objective, ctx, parallel, variant)
+        estimated_safe_ctx = candidate_safe_context_estimate(candidate, profile)
+        if progress:
+            progress(
+                f'exhaustive candidate {candidate_label} attempt={attempt} '
+                f'estimated_safe_ctx={estimated_safe_ctx}'
+            )
+        emit_benchmark_event(
+            progress,
+            'benchmark_candidate',
+            base_model,
+            'server',
+            message=f'coarse-to-fine candidate {candidate_label} attempt={attempt}',
+            phase='measuring coarse-to-fine candidates',
+            completed=completed,
+            total=total,
+            candidate=candidate_label,
+        )
+        record, measured_item = benchmark_adaptive_candidate(app, candidate, objective, progress, cancel_token)
+        completed += 1
+        ok = record.get('status') == 'ok'
+        break_point = not ok and attempt == 2
+        enrich_exhaustive_record(record, candidate, variant, attempt, estimated_safe_ctx, scan_level=scan_level, break_point=break_point)
+        records.append(record)
+        if measured_item:
+            measured_item['variant'] = variant
+            measured_item['retry_attempt'] = attempt
+            measured_item['scan_level'] = scan_level
+            measured.append(measured_item)
+        emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label)
+        if ok:
+            return True, False, records, measured, completed
+        if attempt == 1 and progress:
+            progress(f'coarse-to-fine candidate {candidate_label} failed once; retrying to confirm break...')
+    return False, True, records, measured, completed
+
+
+def benchmark_exhaustive_profiles(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    status, _detail = app.health(model)
+    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
+        return False, '❌ Stop the model before running coarse-to-fine benchmark profiles.'
+
+    profile = app.hardware_profile(refresh=True)
+    started_at = datetime.now().isoformat(timespec='seconds')
+    run_id = f'server-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
+    contexts = exhaustive_context_ladder(ctx_min, ctx_max)
+    variants = exhaustive_variants(model, profile)
+    broad_parallel_count = len(exhaustive_parallel_values(profile))
+    total = max(1, len(variants) * len(contexts) * (2 + broad_parallel_count) * 2)
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    current: Optional[ModelConfig] = None
+    completed = 0
+
+    running_model = ModelConfig(**asdict(model))
+    running_model.default_benchmark_status = 'running'
+    running_run = build_benchmark_run(run_id, 'server', 'running', [], {}, started_at, hardware=profile.short_summary())
+    upsert_benchmark_run(running_model, running_run)
+    app.add_or_update(running_model)
+
+    start_msg = (
+        f'coarse-to-fine benchmark started: ctx={ctx_min}..{ctx_max}, '
+        f'steps={COARSE_CONTEXT_LOW_STEP}/{COARSE_CONTEXT_MID_STEP}/{COARSE_CONTEXT_HIGH_STEP}, '
+        f'variants={",".join(variants)}, {profile.short_summary()}'
+    )
+    if progress:
+        progress(start_msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_started',
+        model,
+        'server',
+        message=start_msg,
+        phase='starting',
+        completed=0,
+        total=total,
+    )
+
+    try:
+        for variant in variants:
+            check_cancelled(cancel_token)
+            variant_contexts: List[int] = []
+            context_levels: Dict[int, str] = {}
+            long_records: List[Dict[str, object]] = []
+            tested_contexts = set()
+            confirmed_break_ctx = 0
+            emit_benchmark_event(
+                progress,
+                'benchmark_phase',
+                model,
+                'server',
+                message=f'coarse long-context sweep {variant}',
+                phase=f'coarse long-context sweep {variant}',
+                completed=completed,
+                total=total,
+                candidate=variant,
+            )
+            for ctx in contexts:
+                check_cancelled(cancel_token)
+                current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, variant)
+                tested_contexts.add(ctx)
+                ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                    app,
+                    model,
+                    profile,
+                    'long_context',
+                    ctx,
+                    1,
+                    variant,
+                    progress,
+                    cancel_token,
+                    completed,
+                    total,
+                    scan_level='broad',
+                )
+                records.extend(new_records)
+                long_records.extend(new_records)
+                measured.extend(new_measured)
+                if not ok and broke:
+                    confirmed_break_ctx = ctx
+                    if progress:
+                        progress(f'coarse long-context sweep {variant} stopped at break ctx={ctx}')
+                    break
+                variant_contexts.append(ctx)
+                context_levels[ctx] = 'broad'
+
+            if progress:
+                progress(f'coarse-to-fine variant {variant} found {len(variant_contexts)} launchable context step(s)')
+            if not variant_contexts:
+                continue
+
+            if confirmed_break_ctx:
+                last_success_ctx = max(variant_contexts)
+                refine_contexts = break_refinement_contexts(last_success_ctx, confirmed_break_ctx, tested_contexts)
+                if refine_contexts:
+                    emit_benchmark_event(
+                        progress,
+                        'benchmark_phase',
+                        model,
+                        'server',
+                        message=f'break refinement {variant}: {last_success_ctx}..{confirmed_break_ctx}',
+                        phase=f'break refinement {variant}',
+                        completed=completed,
+                        total=total,
+                        candidate=variant,
+                    )
+                for ctx in refine_contexts:
+                    check_cancelled(cancel_token)
+                    current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, variant)
+                    tested_contexts.add(ctx)
+                    ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                        app,
+                        model,
+                        profile,
+                        'long_context',
+                        ctx,
+                        1,
+                        variant,
+                        progress,
+                        cancel_token,
+                        completed,
+                        total,
+                        scan_level='break_refine',
+                    )
+                    records.extend(new_records)
+                    long_records.extend(new_records)
+                    measured.extend(new_measured)
+                    if not ok and broke:
+                        confirmed_break_ctx = ctx
+                        if progress:
+                            progress(f'break refinement {variant} confirmed closer break ctx={ctx}')
+                        break
+                    variant_contexts.append(ctx)
+                    context_levels[ctx] = 'break_refine'
+
+            knee_contexts = context_knee_refinement_contexts(long_records, tested_contexts, ctx_max)
+            if knee_contexts:
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_phase',
+                    model,
+                    'server',
+                    message=f'knee refinement {variant}: {len(knee_contexts)} context(s)',
+                    phase=f'knee refinement {variant}',
+                    completed=completed,
+                    total=total,
+                    candidate=variant,
+                )
+            for ctx in knee_contexts:
+                check_cancelled(cancel_token)
+                current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, variant)
+                tested_contexts.add(ctx)
+                ok, _broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                    app,
+                    model,
+                    profile,
+                    'long_context',
+                    ctx,
+                    1,
+                    variant,
+                    progress,
+                    cancel_token,
+                    completed,
+                    total,
+                    scan_level='knee_refine',
+                )
+                records.extend(new_records)
+                long_records.extend(new_records)
+                measured.extend(new_measured)
+                if ok:
+                    variant_contexts.append(ctx)
+                    context_levels[ctx] = 'knee_refine'
+
+            variant_contexts = sorted(set(variant_contexts))
+
+            emit_benchmark_event(
+                progress,
+                'benchmark_phase',
+                model,
+                'server',
+                message=f'OpenCode-ready sweep {variant}',
+                phase=f'opencode-ready sweep {variant}',
+                completed=completed,
+                total=total,
+                candidate=variant,
+            )
+            for ctx in variant_contexts:
+                check_cancelled(cancel_token)
+                current = configure_adaptive_candidate(model, profile, 'opencode_ready', ctx, 1, variant)
+                ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                    app,
+                    model,
+                    profile,
+                    'opencode_ready',
+                    ctx,
+                    1,
+                    variant,
+                    progress,
+                    cancel_token,
+                    completed,
+                    total,
+                    scan_level=context_levels.get(ctx, 'broad'),
+                )
+                records.extend(new_records)
+                measured.extend(new_measured)
+                if not ok and broke:
+                    if progress:
+                        progress(f'exhaustive opencode-ready sweep {variant} stopped at break ctx={ctx}')
+                    break
+
+            emit_benchmark_event(
+                progress,
+                'benchmark_phase',
+                model,
+                'server',
+                message=f'coarse fast-chat sweep {variant}',
+                phase=f'coarse fast-chat sweep {variant}',
+                completed=completed,
+                total=total,
+                candidate=variant,
+            )
+            chat_floor = chat_min_ctx_per_slot(model)
+            for ctx in variant_contexts:
+                fast_records_for_context: List[Dict[str, object]] = []
+                tested_parallel = set()
+                for parallel in exhaustive_parallel_values(profile):
+                    check_cancelled(cancel_token)
+                    if ctx // max(1, parallel) < chat_floor:
+                        break
+                    current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, variant)
+                    tested_parallel.add(parallel)
+                    ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                        app,
+                        model,
+                        profile,
+                        'fast_chat',
+                        ctx,
+                        parallel,
+                        variant,
+                        progress,
+                        cancel_token,
+                        completed,
+                        total,
+                        scan_level=context_levels.get(ctx, 'broad'),
+                    )
+                    records.extend(new_records)
+                    fast_records_for_context.extend(new_records)
+                    measured.extend(new_measured)
+                    if not ok and broke:
+                        if progress:
+                            progress(
+                                f'coarse fast-chat parallel sweep {variant} ctx={ctx} '
+                                f'stopped at parallel={parallel}'
+                            )
+                        break
+                successful_fast = [record for record in fast_records_for_context if record.get('status') == 'ok']
+                if successful_fast:
+                    best_parallel = int(max(
+                        successful_fast,
+                        key=lambda record: float(record.get('tokens_per_sec', 0.0) or 0.0),
+                    ).get('parallel', 1) or 1)
+                    for parallel in parallel_refinement_values(profile, best_parallel, tested_parallel):
+                        check_cancelled(cancel_token)
+                        if ctx // max(1, parallel) < chat_floor:
+                            continue
+                        current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, variant)
+                        ok, _broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                            app,
+                            model,
+                            profile,
+                            'fast_chat',
+                            ctx,
+                            parallel,
+                            variant,
+                            progress,
+                            cancel_token,
+                            completed,
+                            total,
+                            scan_level='parallel_refine',
+                        )
+                        records.extend(new_records)
+                        measured.extend(new_measured)
+            if progress:
+                progress(f'coarse-to-fine variant {variant} finished {len(variant_contexts)} context step(s)')
+    except CancelledError:
+        if current is not None:
+            app.stop(current, managed_only=True)
+            records.append(enrich_exhaustive_record(
+                adaptive_record_from_candidate(current, 'coarse-to-fine', 'aborted', detail='user requested abort'),
+                current,
+                str(getattr(current, 'variant', 'default') or 'default'),
+                1,
+                0,
+            ))
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        aborted_model = ModelConfig(**asdict(model))
+        aborted_model.last_benchmark_results = records
+        aborted_model.default_benchmark_status = 'aborted'
+        aborted_model.default_benchmark_at = ended_at
+        run = build_benchmark_run(run_id, 'server', 'aborted', records, {}, started_at, ended_at, profile.short_summary())
+        upsert_benchmark_run(aborted_model, run)
+        app.add_or_update(aborted_model)
+        msg = '⚠ aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_aborted',
+            model,
+            'server',
+            message=msg,
+            phase='aborted',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    winners = select_measured_profiles(model, measured, profile)
+    annotate_spectrum_records(records, winners)
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    saved.measured_profiles = winners
+    saved.benchmark_fingerprint = app.model_fingerprint(saved)
+    saved.default_benchmark_at = ended_at
+    status_text = 'done' if winners else 'failed'
+    run = build_benchmark_run(run_id, 'server', status_text, records, winners, started_at, ended_at, profile.short_summary())
+    upsert_benchmark_run(saved, run)
+
+    if not winners:
+        saved.default_benchmark_status = 'failed'
+        app.add_or_update(saved)
+        msg = '❌ exhaustive benchmark failed: no measured candidates completed'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_error',
+            model,
+            'server',
+            message=msg,
+            phase='failed',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    auto_profile = winners['auto']
+    apply_measured_profile(saved, 'auto')
+    saved.measured_profiles = winners
+    saved.last_benchmark_tokens_per_sec = round(float(auto_profile.get('tokens_per_sec', 0.0) or 0.0), 2)
+    saved.last_benchmark_seconds = round(float(auto_profile.get('seconds', 0.0) or 0.0), 2)
+    saved.last_benchmark_profile = (
+        f'auto/coarse-to-fine {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
+        f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
+    )
+    saved.default_benchmark_status = 'done'
+    app.add_or_update(saved)
+    sync_msg = sync_opencode_after_tuning(app)
+    msg = (
+        f'✅ coarse-to-fine profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
+        f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
+        f'opencode ctx/slot={winners["opencode_ready"]["ctx_per_slot"]}, '
+        f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
+    )
+    if progress:
+        progress(msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_done',
+        saved,
+        'server',
+        message=msg,
+        phase='complete',
+        completed=completed,
+        total=completed,
+        records=records,
+    )
+    return True, msg
+
+
 def benchmark_adaptive_profiles(
     app: AppConfig,
     model: ModelConfig,
@@ -1611,7 +2356,7 @@ def benchmark_best_optimization(
     progress: Optional[Callable[[str], None]] = None,
     cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
-    return benchmark_adaptive_profiles(app, model, progress=progress, cancel_token=cancel_token)
+    return benchmark_exhaustive_profiles(app, model, progress=progress, cancel_token=cancel_token)
 
 
 def safe_bootstrap_benchmark(

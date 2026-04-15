@@ -571,15 +571,24 @@ def run_opencode_task(
             env = isolated_opencode_env(home, config_path)
             command = build_opencode_run_command(app, model, workspace, task.prompt)
             preview = shlex.join(command)
-            app.append_log(model.id, f'OpenCode benchmark command: {preview}')
+            app.append_log(model.id, f'OpenCode headless benchmark command: {preview}')
             if progress:
-                progress(f'opencode command: {preview}')
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_phase',
+                    model,
+                    'opencode',
+                    message=f'headless OpenCode command: {preview}',
+                    phase='OpenCode benchmark (headless)',
+                    candidate=task.name,
+                )
             run = run_process_with_metrics(command, workspace, env, timeout, app, cancel_token=cancel_token)
             all_output = list(run.get('stdout', []) or []) + list(run.get('stderr', []) or [])
             unittest_seen = detected_unittest_command(all_output)
             if run.get('aborted'):
                 return {
                     'task': task.name,
+                    'command_preview': preview,
                     'ok': False,
                     'tests_ok': False,
                     'status': 'aborted',
@@ -624,6 +633,7 @@ def run_opencode_task(
                 status = 'tests failed'
             return {
                 'task': task.name,
+                'command_preview': preview,
                 'ok': bool(status == 'tests passed'),
                 'tests_ok': tests_ok,
                 'status': status,
@@ -692,15 +702,29 @@ def summarize_sample_status(samples: List[Dict[str, object]]) -> str:
     return 'tests failed' if samples else 'failed'
 
 
+def sample_timeout_type(sample: Dict[str, object]) -> str:
+    if sample.get('aborted'):
+        return 'aborted'
+    if sample.get('no_output_timeout'):
+        return 'no_output'
+    if sample.get('idle_output_timeout'):
+        return 'idle'
+    if sample.get('timed_out'):
+        return 'total'
+    return ''
+
+
 def compact_sample_details(samples: List[Dict[str, object]]) -> List[Dict[str, object]]:
     details: List[Dict[str, object]] = []
     for sample in samples:
         details.append({
             'task': sample.get('task', ''),
+            'command_preview': sample.get('command_preview', ''),
             'status': sample.get('status', ''),
             'ok': bool(sample.get('ok')),
             'tests_ok': bool(sample.get('tests_ok')),
             'exit_code': int(sample.get('exit_code', -1) or -1),
+            'timeout_type': sample_timeout_type(sample),
             'timed_out': bool(sample.get('timed_out')),
             'no_output_timeout': bool(sample.get('no_output_timeout')),
             'idle_output_timeout': bool(sample.get('idle_output_timeout')),
@@ -787,7 +811,7 @@ def benchmark_opencode_workflow(
         return False, msg
     if progress:
         progress(
-            f'opencode workflow benchmark started: {len(candidates)} candidate(s), '
+            f'OpenCode benchmark (headless) started: {len(candidates)} candidate(s), '
             f'vscode={vscode["processes"]} proc/{vscode["rss_mib"]} MiB, {profile.short_summary()}'
         )
     emit_benchmark_event(
@@ -796,10 +820,10 @@ def benchmark_opencode_workflow(
         model,
         'opencode',
         message=(
-            f'opencode workflow benchmark started: {len(candidates)} candidate(s), '
+            f'OpenCode benchmark (headless) started: {len(candidates)} candidate(s), '
             f'vscode={vscode["processes"]} proc/{vscode["rss_mib"]} MiB, {profile.short_summary()}'
         ),
-        phase='starting',
+        phase='OpenCode benchmark (headless)',
         completed=0,
         total=total_steps,
     )
@@ -812,7 +836,7 @@ def benchmark_opencode_workflow(
             current = (preset, tier, candidate)
             if progress:
                 progress(
-                    f'opencode candidate {attempt}/{len(candidates)} {preset}/{tier}: '
+                    f'headless opencode candidate {attempt}/{len(candidates)} {preset}/{tier}: '
                     f'ctx={candidate.ctx} slot={ctx_per_slot(candidate)} parallel={candidate.parallel} | {tune_msg}'
                 )
             emit_benchmark_event(
@@ -821,10 +845,10 @@ def benchmark_opencode_workflow(
                 model,
                 'opencode',
                 message=(
-                    f'opencode candidate {attempt}/{len(candidates)} {preset}/{tier}: '
+                    f'headless opencode candidate {attempt}/{len(candidates)} {preset}/{tier}: '
                     f'ctx={candidate.ctx} slot={ctx_per_slot(candidate)} parallel={candidate.parallel}'
                 ),
-                phase='launching candidate',
+                phase='OpenCode benchmark (headless)',
                 completed=completed_steps,
                 total=total_steps,
                 candidate=f'{preset}/{tier}',
@@ -857,7 +881,7 @@ def benchmark_opencode_workflow(
                     model,
                     'opencode',
                     message=f'opencode candidate {attempt}/{len(candidates)} failed to start',
-                    phase='candidate failed',
+                    phase='OpenCode benchmark (headless)',
                     completed=completed_steps,
                     total=total_steps,
                     candidate=f'{preset}/{tier}',
@@ -895,7 +919,7 @@ def benchmark_opencode_workflow(
                         model,
                         'opencode',
                         message=f'opencode candidate {attempt}/{len(candidates)} not ready',
-                        phase='candidate failed',
+                        phase='OpenCode benchmark (headless)',
                         completed=completed_steps,
                         total=total_steps,
                         candidate=f'{preset}/{tier}',
@@ -931,7 +955,7 @@ def benchmark_opencode_workflow(
                         model,
                         'opencode',
                         message='opencode provider check failed',
-                        phase='candidate failed',
+                        phase='OpenCode benchmark (headless)',
                         completed=completed_steps,
                         total=total_steps,
                         candidate=f'{preset}/{tier}',
@@ -945,7 +969,7 @@ def benchmark_opencode_workflow(
                     check_cancelled(cancel_token)
                     if progress:
                         progress(
-                            f'opencode candidate {attempt}/{len(candidates)} running task {task.name} '
+                            f'headless opencode candidate {attempt}/{len(candidates)} running task {task.name} '
                             f'ctx/slot={ctx_per_slot(candidate)}...'
                         )
                     emit_benchmark_event(
@@ -953,8 +977,8 @@ def benchmark_opencode_workflow(
                         'benchmark_phase',
                         model,
                         'opencode',
-                        message=f'opencode candidate {attempt}/{len(candidates)} task {task.name}',
-                        phase='running workflow tasks',
+                        message=f'headless opencode candidate {attempt}/{len(candidates)} task {task.name}',
+                        phase='OpenCode benchmark (headless)',
                         completed=completed_steps,
                         total=total_steps,
                         candidate=f'{preset}/{tier} task {task_idx}/{len(OPENCODE_WORKFLOW_TASKS)}',
@@ -978,6 +1002,10 @@ def benchmark_opencode_workflow(
                 elapsed = sum(float(sample.get('elapsed', 0.0) or 0.0) for sample in samples)
                 status_text = summarize_sample_status(samples)
                 detail = '; '.join(str(sample.get('detail', '')) for sample in samples if not sample.get('ok')) or 'all tasks passed'
+                failing_sample = next((sample for sample in samples if not sample.get('ok')), samples[-1] if samples else {})
+                timeout_types = [sample_timeout_type(sample) for sample in samples if sample_timeout_type(sample)]
+                exit_codes = [int(sample.get('exit_code', -1) or -1) for sample in samples]
+                context_required = max([int(sample.get('context_required', 0) or 0) for sample in samples] or [0])
                 record = {
                     'preset': preset,
                     'tier': tier,
@@ -994,6 +1022,12 @@ def benchmark_opencode_workflow(
                     'ngl': int(getattr(candidate, 'ngl', 0) or 0),
                     'vscode_processes': vscode['processes'],
                     'vscode_rss_mib': vscode['rss_mib'],
+                    'exit_code': next((code for code in exit_codes if code != 0), exit_codes[-1] if exit_codes else -1),
+                    'timeout_type': timeout_types[0] if timeout_types else '',
+                    'unittest_command_seen': any(bool(sample.get('unittest_command_seen')) for sample in samples),
+                    'context_required': context_required,
+                    'stdout_tail': list(failing_sample.get('stdout_tail', []) or [])[-8:],
+                    'stderr_tail': list(failing_sample.get('stderr_tail', []) or [])[-8:],
                     'task_details': compact_sample_details(samples),
                     'detail': concise_failure(detail, limit=500),
                     'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
@@ -1017,7 +1051,7 @@ def benchmark_opencode_workflow(
                     model,
                     'opencode',
                     message=f'opencode candidate {attempt}/{len(candidates)} scored {score:.2f} ({passed}/{len(samples)} tasks)',
-                    phase='candidate complete',
+                    phase='OpenCode benchmark (headless)',
                     completed=completed_steps,
                     total=total_steps,
                     candidate=f'{preset}/{tier}',
