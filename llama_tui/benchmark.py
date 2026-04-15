@@ -46,6 +46,14 @@ COARSE_CONTEXT_HIGH_STEP = 8_192
 CONTEXT_REFINE_STEP = 2_048
 CONTEXT_KNEE_ROUNDING = 1_024
 BENCHMARK_HISTORY_LIMIT = 10
+FAST_BENCHMARK_CONTEXT_TARGETS = (8_192, 16_384)
+FAST_BENCHMARK_PARALLEL_TARGETS = (1, 2, 4)
+SMART_BENCHMARK_SOFT_BUDGET_SECONDS = 45 * 60
+SMART_FRONTIER_MAX_PROBES = 10
+SMART_PARALLEL_IMPROVEMENT_THRESHOLD = 0.08
+SMART_PARALLEL_NON_IMPROVING_LIMIT = 2
+SMART_Q8_CONTEXT_GAIN_THRESHOLD = 0.15
+SMART_MAX_FULL_CONTEXTS_PER_VARIANT = 5
 ADAPTIVE_PROFILE_KEYS = ('fast_chat', 'long_context', 'opencode_ready', 'auto')
 ADAPTIVE_RESERVE_BY_OBJECTIVE = {
     'fast_chat': 25,
@@ -82,6 +90,13 @@ def append_model_log(app: AppConfig, model: ModelConfig, text: str):
     app.append_log(model.id, text)
 
 
+def benchmark_command_preview(app: AppConfig, model: ModelConfig) -> str:
+    try:
+        return ' '.join(str(item) for item in app.build_command(model))
+    except Exception:
+        return ''
+
+
 def emit_benchmark_event(
     progress: Optional[Callable[[object], None]],
     event: str,
@@ -92,6 +107,7 @@ def emit_benchmark_event(
     completed: Optional[int] = None,
     total: Optional[int] = None,
     candidate: str = '',
+    command: str = '',
     record: Optional[Dict[str, object]] = None,
     records: Optional[List[Dict[str, object]]] = None,
 ):
@@ -111,6 +127,8 @@ def emit_benchmark_event(
         payload['total'] = int(total)
     if candidate:
         payload['candidate'] = candidate
+    if command:
+        payload['command'] = command
     if record is not None:
         payload['record'] = dict(record)
     if records is not None:
@@ -467,6 +485,74 @@ def context_knee_refinement_contexts(
                     if left_ctx < midpoint < right_ctx and midpoint not in tested:
                         candidates.add(midpoint)
     return sorted(candidates)
+
+
+def smart_break_refinement_contexts(last_success_ctx: int, break_ctx: int, tested: set) -> List[int]:
+    last_success_ctx = int(last_success_ctx or 0)
+    break_ctx = int(break_ctx or 0)
+    if last_success_ctx <= 0 or break_ctx <= last_success_ctx:
+        return []
+    candidates = {
+        last_success_ctx + CONTEXT_REFINE_STEP,
+        round_context((last_success_ctx + break_ctx) // 2, CONTEXT_KNEE_ROUNDING),
+        break_ctx - CONTEXT_REFINE_STEP,
+    }
+    return sorted(
+        value for value in candidates
+        if last_success_ctx < value < break_ctx and value not in tested
+    )
+
+
+def _nearest_context_at_or_above(contexts: List[int], target: int) -> int:
+    if not contexts:
+        return 0
+    target = int(target or 0)
+    above = [ctx for ctx in contexts if ctx >= target]
+    if above:
+        return min(above, key=lambda ctx: (ctx - target, ctx))
+    return max(contexts)
+
+
+def smart_measurement_contexts(
+    successes: List[int],
+    failures: List[int],
+    ctx_min: int,
+    ctx_max: int,
+    chat_floor: int,
+    opencode_floor: int = 0,
+) -> List[int]:
+    ordered = sorted(set(int(ctx) for ctx in successes if int(ctx) > 0))
+    if not ordered:
+        return []
+    selected = {ordered[0], ordered[-1]}
+    if len(ordered) >= 2:
+        selected.add(ordered[-2])
+    span = max(0, ordered[-1] - ordered[0])
+    if span > CONTEXT_REFINE_STEP:
+        midpoint = round_context((ordered[0] + ordered[-1]) // 2, CONTEXT_KNEE_ROUNDING)
+        selected.add(min(ordered, key=lambda ctx: (abs(ctx - midpoint), ctx)))
+    for target in (chat_floor, opencode_floor, ctx_min, ctx_max):
+        if int(target or 0) > 0:
+            selected.add(_nearest_context_at_or_above(ordered, int(target)))
+    positive_failures = [int(ctx) for ctx in failures if int(ctx) > 0]
+    if positive_failures:
+        first_break = min(positive_failures)
+        below_break = [ctx for ctx in ordered if ctx < first_break]
+        if below_break:
+            selected.add(max(below_break))
+    return sorted(ctx for ctx in selected if ctx in ordered)[:SMART_MAX_FULL_CONTEXTS_PER_VARIANT]
+
+
+def smart_fast_contexts(successes: List[int], chat_floor: int) -> List[int]:
+    ordered = sorted(set(int(ctx) for ctx in successes if int(ctx) > 0))
+    if not ordered:
+        return []
+    primary = _nearest_context_at_or_above(ordered, chat_floor)
+    selected = {primary}
+    above = [ctx for ctx in ordered if ctx > primary]
+    if above and primary <= max(chat_floor, 1) * 2:
+        selected.add(above[0])
+    return sorted(selected)
 
 
 def adaptive_parallel_values(model: ModelConfig, profile: HardwareProfile, objective: str, ctx: int, variant: str) -> List[int]:
@@ -1153,7 +1239,10 @@ def select_measured_profiles(
     measured: List[Dict[str, object]],
     profile: HardwareProfile,
 ) -> Dict[str, Dict[str, object]]:
-    successful = [item for item in measured if item.get('status') == 'ok']
+    successful = [
+        item for item in measured
+        if item.get('status') == 'ok' and str(item.get('measurement_type', 'full') or 'full') == 'full'
+    ]
     if not successful:
         return {}
     max_tps = max(float(item.get('tokens_per_sec', 0.0) or 0.0) for item in successful) or 1.0
@@ -1162,7 +1251,7 @@ def select_measured_profiles(
     opencode_floor = observed_opencode_context_floor(model)
 
     fast_pool = [item for item in successful if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or successful
-    long_pool = successful
+    long_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
     opencode_pool = [
         item for item in successful
         if int(item.get('parallel', 1) or 1) == 1 and int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor
@@ -1189,10 +1278,14 @@ def select_measured_profiles(
         'opencode_ready': opencode,
         'auto': auto,
     }
-    return {
-        key: adaptive_profile_dict(key, item['model'], item, profile)
-        for key, item in winners.items()
-    }
+    profiles = {}
+    for key, item in winners.items():
+        profile_dict = adaptive_profile_dict(key, item['model'], item, profile)
+        source_objective = str(item.get('objective', '') or '')
+        if source_objective and source_objective != key:
+            profile_dict['reused_from'] = source_objective
+        profiles[key] = profile_dict
+    return profiles
 
 
 def record_matches_profile(record: Dict[str, object], profile: Dict[str, object]) -> bool:
@@ -1226,11 +1319,14 @@ def annotate_spectrum_records(
     winners: Dict[str, Dict[str, object]],
 ) -> List[Dict[str, object]]:
     for record in records:
-        if record.get('status') != 'ok':
+        if record.get('status') not in ('ok', 'probe ok'):
             add_spectrum_label(record, 'failed')
         if record.get('break_point'):
             add_spectrum_label(record, 'break_point')
-    successful = [record for record in records if record.get('status') == 'ok']
+    successful = [
+        record for record in records
+        if record.get('status') == 'ok' and str(record.get('measurement_type', 'full') or 'full') == 'full'
+    ]
     if not successful:
         return records
     possible = min(
@@ -1328,7 +1424,7 @@ def build_benchmark_run(
     hardware: str = '',
 ) -> Dict[str, object]:
     successful = [row for row in records if row.get('status') == 'ok']
-    failed = [row for row in records if row.get('status') != 'ok']
+    failed = [row for row in records if row.get('status') not in ('ok', 'probe ok')]
     elapsed = 0.0
     for row in records:
         elapsed += float(row.get('seconds', 0.0) or 0.0)
@@ -1649,6 +1745,26 @@ def parallel_refinement_values(profile: HardwareProfile, best_parallel: int, tes
     return sorted(values)
 
 
+def fast_benchmark_parallel_values(profile: HardwareProfile) -> List[int]:
+    max_parallel = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 1)))
+    return [value for value in FAST_BENCHMARK_PARALLEL_TARGETS if value <= max_parallel] or [1]
+
+
+def fast_benchmark_contexts(model: ModelConfig, profile: HardwareProfile) -> List[int]:
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
+    seed = configure_adaptive_candidate(model, profile, 'long_context', ctx_min, 1, 'default')
+    estimate = candidate_safe_context_estimate(seed, profile)
+    points = [ctx_min, *FAST_BENCHMARK_CONTEXT_TARGETS]
+    if estimate > 0:
+        points.append(round_context_down(estimate, CONTEXT_REFINE_STEP))
+    clamped = []
+    for point in points:
+        value = max(ctx_min, min(ctx_max, int(point or ctx_min)))
+        clamped.append(value)
+    return sorted(set(clamped))
+
+
 def candidate_safe_context_estimate(candidate: ModelConfig, profile: HardwareProfile) -> int:
     ctx_min = max(256, int(getattr(candidate, 'ctx_min', 2048) or 2048))
     ctx_max = max(ctx_min, int(getattr(candidate, 'ctx_max', 131072) or 131072))
@@ -1662,6 +1778,68 @@ def candidate_safe_context_estimate(candidate: ModelConfig, profile: HardwarePro
     )
 
 
+def benchmark_config_fingerprint(candidate: ModelConfig) -> str:
+    payload = {
+        'runtime': getattr(candidate, 'runtime', 'llama.cpp'),
+        'path': getattr(candidate, 'path', ''),
+        'ctx': int(getattr(candidate, 'ctx', 0) or 0),
+        'parallel': int(getattr(candidate, 'parallel', 1) or 1),
+        'threads': int(getattr(candidate, 'threads', 0) or 0),
+        'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+        'output': int(getattr(candidate, 'output', 0) or 0),
+        'cache_ram': int(getattr(candidate, 'cache_ram', 0) or 0),
+        'temp': float(getattr(candidate, 'temp', 0.7) or 0.7),
+        'flash_attn': bool(getattr(candidate, 'flash_attn', True)),
+        'jinja': bool(getattr(candidate, 'jinja', True)),
+        'memory_reserve_percent': int(getattr(candidate, 'memory_reserve_percent', 0) or 0),
+        'extra_args': list(getattr(candidate, 'extra_args', []) or []),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+
+def smart_should_continue_optional(
+    started_monotonic: float,
+    measured: List[Dict[str, object]],
+    model: ModelConfig,
+    profile: HardwareProfile,
+    now: Optional[float] = None,
+) -> bool:
+    now = time.monotonic() if now is None else float(now)
+    started = float(started_monotonic if started_monotonic is not None else now)
+    if now - started < SMART_BENCHMARK_SOFT_BUDGET_SECONDS:
+        return True
+    successful = [
+        item for item in measured
+        if item.get('status') == 'ok' and str(item.get('measurement_type', 'full') or 'full') == 'full'
+    ]
+    if not successful:
+        return True
+    has_chat = any(int(item.get('ctx_per_slot', 0) or 0) >= chat_min_ctx_per_slot(model) for item in successful)
+    has_single_slot = any(int(item.get('parallel', 1) or 1) == 1 for item in successful)
+    return not (has_chat and has_single_slot)
+
+
+def smart_should_try_q8(
+    model: ModelConfig,
+    profile: HardwareProfile,
+    default_best_ctx: int,
+    default_break_ctx: int = 0,
+) -> bool:
+    if getattr(model, 'runtime', 'llama.cpp') != 'llama.cpp' or not profile.has_usable_gpu():
+        return False
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
+    if default_break_ctx and int(default_best_ctx or 0) < ctx_max:
+        return True
+    default_seed = configure_adaptive_candidate(model, profile, 'long_context', ctx_min, 1, 'default')
+    q8_seed = configure_adaptive_candidate(model, profile, 'long_context', ctx_min, 1, 'q8_kv')
+    default_safe = candidate_safe_context_estimate(default_seed, profile)
+    q8_safe = candidate_safe_context_estimate(q8_seed, profile)
+    if default_safe <= 0:
+        return q8_safe >= ctx_min
+    return q8_safe >= int(default_safe * (1.0 + SMART_Q8_CONTEXT_GAIN_THRESHOLD))
+
+
 def enrich_exhaustive_record(
     record: Dict[str, object],
     candidate: ModelConfig,
@@ -1670,12 +1848,20 @@ def enrich_exhaustive_record(
     estimated_safe_ctx: int,
     scan_level: str = 'broad',
     break_point: bool = False,
+    measurement_type: str = 'full',
+    planner_reason: str = '',
+    reused_from: str = '',
 ) -> Dict[str, object]:
     record['variant'] = variant
     record['retry_attempt'] = retry_attempt
     record['scan_level'] = scan_level
     record['break_point'] = bool(break_point)
     record['estimated_safe_ctx'] = int(estimated_safe_ctx or 0)
+    record['measurement_type'] = measurement_type or 'full'
+    record['planner_reason'] = planner_reason or scan_level
+    record['config_fingerprint'] = benchmark_config_fingerprint(candidate)
+    if reused_from:
+        record['reused_from'] = reused_from
     if estimated_safe_ctx and estimated_safe_ctx < int(getattr(candidate, 'ctx', 0) or 0):
         detail = str(record.get('detail', '') or '')
         suffix = f'estimate warned safe_ctx={estimated_safe_ctx}'
@@ -1690,19 +1876,21 @@ def emit_exhaustive_result(
     completed: int,
     total: int,
     candidate_label: str,
+    run_kind: str = 'server',
 ):
+    benchmark_label = 'fast benchmark' if run_kind == 'server_fast' else 'smart bounded'
     emit_benchmark_event(
         progress,
         'benchmark_result',
         model,
-        'server',
+        run_kind,
         message=(
-            f'coarse-to-fine {record.get("objective")} {record.get("status")}: '
+            f'{benchmark_label} {record.get("objective")} {record.get("status")}: '
             f'{float(record.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s '
             f'ctx={record.get("ctx")} slot={record.get("ctx_per_slot")} '
             f'par={record.get("parallel")} variant={record.get("variant")}'
         ),
-        phase='measuring coarse-to-fine candidates',
+        phase=f'measuring {benchmark_label} candidates',
         completed=completed,
         total=total,
         candidate=candidate_label,
@@ -1723,47 +1911,171 @@ def benchmark_exhaustive_candidate_with_retry(
     completed: int,
     total: int,
     scan_level: str = 'broad',
+    run_kind: str = 'server',
+    planner_reason: str = '',
+    measurement_type: str = 'full',
 ) -> Tuple[bool, bool, List[Dict[str, object]], List[Dict[str, object]], int]:
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     candidate_label = f'{objective}/{variant}/{scan_level} ctx={ctx} par={parallel}'
+    benchmark_label = 'fast benchmark' if run_kind == 'server_fast' else 'smart bounded'
     for attempt in (1, 2):
         check_cancelled(cancel_token)
         candidate = configure_adaptive_candidate(base_model, profile, objective, ctx, parallel, variant)
         estimated_safe_ctx = candidate_safe_context_estimate(candidate, profile)
+        command_preview = benchmark_command_preview(app, candidate)
         if progress:
             progress(
-                f'exhaustive candidate {candidate_label} attempt={attempt} '
+                f'{benchmark_label} candidate {candidate_label} attempt={attempt} '
                 f'estimated_safe_ctx={estimated_safe_ctx}'
             )
         emit_benchmark_event(
             progress,
             'benchmark_candidate',
             base_model,
-            'server',
-            message=f'coarse-to-fine candidate {candidate_label} attempt={attempt}',
-            phase='measuring coarse-to-fine candidates',
+            run_kind,
+            message=f'{benchmark_label} candidate {candidate_label} attempt={attempt}',
+            phase=f'measuring {benchmark_label} candidates',
             completed=completed,
             total=total,
             candidate=candidate_label,
+            command=command_preview,
         )
         record, measured_item = benchmark_adaptive_candidate(app, candidate, objective, progress, cancel_token)
         completed += 1
         ok = record.get('status') == 'ok'
         break_point = not ok and attempt == 2
-        enrich_exhaustive_record(record, candidate, variant, attempt, estimated_safe_ctx, scan_level=scan_level, break_point=break_point)
+        enrich_exhaustive_record(
+            record,
+            candidate,
+            variant,
+            attempt,
+            estimated_safe_ctx,
+            scan_level=scan_level,
+            break_point=break_point,
+            measurement_type=measurement_type,
+            planner_reason=planner_reason or scan_level,
+        )
         records.append(record)
         if measured_item:
             measured_item['variant'] = variant
             measured_item['retry_attempt'] = attempt
             measured_item['scan_level'] = scan_level
+            measured_item['measurement_type'] = measurement_type
+            measured_item['planner_reason'] = planner_reason or scan_level
+            measured_item['config_fingerprint'] = benchmark_config_fingerprint(candidate)
             measured.append(measured_item)
-        emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label)
+        emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label, run_kind=run_kind)
         if ok:
             return True, False, records, measured, completed
         if attempt == 1 and progress:
-            progress(f'coarse-to-fine candidate {candidate_label} failed once; retrying to confirm break...')
+            progress(f'{benchmark_label} candidate {candidate_label} failed once; retrying to confirm break...')
     return False, True, records, measured, completed
+
+
+def benchmark_frontier_probe_candidate(
+    app: AppConfig,
+    candidate: ModelConfig,
+    objective: str,
+    progress: Optional[Callable[[str], None]],
+    cancel_token: Optional[CancelToken],
+) -> Tuple[Dict[str, object], bool]:
+    check_cancelled(cancel_token)
+    ok, msg = app.start(candidate)
+    if not ok:
+        return adaptive_record_from_candidate(candidate, objective, 'start failed', detail=msg), False
+    try:
+        ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
+        if not ready_ok:
+            return adaptive_record_from_candidate(candidate, objective, 'not ready', detail=ready_msg), False
+        if int(getattr(candidate, 'last_good_ctx', 0) or 0) > 0:
+            candidate.ctx = int(candidate.last_good_ctx)
+        if int(getattr(candidate, 'last_good_parallel', 0) or 0) > 0:
+            candidate.parallel = int(candidate.last_good_parallel)
+        if progress:
+            progress(f'frontier probe ready: ctx={candidate.ctx} slot={ctx_per_slot(candidate)} variant={getattr(candidate, "variant", "default")}')
+        warm_ok, warm = benchmark_completion(
+            candidate,
+            max_tokens=BENCHMARK_WARMUP_TOKENS,
+            timeout=BENCHMARK_WARMUP_TIMEOUT,
+            cancel_token=cancel_token,
+        )
+        if not warm_ok:
+            return adaptive_record_from_candidate(candidate, objective, 'benchmark failed', detail=str(warm.get('error', 'warmup failed'))), False
+        snap = app.hardware_profile(refresh=True)
+        record = adaptive_record_from_candidate(
+            candidate,
+            objective,
+            'probe ok',
+            tokens_per_sec=float(warm.get('tokens_per_sec', 0.0) or 0.0),
+            seconds=float(warm.get('elapsed', 0.0) or 0.0),
+            detail='warmup probe',
+            ram_available=int(getattr(snap, 'memory_available', 0) or 0),
+            gpu_memory_free=int(getattr(snap, 'gpu_memory_free', 0) or 0),
+        )
+        return record, True
+    finally:
+        app.stop(candidate, managed_only=True)
+        sleep_with_cancel(0.25, cancel_token)
+
+
+def benchmark_smart_probe_with_retry(
+    app: AppConfig,
+    base_model: ModelConfig,
+    profile: HardwareProfile,
+    ctx: int,
+    variant: str,
+    progress: Optional[Callable[[object], None]],
+    cancel_token: Optional[CancelToken],
+    completed: int,
+    total: int,
+    planner_reason: str = 'frontier',
+) -> Tuple[bool, bool, List[Dict[str, object]], int]:
+    records: List[Dict[str, object]] = []
+    candidate_label = f'long_context/{variant}/{planner_reason} ctx={ctx} par=1'
+    for attempt in (1, 2):
+        check_cancelled(cancel_token)
+        candidate = configure_adaptive_candidate(base_model, profile, 'long_context', ctx, 1, variant)
+        estimated_safe_ctx = candidate_safe_context_estimate(candidate, profile)
+        command_preview = benchmark_command_preview(app, candidate)
+        if progress:
+            progress(
+                f'smart frontier probe {candidate_label} attempt={attempt} '
+                f'estimated_safe_ctx={estimated_safe_ctx}'
+            )
+        emit_benchmark_event(
+            progress,
+            'benchmark_probe',
+            base_model,
+            'server',
+            message=f'smart frontier probe {candidate_label} attempt={attempt}',
+            phase='smart frontier probes',
+            completed=completed,
+            total=total,
+            candidate=candidate_label,
+            command=command_preview,
+        )
+        record, ok = benchmark_frontier_probe_candidate(app, candidate, 'long_context', progress, cancel_token)
+        completed += 1
+        break_point = not ok and attempt == 2
+        enrich_exhaustive_record(
+            record,
+            candidate,
+            variant,
+            attempt,
+            estimated_safe_ctx,
+            scan_level=planner_reason,
+            break_point=break_point,
+            measurement_type='probe',
+            planner_reason=planner_reason,
+        )
+        records.append(record)
+        emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label)
+        if ok:
+            return True, False, records, completed
+        if attempt == 1 and progress:
+            progress(f'smart frontier probe {candidate_label} failed once; retrying to confirm break...')
+    return False, True, records, completed
 
 
 def benchmark_exhaustive_profiles(
@@ -1774,21 +2086,22 @@ def benchmark_exhaustive_profiles(
 ) -> Tuple[bool, str]:
     status, _detail = app.health(model)
     if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
-        return False, '❌ Stop the model before running coarse-to-fine benchmark profiles.'
+        return False, '❌ Stop the model before running smart bounded benchmark profiles.'
 
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'server-{datetime.now().strftime("%Y%m%d%H%M%S")}'
     ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
     ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
-    contexts = exhaustive_context_ladder(ctx_min, ctx_max)
-    variants = exhaustive_variants(model, profile)
-    broad_parallel_count = len(exhaustive_parallel_values(profile))
-    total = max(1, len(variants) * len(contexts) * (2 + broad_parallel_count) * 2)
+    chat_floor = chat_min_ctx_per_slot(model)
+    opencode_floor = observed_opencode_context_floor(model)
+    total = max(24, SMART_FRONTIER_MAX_PROBES * 2 + 16)
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
     completed = 0
+    started_monotonic = time.monotonic()
+    full_by_fingerprint: Dict[str, Dict[str, object]] = {}
 
     running_model = ModelConfig(**asdict(model))
     running_model.default_benchmark_status = 'running'
@@ -1797,9 +2110,9 @@ def benchmark_exhaustive_profiles(
     app.add_or_update(running_model)
 
     start_msg = (
-        f'coarse-to-fine benchmark started: ctx={ctx_min}..{ctx_max}, '
-        f'steps={COARSE_CONTEXT_LOW_STEP}/{COARSE_CONTEXT_MID_STEP}/{COARSE_CONTEXT_HIGH_STEP}, '
-        f'variants={",".join(variants)}, {profile.short_summary()}'
+        f'smart bounded benchmark started: ctx={ctx_min}..{ctx_max}, '
+        f'chat_floor={chat_floor}, opencode_floor={opencode_floor or "none"}, '
+        f'soft_budget={SMART_BENCHMARK_SOFT_BUDGET_SECONDS // 60}m, {profile.short_summary()}'
     )
     if progress:
         progress(start_msg)
@@ -1814,261 +2127,207 @@ def benchmark_exhaustive_profiles(
         total=total,
     )
 
-    try:
-        for variant in variants:
+    def optional_refinement_allowed() -> bool:
+        return smart_should_continue_optional(started_monotonic, measured, model, profile)
+
+    def run_full_measurement(
+        objective: str,
+        ctx: int,
+        parallel: int,
+        variant: str,
+        planner_reason: str,
+        optional: bool = False,
+    ) -> Tuple[bool, bool]:
+        nonlocal completed, current, total
+        check_cancelled(cancel_token)
+        if optional and not optional_refinement_allowed():
+            if progress:
+                progress(f'smart bounded skipped optional {planner_reason}: soft budget reached and winners exist')
+            return False, False
+        current = configure_adaptive_candidate(model, profile, objective, ctx, parallel, variant)
+        fingerprint = benchmark_config_fingerprint(current)
+        if fingerprint in full_by_fingerprint:
+            source = full_by_fingerprint[fingerprint]
+            if progress:
+                progress(
+                    f'smart bounded reused {objective}/{variant} ctx={ctx} par={parallel} '
+                    f'from {source.get("objective", "measured")}/{source.get("planner_reason", "full")}'
+                )
+            return True, False
+        ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+            app,
+            model,
+            profile,
+            objective,
+            ctx,
+            parallel,
+            variant,
+            progress,
+            cancel_token,
+            completed,
+            total,
+            scan_level=planner_reason,
+            planner_reason=planner_reason,
+            measurement_type='full',
+        )
+        records.extend(new_records)
+        measured.extend(new_measured)
+        for item in new_measured:
+            full_by_fingerprint[str(item.get('config_fingerprint', '') or fingerprint)] = item
+        return ok, broke
+
+    def run_frontier(variant: str, planner_reason: str = 'frontier') -> Tuple[List[int], List[int], int]:
+        nonlocal completed, current, total
+        successes: List[int] = []
+        failures: List[int] = []
+        tested = set()
+
+        def probe(value: int) -> bool:
+            nonlocal completed, current
+            value = max(ctx_min, min(ctx_max, round_context(value)))
+            if value in tested:
+                return value in successes
+            tested.add(value)
+            current = configure_adaptive_candidate(model, profile, 'long_context', value, 1, variant)
+            ok, broke, new_records, completed = benchmark_smart_probe_with_retry(
+                app,
+                model,
+                profile,
+                value,
+                variant,
+                progress,
+                cancel_token,
+                completed,
+                total,
+                planner_reason=planner_reason,
+            )
+            records.extend(new_records)
+            (successes if ok else failures).append(value)
+            return ok
+
+        emit_benchmark_event(
+            progress,
+            'benchmark_phase',
+            model,
+            'server',
+            message=f'smart frontier search {variant}',
+            phase=f'smart frontier search {variant}',
+            completed=completed,
+            total=total,
+            candidate=variant,
+        )
+        probe_successes, probe_failures = adaptive_context_search(
+            ctx_min,
+            ctx_max,
+            probe,
+            max_probes=SMART_FRONTIER_MAX_PROBES,
+        )
+        successes = sorted(set(successes + probe_successes))
+        failures = sorted(set(failures + probe_failures))
+        if successes and failures and optional_refinement_allowed():
+            first_break = min(ctx for ctx in failures if ctx > max(successes)) if any(ctx > max(successes) for ctx in failures) else min(failures)
+            for ctx in smart_break_refinement_contexts(max(successes), first_break, tested):
+                probe(ctx)
+            successes = sorted(set(successes))
+            failures = sorted(set(failures))
+        break_ctx = min(failures) if failures else 0
+        if progress:
+            progress(
+                f'smart frontier {variant}: {len(successes)} viable probe(s), '
+                f'break={break_ctx or "none"}'
+            )
+        return successes, failures, break_ctx
+
+    def run_fast_chat_race(ctx: int, variant: str):
+        nonlocal completed, current
+        max_parallel = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 1)))
+        parallel_values = [value for value in (1, 2, 4, 8, 16) if value <= max_parallel]
+        best_parallel = 0
+        best_tps = 0.0
+        non_improving = 0
+        tested_parallel = set()
+        for parallel in parallel_values:
             check_cancelled(cancel_token)
-            variant_contexts: List[int] = []
-            context_levels: Dict[int, str] = {}
-            long_records: List[Dict[str, object]] = []
-            tested_contexts = set()
-            confirmed_break_ctx = 0
-            emit_benchmark_event(
-                progress,
-                'benchmark_phase',
-                model,
-                'server',
-                message=f'coarse long-context sweep {variant}',
-                phase=f'coarse long-context sweep {variant}',
-                completed=completed,
-                total=total,
-                candidate=variant,
-            )
-            for ctx in contexts:
+            if ctx // max(1, parallel) < chat_floor:
+                break
+            ok, broke = run_full_measurement('fast_chat', ctx, parallel, variant, 'chat_parallel')
+            tested_parallel.add(parallel)
+            latest = [item for item in measured if item.get('status') == 'ok' and item.get('objective') == 'fast_chat' and int(item.get('ctx', 0) or 0) == ctx and int(item.get('parallel', 1) or 1) == parallel and str(item.get('variant', '') or 'default') == variant]
+            tps = max([float(item.get('tokens_per_sec', 0.0) or 0.0) for item in latest] or [0.0])
+            if ok and tps > best_tps * (1.0 + SMART_PARALLEL_IMPROVEMENT_THRESHOLD):
+                best_tps = tps
+                best_parallel = parallel
+                non_improving = 0
+            elif ok:
+                non_improving += 1
+            if broke or non_improving >= SMART_PARALLEL_NON_IMPROVING_LIMIT:
+                break
+        if best_parallel:
+            for parallel in parallel_refinement_values(profile, best_parallel, tested_parallel):
                 check_cancelled(cancel_token)
-                current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, variant)
-                tested_contexts.add(ctx)
-                ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                    app,
-                    model,
-                    profile,
-                    'long_context',
-                    ctx,
-                    1,
-                    variant,
-                    progress,
-                    cancel_token,
-                    completed,
-                    total,
-                    scan_level='broad',
-                )
-                records.extend(new_records)
-                long_records.extend(new_records)
-                measured.extend(new_measured)
-                if not ok and broke:
-                    confirmed_break_ctx = ctx
-                    if progress:
-                        progress(f'coarse long-context sweep {variant} stopped at break ctx={ctx}')
-                    break
-                variant_contexts.append(ctx)
-                context_levels[ctx] = 'broad'
+                if ctx // max(1, parallel) >= chat_floor:
+                    run_full_measurement('fast_chat', ctx, parallel, variant, 'parallel_refine', optional=True)
 
-            if progress:
-                progress(f'coarse-to-fine variant {variant} found {len(variant_contexts)} launchable context step(s)')
-            if not variant_contexts:
-                continue
+    try:
+        default_successes, default_failures, default_break = run_frontier('default')
+        if not default_successes:
+            default_successes = [ctx_min]
+        default_contexts = smart_measurement_contexts(
+            default_successes,
+            default_failures,
+            ctx_min,
+            ctx_max,
+            chat_floor,
+            opencode_floor,
+        )
+        for ctx in default_contexts:
+            run_full_measurement('long_context', ctx, 1, 'default', 'frontier')
 
-            if confirmed_break_ctx:
-                last_success_ctx = max(variant_contexts)
-                refine_contexts = break_refinement_contexts(last_success_ctx, confirmed_break_ctx, tested_contexts)
-                if refine_contexts:
-                    emit_benchmark_event(
-                        progress,
-                        'benchmark_phase',
-                        model,
-                        'server',
-                        message=f'break refinement {variant}: {last_success_ctx}..{confirmed_break_ctx}',
-                        phase=f'break refinement {variant}',
-                        completed=completed,
-                        total=total,
-                        candidate=variant,
-                    )
-                for ctx in refine_contexts:
-                    check_cancelled(cancel_token)
-                    current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, variant)
-                    tested_contexts.add(ctx)
-                    ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                        app,
-                        model,
-                        profile,
-                        'long_context',
-                        ctx,
-                        1,
-                        variant,
-                        progress,
-                        cancel_token,
-                        completed,
-                        total,
-                        scan_level='break_refine',
-                    )
-                    records.extend(new_records)
-                    long_records.extend(new_records)
-                    measured.extend(new_measured)
-                    if not ok and broke:
-                        confirmed_break_ctx = ctx
-                        if progress:
-                            progress(f'break refinement {variant} confirmed closer break ctx={ctx}')
-                        break
-                    variant_contexts.append(ctx)
-                    context_levels[ctx] = 'break_refine'
+        if opencode_floor:
+            opencode_ctx = _nearest_context_at_or_above(default_successes, opencode_floor)
+            if opencode_ctx and opencode_ctx not in default_contexts:
+                run_full_measurement('long_context', opencode_ctx, 1, 'default', 'opencode_floor', optional=True)
 
-            knee_contexts = context_knee_refinement_contexts(long_records, tested_contexts, ctx_max)
-            if knee_contexts:
-                emit_benchmark_event(
-                    progress,
-                    'benchmark_phase',
-                    model,
-                    'server',
-                    message=f'knee refinement {variant}: {len(knee_contexts)} context(s)',
-                    phase=f'knee refinement {variant}',
-                    completed=completed,
-                    total=total,
-                    candidate=variant,
-                )
-            for ctx in knee_contexts:
-                check_cancelled(cancel_token)
-                current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, variant)
-                tested_contexts.add(ctx)
-                ok, _broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                    app,
-                    model,
-                    profile,
-                    'long_context',
-                    ctx,
-                    1,
-                    variant,
-                    progress,
-                    cancel_token,
-                    completed,
-                    total,
-                    scan_level='knee_refine',
-                )
-                records.extend(new_records)
-                long_records.extend(new_records)
-                measured.extend(new_measured)
-                if ok:
-                    variant_contexts.append(ctx)
-                    context_levels[ctx] = 'knee_refine'
+        long_records = [
+            row for row in records
+            if row.get('status') == 'ok'
+            and row.get('objective') == 'long_context'
+            and row.get('variant') == 'default'
+            and row.get('measurement_type') == 'full'
+        ]
+        tested_full_contexts = {int(row.get('ctx', 0) or 0) for row in long_records}
+        for ctx in context_knee_refinement_contexts(long_records, tested_full_contexts, ctx_max)[:2]:
+            run_full_measurement('long_context', ctx, 1, 'default', 'speed_knee', optional=True)
 
-            variant_contexts = sorted(set(variant_contexts))
+        for ctx in smart_fast_contexts(default_successes, chat_floor):
+            run_fast_chat_race(ctx, 'default')
 
-            emit_benchmark_event(
-                progress,
-                'benchmark_phase',
-                model,
-                'server',
-                message=f'OpenCode-ready sweep {variant}',
-                phase=f'opencode-ready sweep {variant}',
-                completed=completed,
-                total=total,
-                candidate=variant,
-            )
-            for ctx in variant_contexts:
-                check_cancelled(cancel_token)
-                current = configure_adaptive_candidate(model, profile, 'opencode_ready', ctx, 1, variant)
-                ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                    app,
-                    model,
-                    profile,
-                    'opencode_ready',
-                    ctx,
-                    1,
-                    variant,
-                    progress,
-                    cancel_token,
-                    completed,
-                    total,
-                    scan_level=context_levels.get(ctx, 'broad'),
-                )
-                records.extend(new_records)
-                measured.extend(new_measured)
-                if not ok and broke:
-                    if progress:
-                        progress(f'exhaustive opencode-ready sweep {variant} stopped at break ctx={ctx}')
-                    break
-
-            emit_benchmark_event(
-                progress,
-                'benchmark_phase',
-                model,
-                'server',
-                message=f'coarse fast-chat sweep {variant}',
-                phase=f'coarse fast-chat sweep {variant}',
-                completed=completed,
-                total=total,
-                candidate=variant,
-            )
-            chat_floor = chat_min_ctx_per_slot(model)
-            for ctx in variant_contexts:
-                fast_records_for_context: List[Dict[str, object]] = []
-                tested_parallel = set()
-                for parallel in exhaustive_parallel_values(profile):
-                    check_cancelled(cancel_token)
-                    if ctx // max(1, parallel) < chat_floor:
-                        break
-                    current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, variant)
-                    tested_parallel.add(parallel)
-                    ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                        app,
-                        model,
-                        profile,
-                        'fast_chat',
-                        ctx,
-                        parallel,
-                        variant,
-                        progress,
-                        cancel_token,
-                        completed,
-                        total,
-                        scan_level=context_levels.get(ctx, 'broad'),
-                    )
-                    records.extend(new_records)
-                    fast_records_for_context.extend(new_records)
-                    measured.extend(new_measured)
-                    if not ok and broke:
-                        if progress:
-                            progress(
-                                f'coarse fast-chat parallel sweep {variant} ctx={ctx} '
-                                f'stopped at parallel={parallel}'
-                            )
-                        break
-                successful_fast = [record for record in fast_records_for_context if record.get('status') == 'ok']
-                if successful_fast:
-                    best_parallel = int(max(
-                        successful_fast,
-                        key=lambda record: float(record.get('tokens_per_sec', 0.0) or 0.0),
-                    ).get('parallel', 1) or 1)
-                    for parallel in parallel_refinement_values(profile, best_parallel, tested_parallel):
-                        check_cancelled(cancel_token)
-                        if ctx // max(1, parallel) < chat_floor:
-                            continue
-                        current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, variant)
-                        ok, _broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                            app,
-                            model,
-                            profile,
-                            'fast_chat',
-                            ctx,
-                            parallel,
-                            variant,
-                            progress,
-                            cancel_token,
-                            completed,
-                            total,
-                            scan_level='parallel_refine',
-                        )
-                        records.extend(new_records)
-                        measured.extend(new_measured)
-            if progress:
-                progress(f'coarse-to-fine variant {variant} finished {len(variant_contexts)} context step(s)')
+        default_best_ctx = max(default_successes or [0])
+        if smart_should_try_q8(model, profile, default_best_ctx, default_break) and optional_refinement_allowed():
+            q8_successes, q8_failures, _q8_break = run_frontier('q8_kv', planner_reason='q8_probe')
+            q8_contexts = smart_measurement_contexts(
+                q8_successes,
+                q8_failures,
+                ctx_min,
+                ctx_max,
+                chat_floor,
+                opencode_floor,
+            )[:3]
+            for ctx in q8_contexts:
+                run_full_measurement('long_context', ctx, 1, 'q8_kv', 'q8_probe', optional=True)
+            for ctx in smart_fast_contexts(q8_successes, chat_floor)[:1]:
+                run_fast_chat_race(ctx, 'q8_kv')
     except CancelledError:
         if current is not None:
             app.stop(current, managed_only=True)
             records.append(enrich_exhaustive_record(
-                adaptive_record_from_candidate(current, 'coarse-to-fine', 'aborted', detail='user requested abort'),
+                adaptive_record_from_candidate(current, 'smart_bounded', 'aborted', detail='user requested abort'),
                 current,
                 str(getattr(current, 'variant', 'default') or 'default'),
                 1,
                 0,
+                measurement_type='full',
+                planner_reason='abort',
             ))
         ended_at = datetime.now().isoformat(timespec='seconds')
         aborted_model = ModelConfig(**asdict(model))
@@ -2109,7 +2368,7 @@ def benchmark_exhaustive_profiles(
     if not winners:
         saved.default_benchmark_status = 'failed'
         app.add_or_update(saved)
-        msg = '❌ exhaustive benchmark failed: no measured candidates completed'
+        msg = '❌ smart bounded benchmark failed: no measured candidates completed'
         if progress:
             progress(msg)
         emit_benchmark_event(
@@ -2131,14 +2390,14 @@ def benchmark_exhaustive_profiles(
     saved.last_benchmark_tokens_per_sec = round(float(auto_profile.get('tokens_per_sec', 0.0) or 0.0), 2)
     saved.last_benchmark_seconds = round(float(auto_profile.get('seconds', 0.0) or 0.0), 2)
     saved.last_benchmark_profile = (
-        f'auto/coarse-to-fine {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
+        f'auto/smart-bounded {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
         f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
     )
     saved.default_benchmark_status = 'done'
     app.add_or_update(saved)
     sync_msg = sync_opencode_after_tuning(app)
     msg = (
-        f'✅ coarse-to-fine profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
+        f'✅ smart bounded profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
         f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
         f'opencode ctx/slot={winners["opencode_ready"]["ctx_per_slot"]}, '
         f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
@@ -2150,6 +2409,222 @@ def benchmark_exhaustive_profiles(
         'benchmark_done',
         saved,
         'server',
+        message=msg,
+        phase='complete',
+        completed=completed,
+        total=completed,
+        records=records,
+    )
+    return True, msg
+
+
+def benchmark_fast_profiles(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    status, _detail = app.health(model)
+    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
+        return False, '❌ Stop the model before running fast benchmark profiles.'
+
+    profile = app.hardware_profile(refresh=True)
+    started_at = datetime.now().isoformat(timespec='seconds')
+    run_id = f'server-fast-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    contexts = fast_benchmark_contexts(model, profile)
+    parallel_values = fast_benchmark_parallel_values(profile)
+    total = max(1, len(contexts) * (2 + len(parallel_values)) * 2)
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    current: Optional[ModelConfig] = None
+    completed = 0
+
+    running_model = ModelConfig(**asdict(model))
+    running_model.default_benchmark_status = 'running'
+    running_run = build_benchmark_run(run_id, 'server_fast', 'running', [], {}, started_at, hardware=profile.short_summary())
+    upsert_benchmark_run(running_model, running_run)
+    app.add_or_update(running_model)
+
+    start_msg = (
+        f'fast benchmark started: contexts={",".join(str(ctx) for ctx in contexts)}, '
+        f'parallel={",".join(str(value) for value in parallel_values)}, default variant, {profile.short_summary()}'
+    )
+    if progress:
+        progress(start_msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_started',
+        model,
+        'server_fast',
+        message=start_msg,
+        phase='fast benchmark',
+        completed=0,
+        total=total,
+    )
+
+    try:
+        chat_floor = chat_min_ctx_per_slot(model)
+        for ctx in contexts:
+            check_cancelled(cancel_token)
+            current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, 'default')
+            ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                app,
+                model,
+                profile,
+                'long_context',
+                ctx,
+                1,
+                'default',
+                progress,
+                cancel_token,
+                completed,
+                total,
+                scan_level='fast',
+                run_kind='server_fast',
+            )
+            records.extend(new_records)
+            measured.extend(new_measured)
+            if not ok and broke:
+                if progress:
+                    progress(f'fast benchmark stopped at confirmed context break ctx={ctx}')
+                break
+
+            current = configure_adaptive_candidate(model, profile, 'opencode_ready', ctx, 1, 'default')
+            ok, _broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                app,
+                model,
+                profile,
+                'opencode_ready',
+                ctx,
+                1,
+                'default',
+                progress,
+                cancel_token,
+                completed,
+                total,
+                scan_level='fast',
+                run_kind='server_fast',
+            )
+            records.extend(new_records)
+            measured.extend(new_measured)
+
+            for parallel in parallel_values:
+                check_cancelled(cancel_token)
+                if ctx // max(1, parallel) < chat_floor:
+                    continue
+                current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, 'default')
+                ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                    app,
+                    model,
+                    profile,
+                    'fast_chat',
+                    ctx,
+                    parallel,
+                    'default',
+                    progress,
+                    cancel_token,
+                    completed,
+                    total,
+                    scan_level='fast',
+                    run_kind='server_fast',
+                )
+                records.extend(new_records)
+                measured.extend(new_measured)
+                if not ok and broke:
+                    if progress:
+                        progress(f'fast benchmark stopped parallel sweep ctx={ctx} parallel={parallel}')
+                    break
+    except CancelledError:
+        if current is not None:
+            app.stop(current, managed_only=True)
+            records.append(enrich_exhaustive_record(
+                adaptive_record_from_candidate(current, 'fast', 'aborted', detail='user requested abort'),
+                current,
+                'default',
+                1,
+                0,
+                scan_level='fast',
+            ))
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        aborted_model = ModelConfig(**asdict(model))
+        aborted_model.last_benchmark_results = records
+        aborted_model.default_benchmark_status = 'aborted'
+        aborted_model.default_benchmark_at = ended_at
+        run = build_benchmark_run(run_id, 'server_fast', 'aborted', records, {}, started_at, ended_at, profile.short_summary())
+        upsert_benchmark_run(aborted_model, run)
+        app.add_or_update(aborted_model)
+        msg = '⚠ aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_aborted',
+            model,
+            'server_fast',
+            message=msg,
+            phase='aborted',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    winners = select_measured_profiles(model, measured, profile)
+    annotate_spectrum_records(records, winners)
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    saved.measured_profiles = winners
+    saved.benchmark_fingerprint = app.model_fingerprint(saved)
+    saved.default_benchmark_at = ended_at
+    status_text = 'done' if winners else 'failed'
+    run = build_benchmark_run(run_id, 'server_fast', status_text, records, winners, started_at, ended_at, profile.short_summary())
+    upsert_benchmark_run(saved, run)
+
+    if not winners:
+        saved.default_benchmark_status = 'failed'
+        app.add_or_update(saved)
+        msg = '❌ fast benchmark failed: no measured candidates completed'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_error',
+            model,
+            'server_fast',
+            message=msg,
+            phase='failed',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    auto_profile = winners['auto']
+    apply_measured_profile(saved, 'auto')
+    saved.measured_profiles = winners
+    saved.last_benchmark_tokens_per_sec = round(float(auto_profile.get('tokens_per_sec', 0.0) or 0.0), 2)
+    saved.last_benchmark_seconds = round(float(auto_profile.get('seconds', 0.0) or 0.0), 2)
+    saved.last_benchmark_profile = (
+        f'auto/fast {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
+        f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
+    )
+    saved.default_benchmark_status = 'done'
+    app.add_or_update(saved)
+    sync_msg = sync_opencode_after_tuning(app)
+    msg = (
+        f'✅ fast profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
+        f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
+        f'opencode ctx/slot={winners["opencode_ready"]["ctx_per_slot"]}, '
+        f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
+    )
+    if progress:
+        progress(msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_done',
+        saved,
+        'server_fast',
         message=msg,
         phase='complete',
         completed=completed,

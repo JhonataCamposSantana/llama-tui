@@ -15,19 +15,28 @@ from llama_tui.benchmark import (
     adaptive_record_from_candidate,
     annotate_spectrum_records,
     apply_measured_profile,
+    benchmark_config_fingerprint,
     benchmark_exhaustive_candidate_with_retry,
     benchmark_exhaustive_profiles,
+    benchmark_fast_profiles,
     break_refinement_contexts,
     build_benchmark_run,
     context_knee_refinement_contexts,
     exhaustive_context_ladder,
     exhaustive_parallel_values,
+    fast_benchmark_contexts,
+    fast_benchmark_parallel_values,
     model_from_measured_profile,
     parallel_refinement_values,
     parse_context_requirement,
     safe_bootstrap_candidate_models,
     select_adaptive_candidate_mix,
     select_measured_profiles,
+    smart_break_refinement_contexts,
+    smart_fast_contexts,
+    smart_measurement_contexts,
+    smart_should_continue_optional,
+    smart_should_try_q8,
     upsert_benchmark_run,
 )
 from llama_tui.control import CancelToken
@@ -394,16 +403,94 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
 
     def test_break_and_knee_context_refinement_helpers(self):
         self.assertEqual(break_refinement_contexts(20480, 32768, {20480, 32768}), [22528, 24576, 26624, 28672, 30720])
+        self.assertEqual(smart_break_refinement_contexts(20480, 32768, {20480, 32768}), [22528, 26624, 30720])
         records = [
             {'status': 'ok', 'ctx': 2048, 'ctx_per_slot': 2048, 'tokens_per_sec': 80.0},
             {'status': 'ok', 'ctx': 8192, 'ctx_per_slot': 8192, 'tokens_per_sec': 40.0},
         ]
         self.assertEqual(context_knee_refinement_contexts(records, {2048, 8192}, 8192), [5120])
 
+    def test_smart_measurement_contexts_focus_frontier_and_floors(self):
+        contexts = smart_measurement_contexts(
+            [2048, 4096, 8192, 16384, 32768],
+            [65536],
+            2048,
+            131072,
+            chat_floor=5000,
+            opencode_floor=20000,
+        )
+
+        self.assertIn(2048, contexts)
+        self.assertIn(8192, contexts)
+        self.assertIn(32768, contexts)
+        self.assertLessEqual(len(contexts), 5)
+        self.assertEqual(smart_fast_contexts([2048, 4096, 8192, 16384], 5000), [8192, 16384])
+
+    def test_smart_fingerprint_ignores_objective_but_tracks_runtime_settings(self):
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200)
+        candidate = ModelConfig(**asdict(model))
+        first = benchmark_config_fingerprint(candidate)
+        candidate.ctx = 4096
+        second = benchmark_config_fingerprint(candidate)
+
+        self.assertNotEqual(first, second)
+        long_candidate = ModelConfig(**asdict(model))
+        fast_candidate = ModelConfig(**asdict(model))
+        long_candidate.ctx = fast_candidate.ctx = 4096
+        long_candidate.parallel = fast_candidate.parallel = 1
+        self.assertEqual(benchmark_config_fingerprint(long_candidate), benchmark_config_fingerprint(fast_candidate))
+
+    def test_smart_optional_budget_continues_only_until_winners_exist(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200)
+        fast_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=4096, parallel=2)
+        long_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=32768, parallel=1)
+        measured = [
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'fast_chat', 'model': fast_model, 'tokens_per_sec': 80.0, 'ctx_per_slot': 2048, 'parallel': 2, 'ram_available': 8 * 1024**3},
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'long_context', 'model': long_model, 'tokens_per_sec': 20.0, 'ctx_per_slot': 32768, 'parallel': 1, 'ram_available': 8 * 1024**3},
+        ]
+
+        self.assertFalse(smart_should_continue_optional(0.0, measured, model, profile, now=3600.0))
+        self.assertTrue(smart_should_continue_optional(0.0, measured[:1], model, profile, now=3600.0))
+
+    def test_smart_q8_gate_requires_llamacpp_gpu_and_meaningful_gain(self):
+        profile = HardwareProfile(
+            cpu_logical=8,
+            cpu_physical=4,
+            memory_total=64 * 1024**3,
+            memory_available=48 * 1024**3,
+            gpu_memory_total=8 * 1024**3,
+            gpu_memory_free=6 * 1024**3,
+        )
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, runtime='llama.cpp', ctx_max=65536)
+
+        self.assertTrue(smart_should_try_q8(model, profile, default_best_ctx=32768, default_break_ctx=65536))
+        with patch('llama_tui.benchmark.candidate_safe_context_estimate', side_effect=[10000, 11499]):
+            self.assertFalse(smart_should_try_q8(model, profile, default_best_ctx=32768, default_break_ctx=0))
+        with patch('llama_tui.benchmark.candidate_safe_context_estimate', side_effect=[10000, 11600]):
+            self.assertTrue(smart_should_try_q8(model, profile, default_best_ctx=32768, default_break_ctx=0))
+        model.runtime = 'vllm'
+        self.assertFalse(smart_should_try_q8(model, profile, default_best_ctx=32768, default_break_ctx=65536))
+
     def test_exhaustive_parallel_values_are_power_of_two_and_refined(self):
         profile = HardwareProfile(cpu_logical=20, cpu_physical=10, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
         self.assertEqual(exhaustive_parallel_values(profile), [1, 2, 4, 8, 16])
         self.assertEqual(parallel_refinement_values(profile, 4, {1, 2, 4, 8, 16}), [3, 5])
+
+    def test_fast_benchmark_planners_are_shallow_and_limited(self):
+        profile = HardwareProfile(cpu_logical=20, cpu_physical=10, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx_min=2048, ctx_max=20000)
+
+        with patch('llama_tui.benchmark.candidate_safe_context_estimate', return_value=12288):
+            contexts = fast_benchmark_contexts(model, profile)
+
+        self.assertEqual(fast_benchmark_parallel_values(profile), [1, 2, 4])
+        self.assertEqual(fast_benchmark_parallel_values(HardwareProfile(cpu_logical=2, cpu_physical=1)), [1, 2])
+        self.assertIn(2048, contexts)
+        self.assertIn(8192, contexts)
+        self.assertIn(16384, contexts)
+        self.assertIn(12288, contexts)
+        self.assertLessEqual(max(contexts), 20000)
 
     def test_exhaustive_candidate_retries_and_marks_break_point(self):
         profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
@@ -445,7 +532,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertFalse(records[0]['break_point'])
         self.assertTrue(records[1]['break_point'])
 
-    def test_exhaustive_profiles_keep_long_and_fast_after_opencode_break(self):
+    def test_smart_profiles_reuse_long_context_for_opencode_ready(self):
         profile = HardwareProfile(cpu_logical=2, cpu_physical=1, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
         model = ModelConfig(
             id='m',
@@ -481,10 +568,19 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             def add_or_update(self, model):
                 self.saved.append(model)
 
+        def fake_probe(_app, candidate, objective, _progress, _cancel_token):
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'probe ok',
+                tokens_per_sec=10.0,
+                seconds=0.1,
+                ram_available=8 * 1024**3,
+            )
+            return record, True
+
         def fake_benchmark(_app, candidate, objective, _progress, _cancel_token):
             calls.append((objective, candidate.ctx, candidate.parallel))
-            if objective == 'opencode_ready':
-                return adaptive_record_from_candidate(candidate, objective, 'start failed', detail='context too small'), None
             record = adaptive_record_from_candidate(
                 candidate,
                 objective,
@@ -496,19 +592,141 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             measured['model'] = ModelConfig(**asdict(candidate))
             return record, measured
 
-        with patch('llama_tui.benchmark.benchmark_adaptive_candidate', side_effect=fake_benchmark):
-            ok, msg = benchmark_exhaustive_profiles(FakeApp(), model)
+        app = FakeApp()
+        with patch('llama_tui.benchmark.benchmark_frontier_probe_candidate', side_effect=fake_probe), \
+             patch('llama_tui.benchmark.benchmark_adaptive_candidate', side_effect=fake_benchmark):
+            ok, msg = benchmark_exhaustive_profiles(app, model)
 
         self.assertTrue(ok, msg)
         self.assertEqual(
             [ctx for objective, ctx, _parallel in calls if objective == 'long_context'],
-            [2048, 4096, 6144],
+            [2048, 4096, 5632, 6144],
         )
-        self.assertEqual(
-            [ctx for objective, ctx, _parallel in calls if objective == 'opencode_ready'],
-            [2048, 2048],
+        self.assertEqual([ctx for objective, ctx, _parallel in calls if objective == 'opencode_ready'], [])
+        self.assertTrue(any(objective == 'fast_chat' for objective, _ctx, _parallel in calls))
+        saved = app.saved[-1]
+        self.assertEqual(saved.benchmark_runs[0]['kind'], 'server')
+        self.assertEqual(saved.measured_profiles['opencode_ready'].get('reused_from'), 'long_context')
+        self.assertIn('auto/smart-bounded', saved.last_benchmark_profile)
+
+    def test_fast_benchmark_profiles_persist_server_fast_history(self):
+        profile = HardwareProfile(cpu_logical=4, cpu_physical=2, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path=__file__,
+            alias='m',
+            port=18200,
+            runtime='vllm',
+            ctx_min=2048,
+            ctx_max=8192,
+            output=256,
         )
-        self.assertIn(('fast_chat', 6144, 1), calls)
+
+        class FakeApp:
+            opencode = SimpleNamespace(path='')
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return profile
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, model):
+                self.saved.append(model)
+
+        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token):
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=100.0 / max(1, candidate.parallel),
+                seconds=1.0,
+                ram_available=8 * 1024**3,
+            )
+            measured = dict(record)
+            measured['model'] = ModelConfig(**asdict(candidate))
+            return record, measured
+
+        app = FakeApp()
+        with patch('llama_tui.benchmark.benchmark_adaptive_candidate', side_effect=fake_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model)
+
+        self.assertTrue(ok, msg)
+        saved = app.saved[-1]
+        self.assertEqual(saved.benchmark_runs[0]['kind'], 'server_fast')
+        self.assertIn('auto', saved.measured_profiles)
+        self.assertIn('auto/fast', saved.last_benchmark_profile)
+        self.assertGreater(saved.last_benchmark_tokens_per_sec, 0.0)
+
+    def test_fast_benchmark_stops_higher_contexts_after_confirmed_break(self):
+        profile = HardwareProfile(cpu_logical=4, cpu_physical=2, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path=__file__,
+            alias='m',
+            port=18200,
+            runtime='vllm',
+            ctx_min=2048,
+            ctx_max=16384,
+            output=256,
+        )
+        calls = []
+
+        class FakeApp:
+            opencode = SimpleNamespace(path='')
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return profile
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, model):
+                self.saved.append(model)
+
+        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token):
+            calls.append((objective, candidate.ctx, candidate.parallel))
+            if objective == 'long_context' and candidate.ctx > 2048:
+                return adaptive_record_from_candidate(candidate, objective, 'start failed', detail='oom'), None
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=50.0,
+                seconds=1.0,
+                ram_available=8 * 1024**3,
+            )
+            measured = dict(record)
+            measured['model'] = ModelConfig(**asdict(candidate))
+            return record, measured
+
+        app = FakeApp()
+        with patch('llama_tui.benchmark.benchmark_adaptive_candidate', side_effect=fake_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual([ctx for objective, ctx, _parallel in calls if objective == 'long_context'], [2048, 8192, 8192])
+        self.assertNotIn(('long_context', 16384, 1), calls)
 
     def test_adaptive_candidate_mix_keeps_each_spectrum_objective(self):
         items = []
@@ -540,6 +758,21 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertEqual(winners['long_context']['ctx_per_slot'], 32000)
         self.assertEqual(winners['opencode_ready']['ctx_per_slot'], 32000)
         self.assertIn('auto', winners)
+
+    def test_select_measured_profiles_ignores_probe_rows_for_winners(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200)
+        probe_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=65536, parallel=1)
+        full_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=8192, parallel=1)
+        measured = [
+            {'status': 'ok', 'measurement_type': 'probe', 'objective': 'long_context', 'model': probe_model, 'tokens_per_sec': 999.0, 'ctx_per_slot': 65536, 'parallel': 1},
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'long_context', 'model': full_model, 'tokens_per_sec': 20.0, 'ctx_per_slot': 8192, 'parallel': 1},
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertEqual(winners['long_context']['ctx_per_slot'], 8192)
+        self.assertEqual(winners['opencode_ready'].get('reused_from'), 'long_context')
 
     def test_annotates_spectrum_tradeoff_rows(self):
         records = [

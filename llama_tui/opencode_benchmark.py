@@ -581,6 +581,7 @@ def run_opencode_task(
                     message=f'headless OpenCode command: {preview}',
                     phase='OpenCode benchmark (headless)',
                     candidate=task.name,
+                    command=preview,
                 )
             run = run_process_with_metrics(command, workspace, env, timeout, app, cancel_token=cancel_token)
             all_output = list(run.get('stdout', []) or []) + list(run.get('stderr', []) or [])

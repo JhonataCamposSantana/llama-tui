@@ -11,6 +11,7 @@ from .benchmark import (
     append_model_log,
     apply_measured_profile,
     benchmark_best_optimization,
+    benchmark_fast_profiles,
     estimate_text_tokens,
     launch_opencode_stack,
     launch_with_failsafe,
@@ -25,7 +26,7 @@ from .hardware import HardwareProfile
 from .models import ModelConfig
 from .opencode_benchmark import benchmark_opencode_workflow
 from .optimize import apply_best_optimization, select_best_tier
-from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, tail_text, wrap_display_lines
+from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, wrap_display_lines
 
 PROFILE_LABELS = {
     'best': 'Auto Profile',
@@ -64,6 +65,78 @@ SIMPLE_PROFILE_ACTIONS = {
 TRY_INPUT_ROWS = 5
 BENCHMARK_FEED_LIMIT = 80
 BENCHMARK_RECORD_LIMIT = 120
+BENCHMARK_COMMAND_LIMIT = 12
+RIGHT_PANE_SCROLL_KEYS = {
+    curses.KEY_UP: 'older',
+    ord('k'): 'older',
+    curses.KEY_DOWN: 'newer',
+    ord('j'): 'newer',
+    curses.KEY_PPAGE: 'page_older',
+    curses.KEY_NPAGE: 'page_newer',
+    curses.KEY_HOME: 'oldest',
+    curses.KEY_END: 'newest',
+}
+RIGHT_TABS = {
+    'detail': ['summary', 'logs_errors', 'command', 'benchmarks'],
+    'benchmark': ['progress', 'results', 'commands', 'logs_errors'],
+    'try': ['profile', 'logs_errors', 'stats', 'command'],
+    'results': ['run_summary', 'rankings', 'failures'],
+}
+RIGHT_TAB_LABELS = {
+    'summary': 'Summary',
+    'logs_errors': 'Logs + Errors',
+    'command': 'Command',
+    'commands': 'Commands',
+    'benchmarks': 'Benchmarks',
+    'progress': 'Progress',
+    'results': 'Results',
+    'profile': 'Profile',
+    'stats': 'Stats',
+    'run_summary': 'Run Summary',
+    'rankings': 'Rankings',
+    'failures': 'Failures',
+}
+RIGHT_DEFAULT_TAB = {
+    'detail': 'summary',
+    'benchmark': 'progress',
+    'try': 'profile',
+    'results': 'run_summary',
+}
+
+BENCHMARK_WIKI_SECTIONS = [
+    (
+        'What is a benchmark?',
+        'A benchmark is a safe test run. llama-tui starts the model with one set of settings, checks that the server is ready, asks it to write a short answer, records speed and stability, then stops that server before trying the next set.',
+    ),
+    (
+        'What the numbers mean',
+        'ctx is how much conversation or code the model can keep in memory. ctx/slot is how much of that memory each simultaneous request gets. parallel is how many requests the server can handle at once. tok/s is how fast the model writes. threads is CPU worker count. ngl is how many llama.cpp layers go to the GPU. Headroom is RAM or VRAM left after the test.',
+    ),
+    (
+        'Extra table labels',
+        'variant shows runtime tweaks, usually default or q8 KV. measurement_type tells you whether a row was a quick probe or a full speed measurement. planner_reason explains why llama-tui tested that row, such as frontier, speed_knee, chat_parallel, opencode_floor, or q8_probe.',
+    ),
+    (
+        'Deep benchmark: B',
+        'B is the careful benchmark. It first finds the safe edge for context, then fully measures only the settings that could realistically win. This is the smart bounded path: less waste than testing everything, but winners still come from real measurements.',
+    ),
+    (
+        'Fast benchmark: F',
+        'F is the quick benchmark. It tests a small set of practical settings and gives you a useful first profile faster. Use it when you want a good starting point; use B when you want higher confidence.',
+    ),
+    (
+        'OpenCode benchmark: O',
+        'O is the OpenCode check. It runs headless, meaning no terminal opens. llama-tui uses throwaway test projects, captures logs and exit codes, checks the result with python -m unittest -q, then cleans up OpenCode and the model server.',
+    ),
+    (
+        'Reading results',
+        'Winner is the saved setting for that category. Runner-up is the next best measured option. Failed means the server did not start, did not become ready, or could not finish the sample. Break Point means a setting failed twice, so llama-tui stopped trying larger or heavier settings in that direction.',
+    ),
+    (
+        'Which result should I use?',
+        'Fast Chat is for snappy replies. Long Context is for large files and long sessions. OpenCode-ready is for coding workflows with OpenCode. Auto is the balanced everyday choice when you just want llama-tui to pick a sensible profile.',
+    ),
+]
 
 
 def profile_label(value: str) -> str:
@@ -80,6 +153,193 @@ def tier_label(value: str) -> str:
 
 def simple_profile_action(value: str) -> Tuple[str, str, str]:
     return SIMPLE_PROFILE_ACTIONS[value]
+
+
+def benchmark_wiki_lines(width: int) -> List[str]:
+    width = max(24, int(width or 24))
+    lines: List[str] = []
+    for title, body in BENCHMARK_WIKI_SECTIONS:
+        if lines:
+            lines.append('')
+        lines.append(title)
+        lines.extend(wrap_display_lines(body, width))
+    return lines
+
+
+def clamp_scroll(scroll: int, total_lines: int, visible_rows: int) -> int:
+    max_scroll = max(0, int(total_lines or 0) - max(1, int(visible_rows or 1)))
+    return max(0, min(max_scroll, int(scroll or 0)))
+
+
+def scrollable_pane_wrapped_items(items: List[object], width: int, default_attr: int = 0) -> List[Tuple[str, int]]:
+    width = max(1, int(width or 1))
+    wrapped: List[Tuple[str, int]] = []
+    for item in items or ['']:
+        if isinstance(item, tuple):
+            text, attr = item[0], int(item[1] or default_attr)
+        else:
+            text, attr = item, default_attr
+        lines = wrap_display_lines(str(text), width) or ['']
+        wrapped.extend((line, attr) for line in lines)
+    return wrapped or [('', default_attr)]
+
+
+def scrollable_pane_wrapped_lines(lines: List[str], width: int) -> List[str]:
+    return [line for line, _attr in scrollable_pane_wrapped_items(list(lines or []), width)]
+
+
+def scrollable_pane_max_scroll(lines: List[str], width: int, rows: int) -> int:
+    return max(0, len(scrollable_pane_wrapped_lines(lines, width)) - max(1, int(rows or 1)))
+
+
+def scrollable_pane_view(lines: List[str], width: int, rows: int, scroll: int) -> Tuple[List[str], int, bool, bool]:
+    items, clamped, has_older, has_newer, _total = scrollable_pane_item_view(lines, width, rows, scroll)
+    return [line for line, _attr in items], clamped, has_older, has_newer
+
+
+def scrollable_pane_item_view(
+    items: List[object],
+    width: int,
+    rows: int,
+    scroll: int,
+    default_attr: int = 0,
+) -> Tuple[List[Tuple[str, int]], int, bool, bool, int]:
+    visible_rows = max(1, int(rows or 1))
+    wrapped = scrollable_pane_wrapped_items(items, width, default_attr)
+    total = len(wrapped)
+    clamped = clamp_scroll(scroll, total, visible_rows)
+    start = max(0, total - visible_rows - clamped)
+    end = min(total, start + visible_rows)
+    visible = wrapped[start:end]
+    has_older = start > 0
+    has_newer = end < total
+    while len(visible) < visible_rows:
+        visible.append(('', default_attr))
+    return visible, clamped, has_older, has_newer, total
+
+
+def adjust_scroll_offset(scroll: int, action: str, total_lines: int, visible_rows: int) -> int:
+    page = max(1, int(visible_rows or 1))
+    if action == 'older':
+        scroll += 1
+    elif action == 'newer':
+        scroll -= 1
+    elif action == 'page_older':
+        scroll += page
+    elif action == 'page_newer':
+        scroll -= page
+    elif action == 'oldest':
+        scroll = max(0, int(total_lines or 0))
+    elif action == 'newest':
+        scroll = 0
+    return clamp_scroll(scroll, total_lines, visible_rows)
+
+
+def read_display_file_lines(path: Path) -> List[str]:
+    if not path.exists():
+        return ['<no log file yet>']
+    try:
+        return path.read_text(errors='replace').splitlines() or ['<empty log>']
+    except Exception as exc:
+        return [f'<failed to read log: {exc}>']
+
+
+def pane_title(title: str, pane: str, focused_pane: str, focus_active: bool = True) -> str:
+    return f'{title} *' if focus_active and pane == focused_pane else title
+
+
+def right_tabs_for_view(view_mode: str) -> List[str]:
+    return list(RIGHT_TABS.get(view_mode, []))
+
+
+def default_right_tab(view_mode: str) -> str:
+    tabs = right_tabs_for_view(view_mode)
+    return RIGHT_DEFAULT_TAB.get(view_mode, tabs[0] if tabs else '')
+
+
+def normalize_right_tab(view_mode: str, tab: str) -> str:
+    tabs = right_tabs_for_view(view_mode)
+    if tab in tabs:
+        return tab
+    return default_right_tab(view_mode)
+
+
+def cycle_right_tab(view_mode: str, current_tab: str, direction: int = 1) -> str:
+    tabs = right_tabs_for_view(view_mode)
+    if not tabs:
+        return ''
+    current = normalize_right_tab(view_mode, current_tab)
+    try:
+        index = tabs.index(current)
+    except ValueError:
+        index = 0
+    return tabs[(index + int(direction or 1)) % len(tabs)]
+
+
+def right_tab_scroll_key(view_mode: str, tab: str) -> str:
+    return f'{view_mode}:{normalize_right_tab(view_mode, tab)}'
+
+
+def build_logs_errors_items(
+    error_lines: List[str],
+    log_lines: List[str],
+    error_attr: int = 0,
+    log_attr: int = 0,
+    heading_attr: int = 0,
+    muted_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    items: List[Tuple[str, int]] = []
+    if error_lines:
+        items.append(('errors:', heading_attr))
+        items.extend((str(line), error_attr) for line in error_lines)
+        items.append(('', log_attr))
+    else:
+        items.append(('errors: none captured', muted_attr))
+        items.append(('', log_attr))
+    items.append(('logs:', heading_attr))
+    if log_lines:
+        items.extend((str(line), log_attr) for line in log_lines)
+    else:
+        items.append(('<no log lines>', muted_attr))
+    return items
+
+
+def build_benchmark_progress_items(
+    model: ModelConfig,
+    state: Dict[str, object],
+    status: str,
+    detail: str,
+    pid: object,
+    width: int,
+    accent_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    completed = int(state.get('completed', 0) or 0)
+    total = int(state.get('total', 0) or 0)
+    fraction = benchmark_progress_fraction(completed, total)
+    return [
+        (f'model: {model.id}', normal_attr),
+        (f'run: {state.get("run_kind") or "server"}', normal_attr),
+        (f'status: {state.get("status") or "idle"} / server {status}', accent_attr),
+        (f'phase: {state.get("phase") or "-"}', normal_attr),
+        (f'elapsed: {benchmark_elapsed_text(state)}', normal_attr),
+        (f'progress: {progress_bar_text(completed, total, max(8, width - 18))} {int(round(fraction * 100))}%', accent_attr),
+        (f'candidate: {state.get("candidate") or "-"}', normal_attr),
+        (f'pid: {pid or "-"}  {detail}', normal_attr),
+    ]
+
+
+def should_prompt_quit_keepalive(managed_running: bool, action_active: bool) -> bool:
+    return bool(managed_running) and not bool(action_active)
+
+
+def apply_quit_policy(app: AppConfig, policy: str) -> Tuple[bool, str]:
+    if policy == 'cancel':
+        return False, 'Quit cancelled.'
+    if policy == 'leave':
+        app.leave_managed_processes_running()
+        return True, 'Leaving managed model servers running.'
+    return True, 'Stopping managed model servers on quit.'
 
 
 def model_profile_summary(model: ModelConfig) -> str:
@@ -243,6 +503,8 @@ def new_benchmark_run_state(
         'updated_at': timestamp,
         'records': [],
         'feed': [],
+        'commands': [],
+        'current_command': '',
         'errors': [],
     }
 
@@ -263,6 +525,27 @@ def progress_bar_text(completed: object, total: object, width: int) -> str:
     fraction = benchmark_progress_fraction(completed, total)
     filled = max(0, min(width, int(round(width * fraction))))
     return '[' + ('#' * filled) + ('-' * (width - filled)) + ']'
+
+
+def benchmark_command_lines(state: Dict[str, object], width: int, max_rows: int) -> List[Tuple[str, str]]:
+    width = max(8, int(width or 8))
+    max_rows = max(1, int(max_rows or 1))
+    current = str(state.get('current_command', '') or '')
+    commands = [str(item) for item in list(state.get('commands', []) or []) if str(item)]
+    if not current and not commands:
+        return [('waiting for first command...', 'muted')]
+    lines: List[Tuple[str, str]] = []
+    if current:
+        lines.append((ellipsize(f'current: {current}', width), 'current'))
+    else:
+        lines.append(('current: -', 'muted'))
+    remaining = max_rows - len(lines)
+    if remaining > 0:
+        recent = commands[-remaining:]
+        for command in recent:
+            prefix = 'recent: '
+            lines.append((ellipsize(prefix + command, width), 'muted'))
+    return lines[:max_rows]
 
 
 def benchmark_elapsed_text(state: Dict[str, object], now: Optional[float] = None) -> str:
@@ -400,11 +683,21 @@ def reduce_benchmark_event(
     if 'total' in payload:
         state['total'] = max(0, int(payload.get('total') or 0))
 
+    command = compact_message(str(payload.get('command') or payload.get('command_preview') or ''))
+    if command:
+        state['current_command'] = command
+        commands = list(state.get('commands', []) or [])
+        if not commands or commands[-1] != command:
+            commands.append(command)
+        state['commands'] = commands[-BENCHMARK_COMMAND_LIMIT:]
+
     message = compact_message(str(payload.get('message', '') or ''))
     if message:
-        feed = list(state.get('feed', []) or [])
-        feed.append(message)
-        state['feed'] = feed[-BENCHMARK_FEED_LIMIT:]
+        pure_command = command and message == command
+        if not pure_command:
+            feed = list(state.get('feed', []) or [])
+            feed.append(message)
+            state['feed'] = feed[-BENCHMARK_FEED_LIMIT:]
     if 'records' in payload and isinstance(payload.get('records'), list):
         state['records'] = list(payload.get('records') or [])[-BENCHMARK_RECORD_LIMIT:]
     elif event == 'benchmark_result' and isinstance(payload.get('record'), dict):
@@ -634,21 +927,142 @@ def prompt_quit_policy(stdscr, colors) -> str:
         ('2', 'Leave servers running and quit', 'leave'),
         ('q', 'Cancel', 'cancel'),
     ])
+
+
+def show_benchmark_wiki(stdscr, colors):
+    h, w = stdscr.getmaxyx()
+    box_w = min(92, max(50, w - 8))
+    box_h = min(max(12, h - 6), 28)
+    if h < 12 or w < 54:
+        return
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(2, (h - box_h) // 2)
+    modal = curses.newwin(box_h, box_w, box_y, box_x)
+    modal.keypad(True)
+    content_h = max(1, box_h - 4)
+    lines = benchmark_wiki_lines(box_w - 4)
+    scroll = 0
+    stdscr.nodelay(False)
+    try:
+        while True:
+            scroll = clamp_scroll(scroll, len(lines), content_h)
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, 'Benchmark Wiki', colors['accent'] | curses.A_BOLD, colors['accent'])
+            visible = lines[scroll: scroll + content_h]
+            for idx, line in enumerate(visible):
+                attr = colors['accent'] | curses.A_BOLD if line and not line.startswith(' ') and any(line == title for title, _body in BENCHMARK_WIKI_SECTIONS) else curses.A_NORMAL
+                modal.addstr(2 + idx, 2, line[: box_w - 4], attr)
+            footer = '[Up/Down] scroll  [PgUp/PgDn] page  [Esc/q] close'
+            modal.addstr(box_h - 2, 2, footer[: box_w - 4], colors['muted'])
+            modal.refresh()
+            key = modal.getch()
+            if key in (27, ord('q')):
+                return
+            if key in (curses.KEY_UP, ord('k')):
+                scroll -= 1
+            elif key in (curses.KEY_DOWN, ord('j')):
+                scroll += 1
+            elif key == curses.KEY_PPAGE:
+                scroll -= content_h
+            elif key == curses.KEY_NPAGE:
+                scroll += content_h
+            elif key == curses.KEY_HOME:
+                scroll = 0
+            elif key == curses.KEY_END:
+                scroll = len(lines)
+    finally:
+        stdscr.touchwin()
+        stdscr.nodelay(True)
+
+
+def safe_addch(stdscr, y: int, x: int, ch, attr: int = 0):
+    try:
+        stdscr.addch(y, x, ch, attr)
+    except curses.error:
+        pass
+
+
+def safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0):
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def draw_scrollable_items(
+    stdscr,
+    y: int,
+    x: int,
+    h: int,
+    w: int,
+    items: List[object],
+    scroll: int,
+    colors: Dict[str, int],
+    default_attr: int = 0,
+) -> Tuple[int, int, int]:
+    rows = max(1, h - 3)
+    width = max(1, w - 4)
+    visible, clamped, has_older, has_newer, total = scrollable_pane_item_view(
+        items,
+        width,
+        rows,
+        scroll,
+        default_attr=default_attr,
+    )
+    if rows == 1 and has_older and has_newer:
+        visible[0] = ('^ older / v newer', colors['muted'])
+    else:
+        if has_older and visible:
+            visible[0] = ('^ older lines above', colors['muted'])
+        if has_newer and visible:
+            visible[-1] = ('v newer lines below', colors['muted'])
+    for idx, (line, attr) in enumerate(visible[:rows]):
+        safe_addstr(stdscr, y + 2 + idx, x + 2, str(line)[:width], attr)
+    return clamped, total, rows
+
+
+def draw_tabbed_panel(
+    stdscr,
+    y: int,
+    x: int,
+    h: int,
+    w: int,
+    title: str,
+    tabs: List[str],
+    active_tab: str,
+    colors: Dict[str, int],
+):
+    draw_box(stdscr, y, x, h, w, title, colors['accent'] | curses.A_BOLD, colors['accent'])
+    tab_x = x + len(title) + 5
+    max_x = x + w - 2
+    for tab in tabs:
+        label = RIGHT_TAB_LABELS.get(tab, tab.replace('_', ' ').title())
+        text = f'[{label}]' if tab == active_tab else f' {label} '
+        if tab_x + len(text) > max_x:
+            remaining = max_x - tab_x
+            if remaining > 4:
+                safe_addstr(stdscr, y, tab_x, ellipsize(text, remaining), colors['muted'])
+            break
+        attr = colors['selection'] | curses.A_BOLD if tab == active_tab else colors['muted']
+        safe_addstr(stdscr, y, tab_x, text, attr)
+        tab_x += len(text) + 1
+
+
 def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
     if h < 2 or w < 4:
         return
-    stdscr.addstr(y, x + 2, f' {title} ', title_attr)
+    safe_addstr(stdscr, y, x + 2, f' {title} ', title_attr)
     for i in range(x, x + w):
-        stdscr.addch(y + 1, i, curses.ACS_HLINE, border_attr)
+        safe_addch(stdscr, y + 1, i, curses.ACS_HLINE, border_attr)
     for i in range(y + 1, y + h):
-        stdscr.addch(i, x, curses.ACS_VLINE, border_attr)
-        stdscr.addch(i, x + w - 1, curses.ACS_VLINE, border_attr)
-    stdscr.addch(y + 1, x, curses.ACS_ULCORNER, border_attr)
-    stdscr.addch(y + 1, x + w - 1, curses.ACS_URCORNER, border_attr)
-    stdscr.addch(y + h, x, curses.ACS_LLCORNER, border_attr)
-    stdscr.addch(y + h, x + w - 1, curses.ACS_LRCORNER, border_attr)
+        safe_addch(stdscr, i, x, curses.ACS_VLINE, border_attr)
+        safe_addch(stdscr, i, x + w - 1, curses.ACS_VLINE, border_attr)
+    safe_addch(stdscr, y + 1, x, curses.ACS_ULCORNER, border_attr)
+    safe_addch(stdscr, y + 1, x + w - 1, curses.ACS_URCORNER, border_attr)
+    safe_addch(stdscr, y + h, x, curses.ACS_LLCORNER, border_attr)
+    safe_addch(stdscr, y + h, x + w - 1, curses.ACS_LRCORNER, border_attr)
     for i in range(x + 1, x + w - 1):
-        stdscr.addch(y + h, i, curses.ACS_HLINE, border_attr)
+        safe_addch(stdscr, y + h, i, curses.ACS_HLINE, border_attr)
 def init_colors():
     palette = {
         'default': 0,
@@ -729,8 +1143,12 @@ def tui(stdscr, app: AppConfig):
     detail_model_id = ''
     message = 'Ready.'
     last_error_message = ''
+    error_history: List[str] = []
+    right_tab_by_view: Dict[str, str] = {}
+    right_tab_scrolls: Dict[str, int] = {}
+    right_tab_scroll_total = 0
+    right_tab_scroll_rows = 1
     last_refresh = 0.0
-    external_stack_launched = False
     statuses: Dict[str, Tuple[str, str]] = {}
     action_thread: Optional[threading.Thread] = None
     action_token: Optional[CancelToken] = None
@@ -747,6 +1165,24 @@ def tui(stdscr, app: AppConfig):
     try_input_scroll = 0
     benchmark_state = new_benchmark_run_state()
     results_run_index = 0
+
+    def reset_right_tabs(view: str = ''):
+        nonlocal right_tab_by_view, right_tab_scrolls
+        if view:
+            right_tab_by_view[view] = default_right_tab(view)
+        else:
+            right_tab_by_view = {}
+        right_tab_scrolls = {}
+
+    def remember_error(text: str):
+        nonlocal last_error_message
+        line = compact_message(text)
+        if not line:
+            return
+        last_error_message = line
+        if not error_history or error_history[-1] != line:
+            error_history.append(line)
+            del error_history[:-BENCHMARK_FEED_LIMIT]
 
     def action_running() -> bool:
         return action_thread is not None and action_thread.is_alive()
@@ -765,6 +1201,7 @@ def tui(stdscr, app: AppConfig):
         token = CancelToken()
         action_token = token
         if run_kind:
+            reset_right_tabs('benchmark')
             view_mode = 'benchmark'
             detail_model_id = model.id
             benchmark_state = new_benchmark_run_state(model.id, run_kind, label)
@@ -868,6 +1305,7 @@ def tui(stdscr, app: AppConfig):
 
     def open_model_details(model: ModelConfig):
         nonlocal view_mode, detail_model_id, message
+        reset_right_tabs('detail')
         view_mode = 'detail'
         detail_model_id = model.id
         message = f'{model.id}: details loaded. Press Enter/l to start or Esc to return.'
@@ -879,6 +1317,7 @@ def tui(stdscr, app: AppConfig):
         if action_running():
             message = '⏳ Wait for the current launch or benchmark before opening Try it out.'
             return
+        reset_right_tabs('try')
         view_mode = 'try'
         detail_model_id = model.id
         try_session += 1
@@ -923,6 +1362,7 @@ def tui(stdscr, app: AppConfig):
 
     def open_results_view(model: ModelConfig):
         nonlocal view_mode, detail_model_id, message, results_run_index
+        reset_right_tabs('results')
         view_mode = 'results'
         detail_model_id = model.id
         results_run_index = 0
@@ -989,6 +1429,7 @@ def tui(stdscr, app: AppConfig):
             message = f'{model.id}: try-out closed; {stop_msg}'
         else:
             message = 'Try-out closed.'
+        reset_right_tabs('detail')
         view_mode = 'detail'
         try_thread = None
         try_token = None
@@ -1110,7 +1551,7 @@ def tui(stdscr, app: AppConfig):
                     try_error = text or 'try-out failed'
                     try_thread = None
                     message = f'❌ {try_error}'
-                    last_error_message = message
+                    remember_error(message)
                     continue
                 if event == 'chat_chunk':
                     update_try_live_metrics(try_live_metrics, text)
@@ -1140,7 +1581,7 @@ def tui(stdscr, app: AppConfig):
                     try_response_index = None
                     try_thread = None
                     message = f'❌ {try_error}'
-                    last_error_message = message
+                    remember_error(message)
                     continue
             if event == 'benchmark_event':
                 payload = text if isinstance(text, dict) else {}
@@ -1149,12 +1590,10 @@ def tui(stdscr, app: AppConfig):
                 if event_message:
                     message = event_message
                     if is_error_message(event_message):
-                        last_error_message = event_message
+                        remember_error(event_message)
                 continue
-            if event == 'stack_done' and text.startswith('✅'):
-                external_stack_launched = True
             if is_error_message(text):
-                last_error_message = text
+                remember_error(text)
             message = text
             if event in ('done', 'stack_done', 'benchmark_done'):
                 action_thread = None
@@ -1179,7 +1618,7 @@ def tui(stdscr, app: AppConfig):
 
         active_model = active_detail_model()
         if is_error_message(message):
-            last_error_message = compact_message(message)
+            remember_error(message)
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
@@ -1261,76 +1700,40 @@ def tui(stdscr, app: AppConfig):
         benchmark_mode = view_mode == 'benchmark'
         results_mode = view_mode == 'results'
         benchmark_errors = list(benchmark_state.get('errors', []) or [])
-        error_text = '\n'.join(str(item) for item in benchmark_errors[-6:]) if benchmark_mode and benchmark_errors else (last_error_message or status_error)
-        error_lines = wrap_display_lines(error_text, right_w - 4) if error_text else ['No errors captured.']
-        if try_mode:
-            error_box_h = 0
-        elif benchmark_mode:
-            error_box_h = max(4, min(8, right_total_h // 4)) if right_total_h >= 14 else 0
-        elif results_mode:
-            error_box_h = 0
-        elif right_total_h >= 14:
-            desired_error_h = min(max(5, len(error_lines) + 3), 14)
-            error_box_h = min(desired_error_h, max(5, right_total_h - 8))
+        if benchmark_mode and benchmark_errors:
+            error_source_lines = [str(item) for item in benchmark_errors]
         else:
-            error_box_h = 0
-        if try_mode:
-            if right_total_h >= 14:
-                stats_box_h = max(4, min(7, right_total_h // 4))
-                profile_box_h = max(5, min(11, right_total_h // 3))
-                logs_box_h = right_total_h - profile_box_h - stats_box_h - 2
-                if logs_box_h < 4:
-                    deficit = 4 - logs_box_h
-                    profile_cut = min(deficit, max(0, profile_box_h - 4))
-                    profile_box_h -= profile_cut
-                    deficit -= profile_cut
-                    stats_cut = min(deficit, max(0, stats_box_h - 3))
-                    stats_box_h -= stats_cut
-                    logs_box_h = right_total_h - profile_box_h - stats_box_h - 2
-                logs_box_h = max(2, logs_box_h)
-            else:
-                stats_box_h = 0
-                profile_box_h = max(2, min(6, right_total_h // 2))
-                logs_box_h = max(2, right_total_h - profile_box_h - 1)
-            logs_box_y = box_top + profile_box_h + 1
-            stats_box_y = logs_box_y + logs_box_h + 1
-            error_box_y = 0
-        elif benchmark_mode:
-            profile_box_h = max(5, min(9, right_total_h // 4 if right_total_h >= 20 else 6))
-            stats_box_h = 0
-            stats_box_y = 0
-            logs_box_h = right_total_h - profile_box_h - (error_box_h + 2 if error_box_h else 1)
-            if logs_box_h < 4:
-                deficit = 4 - logs_box_h
-                profile_box_h = max(4, profile_box_h - deficit)
-                logs_box_h = right_total_h - profile_box_h - (error_box_h + 2 if error_box_h else 1)
-            logs_box_h = max(2, logs_box_h)
-            logs_box_y = box_top + profile_box_h + 1
-            error_box_y = logs_box_y + logs_box_h + 1 if error_box_h else 0
-        else:
-            profile_box_h = 0
-            stats_box_h = 0
-            stats_box_y = 0
-            logs_box_h = right_total_h if error_box_h == 0 else max(5, right_total_h - error_box_h - 1)
-            logs_box_y = box_top
-            error_box_y = box_top + logs_box_h + 1
+            error_source_lines = list(error_history)
+            if status_error and (not error_source_lines or error_source_lines[-1] != status_error):
+                error_source_lines.append(status_error)
+            elif last_error_message and not error_source_lines:
+                error_source_lines.append(last_error_message)
+        error_text = '\n'.join(error_source_lines)
+        right_tabs = right_tabs_for_view(view_mode)
+        right_active_tab = normalize_right_tab(view_mode, right_tab_by_view.get(view_mode, '')) if right_tabs else ''
+        if right_tabs:
+            right_tab_by_view[view_mode] = right_active_tab
+        right_panel_h = right_total_h
+        right_content_w = max(1, right_w - 4)
+        right_tab_key = right_tab_scroll_key(view_mode, right_active_tab)
+        right_scroll = int(right_tab_scrolls.get(right_tab_key, 0) or 0)
 
         left_title = 'Try It Out' if try_mode else 'Benchmark' if benchmark_mode else 'Results' if results_mode else 'Model Details' if view_mode == 'detail' else 'Models'
         draw_box(stdscr, box_top, 1, h - box_top - 4, left_w, left_title, colors['accent'] | curses.A_BOLD, colors['accent'])
-        if try_mode:
-            draw_box(stdscr, box_top, right_x, profile_box_h, right_w, 'Active Test Profile', colors['accent'] | curses.A_BOLD, colors['accent'])
-            draw_box(stdscr, logs_box_y, right_x, logs_box_h, right_w, 'Server Logs', colors['accent'] | curses.A_BOLD, colors['accent'])
-            if stats_box_h:
-                draw_box(stdscr, stats_box_y, right_x, stats_box_h, right_w, 'Live Stats', colors['accent'] | curses.A_BOLD, colors['accent'])
-        elif benchmark_mode:
-            draw_box(stdscr, box_top, right_x, profile_box_h, right_w, 'Benchmark Progress', colors['accent'] | curses.A_BOLD, colors['accent'])
-            draw_box(stdscr, logs_box_y, right_x, logs_box_h, right_w, 'Benchmark Logs', colors['accent'] | curses.A_BOLD, colors['accent'])
-        elif results_mode:
-            draw_box(stdscr, box_top, right_x, logs_box_h, right_w, 'Run Rankings', colors['accent'] | curses.A_BOLD, colors['accent'])
+        if right_tabs:
+            draw_tabbed_panel(
+                stdscr,
+                box_top,
+                right_x,
+                right_panel_h,
+                right_w,
+                'Right Pane',
+                right_tabs,
+                right_active_tab,
+                colors,
+            )
         else:
-            draw_box(stdscr, box_top, right_x, logs_box_h, right_w, 'Details / Logs / Roles', colors['accent'] | curses.A_BOLD, colors['accent'])
-        if error_box_h:
-            draw_box(stdscr, error_box_y, right_x, error_box_h, right_w, 'Errors', colors['error'] | curses.A_BOLD, colors['error'])
+            draw_box(stdscr, box_top, right_x, right_panel_h, right_w, 'Details / Logs / Roles', colors['accent'] | curses.A_BOLD, colors['accent'])
 
         if view_mode == 'results' and active_model:
             model = active_model
@@ -1501,7 +1904,7 @@ def tui(stdscr, app: AppConfig):
                 opencode_summary = 'not run yet; press O for opencode workflow'
             hardware = app.hardware_profile().short_summary()
             detail_rows = [
-                ('[Esc] back   [Enter/l] actions   [T] try   [B] server bench   [O] opencode bench   [R] results   [z] auto profile', colors['accent'] | curses.A_BOLD),
+                ('[Esc] back   [Enter/l] actions   [T] try   [B] deep bench   [F] fast bench   [O] opencode bench   [R] results   [z] auto profile', colors['accent'] | curses.A_BOLD),
                 ('', curses.A_NORMAL),
                 (f'name: {model.name}', curses.A_BOLD),
                 (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
@@ -1639,154 +2042,260 @@ def tui(stdscr, app: AppConfig):
         else:
             stdscr.addstr(box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
 
-        if active_model and view_mode == 'results':
-            model = active_model
-            runs = benchmark_runs_for_model(model)
-            if runs:
-                results_run_index = max(0, min(results_run_index, len(runs) - 1))
-                run = runs[results_run_index]
-                lines = [
-                    f'run: {run.get("id", "-")}',
-                    f'status: {run.get("status", "-")}  kind: {run.get("kind", "-")}',
-                    f'started: {run.get("started_at", "-")}',
-                    f'ended: {run.get("ended_at", "-")}',
-                    f'elapsed: {float(run.get("elapsed_seconds", 0.0) or 0.0):.1f}s',
-                    f'summary: {run.get("summary", "no summary")}',
-                    '',
-                    'winners and ranking:',
-                ]
-                lines.extend(benchmark_ranking_rows(run))
-            else:
-                lines = ['No benchmark run selected.']
-            for i, line in enumerate(lines[: max(1, logs_box_h - 3)]):
-                attr = curses.A_NORMAL
-                if line.startswith(('run:', 'winners')):
-                    attr = colors['accent'] | curses.A_BOLD
-                elif line.startswith(('Fast Chat:', 'Long Context:', 'OpenCode-ready:', 'Auto:')):
-                    attr = colors['success'] | curses.A_BOLD if 'not measured' not in line else colors['warning']
-                elif line.startswith(('break:', 'fail:')):
-                    attr = colors['error']
-                stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
-        elif active_model and view_mode == 'benchmark':
+        if active_model and right_tabs:
             model = active_model
             status, detail = statuses.get(model.id, ('?', ''))
-            completed = int(benchmark_state.get('completed', 0) or 0)
-            total = int(benchmark_state.get('total', 0) or 0)
-            fraction = benchmark_progress_fraction(completed, total)
-            progress_lines = [
-                f'model: {model.id}',
-                f'run: {benchmark_state.get("run_kind") or "server"}',
-                f'status: {benchmark_state.get("status") or "idle"} / server {status}',
-                f'phase: {benchmark_state.get("phase") or "-"}',
-                f'elapsed: {benchmark_elapsed_text(benchmark_state)}',
-                f'progress: {progress_bar_text(completed, total, max(8, right_w - 22))} {int(round(fraction * 100))}%',
-                f'candidate: {benchmark_state.get("candidate") or "-"}',
-                f'pid: {app.get_pid(model) or "-"}  {detail}',
-            ]
-            for i, line in enumerate(progress_lines[: max(1, profile_box_h - 3)]):
-                attr = colors['accent'] | curses.A_BOLD if line.startswith(('progress:', 'status:')) else curses.A_NORMAL
-                stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
-            log_lines = tail_text(app.logfile(model.id), max_lines=max(12, logs_box_h - 3))
-            for i, line in enumerate(log_lines[: max(1, logs_box_h - 3)]):
-                stdscr.addstr(logs_box_y + 2 + i, right_x + 2, line[: right_w - 4], curses.A_NORMAL)
-        elif active_model and view_mode == 'try':
-            model = active_model
-            status, detail = statuses.get(model.id, ('?', ''))
-            profile_lines = [
-                f'model: {model.name}',
-                f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}',
-                f'status: {status} ({detail})',
-                f'pid: {app.get_pid(model) or "-"}',
-                f'url: http://{model.host}:{model.port}',
-                f'ctx/output: {model.ctx} / {model.output}',
-                f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}',
-                f'temp/cache_ram: {model.temp} / {model.cache_ram}',
-                f'profile: {model_profile_summary(model)}',
-                f'last bench: {getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}',
-                f'opencode: {getattr(model, "last_opencode_benchmark_score", 0.0):.2f} score {getattr(model, "last_opencode_benchmark_profile", "")}',
-                f'chat: {try_status}',
-            ]
-            if try_error:
-                profile_lines.append(f'error: {try_error}')
-            profile_lines.extend([
-                'command preview:',
-                ellipsize(' '.join(app.build_command(model)), right_w - 6),
-            ])
-            for i, line in enumerate(profile_lines[: max(1, profile_box_h - 3)]):
-                attr = curses.A_NORMAL
-                if line.startswith('status:'):
-                    attr = status_attr(colors, status)
-                elif line.startswith('error:'):
-                    attr = colors['error'] | curses.A_BOLD
-                elif line in ('command preview:',):
-                    attr = colors['accent'] | curses.A_BOLD
-                stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
-            log_lines = tail_text(app.logfile(model.id), max_lines=max(12, logs_box_h - 3))
-            for i, line in enumerate(log_lines[: max(1, logs_box_h - 3)]):
-                stdscr.addstr(logs_box_y + 2 + i, right_x + 2, line[: right_w - 4], curses.A_NORMAL)
-            if stats_box_h:
-                stats_lines = build_try_live_stat_lines(
-                    model,
-                    try_status,
-                    app.get_pid(model),
-                    try_live_metrics,
-                )
-                for i, line in enumerate(stats_lines[: max(1, stats_box_h - 3)]):
-                    attr = colors['accent'] | curses.A_BOLD if line.startswith(('benchmark:', 'live:', 'last:')) else curses.A_NORMAL
-                    stdscr.addstr(stats_box_y + 2 + i, right_x + 2, line[: right_w - 4], attr)
+            pid = app.get_pid(model)
+            command_preview = ' '.join(app.build_command(model))
+            log_lines = read_display_file_lines(app.logfile(model.id))
+            if view_mode == 'detail' and status in ('ERROR', 'STOPPED') and error_text:
+                log_lines = important_log_excerpt(app.logfile(model.id), max_lines=400, after_last_launch=True)
+            right_items: List[Tuple[str, int]] = []
+
+            if view_mode == 'detail':
+                benchmark_score = float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0)
+                opencode_score = float(getattr(model, 'last_opencode_benchmark_score', 0.0) or 0.0)
+                if right_active_tab == 'summary':
+                    right_items = [
+                        (f'name: {model.name}', curses.A_BOLD),
+                        (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                        (f'path: {model.path}', curses.A_NORMAL),
+                        (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
+                        (f'quant/type: {extract_quant(model)} / {classify_model_type(model)}', curses.A_NORMAL),
+                        (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
+                        (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
+                        (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
+                        (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
+                        (f'status: {status} ({detail})', status_attr(colors, status)),
+                        (f'pid/roles: {pid or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
+                        (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
+                    ]
+                elif right_active_tab == 'logs_errors':
+                    right_items = build_logs_errors_items(
+                        error_source_lines,
+                        log_lines,
+                        error_attr=colors['error'],
+                        log_attr=curses.A_NORMAL,
+                        heading_attr=colors['accent'] | curses.A_BOLD,
+                        muted_attr=colors['muted'],
+                    )
+                elif right_active_tab == 'command':
+                    right_items = [
+                        ('command preview:', colors['accent'] | curses.A_BOLD),
+                        (command_preview, curses.A_NORMAL),
+                    ]
+                elif right_active_tab == 'benchmarks':
+                    right_items = [
+                        (f'benchmark: {benchmark_score:.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', colors['success'] | curses.A_BOLD if benchmark_score > 0 else colors['warning']),
+                        (f'opencode: {opencode_score:.2f} score {getattr(model, "last_opencode_benchmark_profile", "")}', colors['success'] | curses.A_BOLD if opencode_score > 0 else colors['warning']),
+                        ('', curses.A_NORMAL),
+                        ('server benchmark rows:', colors['accent'] | curses.A_BOLD),
+                    ]
+                    rows = sorted(
+                        list(getattr(model, 'last_benchmark_results', []) or []),
+                        key=lambda row: float(row.get('tokens_per_sec', 0.0) or 0.0),
+                        reverse=True,
+                    )
+                    if rows:
+                        right_items.extend((benchmark_row_text(row), colors['success'] if row.get('status') == 'ok' else colors['warning']) for row in rows[:30])
+                    else:
+                        right_items.append(('no server benchmark rows yet', colors['muted']))
+                    right_items.extend([('', curses.A_NORMAL), ('opencode workflow rows:', colors['accent'] | curses.A_BOLD)])
+                    opencode_rows = sorted(
+                        list(getattr(model, 'last_opencode_benchmark_results', []) or []),
+                        key=lambda row: float(row.get('score', 0.0) or 0.0),
+                        reverse=True,
+                    )
+                    if opencode_rows:
+                        right_items.extend((benchmark_row_text(row), colors['success'] if row.get('status') in ('ok', 'tests passed') else colors['warning']) for row in opencode_rows[:30])
+                    else:
+                        right_items.append(('no opencode workflow rows yet', colors['muted']))
+
+            elif view_mode == 'benchmark':
+                records = list(benchmark_state.get('records', []) or [])
+                if not records:
+                    if str(benchmark_state.get('run_kind') or '') == 'opencode':
+                        records = list(getattr(model, 'last_opencode_benchmark_results', []) or [])
+                    else:
+                        records = list(getattr(model, 'last_benchmark_results', []) or [])
+                if right_active_tab == 'progress':
+                    right_items = build_benchmark_progress_items(
+                        model,
+                        benchmark_state,
+                        status,
+                        detail,
+                        pid,
+                        right_content_w,
+                        accent_attr=colors['accent'] | curses.A_BOLD,
+                    )
+                elif right_active_tab == 'results':
+                    right_items = [('real-time results:', colors['accent'] | curses.A_BOLD)]
+                    if records:
+                        for record in records[-80:]:
+                            status_value = str(record.get('status', '') or '')
+                            attr = (
+                                colors['success'] | curses.A_BOLD
+                                if status_value in ('ok', 'tests passed')
+                                else colors['warning']
+                                if status_value in ('time budget exhausted', 'context too small', 'tests failed', 'probe ok')
+                                else colors['error']
+                                if status_value not in ('', '-')
+                                else curses.A_NORMAL
+                            )
+                            right_items.append((benchmark_row_text(record), attr))
+                    else:
+                        right_items.append(('waiting for first measured result...', colors['muted']))
+                    feed = list(benchmark_state.get('feed', []) or [])
+                    if feed:
+                        right_items.extend([('', curses.A_NORMAL), ('live feed:', colors['accent'] | curses.A_BOLD)])
+                        right_items.extend((str(line), colors['error'] if is_error_message(str(line)) else colors['muted']) for line in feed[-20:])
+                elif right_active_tab == 'commands':
+                    right_items = [
+                        (line, colors['warning'] if kind == 'current' and benchmark_state.get('active') else colors['muted'])
+                        for line, kind in benchmark_command_lines(benchmark_state, right_content_w, BENCHMARK_COMMAND_LIMIT + 1)
+                    ]
+                elif right_active_tab == 'logs_errors':
+                    right_items = build_logs_errors_items(
+                        error_source_lines,
+                        log_lines,
+                        error_attr=colors['error'],
+                        log_attr=curses.A_NORMAL,
+                        heading_attr=colors['accent'] | curses.A_BOLD,
+                        muted_attr=colors['muted'],
+                    )
+
+            elif view_mode == 'try':
+                if right_active_tab == 'profile':
+                    right_items = [
+                        (f'model: {model.name}', curses.A_BOLD),
+                        (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                        (f'status: {status} ({detail})', status_attr(colors, status)),
+                        (f'pid: {pid or "-"}', curses.A_NORMAL),
+                        (f'url: http://{model.host}:{model.port}', curses.A_NORMAL),
+                        (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
+                        (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
+                        (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
+                        (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
+                        (f'last bench: {getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', curses.A_NORMAL),
+                        (f'opencode: {getattr(model, "last_opencode_benchmark_score", 0.0):.2f} score {getattr(model, "last_opencode_benchmark_profile", "")}', curses.A_NORMAL),
+                        (f'chat: {try_status}', colors['accent'] | curses.A_BOLD),
+                    ]
+                    if try_error:
+                        right_items.append((f'error: {try_error}', colors['error'] | curses.A_BOLD))
+                elif right_active_tab == 'logs_errors':
+                    right_items = build_logs_errors_items(
+                        error_source_lines,
+                        log_lines,
+                        error_attr=colors['error'],
+                        log_attr=curses.A_NORMAL,
+                        heading_attr=colors['accent'] | curses.A_BOLD,
+                        muted_attr=colors['muted'],
+                    )
+                elif right_active_tab == 'stats':
+                    right_items = [
+                        (line, colors['accent'] | curses.A_BOLD if line.startswith(('benchmark:', 'live:', 'last:')) else curses.A_NORMAL)
+                        for line in build_try_live_stat_lines(model, try_status, pid, try_live_metrics)
+                    ]
+                elif right_active_tab == 'command':
+                    right_items = [
+                        ('command preview:', colors['accent'] | curses.A_BOLD),
+                        (command_preview, curses.A_NORMAL),
+                    ]
+
+            elif view_mode == 'results':
+                runs = benchmark_runs_for_model(model)
+                run = runs[results_run_index] if runs and 0 <= results_run_index < len(runs) else {}
+                if right_active_tab == 'run_summary':
+                    if run:
+                        right_items = [
+                            (f'run: {run.get("id", "-")}', colors['accent'] | curses.A_BOLD),
+                            (f'status: {run.get("status", "-")}  kind: {run.get("kind", "-")}', curses.A_NORMAL),
+                            (f'started: {run.get("started_at", "-")}', curses.A_NORMAL),
+                            (f'ended: {run.get("ended_at", "-")}', curses.A_NORMAL),
+                            (f'elapsed: {float(run.get("elapsed_seconds", 0.0) or 0.0):.1f}s', curses.A_NORMAL),
+                            (f'summary: {run.get("summary", "no summary")}', curses.A_NORMAL),
+                        ]
+                    else:
+                        right_items = [('No benchmark run selected.', colors['muted'])]
+                elif right_active_tab == 'rankings':
+                    rows = benchmark_ranking_rows(run) if run else ['No benchmark run selected.']
+                    for line in rows:
+                        attr = curses.A_NORMAL
+                        if line.startswith(('Fast Chat:', 'Long Context:', 'OpenCode-ready:', 'Auto:')):
+                            attr = colors['success'] | curses.A_BOLD if 'not measured' not in line else colors['warning']
+                        elif line.startswith(('break:', 'fail:')):
+                            attr = colors['error']
+                        elif line.startswith(('Failed', 'winners')):
+                            attr = colors['accent'] | curses.A_BOLD
+                        right_items.append((line, attr))
+                elif right_active_tab == 'failures':
+                    records = list(run.get('records', []) or []) if run else []
+                    failures = [row for row in records if row.get('status') != 'ok' or row.get('break_point')]
+                    if failures:
+                        for row in failures:
+                            detail_line = compact_message(str(row.get('detail', '') or ''))
+                            right_items.append((
+                                f'{row.get("objective", "-")} {row.get("variant", "-")} ctx={row.get("ctx", 0)} par={row.get("parallel", 0)} {row.get("status", "-")} {detail_line}',
+                                colors['error'] if row.get('break_point') else colors['warning'],
+                            ))
+                    else:
+                        right_items = [('No failures or break points in this run.', colors['success'] | curses.A_BOLD)]
+
+            if not right_items:
+                right_items = [(f'{RIGHT_TAB_LABELS.get(right_active_tab, "Tab")}: no content yet.', colors['muted'])]
+            right_scroll, right_tab_scroll_total, right_tab_scroll_rows = draw_scrollable_items(
+                stdscr,
+                box_top,
+                right_x,
+                right_panel_h,
+                right_w,
+                right_items,
+                right_scroll,
+                colors,
+                curses.A_NORMAL,
+            )
+            right_tab_scrolls[right_tab_key] = right_scroll
         elif active_model:
             model = active_model
             status, detail = statuses.get(model.id, ('?', ''))
-            lines = [
-                f'name: {model.name}',
-                f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}',
-                f'path: {ellipsize(model.path, right_w - 12)}',
-                f'alias/bind: {model.alias} / {model.host}:{model.port}',
-                f'quant/type: {extract_quant(model)} / {classify_model_type(model)}',
-                f'ctx/output: {model.ctx} / {model.output}  threads/ngl/par: {model.threads}/{model.ngl}/{model.parallel}',
-                f'temp/cache_ram: {model.temp} / {model.cache_ram}',
-                f'profile={model_profile_summary(model)} ctx_range={getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)}',
-                f'benchmark={getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}',
-                f'opencode_bench={getattr(model, "last_opencode_benchmark_score", 0.0):.2f} score {getattr(model, "last_opencode_benchmark_profile", "")}',
-                f'flags: enabled={model.enabled} flash_attn={model.flash_attn} jinja={model.jinja}',
-                f'status: {status} ({detail})',
-                f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}  [m main] [s small] [b build] [p plan]',
-                f'log: {app.logfile(model.id)}',
-                'command preview:',
-                ellipsize(' '.join(app.build_command(model)), right_w - 6),
-                '',
-                'last important log lines:' if status in ('ERROR', 'STOPPED') and error_text else 'last log lines:',
+            list_right_items: List[Tuple[str, int]] = [
+                (f'name: {model.name}', curses.A_BOLD),
+                (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
+                (f'quant/type: {extract_quant(model)} / {classify_model_type(model)}', curses.A_NORMAL),
+                (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
+                (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
+                (f'benchmark: {getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', curses.A_NORMAL),
+                (f'status: {status} ({detail})', status_attr(colors, status)),
+                (f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
+                ('', curses.A_NORMAL),
+                ('last log lines:', colors['accent'] | curses.A_BOLD),
             ]
-            if status in ('ERROR', 'STOPPED') and error_text:
-                log_lines = important_log_excerpt(app.logfile(model.id), max_lines=max(12, logs_box_h), after_last_launch=True)
-            else:
-                log_lines = tail_text(app.logfile(model.id), max_lines=max(12, logs_box_h))
-            lines.extend(log_lines)
-            for i, line in enumerate(lines[: max(1, logs_box_h - 3)]):
-                attr = curses.A_NORMAL
-                if line.startswith('status:'):
-                    attr = status_attr(colors, status)
-                elif line in ('command preview:', 'last log lines:', 'last important log lines:'):
-                    attr = colors['accent'] | curses.A_BOLD
-                stdscr.addstr(box_top + 2 + i, right_x + 2, line[: right_w - 4], attr)
-
-        if error_box_h:
-            error_attr = colors['error'] if error_text else colors['muted']
-            for i, line in enumerate(error_lines[: max(1, error_box_h - 3)]):
-                stdscr.addstr(error_box_y + 2 + i, right_x + 2, line[: right_w - 4], error_attr)
+            list_right_items.extend((line, curses.A_NORMAL) for line in read_display_file_lines(app.logfile(model.id))[-40:])
+            draw_scrollable_items(
+                stdscr,
+                box_top,
+                right_x,
+                right_panel_h,
+                right_w,
+                list_right_items,
+                0,
+                colors,
+                curses.A_NORMAL,
+            )
 
         if view_mode == 'try':
-            footer = '[Enter] send  [Up/Down] scroll input  [Ctrl+U] clear  [Esc] stop model + exit'
-            footer2 = 'Prompt editor shows 5 wrapped rows. Transcript is temporary.'
+            footer = '[Enter] send  [Tab/[/]] right tabs  [PgUp/PgDn] scroll tab  [Esc] stop model + exit'
+            footer2 = '[Up/Down] scroll prompt input. Right pane uses Profile, Logs + Errors, Stats, and Command tabs.'
         elif view_mode == 'benchmark':
-            footer = '[Esc] details  [R] results  [A] abort active benchmark'
-            footer2 = 'Dashboard shows measured tradeoffs: possible, fastest, ideal, highest context, and OpenCode-ready.'
+            footer = '[Esc] details  [F] fast bench  [R] results  [W] wiki  [Tab/[/]] right tabs  [A] abort active benchmark'
+            footer2 = '[Up/Down/PgUp/PgDn/Home/End] scroll active right tab.'
         elif view_mode == 'results':
-            footer = '[Esc] details  [Up/Down] select benchmark run'
-            footer2 = 'Results keep the latest 10 runs with winners, runner-ups, failures, and break points.'
+            footer = '[Esc] details  [Up/Down] select run  [Tab/[/]] right tabs'
+            footer2 = '[PgUp/PgDn/Home/End] scroll active right tab.'
         elif view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] actions  [T] try  [B] server bench  [O] opencode bench  [R] results  [z] auto'
-            footer2 = '[m/s/b/p] roles  [g] gen opencode  [S] stop-all  [q] quit'
+            footer = '[Esc] models  [Enter/l] actions  [T] try  [B] deep bench  [F] fast bench  [O] opencode  [R] results  [z] auto'
+            footer2 = '[Tab/[/]] right tabs  [Up/Down/PgUp/PgDn] scroll tab  [m/s/b/p] roles  [g] gen opencode  [S] stop-all  [q] quit'
         else:
             footer = '[Enter] details  [z] auto profile  [B] benchmark best  [x] detect  [X] prune'
             footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
@@ -1804,7 +2313,20 @@ def tui(stdscr, app: AppConfig):
         if key == -1:
             time.sleep(0.05)
             continue
+        scroll_action = RIGHT_PANE_SCROLL_KEYS.get(key, '')
+        if active_model and view_mode in ('detail', 'benchmark', 'try', 'results') and key in (9, ord(']')):
+            right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, 1)
+            message = f'Right tab: {RIGHT_TAB_LABELS.get(right_tab_by_view[view_mode], right_tab_by_view[view_mode])}.'
+            continue
+        if active_model and view_mode in ('detail', 'benchmark', 'try', 'results') and key in (getattr(curses, 'KEY_BTAB', -999), ord('[')):
+            right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, -1)
+            message = f'Right tab: {RIGHT_TAB_LABELS.get(right_tab_by_view[view_mode], right_tab_by_view[view_mode])}.'
+            continue
         if view_mode == 'try':
+            if key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+                right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
+                message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
+                continue
             if key == 27:
                 exit_try_view()
                 continue
@@ -1847,10 +2369,19 @@ def tui(stdscr, app: AppConfig):
                 action_token.cancel('user requested abort')
             message = '⏳ Aborting active action and cleaning up managed processes...'
             continue
+        if view_mode == 'benchmark' and key in (ord('W'), ord('w')):
+            show_benchmark_wiki(stdscr, colors)
+            message = 'Benchmark wiki closed.'
+            continue
         if view_mode == 'results':
             if key in (27, curses.KEY_BACKSPACE, 127, 8):
+                reset_right_tabs('detail')
                 view_mode = 'detail'
                 message = 'Back to model details.'
+                continue
+            if key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+                right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
+                message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
                 continue
             if key in (curses.KEY_UP, ord('k'), curses.KEY_DOWN, ord('j')):
                 model = active_detail_model()
@@ -1861,10 +2392,15 @@ def tui(stdscr, app: AppConfig):
                     else:
                         results_run_index = min(len(runs) - 1, results_run_index + 1)
                 continue
-        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, ord('j'), ord('k'), ord('R'), 27, curses.KEY_BACKSPACE, 127, 8):
+        if active_model and view_mode in ('detail', 'benchmark') and scroll_action:
+            right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
+            message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
+            continue
+        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END, ord('j'), ord('k'), ord('R'), ord('W'), ord('w'), ord('['), ord(']'), 9, 27, curses.KEY_BACKSPACE, 127, 8):
             message = '⏳ Action is running. Watch the log window; controls unlock when it finishes.'
             continue
         if view_mode == 'benchmark' and key in (27, curses.KEY_BACKSPACE, 127, 8):
+            reset_right_tabs('detail')
             view_mode = 'detail'
             message = 'Back to model details. Benchmark keeps running unless you press A.'
             continue
@@ -1874,14 +2410,15 @@ def tui(stdscr, app: AppConfig):
             message = 'Back to model list.'
             continue
         if key in (ord('q'), 27):
-            if external_stack_launched and managed_server_running():
+            if action_running():
+                message = '⏳ Action is running. Press A to abort, then quit after cleanup finishes.'
+                continue
+            if should_prompt_quit_keepalive(managed_server_running(), action_running()):
                 quit_policy = prompt_quit_policy(stdscr, colors)
-                if quit_policy == 'cancel':
-                    message = 'Quit cancelled.'
+                should_quit, quit_message = apply_quit_policy(app, quit_policy)
+                message = quit_message
+                if not should_quit:
                     continue
-                if quit_policy == 'leave':
-                    app.leave_managed_processes_running()
-                    message = 'Leaving managed model servers running.'
             break
         if key in (curses.KEY_UP, ord('k')) and app.models and view_mode == 'list':
             selected = max(0, selected - 1)
@@ -1933,7 +2470,7 @@ def tui(stdscr, app: AppConfig):
                 continue
             start_background_action(
                 model,
-                'coarse-to-fine benchmark profiles',
+                'smart bounded benchmark profiles',
                 lambda progress, token, model=model: benchmark_best_optimization(
                     app,
                     model,
@@ -1942,6 +2479,22 @@ def tui(stdscr, app: AppConfig):
                 ),
                 done_event='benchmark_done',
                 run_kind='server',
+            )
+        elif key == ord('F') and app.models and view_mode in ('detail', 'benchmark'):
+            model = active_detail_model()
+            if not model:
+                continue
+            start_background_action(
+                model,
+                'fast benchmark profiles',
+                lambda progress, token, model=model: benchmark_fast_profiles(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
+                done_event='benchmark_done',
+                run_kind='server_fast',
             )
         elif key == ord('O') and app.models and view_mode == 'detail':
             model = active_detail_model()

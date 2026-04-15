@@ -5,13 +5,20 @@ from llama_tui.chat import build_chat_payload, parse_openai_sse_lines, stream_ch
 from llama_tui.control import CancelToken, CancelledError
 from llama_tui.models import ModelConfig
 from llama_tui.ui import (
+    apply_quit_policy,
+    adjust_scroll_offset,
+    build_benchmark_progress_items,
+    build_logs_errors_items,
     benchmark_elapsed_text,
     benchmark_progress_fraction,
     benchmark_ranking_rows,
     benchmark_row_text,
     benchmark_run_line,
     benchmark_runs_for_model,
+    benchmark_wiki_lines,
+    benchmark_command_lines,
     build_try_live_stat_lines,
+    clamp_scroll,
     finish_try_live_metrics,
     new_try_live_metrics,
     new_benchmark_run_state,
@@ -19,7 +26,16 @@ from llama_tui.ui import (
     progress_bar_text,
     reduce_benchmark_event,
     reset_try_live_metrics,
+    cycle_right_tab,
+    default_right_tab,
+    normalize_right_tab,
+    right_tab_scroll_key,
+    right_tabs_for_view,
+    should_prompt_quit_keepalive,
     simple_profile_action,
+    scrollable_pane_max_scroll,
+    scrollable_pane_view,
+    scrollable_pane_wrapped_lines,
     stop_try_model,
     try_live_metric_snapshot,
     try_input_max_scroll,
@@ -118,6 +134,138 @@ class ProfileUiTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(msg, 'stopped')
         self.assertIs(app.stopped_model, model)
+
+    def test_quit_keepalive_policy_helpers(self):
+        class FakeApp:
+            def __init__(self):
+                self.left_running = False
+
+            def leave_managed_processes_running(self):
+                self.left_running = True
+
+        self.assertTrue(should_prompt_quit_keepalive(True, False))
+        self.assertFalse(should_prompt_quit_keepalive(False, False))
+        self.assertFalse(should_prompt_quit_keepalive(True, True))
+
+        app = FakeApp()
+        should_quit, msg = apply_quit_policy(app, 'leave')
+        self.assertTrue(should_quit)
+        self.assertTrue(app.left_running)
+        self.assertIn('Leaving', msg)
+
+        should_quit, msg = apply_quit_policy(app, 'cancel')
+        self.assertFalse(should_quit)
+        self.assertIn('cancelled', msg.lower())
+
+    def test_benchmark_wiki_lines_include_expected_topics(self):
+        text = '\n'.join(benchmark_wiki_lines(48))
+
+        self.assertIn('What is a benchmark?', text)
+        self.assertIn('ctx', text)
+        self.assertIn('parallel', text)
+        self.assertIn('smart bounded', text)
+        self.assertIn('Fast benchmark: F', text)
+        self.assertIn('OpenCode benchmark: O', text)
+        self.assertIn('headless', text)
+        self.assertIn('Fast Chat', text)
+        self.assertIn('Long Context', text)
+        self.assertIn('Auto', text)
+        self.assertIn('Break Point', text)
+
+    def test_clamp_scroll_bounds(self):
+        self.assertEqual(clamp_scroll(-10, 100, 10), 0)
+        self.assertEqual(clamp_scroll(999, 100, 10), 90)
+        self.assertEqual(clamp_scroll(5, 8, 10), 0)
+
+    def test_scrollable_pane_defaults_to_newest_lines(self):
+        lines = [f'line {idx}' for idx in range(8)]
+
+        visible, scroll, has_older, has_newer = scrollable_pane_view(lines, width=20, rows=3, scroll=0)
+
+        self.assertEqual(scroll, 0)
+        self.assertEqual(visible[:3], ['line 5', 'line 6', 'line 7'])
+        self.assertTrue(has_older)
+        self.assertFalse(has_newer)
+
+    def test_scrollable_pane_scrolls_back_and_forward(self):
+        lines = [f'line {idx}' for idx in range(8)]
+        total = len(scrollable_pane_wrapped_lines(lines, width=20))
+
+        scroll = adjust_scroll_offset(0, 'page_older', total, 3)
+        visible, scroll, has_older, has_newer = scrollable_pane_view(lines, width=20, rows=3, scroll=scroll)
+
+        self.assertEqual(visible[:3], ['line 2', 'line 3', 'line 4'])
+        self.assertTrue(has_older)
+        self.assertTrue(has_newer)
+
+        oldest_scroll = adjust_scroll_offset(scroll, 'oldest', total, 3)
+        oldest_visible, oldest_scroll, has_older, has_newer = scrollable_pane_view(lines, width=20, rows=3, scroll=oldest_scroll)
+
+        self.assertEqual(oldest_visible[:3], ['line 0', 'line 1', 'line 2'])
+        self.assertFalse(has_older)
+        self.assertTrue(has_newer)
+
+        scroll = adjust_scroll_offset(scroll, 'newest', total, 3)
+        visible, scroll, _has_older, has_newer = scrollable_pane_view(lines, width=20, rows=3, scroll=scroll)
+
+        self.assertEqual(scroll, 0)
+        self.assertEqual(visible[:3], ['line 5', 'line 6', 'line 7'])
+        self.assertFalse(has_newer)
+
+    def test_scrollable_pane_wraps_long_lines_for_bounds(self):
+        lines = ['alpha beta gamma delta', 'tail']
+
+        wrapped = scrollable_pane_wrapped_lines(lines, width=10)
+        max_scroll = scrollable_pane_max_scroll(lines, width=10, rows=2)
+
+        self.assertGreater(len(wrapped), len(lines))
+        self.assertEqual(max_scroll, len(wrapped) - 2)
+
+    def test_right_tabs_by_view_and_defaults(self):
+        self.assertEqual(right_tabs_for_view('detail'), ['summary', 'logs_errors', 'command', 'benchmarks'])
+        self.assertEqual(right_tabs_for_view('benchmark'), ['progress', 'results', 'commands', 'logs_errors'])
+        self.assertEqual(right_tabs_for_view('try'), ['profile', 'logs_errors', 'stats', 'command'])
+        self.assertEqual(right_tabs_for_view('results'), ['run_summary', 'rankings', 'failures'])
+
+        self.assertEqual(default_right_tab('detail'), 'summary')
+        self.assertEqual(default_right_tab('benchmark'), 'progress')
+        self.assertEqual(normalize_right_tab('detail', 'missing'), 'summary')
+
+    def test_right_tab_cycling_and_scroll_keys(self):
+        self.assertEqual(cycle_right_tab('benchmark', 'progress', 1), 'results')
+        self.assertEqual(cycle_right_tab('benchmark', 'progress', -1), 'logs_errors')
+        self.assertEqual(cycle_right_tab('benchmark', 'missing', 1), 'results')
+        self.assertEqual(right_tab_scroll_key('benchmark', 'commands'), 'benchmark:commands')
+        self.assertEqual(right_tab_scroll_key('benchmark', 'missing'), 'benchmark:progress')
+
+    def test_logs_errors_content_builder_combines_errors_and_logs(self):
+        items = build_logs_errors_items(['boom'], ['server line'], error_attr=1, log_attr=2, heading_attr=3, muted_attr=4)
+
+        self.assertIn(('errors:', 3), items)
+        self.assertIn(('boom', 1), items)
+        self.assertIn(('logs:', 3), items)
+        self.assertIn(('server line', 2), items)
+
+    def test_benchmark_progress_content_builder_includes_runtime_fields(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
+        state = new_benchmark_run_state(model.id, 'server', 'bench', now=10.0)
+        state.update({
+            'status': 'running',
+            'phase': 'measure',
+            'candidate': 'ctx=4096',
+            'completed': 1,
+            'total': 4,
+        })
+
+        items = build_benchmark_progress_items(model, state, 'READY', 'ok', 123, width=40)
+        text = '\n'.join(line for line, _attr in items)
+
+        self.assertIn('model: tiny', text)
+        self.assertIn('status: running / server READY', text)
+        self.assertIn('phase: measure', text)
+        self.assertIn('candidate: ctx=4096', text)
+        self.assertIn('pid: 123', text)
+        self.assertIn('progress:', text)
 
 
 class TryLiveStatsTests(unittest.TestCase):
@@ -254,6 +402,71 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertEqual(len(state['records']), 1)
         self.assertIn('candidate ok', state['feed'])
         self.assertEqual(benchmark_elapsed_text(state, now=15.0), '00:05')
+
+    def test_reducer_tracks_benchmark_commands_separately(self):
+        state = new_benchmark_run_state(now=10.0)
+        reduce_benchmark_event(
+            state,
+            {
+                'event': 'benchmark_started',
+                'model_id': 'tiny',
+                'run_kind': 'server',
+                'message': 'started',
+            },
+            now=10.0,
+        )
+
+        self.assertEqual(state['commands'], [])
+        self.assertEqual(state['current_command'], '')
+
+        reduce_benchmark_event(
+            state,
+            {
+                'event': 'benchmark_candidate',
+                'message': 'running candidate',
+                'command': 'llama-server --ctx-size 4096',
+            },
+            now=11.0,
+        )
+
+        self.assertEqual(state['current_command'], 'llama-server --ctx-size 4096')
+        self.assertEqual(state['commands'], ['llama-server --ctx-size 4096'])
+        self.assertIn('running candidate', state['feed'])
+
+        reduce_benchmark_event(
+            state,
+            {
+                'event': 'benchmark_phase',
+                'message': 'opencode run --pure --dir /tmp/work',
+                'command': 'opencode run --pure --dir /tmp/work',
+            },
+            now=12.0,
+        )
+
+        self.assertEqual(state['current_command'], 'opencode run --pure --dir /tmp/work')
+        self.assertNotIn('opencode run --pure --dir /tmp/work', state['feed'])
+
+        for idx in range(20):
+            reduce_benchmark_event(state, {'event': 'benchmark_candidate', 'command_preview': f'cmd-{idx}'}, now=13.0 + idx)
+
+        self.assertEqual(len(state['commands']), 12)
+        self.assertEqual(state['commands'][0], 'cmd-8')
+        self.assertEqual(state['commands'][-1], 'cmd-19')
+
+    def test_benchmark_command_lines_format_current_and_history(self):
+        empty = benchmark_command_lines(new_benchmark_run_state(), width=40, max_rows=3)
+        self.assertEqual(empty, [('waiting for first command...', 'muted')])
+
+        state = new_benchmark_run_state()
+        state['current_command'] = 'llama-server --ctx-size 4096 --very-long-flag value'
+        state['commands'] = ['cmd-1', 'cmd-2', state['current_command']]
+
+        lines = benchmark_command_lines(state, width=32, max_rows=3)
+
+        self.assertEqual(lines[0][1], 'current')
+        self.assertTrue(lines[0][0].startswith('current: llama-server'))
+        self.assertLessEqual(len(lines[0][0]), 32)
+        self.assertIn(('recent: cmd-2', 'muted'), lines)
 
     def test_benchmark_row_text_includes_tradeoff_fields(self):
         row = benchmark_row_text({
