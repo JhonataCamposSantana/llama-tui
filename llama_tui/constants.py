@@ -14,6 +14,28 @@ def _first_existing(paths: list[Path], fallback: Path) -> Path:
             return expanded
     return fallback.expanduser()
 
+
+def default_lm_studio_home() -> Path:
+    env_home = os.environ.get('LM_STUDIO_HOME')
+    if env_home:
+        return Path(env_home).expanduser()
+    pointer = Path.home() / '.lmstudio-home-pointer'
+    try:
+        pointed = pointer.read_text(encoding='utf-8').strip()
+    except OSError:
+        pointed = ''
+    if pointed:
+        return Path(pointed).expanduser()
+    return Path.home() / '.lmstudio'
+
+
+def default_lm_studio_model_roots() -> list[Path]:
+    home = default_lm_studio_home()
+    return [
+        home / 'models',
+        home / 'hub' / 'models',
+    ]
+
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 APP_NAME = 'llama-tui'
 CONFIG_DIR = Path.home() / '.config' / APP_NAME
@@ -29,6 +51,7 @@ DEFAULT_HF_CACHE = _env_path(
 )
 DEFAULT_LLMFIT_CACHE = Path(os.environ.get('LLMFIT_CACHE_ROOT', Path.home() / '.cache' / 'llmfit' / 'models')).expanduser()
 DEFAULT_LLM_MODELS_CACHE = Path(os.environ.get('LLM_MODELS_CACHE_ROOT', Path.home() / '.cache' / 'llm-models')).expanduser()
+DEFAULT_LM_STUDIO_MODEL_ROOTS = default_lm_studio_model_roots()
 DEFAULT_LLAMA_SERVER = os.environ.get('LLAMA_SERVER') or str(_first_existing(
     [
         Path.home() / 'llama.cpp' / 'build' / 'bin' / 'llama-server',

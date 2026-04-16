@@ -18,6 +18,7 @@ from .constants import (
     CONFIG_DIR,
     DATA_DIR,
     DEFAULT_HF_CACHE,
+    DEFAULT_LM_STUDIO_MODEL_ROOTS,
     DEFAULT_LLMFIT_CACHE,
     DEFAULT_LLM_MODELS_CACHE,
     DEFAULT_LLAMA_SERVER,
@@ -33,7 +34,7 @@ from .discovery import (
 from .control import CancelToken, check_cancelled, sleep_with_cancel
 from .gguf import estimate_kv_bytes_per_token, read_gguf_metadata
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
-from .models import ModelConfig, OpencodeSettings
+from .models import HermesSettings, ModelConfig, OpencodeSettings
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
 from .textutil import compact_message, important_log_excerpt
 
@@ -147,6 +148,19 @@ def render_terminal_template(template: str, title: str, cwd: Path, shell_cmd: st
     return shlex.split(rendered)
 
 
+def shell_env_prefix(env: Dict[str, str]) -> str:
+    clean = {key: str(value) for key, value in env.items() if str(value) != ''}
+    return (' '.join(f'{key}={shlex.quote(value)}' for key, value in clean.items()) + ' ') if clean else ''
+
+
+def yaml_quote(value: object) -> str:
+    return json.dumps(str(value))
+
+
+def yaml_list(values: List[str]) -> str:
+    return '[' + ', '.join(yaml_quote(value) for value in values) + ']'
+
+
 def terminal_launcher_label(launcher: str) -> str:
     if launcher.startswith('flatpak:'):
         return launcher
@@ -209,9 +223,13 @@ class AppConfig:
         self.hf_cache_root = str(DEFAULT_HF_CACHE)
         self.llmfit_cache_root = str(DEFAULT_LLMFIT_CACHE)
         self.llm_models_cache_root = str(DEFAULT_LLM_MODELS_CACHE)
+        self.lm_studio_model_roots = ', '.join(str(path) for path in DEFAULT_LM_STUDIO_MODEL_ROOTS)
         self.opencode = OpencodeSettings(
             path='',
             backup_dir=str(CONFIG_DIR / 'backups'),
+        )
+        self.hermes = HermesSettings(
+            home_root=str(CACHE_DIR / 'hermes'),
         )
         self.models: List[ModelConfig] = []
         self._hardware_profile: Optional[HardwareProfile] = None
@@ -234,7 +252,11 @@ class AppConfig:
         self.hf_cache_root = data.get('hf_cache_root', self.hf_cache_root)
         self.llmfit_cache_root = data.get('llmfit_cache_root', self.llmfit_cache_root)
         self.llm_models_cache_root = data.get('llm_models_cache_root', self.llm_models_cache_root)
+        self.lm_studio_model_roots = data.get('lm_studio_model_roots', self.lm_studio_model_roots)
         self.opencode = OpencodeSettings(**data.get('opencode', {}))
+        self.hermes = HermesSettings(**data.get('hermes', {}))
+        if not self.hermes.home_root:
+            self.hermes.home_root = str(CACHE_DIR / 'hermes')
         self.models = [ModelConfig(**item) for item in data.get('models', [])]
         filtered_models = [m for m in self.models if is_registered_model_entry(m)]
         roots_changed = False
@@ -263,7 +285,9 @@ class AppConfig:
             'hf_cache_root': self.hf_cache_root,
             'llmfit_cache_root': self.llmfit_cache_root,
             'llm_models_cache_root': self.llm_models_cache_root,
+            'lm_studio_model_roots': self.lm_studio_model_roots,
             'opencode': asdict(self.opencode),
+            'hermes': asdict(self.hermes),
             'models': [asdict(m) for m in self.models],
         }
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,6 +407,15 @@ class AppConfig:
     def opencode_model_ref(self, model: ModelConfig) -> str:
         return f'{self.opencode_provider_key(model)}/{model.alias}'
 
+    def hermes_provider_key(self, model: ModelConfig) -> str:
+        return f'local-{model.id}'
+
+    def hermes_model_ref(self, model: ModelConfig) -> str:
+        return model.alias
+
+    def hermes_base_url(self, model: ModelConfig) -> str:
+        return f'http://{model.host}:{model.port}/v1'
+
     def detect_terminal_launcher(self) -> Optional[str]:
         for launcher in TERMINAL_LAUNCHER_ORDER:
             resolved = shutil.which(launcher)
@@ -469,7 +502,7 @@ class AppConfig:
         }
         if self.opencode.path:
             env['OPENCODE_CONFIG'] = str(Path(self.opencode.path).expanduser())
-        env_prefix = ' '.join(f'{key}={shlex.quote(str(value))}' for key, value in env.items()) + ' '
+        env_prefix = shell_env_prefix(env)
         command = [
             'opencode',
             str(workspace),
@@ -483,8 +516,126 @@ class AppConfig:
             'printf "Press Enter to close..."; read -r _; exit "$status"'
         )
 
-    def build_terminal_command(self, title: str, workspace: Path, shell_cmd: str) -> Tuple[bool, List[str], str]:
-        template = getattr(self.opencode, 'terminal_command', '').strip()
+    def hermes_home_for_model(self, model: ModelConfig) -> Path:
+        root = Path(getattr(self.hermes, 'home_root', '') or str(CACHE_DIR / 'hermes')).expanduser()
+        return root / model.id
+
+    def hermes_config_path(self, model: ModelConfig) -> Path:
+        return self.hermes_home_for_model(model) / 'config.yaml'
+
+    def hermes_context_policy(self, model: ModelConfig) -> Dict[str, object]:
+        parallel = max(1, int(getattr(model, 'parallel', 1) or 1))
+        actual_ctx = max(0, int(getattr(model, 'ctx', 0) or 0) // parallel)
+        required = max(1, int(getattr(self.hermes, 'min_context_tokens', 64000) or 64000))
+        override = max(0, int(getattr(self.hermes, 'experimental_context_override_tokens', 0) or 0))
+        experimental = bool(getattr(self.hermes, 'allow_experimental_context_override', False)) and override > 0
+        configured = override if experimental else actual_ctx
+        detail = ''
+        if experimental and configured != actual_ctx:
+            detail = (
+                f'experimental Hermes context override: config={configured} '
+                f'actual ctx/slot={actual_ctx}'
+            )
+        return {
+            'required_context': required,
+            'actual_ctx_per_slot': actual_ctx,
+            'configured_context_length': configured,
+            'experimental_context_override': experimental,
+            'context_detail': detail,
+        }
+
+    def generate_hermes_config(self, model: ModelConfig) -> Tuple[bool, str]:
+        if model is None:
+            return False, 'No model selected for Hermes config.'
+        home = self.hermes_home_for_model(model)
+        config_path = self.hermes_config_path(model)
+        toolsets = list(getattr(self.hermes, 'toolsets', []) or ['terminal', 'file', 'todo'])
+        max_turns = int(getattr(self.hermes, 'max_turns', 20) or 20)
+        context_policy = self.hermes_context_policy(model)
+        lines = [
+            '# Generated by llama-tui. Safe to delete; it will be recreated.',
+            'model:',
+            f'  default: {yaml_quote(self.hermes_model_ref(model))}',
+            '  provider: "custom"',
+            f'  base_url: {yaml_quote(self.hermes_base_url(model))}',
+            f'  context_length: {int(context_policy["configured_context_length"] or 0)}',
+            f'  max_tokens: {int(getattr(model, "output", 0) or 0)}',
+            'terminal:',
+            '  backend: "local"',
+            '  cwd: "."',
+            '  timeout: 180',
+            '  lifetime_seconds: 300',
+            'platform_toolsets:',
+            f'  cli: {yaml_list(toolsets)}',
+            'agent:',
+            f'  max_turns: {max_turns}',
+            '  verbose: false',
+            'memory:',
+            '  memory_enabled: false',
+            '  user_profile_enabled: false',
+            'skills:',
+            '  creation_nudge_interval: 0',
+            '',
+        ]
+        home.mkdir(parents=True, exist_ok=True)
+        config_path.write_text('\n'.join(lines), encoding='utf-8')
+        return True, f'Generated Hermes config {config_path}'
+
+    def build_hermes_env(self, model: ModelConfig, workspace: Path, benchmark: bool = False) -> Dict[str, str]:
+        home = self.hermes_home_for_model(model)
+        env = {
+            'HERMES_HOME': str(home),
+            'HERMES_INFERENCE_PROVIDER': 'custom',
+            'OPENAI_BASE_URL': self.hermes_base_url(model),
+            'OPENAI_API_KEY': 'no-key-required',
+            'HERMES_MAX_ITERATIONS': str(int(getattr(self.hermes, 'max_turns', 20) or 20)),
+        }
+        if benchmark:
+            env.update({
+                'HERMES_CLIENT': 'llama-tui-benchmark',
+                'HERMES_YOLO_MODE': '1',
+                'NO_COLOR': '1',
+            })
+        return env
+
+    def hermes_command_prefix(self) -> List[str]:
+        return self.command_prefix(getattr(self.hermes, 'command', '') or 'hermes') or ['hermes']
+
+    def build_hermes_cli_command(self, model: ModelConfig, workspace: Path, prompt: str = '', benchmark: bool = False) -> List[str]:
+        toolsets = ','.join(list(getattr(self.hermes, 'toolsets', []) or ['terminal', 'file', 'todo']))
+        command = self.hermes_command_prefix() + [
+            'chat',
+            '-m', self.hermes_model_ref(model),
+            '-t', toolsets,
+            '--max-turns', str(int(getattr(self.hermes, 'max_turns', 20) or 20)),
+        ]
+        if benchmark:
+            command.extend(['--yolo'])
+            if bool(getattr(self.hermes, 'quiet', True)):
+                command.extend(['--quiet'])
+        if prompt:
+            command.extend(['-q', prompt])
+        return command
+
+    def build_hermes_shell_command(self, model: ModelConfig, workspace: Path) -> str:
+        self.generate_hermes_config(model)
+        env_prefix = shell_env_prefix(self.build_hermes_env(model, workspace, benchmark=False))
+        command = self.build_hermes_cli_command(model, workspace)
+        hermes_cmd = env_prefix + ' '.join(shlex.quote(part) for part in command)
+        return (
+            f'cd {shlex.quote(str(workspace))} && {hermes_cmd}; status=$?; '
+            'printf "\\nHermes exited with status %s\\n" "$status"; '
+            'printf "Press Enter to close..."; read -r _; exit "$status"'
+        )
+
+    def build_terminal_command(
+        self,
+        title: str,
+        workspace: Path,
+        shell_cmd: str,
+        terminal_template: str = '',
+    ) -> Tuple[bool, List[str], str]:
+        template = terminal_template.strip() if terminal_template else getattr(self.opencode, 'terminal_command', '').strip()
         if template:
             try:
                 return True, render_terminal_template(template, title, workspace, shell_cmd), 'custom'
@@ -542,6 +693,46 @@ class AppConfig:
             )
         self.append_log(model.id, f'OpenCode terminal launched pid={proc.pid} workspace={workspace_path} via {terminal_label}')
         return True, f'OpenCode terminal launched for {model.id} in {workspace_path}'
+
+    def launch_hermes_terminal(self, model: ModelConfig, workspace: str | Path) -> Tuple[bool, str]:
+        command_prefix = self.hermes_command_prefix()
+        if not command_prefix or not self.command_exists(command_prefix[0]):
+            return False, f'Hermes command not found: {getattr(self.hermes, "command", "hermes") or "hermes"}'
+        valid, workspace_path, reason = self.validate_workspace_path(workspace)
+        if not valid or workspace_path is None:
+            return False, reason
+        config_ok, config_msg = self.generate_hermes_config(model)
+        if not config_ok:
+            return False, config_msg
+        shell_cmd = self.build_hermes_shell_command(model, workspace_path)
+        ok, terminal_cmd, terminal_label = self.build_terminal_command(
+            f'Hermes {model.id}',
+            workspace_path,
+            shell_cmd,
+            terminal_template=getattr(self.hermes, 'terminal_command', ''),
+        )
+        if not ok:
+            return False, terminal_label
+        self.append_log(model.id, f'Hermes config: {config_msg}')
+        self.append_log(model.id, f'Hermes terminal command ({terminal_label}): {shlex.join(terminal_cmd)}')
+        try:
+            proc = subprocess.Popen(
+                terminal_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return False, f'failed to launch Hermes terminal: {exc}'
+        time.sleep(0.15)
+        returncode = proc.poll()
+        if returncode not in (None, 0):
+            return False, (
+                f'Hermes terminal launcher exited immediately with status {returncode}. '
+                f'Command: {shlex.join(terminal_cmd)}'
+            )
+        self.append_log(model.id, f'Hermes terminal launched pid={proc.pid} workspace={workspace_path} via {terminal_label}')
+        return True, f'Hermes terminal launched for {model.id} in {workspace_path}'
 
     def launch_vscode_workspace(self, workspace: str | Path) -> Tuple[bool, str]:
         resolved_code = shutil.which('code')
@@ -729,18 +920,38 @@ class AppConfig:
             'llm-models': Path(self.llm_models_cache_root).expanduser(),
         }
 
+    def lm_studio_roots(self) -> List[Path]:
+        roots: List[Path] = []
+        seen = set()
+        for raw in str(getattr(self, 'lm_studio_model_roots', '') or '').split(','):
+            value = raw.strip()
+            if not value:
+                continue
+            path = Path(value).expanduser()
+            key = str(path.resolve(strict=False))
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(path)
+        return roots
+
+    def managed_source_roots(self) -> List[Tuple[str, Path]]:
+        roots = list(self.managed_roots().items())
+        roots.extend(('lm-studio', root) for root in self.lm_studio_roots())
+        return roots
+
     def normalize_model_path(self, path: str | Path) -> Path:
         return Path(path).expanduser().resolve(strict=False)
 
     def infer_model_source(self, model: ModelConfig) -> str:
         if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
             return 'manual'
-        if getattr(model, 'source', '') in ('manual', 'huggingface', 'llmfit', 'llm-models'):
+        if getattr(model, 'source', '') in ('manual', 'huggingface', 'llmfit', 'llm-models', 'lm-studio'):
             existing = getattr(model, 'source', '')
             if existing and existing != 'manual':
                 return existing
         p = self.normalize_model_path(model.path)
-        for source, root in self.managed_roots().items():
+        for source, root in self.managed_source_roots():
             try:
                 p.relative_to(root.resolve(strict=False))
                 return source
@@ -752,7 +963,7 @@ class AppConfig:
         discovered: Dict[str, Tuple[Path, str]] = {}
         notes: List[str] = []
 
-        for source, root in self.managed_roots().items():
+        for source, root in self.managed_source_roots():
             if not root.exists():
                 notes.append(f'{source} cache not found: {root}')
                 continue
@@ -1327,6 +1538,9 @@ class AppConfig:
         for attr in ('default_model_id', 'small_model_id', 'build_model_id', 'plan_model_id'):
             if getattr(self.opencode, attr) == model_id:
                 setattr(self.opencode, attr, '')
+        for attr in ('default_model_id', 'code_model_id'):
+            if getattr(self.hermes, attr) == model_id:
+                setattr(self.hermes, attr, '')
 
     def set_role(self, role: str, model_id: str):
         mapping = {
@@ -1349,6 +1563,10 @@ class AppConfig:
             badges.append('B')
         if self.opencode.plan_model_id == model_id:
             badges.append('P')
+        if self.hermes.default_model_id == model_id:
+            badges.append('H')
+        if self.hermes.code_model_id == model_id:
+            badges.append('C')
         return ''.join(badges) or '-'
 
     def generate_opencode(self) -> Tuple[bool, str]:

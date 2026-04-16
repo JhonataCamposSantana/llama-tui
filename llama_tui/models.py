@@ -41,6 +41,10 @@ class ModelConfig:
     last_opencode_benchmark_seconds: float = 0.0
     last_opencode_benchmark_profile: str = ''
     last_opencode_benchmark_results: List[Dict[str, object]] = field(default_factory=list)
+    last_hermes_benchmark_score: float = 0.0
+    last_hermes_benchmark_seconds: float = 0.0
+    last_hermes_benchmark_profile: str = ''
+    last_hermes_benchmark_results: List[Dict[str, object]] = field(default_factory=list)
     enabled: bool = True
     runtime: str = 'llama.cpp'
     source: str = 'manual'
@@ -61,3 +65,18 @@ class OpencodeSettings:
     plan_model_id: str = ''
     terminal_command: str = ''
     last_workspace_path: str = ''
+
+@dataclass
+class HermesSettings:
+    command: str = 'hermes'
+    home_root: str = ''
+    default_model_id: str = ''
+    code_model_id: str = ''
+    terminal_command: str = ''
+    last_workspace_path: str = ''
+    toolsets: List[str] = field(default_factory=lambda: ['terminal', 'file', 'todo'])
+    max_turns: int = 20
+    quiet: bool = True
+    min_context_tokens: int = 64000
+    experimental_context_override_tokens: int = 0
+    allow_experimental_context_override: bool = False

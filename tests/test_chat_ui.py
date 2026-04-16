@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from llama_tui.chat import build_chat_payload, parse_openai_sse_lines, stream_chat_completion
@@ -7,12 +8,17 @@ from llama_tui.models import ModelConfig
 from llama_tui.ui import (
     apply_quit_policy,
     adjust_scroll_offset,
+    benchmark_ranking_items,
     build_benchmark_progress_items,
-    build_logs_errors_items,
-    latest_error_view_items,
-    logs_errors_split_rows,
+    build_error_items,
+    build_header_config_items,
+    build_header_dashboard_items,
+    build_log_items,
+    header_dashboard_layout,
+    header_dashboard_title,
     benchmark_elapsed_text,
     benchmark_progress_fraction,
+    benchmark_record_display_items,
     benchmark_ranking_rows,
     benchmark_row_text,
     benchmark_run_line,
@@ -31,6 +37,7 @@ from llama_tui.ui import (
     cycle_right_tab,
     default_right_tab,
     normalize_right_tab,
+    right_tab_label,
     right_tab_scroll_key,
     right_tabs_for_view,
     should_prompt_quit_keepalive,
@@ -44,6 +51,7 @@ from llama_tui.ui import (
     try_input_view,
     try_input_wrapped_lines,
     update_try_live_metrics,
+    wrap_display_item_lines,
 )
 
 
@@ -223,10 +231,16 @@ class ProfileUiTests(unittest.TestCase):
         self.assertGreater(len(wrapped), len(lines))
         self.assertEqual(max_scroll, len(wrapped) - 2)
 
+    def test_wrapped_item_lines_indent_continuations(self):
+        wrapped = wrap_display_item_lines('alpha beta gamma delta', width=12)
+
+        self.assertGreater(len(wrapped), 1)
+        self.assertTrue(wrapped[1].startswith('  '))
+
     def test_right_tabs_by_view_and_defaults(self):
-        self.assertEqual(right_tabs_for_view('detail'), ['summary', 'logs_errors', 'command', 'benchmarks'])
-        self.assertEqual(right_tabs_for_view('benchmark'), ['progress', 'results', 'commands', 'logs_errors'])
-        self.assertEqual(right_tabs_for_view('try'), ['profile', 'logs_errors', 'stats', 'command'])
+        self.assertEqual(right_tabs_for_view('detail'), ['summary', 'logs', 'errors', 'command', 'benchmarks'])
+        self.assertEqual(right_tabs_for_view('benchmark'), ['progress', 'results', 'commands', 'logs', 'errors'])
+        self.assertEqual(right_tabs_for_view('try'), ['profile', 'logs', 'errors', 'stats', 'command'])
         self.assertEqual(right_tabs_for_view('results'), ['run_summary', 'rankings', 'failures'])
 
         self.assertEqual(default_right_tab('detail'), 'summary')
@@ -235,39 +249,103 @@ class ProfileUiTests(unittest.TestCase):
 
     def test_right_tab_cycling_and_scroll_keys(self):
         self.assertEqual(cycle_right_tab('benchmark', 'progress', 1), 'results')
-        self.assertEqual(cycle_right_tab('benchmark', 'progress', -1), 'logs_errors')
+        self.assertEqual(cycle_right_tab('benchmark', 'progress', -1), 'errors')
         self.assertEqual(cycle_right_tab('benchmark', 'missing', 1), 'results')
         self.assertEqual(right_tab_scroll_key('benchmark', 'commands'), 'benchmark:commands')
         self.assertEqual(right_tab_scroll_key('benchmark', 'missing'), 'benchmark:progress')
+        self.assertEqual(right_tab_label('errors', 3), 'Errors 3')
+        self.assertEqual(right_tab_label('logs', 3), 'Logs')
 
-    def test_logs_errors_content_builder_combines_errors_and_logs(self):
-        items = build_logs_errors_items(['boom'], ['server line'], error_attr=1, log_attr=2, heading_attr=3, muted_attr=4)
+    def test_header_dashboard_layout_is_responsive(self):
+        enabled, left_w, right_x, right_w = header_dashboard_layout(150)
 
-        self.assertIn(('errors:', 3), items)
-        self.assertIn(('boom', 1), items)
-        self.assertIn(('logs:', 3), items)
-        self.assertIn(('server line', 2), items)
+        self.assertTrue(enabled)
+        self.assertGreaterEqual(left_w, 76)
+        self.assertGreater(right_x, left_w)
+        self.assertLess(right_x, 150)
+        self.assertLessEqual(right_x + right_w, 150)
 
-    def test_logs_errors_split_reserves_error_rows_and_gives_logs_more_space(self):
-        error_rows, log_rows = logs_errors_split_rows(18, 20)
+        small_enabled, _left_w, _right_x, _right_w = header_dashboard_layout(110)
+        self.assertFalse(small_enabled)
 
-        self.assertGreaterEqual(error_rows, 3)
-        self.assertGreater(log_rows, error_rows)
+    def test_header_dashboard_content_builder(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
+        state = new_benchmark_run_state(model.id, 'hermes', 'Hermes workflow', now=10.0)
+        state.update({
+            'active': True,
+            'phase': 'Hermes readiness',
+            'candidate': 'opencode_ready/measured',
+            'completed': 1,
+            'total': 4,
+        })
+        items = build_header_dashboard_items(
+            {
+                'tiny': ('READY', 'ok'),
+                'other': ('ERROR', 'boom'),
+                'loading': ('STARTING', ''),
+            },
+            model,
+            ('READY', 'ok'),
+            'benchmark',
+            state,
+            True,
+            'Hermes workflow',
+            'cpu=8 ram=12/32GiB',
+            ['Hermes not ready, needs 64000 ctx/slot'],
+            width=80,
+        )
+        text = '\n'.join(line for line, _kind in items)
 
-        no_error_rows, no_error_log_rows = logs_errors_split_rows(18, 0)
-        self.assertLessEqual(no_error_rows, 2)
-        self.assertGreater(no_error_log_rows, no_error_rows)
+        self.assertEqual(header_dashboard_title('benchmark'), 'Benchmark Status')
+        self.assertIn('READY:1', text)
+        self.assertIn('LOADING:1', text)
+        self.assertIn('ERROR:1', text)
+        self.assertIn('active: tiny READY', text)
+        self.assertNotIn('action:', text)
+        self.assertIn('view: Benchmark', text)
+        self.assertIn('bench: hermes Hermes readiness 1/4 25%', text)
+        self.assertIn('hardware: cpu=8', text)
+        self.assertIn('last error: Hermes not ready', text)
 
-    def test_latest_error_view_keeps_newest_error_visible(self):
-        errors = [f'error {idx}' for idx in range(10)]
-        visible, has_older, total = latest_error_view_items(errors, 80, 3, error_attr=1, muted_attr=2)
-        lines = [line for line, _attr in visible]
+    def test_header_config_content_builder_mentions_lm_studio_roots(self):
+        class FakeApp:
+            config_path = '/tmp/models.json'
+            llama_server = '/bin/llama-server'
+            vllm_command = 'vllm'
+            hf_cache_root = '/hf'
+            llmfit_cache_root = '/llmfit'
+            llm_models_cache_root = '/models'
 
-        self.assertTrue(has_older)
-        self.assertEqual(total, 10)
-        self.assertIn('error 9', lines)
-        self.assertNotIn('error 0', lines)
-        self.assertEqual(lines[0], '^ older errors above')
+            class OpenCode:
+                path = '/tmp/opencode.json'
+
+            class Hermes:
+                command = 'hermes'
+
+            opencode = OpenCode()
+            hermes = Hermes()
+
+            def lm_studio_roots(self):
+                return [Path('/lmstudio/models'), Path('/lmstudio/hub/models')]
+
+        items = build_header_config_items(FakeApp(), 'Ready.', width=120)
+        text = '\n'.join(line for line, _kind in items)
+
+        self.assertIn('config: /tmp/models.json', text)
+        self.assertIn('llama-server: /bin/llama-server', text)
+        self.assertIn('opencode: /tmp/opencode.json', text)
+        self.assertIn('hermes: hermes', text)
+        self.assertIn('lm-studio=/lmstudio/models, /lmstudio/hub/models', text)
+        self.assertIn('message: Ready.', text)
+
+    def test_log_and_error_tab_builders_are_separate(self):
+        logs = build_log_items(['server line'], log_attr=2, muted_attr=4)
+        errors = build_error_items(['boom'], error_attr=1, muted_attr=4)
+        empty_errors = build_error_items([], error_attr=1, muted_attr=4)
+
+        self.assertEqual(logs, [('server line', 2)])
+        self.assertEqual(errors, [('boom', 1)])
+        self.assertIn(('No errors captured for this model/run.', 4), empty_errors)
 
     def test_benchmark_progress_content_builder_includes_runtime_fields(self):
         model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
@@ -278,6 +356,18 @@ class ProfileUiTests(unittest.TestCase):
             'candidate': 'ctx=4096',
             'completed': 1,
             'total': 4,
+            'records': [{
+                'preset': 'opencode_ready',
+                'score': 0.0,
+                'seconds': 0.0,
+                'ctx': 4096,
+                'ctx_per_slot': 4096,
+                'parallel': 1,
+                'status': 'not Hermes-ready',
+                'required_context': 64000,
+                'actual_ctx_per_slot': 4096,
+                'detail': 'not Hermes-ready: needs 64000 ctx/slot; candidate has 4096',
+            }],
         })
 
         items = build_benchmark_progress_items(model, state, 'READY', 'ok', 123, width=40)
@@ -289,6 +379,10 @@ class ProfileUiTests(unittest.TestCase):
         self.assertIn('candidate: ctx=4096', text)
         self.assertIn('pid: 123', text)
         self.assertIn('progress:', text)
+        self.assertIn('profile:', text)
+        self.assertIn('runtime:', text)
+        self.assertIn('latest result:', text)
+        self.assertIn('Hermes readiness: needs 64000', text)
 
 
 class TryLiveStatsTests(unittest.TestCase):
@@ -422,9 +516,11 @@ class BenchmarkDashboardTests(unittest.TestCase):
 
         self.assertFalse(state['active'])
         self.assertEqual(state['status'], 'done')
+        self.assertEqual(state['ended_at'], 15.0)
         self.assertEqual(len(state['records']), 1)
         self.assertIn('candidate ok', state['feed'])
         self.assertEqual(benchmark_elapsed_text(state, now=15.0), '00:05')
+        self.assertEqual(benchmark_elapsed_text(state, now=99.0), '00:05')
 
     def test_reducer_tracks_benchmark_commands_separately(self):
         state = new_benchmark_run_state(now=10.0)
@@ -488,7 +584,7 @@ class BenchmarkDashboardTests(unittest.TestCase):
 
         self.assertEqual(lines[0][1], 'current')
         self.assertTrue(lines[0][0].startswith('current: llama-server'))
-        self.assertLessEqual(len(lines[0][0]), 32)
+        self.assertGreater(len(lines[0][0]), 32)
         self.assertIn(('recent: cmd-2', 'muted'), lines)
 
     def test_benchmark_row_text_includes_tradeoff_fields(self):
@@ -512,6 +608,40 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('ok', row)
         self.assertIn('knee_refine', row)
         self.assertIn('needs~9616tok', row)
+
+    def test_benchmark_record_display_items_include_sample_details(self):
+        items = benchmark_record_display_items({
+            'preset': 'auto',
+            'score': 10.0,
+            'seconds': 1.0,
+            'ctx': 2048,
+            'ctx_per_slot': 2048,
+            'parallel': 1,
+            'status': 'hermes command failed',
+            'detail': 'bad flag',
+            'required_context': 64000,
+            'configured_context_length': 70000,
+            'actual_ctx_per_slot': 2048,
+            'experimental_context_override': True,
+            'samples': [{
+                'task': 'fix_calc',
+                'status': 'hermes command failed',
+                'exit_code': 2,
+                'timeout_type': '',
+                'unittest_command_seen': False,
+                'command_preview': 'hermes chat -q fix',
+                'config_path': '/tmp/hermes/config.yaml',
+                'stderr_tail': ['bad flag'],
+                'stdout_tail': [],
+            }],
+        })
+        text = '\n'.join(line for line, _attr in items)
+
+        self.assertIn('detail: bad flag', text)
+        self.assertIn('context: required=64000 configured=70000 actual_slot=2048 experimental override', text)
+        self.assertIn('command: hermes chat -q fix', text)
+        self.assertIn('config: /tmp/hermes/config.yaml', text)
+        self.assertIn('stderr: bad flag', text)
 
     def test_benchmark_runs_for_model_falls_back_to_legacy_rows(self):
         model = ModelConfig(
@@ -540,7 +670,8 @@ class BenchmarkDashboardTests(unittest.TestCase):
                 'long_context': {'ctx': 32768, 'ctx_per_slot': 32768, 'parallel': 1, 'tokens_per_sec': 12.0},
             },
             'records': [
-                {'status': 'ok', 'objective': 'fast_chat', 'ctx': 4096, 'parallel': 2},
+                {'status': 'ok', 'objective': 'fast_chat', 'ctx': 4096, 'ctx_per_slot': 2048, 'parallel': 2, 'tokens_per_sec': 40.0},
+                {'status': 'ok', 'objective': 'auto', 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1, 'tokens_per_sec': 20.0},
                 {
                     'status': 'start failed',
                     'objective': 'long_context',
@@ -556,10 +687,32 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('server-1', benchmark_run_line(run, 0, selected=True))
         lines = '\n'.join(benchmark_ranking_rows(run))
 
-        self.assertIn('Fast Chat:', lines)
-        self.assertIn('Long Context:', lines)
-        self.assertIn('Failed / break points:', lines)
-        self.assertIn('break:', lines)
+        self.assertIn('#01 [Winner, Fastest]', lines)
+        self.assertIn('40.00 tok/s', lines)
+        self.assertIn('[Break Point]', lines)
+        self.assertLess(lines.index('[Winner, Fastest]'), lines.index('[Break Point]'))
+
+        items = benchmark_ranking_items(run, success_attr=1, warning_attr=2, error_attr=3, heading_attr=4)
+        self.assertEqual(items[0], ('ranked candidates:', 4))
+        self.assertTrue(any('[Break Point]' in line and attr == 3 for line, attr in items))
+
+    def test_agent_ranking_rows_sort_passed_tasks_before_failures(self):
+        run = {
+            'kind': 'hermes',
+            'winners': {
+                'hermes': {'status': 'tests passed', 'score': 120.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1},
+            },
+            'records': [
+                {'runtime': 'hermes', 'status': 'hermes command failed', 'score': 0.0, 'ctx': 4096, 'ctx_per_slot': 4096, 'parallel': 1, 'detail': 'bad flag'},
+                {'runtime': 'hermes', 'status': 'tests passed', 'score': 120.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1},
+            ],
+        }
+
+        lines = benchmark_ranking_rows(run)
+        text = '\n'.join(lines)
+
+        self.assertIn('#01 [Winner, Passed] tests passed 120.00 score', text)
+        self.assertIn('#02 [Failed] hermes command failed', text)
 
 
 if __name__ == '__main__':

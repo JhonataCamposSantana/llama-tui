@@ -8,7 +8,7 @@ The project is intentionally small: it uses only the Python standard library, st
 
 - Start, stop, and inspect local model servers.
 - Manage `llama.cpp` GGUF models and vLLM/Hugging Face model references.
-- Detect `.gguf` files from Hugging Face, `llmfit`, and local model caches.
+- Detect `.gguf` files from Hugging Face, `llmfit`, LM Studio, and local model caches.
 - Track server PID files, logs, and process groups under `~/.cache/llama-tui`.
 - Clean up llama-tui-managed servers on stop, benchmark completion, and TUI exit.
 - Probe CPU, RAM, and NVIDIA VRAM with `/proc` and `nvidia-smi`.
@@ -109,6 +109,7 @@ Useful top-level settings:
 - `hf_cache_root`: Hugging Face cache root.
 - `llmfit_cache_root`: llmfit model cache root.
 - `llm_models_cache_root`: additional local model cache root.
+- `lm_studio_model_roots`: comma-separated LM Studio user model roots.
 - `opencode`: export settings and role assignments.
 - `models`: registered model entries.
 
@@ -341,7 +342,10 @@ Press `x` to scan configured roots for `.gguf` files:
 hf_cache_root
 llmfit_cache_root
 llm_models_cache_root
+lm_studio_model_roots
 ```
+
+LM Studio defaults are read from `LM_STUDIO_HOME`, then `~/.lmstudio-home-pointer`, then `~/.lmstudio`. llama-tui scans only the user model folders, `models` and `hub/models`, by default; internal bundled models are skipped unless you add that path manually.
 
 Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. Nothing benchmarks automatically in the background; open the model details and press `B` when you want measured settings. Discovery does not special-case model families or filenames.
 

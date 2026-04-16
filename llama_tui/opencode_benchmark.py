@@ -721,6 +721,7 @@ def compact_sample_details(samples: List[Dict[str, object]]) -> List[Dict[str, o
         details.append({
             'task': sample.get('task', ''),
             'command_preview': sample.get('command_preview', ''),
+            'config_path': sample.get('config_path', ''),
             'status': sample.get('status', ''),
             'ok': bool(sample.get('ok')),
             'tests_ok': bool(sample.get('tests_ok')),

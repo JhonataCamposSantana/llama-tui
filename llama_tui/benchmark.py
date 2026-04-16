@@ -692,10 +692,41 @@ def start_model_with_progress(
     if progress:
         progress(ready_msg if ready_ok else concise_failure(ready_msg))
     return ready_ok, ready_msg
-def launch_opencode_stack(
+
+
+def ensure_agent_stack_model_ready(
+    app: AppConfig,
+    model: ModelConfig,
+    runtime_label: str,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str, bool]:
+    check_cancelled(cancel_token)
+    status, _detail = app.health(model)
+    if status == 'READY':
+        if progress:
+            progress(f'{model.id} already ready; using current server for {runtime_label}.')
+        return True, f'{model.id} already ready', False
+    if status in ('LOADING', 'STARTING') or app.get_pid(model):
+        if progress:
+            progress(f'{model.id} is starting; waiting for readiness before {runtime_label} launch...')
+        ready_ok, ready_msg = app.wait_until_ready(model, timeout=180, cancel_token=cancel_token)
+        return ready_ok, concise_failure(ready_msg) if not ready_ok else ready_msg, False
+    if progress:
+        progress(f'{model.id} is stopped; launching agent-ready profile before {runtime_label}...')
+    ready_ok, ready_msg = launch_with_failsafe(app, model, 'opencode_ready', 'auto', progress=progress, cancel_token=cancel_token)
+    return ready_ok, concise_failure(ready_msg) if not ready_ok else ready_msg, bool(ready_ok)
+
+
+def launch_agent_stack(
     app: AppConfig,
     model: ModelConfig,
     workspace: str,
+    runtime_label: str,
+    command_name: str,
+    remember_workspace: Callable[[str], None],
+    sync_config: Callable[[], Tuple[bool, str]],
+    launch_terminal: Callable[[ModelConfig, Path], Tuple[bool, str]],
     include_vscode: bool = False,
     progress: Optional[Callable[[str], None]] = None,
     cancel_token: Optional[CancelToken] = None,
@@ -705,51 +736,37 @@ def launch_opencode_stack(
     if not valid or workspace_path is None:
         return False, f'❌ {reason}'
     if not getattr(model, 'enabled', True):
-        return False, f'❌ {model.id} is disabled; enable it before launching OpenCode.'
+        return False, f'❌ {model.id} is disabled; enable it before launching {runtime_label}.'
 
-    app.opencode.last_workspace_path = str(workspace_path)
+    remember_workspace(str(workspace_path))
     app.save()
 
-    started_for_stack = False
-    status, _detail = app.health(model)
-    if status == 'READY':
-        if progress:
-            progress(f'{model.id} already ready; using current server for OpenCode.')
-    elif status in ('LOADING', 'STARTING') or app.get_pid(model):
-        if progress:
-            progress(f'{model.id} is starting; waiting for readiness before OpenCode launch...')
-        ready_ok, ready_msg = app.wait_until_ready(model, timeout=180, cancel_token=cancel_token)
-        if not ready_ok:
-            return False, concise_failure(ready_msg)
-    else:
-        if progress:
-            progress(f'{model.id} is stopped; launching OpenCode-ready profile before OpenCode...')
-        ready_ok, ready_msg = launch_with_failsafe(app, model, 'opencode_ready', 'auto', progress=progress, cancel_token=cancel_token)
-        if not ready_ok:
-            return False, concise_failure(ready_msg)
-        started_for_stack = True
+    ready_ok, ready_msg, started_for_stack = ensure_agent_stack_model_ready(
+        app,
+        model,
+        runtime_label,
+        progress=progress,
+        cancel_token=cancel_token,
+    )
+    if not ready_ok:
+        return False, ready_msg
 
     if cancel_token is not None and cancel_token.is_cancelled():
         if started_for_stack:
             app.stop(model, managed_only=True)
         check_cancelled(cancel_token)
-    if not (getattr(app.opencode, 'path', '') or '').strip():
-        return False, '❌ Set opencode.path first in settings.'
-    sync_ok, sync_msg = app.generate_opencode()
+    sync_ok, sync_msg = sync_config()
     if not sync_ok:
+        if started_for_stack:
+            app.stop(model, managed_only=True)
         return False, f'❌ {sync_msg}'
     if progress:
         progress(sync_msg)
 
-    if not app.command_exists('opencode'):
-        return False, '❌ opencode command not found in PATH.'
-    terminal_ok, _terminal_cmd, terminal_msg = app.build_terminal_command(
-        f'OpenCode {model.id}',
-        workspace_path,
-        app.build_opencode_shell_command(model, workspace_path),
-    )
-    if not terminal_ok:
-        return False, f'❌ {terminal_msg}'
+    if not app.command_exists(command_name):
+        if started_for_stack:
+            app.stop(model, managed_only=True)
+        return False, f'❌ {runtime_label} command not found: {command_name}'
 
     warnings = []
     if cancel_token is not None and cancel_token.is_cancelled():
@@ -767,8 +784,10 @@ def launch_opencode_stack(
         if started_for_stack:
             app.stop(model, managed_only=True)
         check_cancelled(cancel_token)
-    open_ok, open_msg = app.launch_opencode_terminal(model, workspace_path)
+    open_ok, open_msg = launch_terminal(model, workspace_path)
     if not open_ok:
+        if started_for_stack:
+            app.stop(model, managed_only=True)
         detail = f'❌ {open_msg}'
         if warnings:
             detail += ' | warnings: ' + '; '.join(warnings)
@@ -776,13 +795,66 @@ def launch_opencode_stack(
     if progress:
         progress(open_msg)
 
-    stack_label = 'full-stack' if include_vscode else 'OpenCode'
+    stack_label = f'{runtime_label} full-stack' if include_vscode else runtime_label
     detail = f'✅ launched {stack_label} for {model.id} in {workspace_path}'
     if warnings:
         detail += ' | warnings: ' + '; '.join(warnings)
     return True, detail
+
+
+def launch_opencode_stack(
+    app: AppConfig,
+    model: ModelConfig,
+    workspace: str,
+    include_vscode: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    if not (getattr(app.opencode, 'path', '') or '').strip():
+        return False, '❌ Set opencode.path first in settings.'
+    return launch_agent_stack(
+        app,
+        model,
+        workspace,
+        'OpenCode',
+        'opencode',
+        lambda value: setattr(app.opencode, 'last_workspace_path', value),
+        app.generate_opencode,
+        app.launch_opencode_terminal,
+        include_vscode=include_vscode,
+        progress=progress,
+        cancel_token=cancel_token,
+    )
+
+
+def launch_hermes_stack(
+    app: AppConfig,
+    model: ModelConfig,
+    workspace: str,
+    include_vscode: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    command_name = app.hermes_command_prefix()[0]
+    return launch_agent_stack(
+        app,
+        model,
+        workspace,
+        'Hermes',
+        command_name,
+        lambda value: setattr(app.hermes, 'last_workspace_path', value),
+        lambda: app.generate_hermes_config(model),
+        app.launch_hermes_terminal,
+        include_vscode=include_vscode,
+        progress=progress,
+        cancel_token=cancel_token,
+    )
+
+
 def clone_model_config(model: ModelConfig) -> ModelConfig:
     return ModelConfig(**asdict(model))
+
+
 def estimate_text_tokens(text: str) -> int:
     if not text:
         return 0

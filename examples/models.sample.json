@@ -4,6 +4,7 @@
   "hf_cache_root": "~/.cache/huggingface/hub",
   "llmfit_cache_root": "~/.cache/llmfit/models",
   "llm_models_cache_root": "~/.cache/llm-models",
+  "lm_studio_model_roots": "~/.lmstudio/models, ~/.lmstudio/hub/models",
   "opencode": {
     "path": "~/.config/opencode/opencode.json",
     "backup_dir": "~/.config/llama-tui/backups",
