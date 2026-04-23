@@ -1,19 +1,23 @@
 import curses
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from llama_tui.chat import build_chat_payload, parse_openai_sse_lines, stream_chat_completion, stream_chat_events
 from llama_tui.control import CancelToken, CancelledError
 from llama_tui.models import ModelConfig
+from llama_tui.benchmark import machine_best_summary
 from llama_tui.ui import (
     apply_quit_policy,
     adjust_scroll_offset,
+    benchmark_freshness_label,
     benchmark_ranking_items,
     body_content_bottom,
     body_content_rows,
     body_pane_layout,
     body_pane_height,
+    browser_models,
     build_error_source_lines,
     build_benchmark_progress_items,
     build_error_items,
@@ -34,19 +38,26 @@ from llama_tui.ui import (
     build_try_live_stat_lines,
     build_try_transcript_items,
     clamp_scroll,
+    config_doctor_items,
     deep_benchmark_all_options,
     finish_try_live_metrics,
     machine_category_items,
     machine_gap_items,
     machine_ranking_items,
+    model_sort_key,
     new_try_live_metrics,
     new_benchmark_run_state,
     launch_options_for_stopped_model,
+    parse_bool_text,
+    parse_browser_filter_answers,
+    parse_model_form_answers,
+    parse_settings_form_answers,
     profile_label,
     progress_bar_text,
     reduce_benchmark_event,
     reset_try_live_metrics,
     cycle_right_tab,
+    sort_mode_label,
     default_right_tab,
     normalize_right_tab,
     right_scroll_action_for_view,
@@ -55,6 +66,7 @@ from llama_tui.ui import (
     right_tab_scroll_key,
     right_tabs_for_view,
     should_prompt_quit_keepalive,
+    should_stop_try_model,
     simple_profile_action,
     scrollable_pane_max_scroll,
     scrollable_pane_view,
@@ -164,6 +176,297 @@ class ChatPayloadTests(unittest.TestCase):
         self.assertEqual(events, [('reasoning', 'think'), ('chunk', 'answer')])
 
 
+class BrowserAndFormTests(unittest.TestCase):
+    def test_parse_bool_text_accepts_common_values(self):
+        self.assertTrue(parse_bool_text('true'))
+        self.assertTrue(parse_bool_text('YES'))
+        self.assertFalse(parse_bool_text('0'))
+        with self.assertRaises(ValueError):
+            parse_bool_text('maybe')
+
+    def test_parse_model_form_answers_reports_field_errors(self):
+        initial = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
+        model, errors = parse_model_form_answers({
+            'id': '',
+            'name': 'Tiny',
+            'path': '',
+            'alias': 'tiny',
+            'runtime': 'wrong',
+            'optimize_mode': 'max_context_safe',
+            'optimize_tier': 'wild',
+            'port': 'oops',
+            'host': '',
+            'ctx': '8192',
+            'ctx_min': '2048',
+            'ctx_max': '1024',
+            'threads': '4',
+            'ngl': '10',
+            'temp': '0.7',
+            'parallel': '1',
+            'memory_reserve_percent': '25',
+            'cache_ram': '0',
+            'output': '512',
+            'enabled': 'true',
+            'flash_attn': 'true',
+            'jinja': 'true',
+            'favorite': 'false',
+            'extra_args': '',
+        }, initial=initial)
+
+        self.assertIsNone(model)
+        self.assertIn('id', errors)
+        self.assertIn('path', errors)
+        self.assertIn('runtime', errors)
+        self.assertIn('optimize_tier', errors)
+        self.assertIn('port', errors)
+        self.assertIn('ctx_max', errors)
+        self.assertIn('host', errors)
+
+    def test_parse_settings_form_answers_validates_preferences(self):
+        parsed, errors = parse_settings_form_answers({
+            'llama_server': '/bin/llama-server',
+            'vllm_command': 'vllm',
+            'hf_cache_root': '/hf',
+            'llm_models_cache_root': '/models',
+            'llmfit_cache_root': '/llmfit',
+            'lm_studio_model_roots': '/lm',
+            'opencode_path': '/tmp/opencode.json',
+            'opencode_backup_dir': '/tmp/backups',
+            'continue_path': '/tmp/config.yaml',
+            'continue_backup_dir': '/tmp/backups',
+            'default_model_id': 'main',
+            'small_model_id': 'small',
+            'build_model_id': 'build',
+            'plan_model_id': 'plan',
+            'instructions': './a.md, ./b.md',
+            'build_prompt': 'build',
+            'plan_prompt': 'plan',
+            'timeout': '1000',
+            'chunk_timeout': '100',
+            'terminal_command': '',
+            'last_workspace_path': '/tmp/project',
+            'hermes_command': 'hermes',
+            'hermes_home_root': '/tmp/hermes',
+            'hermes_default_model_id': 'main',
+            'hermes_code_model_id': 'code',
+            'hermes_toolsets': 'terminal, file',
+            'hermes_max_turns': '20',
+            'hermes_quiet': 'not-bool',
+            'hermes_min_context_tokens': '64000',
+            'hermes_allow_experimental_context_override': 'false',
+            'hermes_experimental_context_override_tokens': '0',
+            'hermes_terminal_command': '',
+            'hermes_last_workspace_path': '/tmp/project',
+            'preferred_sort': 'recent',
+            'detail_density': 'dense',
+        })
+
+        self.assertIsNone(parsed)
+        self.assertIn('hermes_quiet', errors)
+        self.assertIn('detail_density', errors)
+
+    def test_parse_settings_form_answers_round_trips_continue_roles(self):
+        parsed, errors = parse_settings_form_answers({
+            'llama_server': '/bin/llama-server',
+            'vllm_command': 'vllm',
+            'hf_cache_root': '/hf',
+            'llm_models_cache_root': '/models',
+            'llmfit_cache_root': '/llmfit',
+            'lm_studio_model_roots': '/lm',
+            'opencode_path': '/tmp/opencode.json',
+            'opencode_backup_dir': '/tmp/backups',
+            'default_model_id': 'main',
+            'small_model_id': 'small',
+            'build_model_id': 'build',
+            'plan_model_id': 'plan',
+            'instructions': './a.md, ./b.md',
+            'build_prompt': 'build',
+            'plan_prompt': 'plan',
+            'timeout': '1000',
+            'chunk_timeout': '100',
+            'terminal_command': '',
+            'last_workspace_path': '/tmp/project',
+            'continue_path': '/tmp/config.yaml',
+            'continue_backup_dir': '/tmp/backups',
+            'continue_default_model_id': 'continue-main',
+            'continue_edit_model_id': 'continue-edit',
+            'continue_autocomplete_model_id': 'continue-small',
+            'continue_merge_mode': 'preserve_sections',
+            'hermes_command': 'hermes',
+            'hermes_home_root': '/tmp/hermes',
+            'hermes_default_model_id': 'main',
+            'hermes_code_model_id': 'code',
+            'hermes_toolsets': 'terminal, file',
+            'hermes_max_turns': '20',
+            'hermes_quiet': 'true',
+            'hermes_min_context_tokens': '64000',
+            'hermes_allow_experimental_context_override': 'false',
+            'hermes_experimental_context_override_tokens': '0',
+            'hermes_terminal_command': '',
+            'hermes_last_workspace_path': '/tmp/project',
+            'preferred_sort': 'recent',
+            'detail_density': 'advanced',
+        })
+
+        self.assertFalse(errors)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed['continue']['default_model_id'], 'continue-main')
+        self.assertEqual(parsed['continue']['edit_model_id'], 'continue-edit')
+        self.assertEqual(parsed['continue']['autocomplete_model_id'], 'continue-small')
+        self.assertEqual(parsed['continue']['merge_mode'], 'preserve_sections')
+
+    def test_browser_models_filters_and_sorts_by_user_preferences(self):
+        alpha = ModelConfig(id='alpha', name='Alpha', path='alpha.gguf', alias='alpha', port=18080, runtime='llama.cpp')
+        beta = ModelConfig(id='beta', name='Beta', path='beta.gguf', alias='beta', port=18081, runtime='vllm')
+        gamma = ModelConfig(id='gamma', name='Gamma', path='gamma.gguf', alias='gamma', port=18082, runtime='llama.cpp')
+        alpha.favorite = True
+        alpha.last_used_at = '2026-04-23T10:00:00'
+        gamma.last_used_at = '2026-04-23T12:00:00'
+        beta.source = 'lm-studio'
+        beta.ctx = 65536
+        beta.parallel = 2
+        alpha.default_benchmark_status = 'done'
+        alpha.benchmark_fingerprint = 'fp-alpha'
+        alpha.measured_profiles = {'auto': {'status': 'ok', 'tokens_per_sec': 60.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1}}
+
+        class FakeApp:
+            models = [alpha, beta, gamma]
+
+            def model_fingerprint(self, model):
+                return f'fp-{model.id}'
+
+        statuses = {
+            'alpha': ('READY', ''),
+            'beta': ('STOPPED', ''),
+            'gamma': ('ERROR', ''),
+        }
+
+        filtered = browser_models(FakeApp(), statuses, search='beta', runtime_filter='vllm', source_filter='lm-studio', status_filter='all', sort_mode='name')
+        self.assertEqual([model.id for model in filtered], ['beta'])
+
+        favorites = browser_models(FakeApp(), statuses, sort_mode='favorites')
+        self.assertEqual(favorites[0].id, 'alpha')
+
+        recents = browser_models(FakeApp(), statuses, sort_mode='recent')
+        self.assertEqual(recents[0].id, 'gamma')
+
+        self.assertEqual(benchmark_freshness_label(FakeApp(), alpha), 'fresh')
+        self.assertEqual(benchmark_freshness_label(FakeApp(), beta), 'missing')
+        self.assertEqual(sort_mode_label('benchmark'), 'Best Benchmark')
+        self.assertLess(model_sort_key(beta, 'context'), model_sort_key(alpha, 'context'))
+
+    def test_browser_models_filters_by_tags(self):
+        alpha = ModelConfig(id='alpha', name='Alpha', path='alpha.gguf', alias='alpha', port=18080, runtime='llama.cpp')
+        beta = ModelConfig(id='beta', name='Beta', path='beta.gguf', alias='beta', port=18081, runtime='vllm')
+        alpha.tags = ['coding', 'fast-chat']
+        beta.tags = ['autocomplete']
+
+        class FakeApp:
+            models = [alpha, beta]
+
+            def model_fingerprint(self, model):
+                return f'fp-{model.id}'
+
+        statuses = {'alpha': ('STOPPED', ''), 'beta': ('STOPPED', '')}
+
+        filtered = browser_models(FakeApp(), statuses, tag_filter='coding')
+        self.assertEqual([model.id for model in filtered], ['alpha'])
+
+    def test_parse_browser_filter_answers_rejects_unknown_values(self):
+        parsed, errors = parse_browser_filter_answers({
+            'runtime_filter': 'weird',
+            'source_filter': 'manual',
+            'status_filter': 'READY',
+            'tag_filter': 'coding',
+        })
+
+        self.assertIsNone(parsed)
+        self.assertIn('runtime_filter', errors)
+
+    def test_parse_browser_filter_answers_accepts_tag_filter(self):
+        parsed, errors = parse_browser_filter_answers({
+            'runtime_filter': 'all',
+            'source_filter': 'manual',
+            'status_filter': 'READY',
+            'tag_filter': 'coding',
+        })
+
+        self.assertFalse(errors)
+        self.assertEqual(parsed, ('all', 'manual', 'READY', 'coding'))
+
+    def test_config_doctor_items_reports_verification_counts(self):
+        passed = ModelConfig(id='passed', name='Passed', path='org/model', alias='passed', port=18080, runtime='vllm')
+        pending = ModelConfig(id='pending', name='Pending', path='org/model2', alias='pending', port=18081, runtime='vllm')
+        passed.verification_status = 'passed'
+        pending.verification_status = 'needs_benchmark'
+        passed.verification_results = {
+            'cap': {
+                'limiting_factor': 'parallel_split',
+                'configured_ctx': 8192,
+                'ctx_per_slot': 4096,
+                'estimated_safe_context': 65536,
+                'measured_max_context': 4096,
+            }
+        }
+
+        class FakeApp:
+            llama_server = '/bin/sh'
+            vllm_command = 'vllm'
+            opencode = SimpleNamespace(path='/tmp/opencode.json')
+            continue_settings = SimpleNamespace(path='/tmp/config.yaml', merge_mode='preserve_sections')
+            hermes = SimpleNamespace(command='hermes', home_root='/tmp/hermes')
+            models = [passed, pending]
+
+            def command_exists(self, command):
+                return command in ('/bin/sh', 'code')
+
+            def detect_terminal_launcher(self):
+                return '/usr/bin/xterm'
+
+            def benchmark_proof_model_ids(self, force=False):
+                return ['pending']
+
+        rows = config_doctor_items(FakeApp(), active_model=passed)
+        text = '\n'.join(row for row, _kind in rows)
+
+        self.assertIn('model verification: needs_benchmark:1 passed:1', text)
+        self.assertIn('benchmark proof needed: 1 model(s)', text)
+        self.assertIn('cap: factor=parallel_split', text)
+
+    def test_machine_best_summary_includes_explanatory_reason(self):
+        model = ModelConfig(id='balanced', name='Balanced', path='balanced.gguf', alias='balanced', port=18080)
+        model.default_benchmark_status = 'done'
+        model.benchmark_fingerprint = 'fp-balanced'
+        model.measured_profiles = {
+            'auto': {
+                'status': 'ok',
+                'tokens_per_sec': 75.0,
+                'ctx': 32768,
+                'ctx_per_slot': 32768,
+                'parallel': 1,
+                'ram_available': 8 * 1024**3,
+                'gpu_memory_free': 4 * 1024**3,
+                'benchmarked_at': '2026-04-23T12:00:00',
+            },
+            'fast_chat': {'status': 'ok', 'tokens_per_sec': 82.0, 'ctx': 16384, 'ctx_per_slot': 16384, 'parallel': 1},
+            'long_context': {'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 65536, 'ctx_per_slot': 65536, 'parallel': 1},
+            'opencode_ready': {'status': 'ok', 'tokens_per_sec': 70.0, 'ctx': 65536, 'ctx_per_slot': 65536, 'parallel': 1},
+        }
+
+        class FakeApp:
+            models = [model]
+
+            def model_fingerprint(self, _model):
+                return 'fp-balanced'
+
+        summary = machine_best_summary(FakeApp())
+        reason = str(summary['machine_pick']['reason'])
+
+        self.assertIn('auto 75.00 tok/s', reason)
+        self.assertIn('ctx/slot 32768', reason)
+        self.assertIn('headroom', reason)
+
+
 class ProfileUiTests(unittest.TestCase):
     def test_simple_profile_mapping(self):
         self.assertEqual(simple_profile_action('auto_profile')[:2], ('best', 'auto'))
@@ -194,6 +497,14 @@ class ProfileUiTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(msg, 'stopped')
         self.assertIs(app.stopped_model, model)
+
+    def test_try_exit_stop_decision_only_matches_launched_model(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny-local', port=18080)
+
+        self.assertTrue(should_stop_try_model('tiny', model))
+        self.assertFalse(should_stop_try_model('', model))
+        self.assertFalse(should_stop_try_model('other', model))
+        self.assertFalse(should_stop_try_model('tiny', None))
 
     def test_quit_keepalive_policy_helpers(self):
         class FakeApp:

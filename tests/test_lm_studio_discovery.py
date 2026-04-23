@@ -79,6 +79,64 @@ class LmStudioDiscoveryTests(unittest.TestCase):
         self.assertTrue(getattr(app, 'lm_studio_model_roots', ''))
         self.assertIn('models', app.lm_studio_model_roots)
 
+    def test_load_ignores_unknown_future_settings_and_model_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'models.json'
+            config.write_text(json.dumps({
+                'continue': {
+                    'path': str(root / 'config.yaml'),
+                    'merge_mode': 'preserve_sections',
+                    'future_continue_key': 'keep loader tolerant',
+                },
+                'opencode': {
+                    'path': str(root / 'opencode.json'),
+                    'future_opencode_key': 'ignored',
+                },
+                'models': [
+                    {
+                        'id': 'good',
+                        'name': 'Good',
+                        'path': str(root / 'good.gguf'),
+                        'alias': 'good',
+                        'port': 18080,
+                        'tags': ['coding'],
+                        'verification_status': 'passed',
+                        'future_model_key': {'ignored': True},
+                    },
+                ],
+            }), encoding='utf-8')
+
+            app = AppConfig(config)
+
+        self.assertEqual(app.continue_settings.path, str(root / 'config.yaml'))
+        self.assertEqual(app.opencode.path, str(root / 'opencode.json'))
+        self.assertEqual([model.id for model in app.models], ['good'])
+        self.assertEqual(app.models[0].tags, ['coding'])
+        self.assertEqual(app.models[0].verification_status, 'passed')
+
+    def test_load_preserves_manual_models_when_paths_are_temporarily_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'models.json'
+            app = AppConfig(config)
+            missing_path = root / 'detached-drive' / 'portable.gguf'
+            app.models = [ModelConfig(
+                id='portable',
+                name='Portable',
+                path=str(missing_path),
+                alias='portable',
+                port=19001,
+                source='manual',
+            )]
+            app.save()
+
+            loaded = AppConfig(config)
+
+        self.assertEqual(len(loaded.models), 1)
+        self.assertEqual(loaded.models[0].id, 'portable')
+        self.assertEqual(loaded.models[0].path, str(missing_path))
+
     def test_prune_removes_missing_lm_studio_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -107,6 +165,72 @@ class LmStudioDiscoveryTests(unittest.TestCase):
         self.assertEqual(removed_count, 1)
         self.assertEqual(removed, ['gone'])
         self.assertEqual(app.models, [])
+
+    def test_load_recovers_from_malformed_json_and_archives_broken_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'models.json'
+            config.write_text('{"models": [', encoding='utf-8')
+            config_dir = root / 'config'
+            data_dir = root / 'data'
+            cache_dir = root / 'cache'
+
+            with patch('llama_tui.app.CONFIG_DIR', config_dir):
+                with patch('llama_tui.app.DATA_DIR', data_dir):
+                    with patch('llama_tui.app.CACHE_DIR', cache_dir):
+                        app = AppConfig(config)
+                        saved_text = config.read_text(encoding='utf-8')
+                        backups = list((config_dir / 'backups').glob('models.broken.*.json'))
+
+        self.assertEqual(app.models, [])
+        self.assertTrue(app.load_warnings)
+        self.assertIn('Config recovery', app.load_warnings[0])
+        self.assertEqual(json.loads(saved_text)['models'], [])
+        self.assertTrue(backups)
+
+    def test_load_keeps_valid_models_and_reports_invalid_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'models.json'
+            config.write_text(json.dumps({
+                'models': [
+                    {
+                        'id': 'good',
+                        'name': 'Good',
+                        'path': str(root / 'good.gguf'),
+                        'alias': 'good',
+                        'port': 18080,
+                    },
+                    {
+                        'id': 'bad',
+                        'name': 'Bad',
+                        'path': str(root / 'bad.gguf'),
+                        'alias': 'bad',
+                        'port': 'oops',
+                    },
+                ],
+            }), encoding='utf-8')
+
+            app = AppConfig(config)
+
+        self.assertEqual([model.id for model in app.models], ['good'])
+        self.assertTrue(any('skipped model row 2' in warning for warning in app.load_warnings))
+        self.assertEqual(app.models[0].sort_rank, 1)
+
+    def test_workspace_presets_remember_recent_unique_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'models.json'
+            app = AppConfig(config)
+
+            app.remember_workspace_preset('opencode', str(root / 'one'))
+            app.remember_workspace_preset('opencode', str(root / 'two'))
+            app.remember_workspace_preset('opencode', str(root / 'one'))
+
+        self.assertEqual(
+            app.workspace_presets('opencode'),
+            [str(root / 'one'), str(root / 'two')],
+        )
 
 
 if __name__ == '__main__':

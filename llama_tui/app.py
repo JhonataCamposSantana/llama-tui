@@ -1,12 +1,12 @@
-import json
 import hashlib
+import json
 import os
 import shlex
 import shutil
 import signal
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,13 +28,12 @@ from .discovery import (
     detected_model_from_path,
     display_runtime,
     is_real_model_file,
-    is_registered_model_entry,
     looks_like_model_reference,
 )
 from .control import CancelToken, check_cancelled, sleep_with_cancel
 from .gguf import estimate_kv_bytes_per_token, read_gguf_metadata
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
-from .models import HermesSettings, ModelConfig, OpencodeSettings
+from .models import ContinueSettings, HermesSettings, ModelConfig, OpencodeSettings, UiSettings
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
 from .textutil import compact_message, important_log_excerpt
 
@@ -74,6 +73,11 @@ HOST_TERMINAL_BRIDGES = (
     'host-spawn',
     'distrobox-host-exec',
 )
+
+CONTINUE_MANAGED_BEGIN = '  # BEGIN llama-tui managed models'
+CONTINUE_MANAGED_END = '  # END llama-tui managed models'
+CONTINUE_MERGE_MODES = ('preserve_sections', 'managed_file')
+VERIFICATION_STATUSES = ('unknown', 'running', 'passed', 'warning', 'failed', 'needs_benchmark')
 
 
 def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cmd: str) -> List[str]:
@@ -161,6 +165,17 @@ def yaml_list(values: List[str]) -> str:
     return '[' + ', '.join(yaml_quote(value) for value in values) + ']'
 
 
+def dataclass_payload(cls, raw: Dict[str, object]) -> Dict[str, object]:
+    allowed = {field.name for field in fields(cls)}
+    return {key: value for key, value in dict(raw).items() if key in allowed}
+
+
+def context_per_slot(model: ModelConfig) -> int:
+    ctx = max(0, int(getattr(model, 'ctx', 0) or 0))
+    parallel = max(1, int(getattr(model, 'parallel', 1) or 1))
+    return ctx // parallel
+
+
 def terminal_launcher_label(launcher: str) -> str:
     if launcher.startswith('flatpak:'):
         return launcher
@@ -228,10 +243,16 @@ class AppConfig:
             path='',
             backup_dir=str(CONFIG_DIR / 'backups'),
         )
+        self.continue_settings = ContinueSettings(
+            path='',
+            backup_dir=str(CONFIG_DIR / 'backups'),
+        )
         self.hermes = HermesSettings(
             home_root=str(CACHE_DIR / 'hermes'),
         )
+        self.ui = UiSettings()
         self.models: List[ModelConfig] = []
+        self.load_warnings: List[str] = []
         self._hardware_profile: Optional[HardwareProfile] = None
         self._hardware_profile_at = 0.0
         self._owned_pids: set[int] = set()
@@ -246,21 +267,57 @@ class AppConfig:
         if not self.config_path.exists():
             self.save()
             return
-        data = json.loads(self.config_path.read_text())
+        self.load_warnings = []
+        try:
+            data = json.loads(self.config_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            archived = self._archive_broken_config_file()
+            detail = f'Config recovery: {compact_message(str(exc))}'
+            if archived:
+                detail += f' | original saved to {archived}'
+            detail += ' | defaults were restored; review settings and re-add any missing manual edits.'
+            self.load_warnings.append(detail)
+            self.save()
+            return
+        if not isinstance(data, dict):
+            self.load_warnings.append('Config recovery: top-level config must be a JSON object; defaults were restored.')
+            self.save()
+            return
         self.llama_server = data.get('llama_server', self.llama_server)
         self.vllm_command = data.get('vllm_command', self.vllm_command)
         self.hf_cache_root = data.get('hf_cache_root', self.hf_cache_root)
         self.llmfit_cache_root = data.get('llmfit_cache_root', self.llmfit_cache_root)
         self.llm_models_cache_root = data.get('llm_models_cache_root', self.llm_models_cache_root)
         self.lm_studio_model_roots = data.get('lm_studio_model_roots', self.lm_studio_model_roots)
-        self.opencode = OpencodeSettings(**data.get('opencode', {}))
-        self.hermes = HermesSettings(**data.get('hermes', {}))
+        self.opencode = self._load_settings(OpencodeSettings, data.get('opencode', {}), self.opencode, 'opencode')
+        self.continue_settings = self._load_settings(ContinueSettings, data.get('continue', {}), self.continue_settings, 'continue')
+        if not self.continue_settings.backup_dir:
+            self.continue_settings.backup_dir = str(CONFIG_DIR / 'backups')
+        if getattr(self.continue_settings, 'merge_mode', '') not in CONTINUE_MERGE_MODES:
+            self.continue_settings.merge_mode = 'preserve_sections'
+        self.hermes = self._load_settings(HermesSettings, data.get('hermes', {}), self.hermes, 'hermes')
         if not self.hermes.home_root:
             self.hermes.home_root = str(CACHE_DIR / 'hermes')
-        self.models = [ModelConfig(**item) for item in data.get('models', [])]
-        filtered_models = [m for m in self.models if is_registered_model_entry(m)]
+        self.ui = self._load_settings(UiSettings, data.get('ui', {}), self.ui, 'ui')
+        loaded_models: List[ModelConfig] = []
+        raw_models = data.get('models', [])
+        if raw_models and not isinstance(raw_models, list):
+            self.load_warnings.append('Config recovery: models must be a list; model entries were ignored.')
+            raw_models = []
+        for index, item in enumerate(raw_models):
+            try:
+                loaded_models.append(self._load_model(item, index))
+            except Exception as exc:
+                self.load_warnings.append(
+                    f'Config recovery: skipped model row {index + 1}: {compact_message(str(exc))}'
+                )
+                continue
+        self.models = loaded_models
         roots_changed = False
-        for m in filtered_models:
+        for m in self.models:
+            if not getattr(m, 'sort_rank', 0):
+                m.sort_rank = self.next_sort_rank()
+                roots_changed = True
             inferred = self.infer_model_source(m)
             if m.source != inferred:
                 m.source = inferred
@@ -272,13 +329,13 @@ class AppConfig:
                 if not getattr(m, 'default_benchmark_at', ''):
                     m.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
                 roots_changed = True
-        if len(filtered_models) != len(self.models) or roots_changed:
-            self.models = filtered_models
+        if self._normalize_model_ranks():
+            roots_changed = True
+        if len(loaded_models) != len(raw_models) or roots_changed:
             self.save()
-        else:
-            self.models = filtered_models
 
     def save(self):
+        self._normalize_model_ranks()
         data = {
             'llama_server': self.llama_server,
             'vllm_command': self.vllm_command,
@@ -287,11 +344,99 @@ class AppConfig:
             'llm_models_cache_root': self.llm_models_cache_root,
             'lm_studio_model_roots': self.lm_studio_model_roots,
             'opencode': asdict(self.opencode),
+            'continue': asdict(self.continue_settings),
             'hermes': asdict(self.hermes),
+            'ui': asdict(self.ui),
             'models': [asdict(m) for m in self.models],
         }
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(json.dumps(data, indent=2) + '\n')
+        self.config_path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+
+    def _archive_broken_config_file(self) -> Optional[Path]:
+        if not self.config_path.exists():
+            return None
+        backup_dir = CONFIG_DIR / 'backups'
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        backup_path = backup_dir / f'{self.config_path.stem}.broken.{stamp}{self.config_path.suffix}'
+        try:
+            shutil.copy2(self.config_path, backup_path)
+        except OSError:
+            return None
+        return backup_path
+
+    def _load_settings(self, cls, raw: object, current, label: str):
+        payload = dataclass_payload(cls, raw) if isinstance(raw, dict) else {}
+        if raw not in ({}, None) and not isinstance(raw, dict):
+            self.load_warnings.append(f'Config recovery: {label} settings were invalid and were reset to defaults.')
+            return current
+        try:
+            return cls(**payload)
+        except Exception as exc:
+            self.load_warnings.append(
+                f'Config recovery: {label} settings were invalid ({compact_message(str(exc))}); defaults were kept.'
+            )
+            return current
+
+    def _load_model(self, raw: object, index: int) -> ModelConfig:
+        if not isinstance(raw, dict):
+            raise ValueError('entry is not an object')
+        payload = dict(raw)
+        required = ('id', 'name', 'path', 'alias', 'port')
+        missing = [field for field in required if field not in payload]
+        if missing:
+            raise ValueError(f'missing fields: {", ".join(missing)}')
+        payload['port'] = int(payload.get('port', 0) or 0)
+        payload['ctx'] = int(payload.get('ctx', 8192) or 8192)
+        payload['ctx_min'] = int(payload.get('ctx_min', 2048) or 2048)
+        payload['ctx_max'] = int(payload.get('ctx_max', 131072) or 131072)
+        payload['threads'] = int(payload.get('threads', 6) or 6)
+        payload['ngl'] = int(payload.get('ngl', 999) or 999)
+        payload['parallel'] = int(payload.get('parallel', 1) or 1)
+        payload['memory_reserve_percent'] = int(payload.get('memory_reserve_percent', 25) or 25)
+        payload['cache_ram'] = int(payload.get('cache_ram', 0) or 0)
+        payload['output'] = int(payload.get('output', 4096) or 4096)
+        payload['temp'] = float(payload.get('temp', 0.7) or 0.7)
+        payload['favorite'] = bool(payload.get('favorite', False))
+        payload['last_used_at'] = str(payload.get('last_used_at', '') or '')
+        payload['sort_rank'] = int(payload.get('sort_rank', index + 1) or (index + 1))
+        extra_args = payload.get('extra_args', [])
+        payload['extra_args'] = [str(item) for item in extra_args] if isinstance(extra_args, list) else []
+        tags = payload.get('tags', [])
+        payload['tags'] = [str(item).strip() for item in tags if str(item).strip()] if isinstance(tags, list) else []
+        payload['verification_status'] = str(payload.get('verification_status', 'unknown') or 'unknown')
+        if payload['verification_status'] not in VERIFICATION_STATUSES:
+            payload['verification_status'] = 'unknown'
+        payload['verification_at'] = str(payload.get('verification_at', '') or '')
+        payload['verification_fingerprint'] = str(payload.get('verification_fingerprint', '') or '')
+        payload['verification_summary'] = str(payload.get('verification_summary', '') or '')
+        verification_results = payload.get('verification_results', {})
+        payload['verification_results'] = verification_results if isinstance(verification_results, dict) else {}
+        return ModelConfig(**dataclass_payload(ModelConfig, payload))
+
+    def _normalize_model_ranks(self) -> bool:
+        changed = False
+        ordered = sorted(
+            self.models,
+            key=lambda model: (
+                int(getattr(model, 'sort_rank', 0) or 0) if int(getattr(model, 'sort_rank', 0) or 0) > 0 else 10**9,
+                int(getattr(model, 'port', 0) or 0),
+                str(getattr(model, 'id', '') or ''),
+            ),
+        )
+        for index, model in enumerate(ordered, 1):
+            if int(getattr(model, 'sort_rank', 0) or 0) != index:
+                model.sort_rank = index
+                changed = True
+        if ordered != self.models:
+            self.models = ordered
+            changed = True
+        return changed
+
+    def pop_load_warnings(self) -> List[str]:
+        warnings = list(self.load_warnings)
+        self.load_warnings = []
+        return warnings
 
     def pidfile(self, model_id: str) -> Path:
         return CACHE_DIR / f'{model_id}.pid'
@@ -304,6 +449,10 @@ class AppConfig:
 
     def get_model(self, model_id: str) -> Optional[ModelConfig]:
         return next((m for m in self.models if m.id == model_id), None)
+
+    def next_sort_rank(self) -> int:
+        values = [int(getattr(model, 'sort_rank', 0) or 0) for model in self.models]
+        return (max(values) if values else 0) + 1
 
     def append_log(self, model_id: str, text: str):
         log_path = self.logfile(model_id)
@@ -378,6 +527,216 @@ class AppConfig:
                 needed.append(model)
         return needed
 
+    def _metadata_native_context(self, metadata: Dict[str, object]) -> int:
+        arch = str(metadata.get('general.architecture') or '')
+        keys = ['general.context_length']
+        if arch:
+            keys.append(f'{arch}.context_length')
+        for key in keys:
+            try:
+                value = int(metadata.get(key) or 0)
+            except Exception:
+                value = 0
+            if value > 0:
+                return value
+        return 0
+
+    def static_model_diagnostics(self, model: ModelConfig) -> Dict[str, object]:
+        runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
+        target = (getattr(model, 'path', '') or '').strip()
+        result: Dict[str, object] = {
+            'runtime': runtime,
+            'target': target,
+            'status': 'passed',
+            'reason': '',
+            'exists': False,
+            'file_size': 0,
+            'gguf_magic': '',
+            'metadata_ok': False,
+            'native_context': 0,
+            'kv_bytes_per_token': 0,
+        }
+        if not target:
+            result.update({'status': 'failed', 'reason': 'model target is empty'})
+            return result
+        path = Path(target).expanduser()
+        if runtime == 'vllm':
+            exists = path.exists()
+            result['exists'] = exists
+            if exists:
+                try:
+                    result['file_size'] = path.stat().st_size if path.is_file() else 0
+                except OSError:
+                    result['file_size'] = 0
+            if exists or looks_like_model_reference(target):
+                result['reason'] = 'vLLM target is a local path or offline-valid repo reference'
+                result['kv_bytes_per_token'] = estimate_kv_bytes_per_token(model)
+                return result
+            result.update({'status': 'failed', 'reason': f'vLLM target is not a path or repo id: {target}'})
+            return result
+
+        if not path.exists():
+            result.update({'status': 'failed', 'reason': f'model path missing: {target}'})
+            return result
+        result['exists'] = True
+        try:
+            result['file_size'] = path.stat().st_size
+        except OSError:
+            result['file_size'] = 0
+        if path.suffix.lower() != '.gguf':
+            result.update({'status': 'failed', 'reason': f'not a GGUF file: {target}'})
+            return result
+        if 'mmproj' in path.name.lower():
+            result.update({'status': 'failed', 'reason': 'mmproj files are projection files, not chat models'})
+            return result
+        try:
+            with open(path, 'rb') as file_obj:
+                magic = file_obj.read(4)
+        except OSError as exc:
+            result.update({'status': 'failed', 'reason': f'failed to read model file: {exc}'})
+            return result
+        result['gguf_magic'] = magic.decode('ascii', errors='replace')
+        if magic != b'GGUF':
+            result.update({'status': 'failed', 'reason': 'bad GGUF magic header'})
+            return result
+        if int(result.get('file_size', 0) or 0) < 32:
+            result.update({'status': 'failed', 'reason': 'truncated GGUF header'})
+            return result
+        metadata = read_gguf_metadata(path)
+        result['metadata_ok'] = bool(metadata)
+        result['native_context'] = self._metadata_native_context(metadata)
+        result['kv_bytes_per_token'] = estimate_kv_bytes_per_token(model)
+        if not metadata:
+            result.update({'status': 'warning', 'reason': 'GGUF header is valid, but metadata could not be parsed'})
+        elif not result['native_context']:
+            result.update({'status': 'warning', 'reason': 'GGUF metadata parsed, but native context was not found'})
+        else:
+            result['reason'] = 'GGUF metadata parsed'
+        return result
+
+    def model_cap_diagnosis(self, model: ModelConfig) -> Dict[str, object]:
+        requested_ctx = max(0, int(getattr(model, 'ctx', 0) or 0))
+        parallel = max(1, int(getattr(model, 'parallel', 1) or 1))
+        per_slot = requested_ctx // parallel
+        ctx_max = max(0, int(getattr(model, 'ctx_max', 0) or 0))
+        ctx_min = max(0, int(getattr(model, 'ctx_min', 0) or 0))
+        static = self.static_model_diagnostics(model)
+        native_context = int(static.get('native_context', 0) or 0)
+        profile = self.hardware_profile(refresh=True)
+        estimated_safe = estimate_safe_context_for_profile(
+            model,
+            profile,
+            max(5, min(70, int(getattr(model, 'memory_reserve_percent', 25) or 25))),
+            parallel,
+            max(256, ctx_min or 2048),
+            max(ctx_min or 2048, ctx_max or requested_ctx or 2048),
+        )
+        measured_values = []
+        for item in (getattr(model, 'measured_profiles', {}) or {}).values():
+            if isinstance(item, dict) and str(item.get('status', 'ok') or 'ok') == 'ok':
+                measured_values.append(int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0))
+        measured_max = max(measured_values or [0])
+        candidates: List[Tuple[str, int]] = []
+        if ctx_max and requested_ctx > ctx_max:
+            candidates.append(('user_ctx_max', ctx_max))
+        if native_context and requested_ctx > native_context:
+            candidates.append(('model_native_context', native_context))
+        if int(estimated_safe or 0) > 0 and requested_ctx > int(estimated_safe or 0):
+            candidates.append(('hardware_safe_context', int(estimated_safe or 0)))
+        if parallel > 1 and per_slot < requested_ctx:
+            candidates.append(('parallel_split', per_slot))
+        if measured_max and requested_ctx > measured_max:
+            candidates.append(('benchmark_proof', measured_max))
+        limiting_factor = 'configured_request'
+        effective_limit = requested_ctx
+        if candidates:
+            priority = {
+                'user_ctx_max': 0,
+                'model_native_context': 1,
+                'hardware_safe_context': 2,
+                'parallel_split': 3,
+                'benchmark_proof': 4,
+            }
+            limiting_factor, effective_limit = min(
+                candidates,
+                key=lambda item: (max(0, int(item[1] or 0)), priority.get(item[0], 99)),
+            )
+        return {
+            'configured_ctx': requested_ctx,
+            'parallel': parallel,
+            'ctx_per_slot': per_slot,
+            'ctx_min': ctx_min,
+            'ctx_max': ctx_max,
+            'native_context': native_context,
+            'estimated_safe_context': int(estimated_safe or 0),
+            'measured_max_context': measured_max,
+            'limiting_factor': limiting_factor,
+            'effective_limit': int(effective_limit or 0),
+            'hardware': profile.short_summary(),
+        }
+
+    def verify_model(self, model: ModelConfig, save: bool = True) -> Dict[str, object]:
+        now = datetime.now().isoformat(timespec='seconds')
+        fingerprint = ''
+        try:
+            fingerprint = self.model_fingerprint(model)
+        except Exception:
+            fingerprint = ''
+        static = self.static_model_diagnostics(model)
+        cap = self.model_cap_diagnosis(model)
+        status = 'needs_benchmark'
+        summary = 'Benchmark proof needed.'
+        fresh = False
+        try:
+            from .benchmark import benchmark_profile_is_fresh
+            fresh = benchmark_profile_is_fresh(self, model)
+        except Exception:
+            fresh = False
+        if static.get('status') == 'failed':
+            status = 'failed'
+            summary = str(static.get('reason') or 'Static model validation failed.')
+        elif fresh:
+            status = 'passed' if static.get('status') == 'passed' else 'warning'
+            summary = 'Fresh benchmark proof exists.' if status == 'passed' else f'Fresh benchmark proof exists, but static check warns: {static.get("reason")}'
+        elif static.get('status') == 'warning':
+            status = 'warning'
+            summary = f'{static.get("reason")}; benchmark proof needed.'
+        results = {
+            'status': status,
+            'summary': summary,
+            'fingerprint': fingerprint,
+            'static': static,
+            'cap': cap,
+            'fresh_benchmark': fresh,
+        }
+        model.verification_status = status
+        model.verification_at = now
+        model.verification_fingerprint = fingerprint
+        model.verification_summary = summary
+        model.verification_results = results
+        if save:
+            self.add_or_update(model)
+        return results
+
+    def benchmark_proof_model_ids(self, force: bool = False) -> List[str]:
+        ids: List[str] = []
+        try:
+            from .benchmark import deep_benchmark_model_decision
+        except Exception:
+            deep_benchmark_model_decision = None
+        for model in self.models:
+            if not getattr(model, 'enabled', True):
+                continue
+            if deep_benchmark_model_decision is not None:
+                should_run, _reason = deep_benchmark_model_decision(self, model, force=force)
+                if should_run:
+                    ids.append(model.id)
+                continue
+            result = self.verify_model(model, save=False)
+            if force or result.get('status') in ('needs_benchmark', 'warning'):
+                ids.append(model.id)
+        return ids
+
     def command_prefix(self, command: str) -> List[str]:
         return shlex.split(command) if command else []
 
@@ -401,11 +760,61 @@ class AppConfig:
             return False, None, f'workspace is not a directory: {path}'
         return True, path, ''
 
+    def workspace_settings(self, runtime: str = 'opencode'):
+        return self.hermes if runtime == 'hermes' else self.opencode
+
+    def workspace_presets(self, runtime: str = 'opencode') -> List[str]:
+        settings = self.workspace_settings(runtime)
+        values = list(getattr(settings, 'workspace_presets', []) or [])
+        if getattr(settings, 'last_workspace_path', ''):
+            values.insert(0, str(getattr(settings, 'last_workspace_path', '') or ''))
+        deduped: List[str] = []
+        seen = set()
+        for value in values:
+            clean = str(value or '').strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            deduped.append(clean)
+        return deduped[:8]
+
+    def remember_workspace_preset(self, runtime: str, workspace: str):
+        clean = str(workspace or '').strip()
+        if not clean:
+            return
+        settings = self.workspace_settings(runtime)
+        current = self.workspace_presets(runtime)
+        merged = [clean] + [value for value in current if value != clean]
+        settings.last_workspace_path = clean
+        settings.workspace_presets = merged[:8]
+        self.save()
+
+    def mark_model_used(self, model_id: str):
+        model = self.get_model(model_id)
+        if not model:
+            return
+        model.last_used_at = datetime.now().isoformat(timespec='seconds')
+        self.save()
+
+    def toggle_favorite(self, model_id: str) -> Tuple[bool, str]:
+        model = self.get_model(model_id)
+        if not model:
+            return False, 'model not found'
+        model.favorite = not bool(getattr(model, 'favorite', False))
+        self.save()
+        return bool(model.favorite), ('favorited' if model.favorite else 'unfavorited')
+
     def opencode_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
 
     def opencode_model_ref(self, model: ModelConfig) -> str:
         return f'{self.opencode_provider_key(model)}/{model.alias}'
+
+    def continue_model_ref(self, model: ModelConfig) -> str:
+        return model.alias or model.id
+
+    def continue_base_url(self, model: ModelConfig) -> str:
+        return f'http://{model.host}:{model.port}/v1'
 
     def hermes_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
@@ -578,6 +987,8 @@ class AppConfig:
             '',
         ]
         home.mkdir(parents=True, exist_ok=True)
+        if config_path.exists():
+            self._backup_export_file(config_path, str(config_path.parent / 'backups'))
         config_path.write_text('\n'.join(lines), encoding='utf-8')
         return True, f'Generated Hermes config {config_path}'
 
@@ -1445,11 +1856,20 @@ class AppConfig:
     def add_or_update(self, model: ModelConfig):
         for idx, existing in enumerate(self.models):
             if existing.id == model.id:
+                if not getattr(model, 'sort_rank', 0):
+                    model.sort_rank = int(getattr(existing, 'sort_rank', 0) or idx + 1)
+                if not getattr(model, 'last_used_at', ''):
+                    model.last_used_at = str(getattr(existing, 'last_used_at', '') or '')
+                if not getattr(model, 'favorite', False):
+                    model.favorite = bool(getattr(existing, 'favorite', False))
                 self.models[idx] = model
+                self._normalize_model_ranks()
                 self.save()
                 return
+        if not getattr(model, 'sort_rank', 0):
+            model.sort_rank = self.next_sort_rank()
         self.models.append(model)
-        self.models.sort(key=lambda m: m.port)
+        self._normalize_model_ranks()
         self.save()
 
     def delete(self, model_id: str) -> Tuple[bool, str]:
@@ -1539,6 +1959,16 @@ class AppConfig:
             port += 1
         return port
 
+    def _backup_export_file(self, path: Path, backup_dir_raw: str) -> Optional[Path]:
+        if not path.exists():
+            return None
+        backup_dir = Path(backup_dir_raw or (path.parent / 'backups')).expanduser()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        backup_path = backup_dir / f'{path.stem}.{stamp}{path.suffix}'
+        shutil.copy2(path, backup_path)
+        return backup_path
+
     def _clear_roles(self, model_id: str):
         for attr in ('default_model_id', 'small_model_id', 'build_model_id', 'plan_model_id'):
             if getattr(self.opencode, attr) == model_id:
@@ -1594,11 +2024,7 @@ class AppConfig:
                 existing = json.loads(path.read_text())
             except Exception:
                 existing = {}
-            backup_dir = Path(self.opencode.backup_dir or (path.parent / 'backups')).expanduser()
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-            backup_path = backup_dir / f'{path.stem}.{stamp}{path.suffix}'
-            shutil.copy2(path, backup_path)
+            self._backup_export_file(path, self.opencode.backup_dir)
 
         instructions = existing.get('instructions', self.opencode.instructions)
         build_prompt = existing.get('agent', {}).get('build', {}).get('prompt', self.opencode.build_prompt)
@@ -1650,5 +2076,158 @@ class AppConfig:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config, indent=2) + '\n')
+        self.save()
+        return True, f'Generated {path}'
+
+    def continue_role_models(self, enabled_models: List[ModelConfig]) -> Tuple[ModelConfig, ModelConfig, ModelConfig]:
+        default_model = (
+            self.get_model(getattr(self.continue_settings, 'default_model_id', ''))
+            or self.get_model(self.opencode.default_model_id)
+            or enabled_models[0]
+        )
+        edit_model = (
+            self.get_model(getattr(self.continue_settings, 'edit_model_id', ''))
+            or self.get_model(self.opencode.build_model_id)
+            or default_model
+        )
+        autocomplete_model = (
+            self.get_model(getattr(self.continue_settings, 'autocomplete_model_id', ''))
+            or self.get_model(self.opencode.small_model_id)
+            or self.get_model(self.hermes.code_model_id)
+            or (enabled_models[1] if len(enabled_models) > 1 else default_model)
+        )
+        return default_model, edit_model, autocomplete_model
+
+    def _continue_managed_model_lines(self, enabled_models: List[ModelConfig]) -> List[str]:
+        default_model, edit_model, autocomplete_model = self.continue_role_models(enabled_models)
+        ordered_models: List[ModelConfig] = []
+        seen_ids = set()
+        for model in (default_model, edit_model, autocomplete_model, *enabled_models):
+            if model.id in seen_ids:
+                continue
+            seen_ids.add(model.id)
+            ordered_models.append(model)
+
+        used_names: set[str] = set()
+
+        def model_display_name(model: ModelConfig) -> str:
+            base = (model.name or model.id or model.alias or 'Local Model').strip() or 'Local Model'
+            candidate = base
+            suffix = 2
+            while candidate in used_names:
+                candidate = f'{base} ({suffix})'
+                suffix += 1
+            used_names.add(candidate)
+            return candidate
+
+        def model_roles(model: ModelConfig) -> List[str]:
+            roles: List[str] = []
+            if model.id == default_model.id:
+                roles.append('chat')
+            if model.id == edit_model.id:
+                roles.extend(['edit', 'apply'])
+            if model.id == autocomplete_model.id:
+                roles.append('autocomplete')
+            if not roles:
+                roles.append('chat')
+            deduped: List[str] = []
+            for role in roles:
+                if role not in deduped:
+                    deduped.append(role)
+            return deduped
+
+        def autocomplete_prompt_tokens(model: ModelConfig) -> int:
+            return min(2048, max(256, context_per_slot(model)))
+
+        lines = [
+            CONTINUE_MANAGED_BEGIN,
+            '  # Generated by llama-tui. Edit models in llama-tui, then regenerate.',
+        ]
+        for model in ordered_models:
+            roles = model_roles(model)
+            lines.extend([
+                f'  - name: {yaml_quote(model_display_name(model))}',
+                '    provider: "openai"',
+                f'    model: {yaml_quote(self.continue_model_ref(model))}',
+                f'    apiBase: {yaml_quote(self.continue_base_url(model))}',
+                '    apiKey: "no-key-required"',
+                '    roles:',
+            ])
+            lines.extend(f'      - {role}' for role in roles)
+            lines.extend([
+                '    defaultCompletionOptions:',
+                f'      contextLength: {max(1, context_per_slot(model))}',
+                f'      maxTokens: {max(1, int(getattr(model, "output", 0) or 0))}',
+                f'      temperature: {float(getattr(model, "temp", 0.7) or 0.7)}',
+            ])
+            if 'autocomplete' in roles:
+                lines.extend([
+                    '    autocompleteOptions:',
+                    '      debounceDelay: 250',
+                    f'      maxPromptTokens: {autocomplete_prompt_tokens(model)}',
+                    '      onlyMyCode: true',
+                ])
+        lines.append(CONTINUE_MANAGED_END)
+        return lines
+
+    def _render_continue_full_config(self, managed_model_lines: List[str]) -> str:
+        lines = [
+            '# Generated by llama-tui. Existing files are backed up before overwrite.',
+            f'name: {yaml_quote("llama-tui Local Models")}',
+            f'version: {yaml_quote("1.0.0")}',
+            'schema: "v1"',
+            'models:',
+            *managed_model_lines,
+        ]
+        return '\n'.join(lines) + '\n'
+
+    def _merge_continue_config_text(self, existing_text: str, managed_model_lines: List[str]) -> str:
+        if not existing_text.strip():
+            return self._render_continue_full_config(managed_model_lines)
+        lines = existing_text.splitlines()
+        try:
+            begin = lines.index(CONTINUE_MANAGED_BEGIN)
+            end = lines.index(CONTINUE_MANAGED_END, begin + 1)
+        except ValueError:
+            begin = -1
+            end = -1
+        if begin >= 0 and end >= begin:
+            merged = lines[:begin] + managed_model_lines + lines[end + 1:]
+            return '\n'.join(merged).rstrip() + '\n'
+
+        models_index = next((idx for idx, line in enumerate(lines) if line.strip() == 'models:' and not line.startswith(' ')), -1)
+        if models_index >= 0:
+            merged = lines[:models_index + 1] + managed_model_lines + lines[models_index + 1:]
+            return '\n'.join(merged).rstrip() + '\n'
+
+        merged = lines
+        if merged and merged[-1].strip():
+            merged.append('')
+        merged.extend(['models:', *managed_model_lines])
+        return '\n'.join(merged).rstrip() + '\n'
+
+    def generate_continue_config(self) -> Tuple[bool, str]:
+        path = Path(self.continue_settings.path).expanduser() if self.continue_settings.path else None
+        if not path:
+            return False, 'Set continue.path first in settings.'
+
+        enabled_models = [m for m in self.models if m.enabled]
+        if not enabled_models:
+            return False, 'No enabled models to export.'
+
+        managed_lines = self._continue_managed_model_lines(enabled_models)
+        existing_text = ''
+        if path.exists():
+            existing_text = path.read_text(encoding='utf-8')
+            self._backup_export_file(path, self.continue_settings.backup_dir)
+
+        merge_mode = getattr(self.continue_settings, 'merge_mode', 'preserve_sections') or 'preserve_sections'
+        if merge_mode == 'managed_file' or not path.exists():
+            output = self._render_continue_full_config(managed_lines)
+        else:
+            output = self._merge_continue_config_text(existing_text, managed_lines)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(output, encoding='utf-8')
         self.save()
         return True, f'Generated {path}'

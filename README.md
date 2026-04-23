@@ -1,6 +1,6 @@
 # llama-tui
 
-`llama-tui` is a zero-dependency terminal control plane for local LLM servers. It keeps a registry of local models, starts and stops `llama.cpp` or vLLM OpenAI-compatible servers, tunes launch settings for the current machine, benchmarks candidate profiles, and can export an `opencode.json` provider config.
+`llama-tui` is a zero-dependency terminal control plane for local LLM servers. It keeps a registry of local models, starts and stops `llama.cpp` or vLLM OpenAI-compatible servers, tunes launch settings for the current machine, benchmarks candidate profiles, and can export tool configs for OpenCode, Continue, and Hermes.
 
 The project is intentionally small: it uses only the Python standard library, stores state as JSON, and runs from a terminal.
 
@@ -19,7 +19,10 @@ The project is intentionally small: it uses only the Python standard library, st
 - Benchmark OpenCode coding workflows against disposable fixture projects.
 - Try a model from inside the TUI with a temporary streaming chat console.
 - Assign OpenCode roles: main, small, build, and plan.
+- Assign independent Continue chat, edit/apply, and autocomplete roles.
+- Verify model entries with static GGUF checks, benchmark proof, and cap diagnostics.
 - Generate `opencode.json` with backups.
+- Generate Continue `config.yaml` with backups while preserving user sections.
 - Launch a model with OpenCode, or a full OpenCode + VS Code stack, from model details.
 
 ## Project Layout
@@ -112,6 +115,9 @@ Useful top-level settings:
 - `llm_models_cache_root`: additional local model cache root.
 - `lm_studio_model_roots`: comma-separated LM Studio user model roots.
 - `opencode`: export settings and role assignments.
+- `continue`: Continue export settings.
+- `hermes`: Hermes export and launch settings.
+- `ui`: saved UI preferences.
 - `models`: registered model entries.
 
 Useful per-model fields:
@@ -129,7 +135,9 @@ Useful per-model fields:
 - `optimize_mode`: `max_context_safe` or `manual`.
 - `optimize_tier`: `safe`, `moderate`, or `extreme`.
 - `ctx_min`, `ctx_max`, `memory_reserve_percent`: guardrails for auto tuning.
+- `tags`: browser labels such as `coding`, `autocomplete`, `long-context`, `fast-chat`, or your own tags.
 - `measured_profiles`: adaptive benchmark winners used by Auto, Fast Chat, Long Context, and OpenCode-ready launches.
+- `verification_status`, `verification_summary`, `verification_results`: model proof and cap diagnosis state.
 
 ## Controls
 
@@ -145,6 +153,8 @@ Useful per-model fields:
 - `D`: run the safer adaptive Deep Benchmark All for missing, stale, failed, or aborted managed models; the modal also offers a force refresh.
 - `R` on the model list or `M` from the main views: open Machine Rankings.
 - `O`: benchmark the selected model with an OpenCode workflow from details.
+- `Y`: verify the selected model entry.
+- `y`: queue benchmark-proof verification for enabled models with missing or stale proof.
 - `A`: abort the active launch or benchmark action and clean up managed processes.
 - `z`: apply the Auto profile without benchmarking.
 - `S`: stop all known models.
@@ -155,11 +165,16 @@ Useful per-model fields:
 - `d`: delete a model from the registry.
 - `m`, `s`, `b`, `p`: assign OpenCode main, small, build, or plan role.
 - `g`: generate `opencode.json`.
+- `c`: generate Continue `config.yaml`.
+- `G`: generate Hermes `config.yaml` for the selected model.
 - `o`: edit settings.
+- `:`: open the command palette, including export actions and Config Doctor.
 - `r`: sync inventory.
 - `q`: quit.
 
 The details screen shows the command preview, hardware profile, server status, PID, roles, recent logs, and the saved benchmark table.
+
+Settings are split into Runtime, Model Roots, OpenCode, Continue, Hermes, and UI sections. Config Doctor is available from the command palette and summarizes runtime commands, terminal launcher detection, VS Code, export paths, generated-config state, and model proof status.
 
 ## Running Servers
 
@@ -179,7 +194,7 @@ If the model is stopped, llama-tui asks how to launch it:
 
 If a model is already running, the details action menu offers stop, Try it out, OpenCode launch, full-stack launch, or cancel.
 
-`Start server now` uses the saved model settings guarded by safe launch checks. It does not require benchmark data. `Try it out` is available from the action menu and as `T` on model details. It opens an integrated chat console inside llama-tui. The left pane is a temporary transcript plus a five-row wrapped prompt editor; the right pane keeps the active launch profile, server logs, and live stats visible. Press `Enter` to send, `Up / Down` to scroll long prompt text, `Ctrl+U` to clear the input, `Ctrl+P/N/B/F/A/E` to scroll the conversation transcript, and `Esc` to leave. Streamed reasoning is shown inline above the final answer when the model provides it. Leaving Try-It-Out always stops the selected model, even if it was already running before you entered the console.
+`Start server now` uses the saved model settings guarded by safe launch checks. It does not require benchmark data. `Try it out` is available from the action menu and as `T` on model details. It opens an integrated chat console inside llama-tui. The left pane is a temporary transcript plus a five-row wrapped prompt editor; the right pane keeps the active launch profile, server logs, and live stats visible. Press `Enter` to send, `Up / Down` to scroll long prompt text, `Ctrl+U` to clear the input, `Ctrl+P/N/B/F/A/E` to scroll the conversation transcript, and `Esc` to leave. Streamed reasoning is shown inline above the final answer when the model provides it. Leaving Try-It-Out stops only a server launched by that Try-It-Out session; a server that was already running before entry is left running.
 
 For `llama.cpp`, llama-tui builds a command like:
 
@@ -344,6 +359,19 @@ Machine Rankings are computed from fresh measured profiles without changing the 
 
 If all candidates fail, the failure details are saved and shown in the model details screen.
 
+## Model Verification
+
+Press `Y` to verify the selected model entry. Verification is offline-first:
+
+- `llama.cpp` entries check the file path, `.gguf` suffix, GGUF magic header, metadata parse health, native context, KV-cache estimate inputs, file size, and projection-file mistakes such as `mmproj`.
+- vLLM entries check that the target is a local path or repo-shaped model reference. llama-tui does not contact Hugging Face or any network service.
+- Fresh measured benchmark proof marks a model `passed`; stale or missing proof is `needs_benchmark`, not failed.
+- Static problems such as missing files, bad GGUF magic, or unsupported targets mark a model `failed`.
+
+Press `y` to queue benchmark-proof verification for enabled models with missing or stale proof. This reuses the existing Deep Benchmark All path and never runs automatically on startup.
+
+Cap diagnostics answer why the requested context may be reduced. The details view and Config Doctor show configured context, `ctx / parallel` per-slot context, native GGUF context, estimated safe hardware context, measured max context, and the active limiting factor: user `ctx_max`, model-native context, safe hardware estimate, parallel split, benchmark proof, or the configured request itself. So when context is lower than expected, it is not treated as a mysterious fixed cap; the UI names the cap that actually applied.
+
 ## Model Detection
 
 Press `x` to scan configured roots for `.gguf` files:
@@ -385,6 +413,34 @@ code --new-window WORKSPACE
 ```
 
 If VS Code is unavailable, it still launches the model + OpenCode path and reports a warning.
+
+## Continue Export
+
+Set `continue.path` in settings, then press `c` to generate the config.
+
+llama-tui writes a local Continue `config.yaml` using the OpenAI-compatible provider format:
+
+- `continue.default_model_id` becomes the chat model,
+- `continue.edit_model_id` becomes the edit/apply model,
+- `continue.autocomplete_model_id` becomes the autocomplete model,
+- any other enabled models are still exported as additional chat choices.
+
+If a Continue role is blank, llama-tui falls back to the matching OpenCode role. If those are also blank, it uses the first enabled model for chat/edit and the second enabled model for autocomplete when available.
+
+Existing Continue config files are backed up under `continue.backup_dir` before writing.
+
+The default `continue.merge_mode` is `preserve_sections`. In that mode llama-tui keeps top-level user sections such as `rules`, `context`, `prompts`, `mcpServers`, `docs`, and `data`, preserves unmarked user models, and replaces only the block between:
+
+```yaml
+  # BEGIN llama-tui managed models
+  # END llama-tui managed models
+```
+
+Set `continue.merge_mode` to `managed_file` if you want llama-tui to rewrite the whole file from its generated template.
+
+Continue `contextLength` is exported as per-slot context, `ctx // parallel`, so autocomplete and chat tools see the same effective window the server exposes for each simultaneous request.
+
+When `continue.path` is set, llama-tui also refreshes the Continue export after benchmark-driven tuning and Auto-profile updates so the exported context and token limits stay aligned with the latest saved model settings.
 
 ## Safety Notes
 

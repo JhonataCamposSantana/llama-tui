@@ -83,10 +83,16 @@ SPECTRUM_LABELS = {
 
 
 def sync_opencode_after_tuning(app: AppConfig) -> str:
-    if not app.opencode.path:
-        return 'opencode.path unset; skipped opencode sync'
-    ok, msg = app.generate_opencode()
-    return msg if ok else f'opencode sync failed: {msg}'
+    messages: List[str] = []
+    if app.opencode.path:
+        ok, msg = app.generate_opencode()
+        messages.append(msg if ok else f'opencode sync failed: {msg}')
+    if getattr(app, 'continue_settings', None) and getattr(app.continue_settings, 'path', ''):
+        ok, msg = app.generate_continue_config()
+        messages.append(msg if ok else f'continue sync failed: {msg}')
+    if messages:
+        return ' | '.join(messages)
+    return 'opencode.path unset; continue.path unset; skipped config sync'
 def append_model_log(app: AppConfig, model: ModelConfig, text: str):
     app.append_log(model.id, text)
 
@@ -1512,14 +1518,23 @@ def machine_benchmark_rows(app: AppConfig, models: Optional[List[ModelConfig]] =
     for row in rows:
         tps_norm = float(row.get('auto_tokens_per_sec', 0.0) or 0.0) / max_tps
         ctx_norm = int(row.get('auto_ctx_per_slot', 0) or 0) / max_ctx
+        headroom = float(row.get('headroom_score', 0.0) or 0.0)
+        stability = float(row.get('stability_score', 0.0) or 0.0)
         score = (
             0.50 * tps_norm
             + 0.30 * ctx_norm
-            + 0.12 * float(row.get('headroom_score', 0.0) or 0.0)
-            + 0.08 * float(row.get('stability_score', 0.0) or 0.0)
+            + 0.12 * headroom
+            + 0.08 * stability
         )
         row['machine_score'] = round(score * 100.0, 2)
-        row['machine_reason'] = '50% speed, 30% ctx/slot, 12% headroom, 8% stability'
+        row['machine_reason'] = (
+            f'auto {float(row.get("auto_tokens_per_sec", 0.0) or 0.0):.2f} tok/s '
+            f'({int(round(tps_norm * 100))}% of fastest), '
+            f'ctx/slot {int(row.get("auto_ctx_per_slot", 0) or 0)} '
+            f'({int(round(ctx_norm * 100))}% of highest), '
+            f'headroom {int(round(headroom * 100))}%, '
+            f'stability {int(round(stability * 100))}%'
+        )
     return sorted(rows, key=lambda row: (-float(row.get('machine_score', 0.0) or 0.0), str(row.get('model_id', ''))))
 
 

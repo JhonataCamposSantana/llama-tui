@@ -22,6 +22,36 @@
     "terminal_command": "",
     "last_workspace_path": ""
   },
+  "continue": {
+    "path": "~/.continue/config.yaml",
+    "backup_dir": "~/.config/llama-tui/backups",
+    "default_model_id": "local-example",
+    "edit_model_id": "local-example",
+    "autocomplete_model_id": "local-example",
+    "merge_mode": "preserve_sections"
+  },
+  "hermes": {
+    "command": "hermes",
+    "home_root": "~/.cache/llama-tui/hermes",
+    "default_model_id": "local-example",
+    "code_model_id": "local-example",
+    "terminal_command": "",
+    "last_workspace_path": "",
+    "toolsets": [
+      "terminal",
+      "file",
+      "todo"
+    ],
+    "max_turns": 20,
+    "quiet": true,
+    "min_context_tokens": 64000,
+    "experimental_context_override_tokens": 0,
+    "allow_experimental_context_override": false
+  },
+  "ui": {
+    "preferred_sort": "port",
+    "detail_density": "simple"
+  },
   "models": [
     {
       "id": "local-example",
@@ -50,7 +80,19 @@
       "enabled": true,
       "runtime": "llama.cpp",
       "source": "manual",
-      "extra_args": []
+      "extra_args": [],
+      "favorite": false,
+      "last_used_at": "",
+      "sort_rank": 1,
+      "tags": [
+        "coding",
+        "fast-chat"
+      ],
+      "verification_status": "unknown",
+      "verification_at": "",
+      "verification_fingerprint": "",
+      "verification_summary": "",
+      "verification_results": {}
     }
   ]
 }

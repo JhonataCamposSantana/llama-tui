@@ -4,9 +4,9 @@ import threading
 import time
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .app import AppConfig
+from .app import AppConfig, CONTINUE_MERGE_MODES, context_per_slot
 from .benchmark import (
     append_model_log,
     apply_measured_profile,
@@ -191,6 +191,56 @@ BENCHMARK_WIKI_SECTIONS = [
     ),
 ]
 
+TRUTHY_VALUES = {'1', 'true', 'yes', 'y', 'on'}
+FALSY_VALUES = {'0', 'false', 'no', 'n', 'off'}
+VALID_RUNTIMES = ('llama.cpp', 'vllm')
+VALID_OPTIMIZE_MODES = ('max_context_safe', 'manual', 'best', 'max_context', 'tokens_per_sec', 'opencode_ready')
+VALID_OPTIMIZE_TIERS = ('safe', 'moderate', 'extreme')
+SORT_OPTIONS = [
+    ('favorites', 'Favorites'),
+    ('recent', 'Recent'),
+    ('name', 'Name'),
+    ('benchmark', 'Best Benchmark'),
+    ('context', 'Highest Context'),
+    ('port', 'Port'),
+]
+DETAIL_DENSITY_OPTIONS = [('simple', 'Simple'), ('advanced', 'Advanced')]
+FILTER_RUNTIME_OPTIONS = [
+    ('all', 'All runtimes'),
+    ('llama.cpp', 'llama.cpp'),
+    ('vllm', 'vLLM'),
+]
+FILTER_SOURCE_OPTIONS = [
+    ('all', 'All sources'),
+    ('manual', 'Manual'),
+    ('huggingface', 'Hugging Face'),
+    ('llmfit', 'llmfit'),
+    ('llm-models', 'llm-models'),
+    ('lm-studio', 'LM Studio'),
+]
+FILTER_STATUS_OPTIONS = [
+    ('all', 'All server states'),
+    ('READY', 'Ready'),
+    ('LOADING', 'Loading'),
+    ('STARTING', 'Starting'),
+    ('STOPPED', 'Stopped'),
+    ('ERROR', 'Error'),
+    ('fresh', 'Fresh benchmark'),
+    ('stale', 'Stale benchmark'),
+    ('missing', 'Missing benchmark'),
+    ('failed', 'Failed benchmark'),
+    ('pending', 'Pending benchmark'),
+    ('running', 'Running benchmark'),
+]
+BENCHMARK_FRESHNESS_LABELS = {
+    'fresh': 'Fresh',
+    'stale': 'Stale',
+    'missing': 'Missing',
+    'failed': 'Failed',
+    'pending': 'Pending',
+    'running': 'Running',
+}
+
 
 def profile_label(value: str) -> str:
     raw = (value or '').strip()
@@ -217,6 +267,171 @@ def benchmark_wiki_lines(width: int) -> List[str]:
         lines.append(title)
         lines.extend(wrap_display_lines(body, width))
     return lines
+
+
+def parse_bool_text(value: str, field_label: str = 'value') -> bool:
+    normalized = str(value or '').strip().lower()
+    if normalized in TRUTHY_VALUES:
+        return True
+    if normalized in FALSY_VALUES:
+        return False
+    raise ValueError(f'{field_label} must be true/false')
+
+
+def normalize_choice(value: str, allowed: Tuple[str, ...], default: str) -> str:
+    normalized = str(value or '').strip().lower() or default
+    return normalized if normalized in allowed else default
+
+
+def sort_mode_label(value: str) -> str:
+    normalized = normalize_choice(value, tuple(key for key, _label in SORT_OPTIONS), 'port')
+    return dict(SORT_OPTIONS).get(normalized, 'Port')
+
+
+def detail_density_label(value: str) -> str:
+    normalized = normalize_choice(value, tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+    return dict(DETAIL_DENSITY_OPTIONS).get(normalized, 'Simple')
+
+
+def benchmark_freshness_label(app: AppConfig, model: ModelConfig) -> str:
+    if benchmark_profile_is_fresh(app, model):
+        return 'fresh'
+    status = (getattr(model, 'default_benchmark_status', '') or '').strip().lower()
+    if status in ('running', 'failed', 'pending', 'aborted'):
+        return 'failed' if status == 'aborted' else status
+    if status == 'done':
+        return 'stale'
+    if float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0:
+        return 'stale'
+    return 'missing'
+
+
+def benchmark_freshness_short(app: AppConfig, model: ModelConfig) -> str:
+    mapping = {
+        'fresh': 'FRSH',
+        'stale': 'STAL',
+        'missing': 'MISS',
+        'failed': 'FAIL',
+        'pending': 'PEND',
+        'running': 'RUN',
+    }
+    return mapping.get(benchmark_freshness_label(app, model), 'MISS')
+
+
+def benchmark_freshness_display(app: AppConfig, model: ModelConfig) -> str:
+    return BENCHMARK_FRESHNESS_LABELS.get(benchmark_freshness_label(app, model), 'Missing')
+
+
+def filter_option_label(options: List[Tuple[str, str]], value: str) -> str:
+    return dict(options).get(value, value or '-')
+
+
+def iso_recent_key(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return time.mktime(time.strptime(value, '%Y-%m-%dT%H:%M:%S'))
+    except Exception:
+        return 0.0
+
+
+def model_matches_search(model: ModelConfig, status: str, search: str) -> bool:
+    needle = str(search or '').strip().lower()
+    if not needle:
+        return True
+    haystack = ' '.join([
+        str(getattr(model, 'id', '') or ''),
+        str(getattr(model, 'name', '') or ''),
+        str(getattr(model, 'alias', '') or ''),
+        str(getattr(model, 'path', '') or ''),
+        str(display_runtime(model) or ''),
+        str(getattr(model, 'source', '') or ''),
+        str(status or ''),
+        str(extract_quant(model) or ''),
+        str(classify_model_type(model) or ''),
+        ' '.join(str(tag) for tag in list(getattr(model, 'tags', []) or [])),
+    ]).lower()
+    return needle in haystack
+
+
+def model_matches_browser_filters(
+    app: AppConfig,
+    model: ModelConfig,
+    status: str,
+    search: str = '',
+    runtime_filter: str = 'all',
+    source_filter: str = 'all',
+    status_filter: str = 'all',
+    tag_filter: str = 'all',
+) -> bool:
+    runtime_filter = str(runtime_filter or 'all').strip().lower() or 'all'
+    source_filter = str(source_filter or 'all').strip().lower() or 'all'
+    status_filter = str(status_filter or 'all').strip() or 'all'
+    tag_filter = str(tag_filter or 'all').strip().lower() or 'all'
+    if runtime_filter != 'all' and str(getattr(model, 'runtime', 'llama.cpp') or '').strip().lower() != runtime_filter:
+        return False
+    if source_filter != 'all' and str(getattr(model, 'source', 'manual') or '').strip().lower() != source_filter:
+        return False
+    if status_filter != 'all':
+        freshness = benchmark_freshness_label(app, model)
+        if status_filter in ('fresh', 'stale', 'missing', 'failed', 'pending', 'running'):
+            if freshness != status_filter:
+                return False
+        elif status != status_filter:
+            return False
+    if tag_filter != 'all':
+        tags = {str(tag).strip().lower() for tag in list(getattr(model, 'tags', []) or []) if str(tag).strip()}
+        if tag_filter not in tags:
+            return False
+    return model_matches_search(model, status, search)
+
+
+def model_sort_key(model: ModelConfig, sort_mode: str) -> Tuple[Any, ...]:
+    normalized = normalize_choice(sort_mode, tuple(key for key, _label in SORT_OPTIONS), 'port')
+    name_key = (str(getattr(model, 'name', '') or getattr(model, 'id', '') or '')).lower()
+    model_id = str(getattr(model, 'id', '') or '')
+    recent_key = iso_recent_key(str(getattr(model, 'last_used_at', '') or ''))
+    benchmark_key = float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0)
+    context_key = int(getattr(model, 'ctx', 0) or 0) // max(1, int(getattr(model, 'parallel', 1) or 1))
+    favorite_key = 0 if bool(getattr(model, 'favorite', False)) else 1
+    if normalized == 'favorites':
+        return favorite_key, name_key, model_id
+    if normalized == 'recent':
+        return -recent_key, favorite_key, name_key, model_id
+    if normalized == 'name':
+        return name_key, model_id
+    if normalized == 'benchmark':
+        return -benchmark_key, favorite_key, name_key, model_id
+    if normalized == 'context':
+        return -context_key, favorite_key, name_key, model_id
+    return int(getattr(model, 'port', 0) or 0), favorite_key, name_key, model_id
+
+
+def browser_models(
+    app: AppConfig,
+    statuses: Dict[str, Tuple[str, str]],
+    search: str = '',
+    runtime_filter: str = 'all',
+    source_filter: str = 'all',
+    status_filter: str = 'all',
+    tag_filter: str = 'all',
+    sort_mode: str = 'port',
+) -> List[ModelConfig]:
+    filtered: List[ModelConfig] = []
+    for model in list(getattr(app, 'models', []) or []):
+        status = str((statuses.get(model.id) or ('STOPPED', ''))[0] or 'STOPPED')
+        if model_matches_browser_filters(
+            app,
+            model,
+            status,
+            search=search,
+            runtime_filter=runtime_filter,
+            source_filter=source_filter,
+            status_filter=status_filter,
+            tag_filter=tag_filter,
+        ):
+            filtered.append(model)
+    return sorted(filtered, key=lambda item: model_sort_key(item, sort_mode))
 
 
 def clamp_scroll(scroll: int, total_lines: int, visible_rows: int) -> int:
@@ -494,6 +709,11 @@ def summarize_roots(paths: List[Path], width: int) -> str:
 
 def build_header_config_items(app: AppConfig, message: str, width: int) -> List[Tuple[str, str]]:
     body_width = max(12, int(width or 12))
+    continue_path = getattr(getattr(app, 'continue_settings', None), 'path', '') or '<unset>'
+    ui_summary = (
+        f'sort={sort_mode_label(getattr(getattr(app, "ui", None), "preferred_sort", "port"))} '
+        f'detail={detail_density_label(getattr(getattr(app, "ui", None), "detail_density", "simple"))}'
+    )
     roots_summary = (
         f'hf={app.hf_cache_root} | llmfit={app.llmfit_cache_root} | '
         f'local={app.llm_models_cache_root} | lm-studio={summarize_roots(app.lm_studio_roots(), body_width)}'
@@ -502,10 +722,13 @@ def build_header_config_items(app: AppConfig, message: str, width: int) -> List[
         (f'config: {app.config_path}', 'muted'),
         (f'llama-server: {app.llama_server}', 'muted'),
         (f'vllm: {app.vllm_command}', 'muted'),
-        (f'opencode: {app.opencode.path or "<unset>"}  hermes: {getattr(app.hermes, "command", "hermes")}', 'muted'),
+        (f'opencode: {app.opencode.path or "<unset>"}  continue: {continue_path}  hermes: {getattr(app.hermes, "command", "hermes")}', 'muted'),
         (f'roots: {roots_summary}', 'muted'),
+        (f'ui: {ui_summary}', 'muted'),
         (f'message: {compact_message(message)}', 'message'),
     ]
+    if getattr(app, 'load_warnings', None):
+        lines.insert(-1, (f'recovery: {compact_message(str(app.load_warnings[0]))}', 'message'))
     return [(ellipsize(text, body_width), kind) for text, kind in lines]
 
 
@@ -654,6 +877,10 @@ def model_profile_summary(model: ModelConfig) -> str:
 
 def stop_try_model(app: AppConfig, model: ModelConfig) -> Tuple[bool, str]:
     return app.stop(model)
+
+
+def should_stop_try_model(try_launched_model_id: str, model: Optional[ModelConfig]) -> bool:
+    return bool(model and try_launched_model_id == getattr(model, 'id', ''))
 
 
 def new_try_live_metrics() -> Dict[str, object]:
@@ -1516,167 +1743,881 @@ def reduce_benchmark_event(
     return state
 
 
-def prompt_value(stdscr, title: str, fields: List[Tuple[str, str]]) -> Optional[Dict[str, str]]:
-    curses.endwin()
-    print(f'\n{title}')
-    print('-' * len(title))
-    print('Leave blank to keep current value. Ctrl+C to cancel.\n')
-    answers = {}
+def form_field(key: str, label: str, default: str = '', hint: str = '') -> Dict[str, str]:
+    return {
+        'key': key,
+        'label': label,
+        'default': str(default or ''),
+        'hint': hint,
+    }
+
+
+def _clip_form_value(value: str, width: int, cursor: int) -> Tuple[str, int]:
+    text = str(value or '')
+    width = max(1, int(width or 1))
+    cursor = max(0, min(int(cursor or 0), len(text)))
+    if len(text) <= width:
+        return text.ljust(width), cursor
+    start = max(0, cursor - width + 1)
+    end = min(len(text), start + width)
+    if end - start < width:
+        start = max(0, end - width)
+    return text[start:end].ljust(width), cursor - start
+
+
+def prompt_form(
+    stdscr,
+    colors,
+    title: str,
+    fields: List[Dict[str, str]],
+    validator: Callable[[Dict[str, str]], Tuple[Optional[object], Dict[str, str]]],
+    footer_hint: str = '',
+    presets: Optional[List[str]] = None,
+) -> Optional[object]:
+    h, w = stdscr.getmaxyx()
+    box_w = min(108, max(64, w - 6))
+    box_h = min(max(14, h - 4), 26)
+    if h < 16 or w < 68:
+        return None
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(1, (h - box_h) // 2)
+    modal = curses.newwin(box_h, box_w, box_y, box_x)
+    modal.keypad(True)
+    values = {field['key']: str(field.get('default', '') or '') for field in fields}
+    selected = 0
+    cursor = len(values[fields[0]['key']]) if fields else 0
+    scroll = 0
+    errors: Dict[str, str] = {}
+    status = 'Edit values in place. Ctrl+S/F2 saves. Esc cancels.'
+    preset_values = list(presets or [])[:9]
+    label_w = max(16, min(28, max(len(field['label']) for field in fields) + 1 if fields else 18))
+    stdscr.nodelay(False)
     try:
-        for label, default in fields:
-            suffix = f' [{default}]' if default else ''
-            value = input(f'{label}{suffix}: ').strip()
-            answers[label] = value if value else default
-    except KeyboardInterrupt:
-        answers = None
-    print()
-    input('Press Enter to return to the TUI...')
-    stdscr.clear()
-    stdscr.refresh()
-    return answers
-def prompt_model(stdscr, title: str, initial: Optional[ModelConfig] = None) -> Optional[ModelConfig]:
+        previous_cursor = curses.curs_set(1)
+    except curses.error:
+        previous_cursor = 0
+    try:
+        while True:
+            scroll = clamp_scroll(scroll, len(fields), max(1, box_h - 9))
+            if selected < scroll:
+                scroll = selected
+            elif selected >= scroll + max(1, box_h - 9):
+                scroll = selected - max(1, box_h - 9) + 1
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, title, colors['accent'] | curses.A_BOLD, colors['accent'])
+            body_rows = max(1, box_h - 9)
+            visible = fields[scroll: scroll + body_rows]
+            for idx, field in enumerate(visible):
+                absolute = scroll + idx
+                key = field['key']
+                label = field['label']
+                line_y = 2 + idx
+                label_text = f'{label}:'
+                attr = colors['selection'] | curses.A_BOLD if absolute == selected else colors['panel']
+                safe_addstr(modal, line_y, 2, ellipsize(label_text, label_w), attr)
+                value_width = max(8, box_w - label_w - 6)
+                display, cursor_x = _clip_form_value(values.get(key, ''), value_width, cursor if absolute == selected else len(values.get(key, '')))
+                value_attr = colors['selection'] | curses.A_BOLD if absolute == selected else curses.A_NORMAL
+                safe_addstr(modal, line_y, 2 + label_w, display[:value_width], value_attr)
+                if absolute == selected:
+                    try:
+                        modal.move(line_y, 2 + label_w + cursor_x)
+                    except curses.error:
+                        pass
+            active_field = fields[selected] if fields else {'key': '', 'hint': '', 'label': ''}
+            hint = active_field.get('hint', '') or footer_hint or 'Use Tab/Shift-Tab or arrows to move.'
+            safe_addstr(modal, box_h - 6, 2, ellipsize(f'Field: {active_field.get("label", "-")} | {hint}', box_w - 4), colors['muted'])
+            if preset_values:
+                preset_text = '  '.join(f'[{idx + 1}] {ellipsize(value, 18)}' for idx, value in enumerate(preset_values))
+                safe_addstr(modal, box_h - 5, 2, ellipsize(f'Presets: {preset_text}', box_w - 4), colors['muted'])
+            else:
+                safe_addstr(modal, box_h - 5, 2, ellipsize(status, box_w - 4), colors['muted'])
+            error_lines = list(errors.items())[:2]
+            for idx in range(2):
+                line = ''
+                attr = colors['muted']
+                if idx < len(error_lines):
+                    field_name, error = error_lines[idx]
+                    line = f'{field_name}: {error}'
+                    attr = colors['error'] | curses.A_BOLD
+                safe_addstr(modal, box_h - 4 + idx, 2, ellipsize(line, box_w - 4), attr)
+            safe_addstr(modal, box_h - 2, 2, ellipsize('[Ctrl+S/F2] save  [Esc] cancel  [Ctrl+U] clear field', box_w - 4), colors['accent'] | curses.A_BOLD)
+            modal.refresh()
+
+            key = modal.getch()
+            if key in (27,):
+                return None
+            if key in (19, getattr(curses, 'KEY_F2', -1)):
+                result, validation_errors = validator(dict(values))
+                if validation_errors:
+                    errors = validation_errors
+                    first_error_key = next(iter(validation_errors))
+                    for idx, field in enumerate(fields):
+                        if field['key'] == first_error_key:
+                            selected = idx
+                            cursor = len(values.get(field['key'], ''))
+                            break
+                    status = 'Fix the highlighted field errors and save again.'
+                    continue
+                return result
+            if key in (curses.KEY_UP,):
+                selected = max(0, selected - 1)
+                cursor = len(values.get(fields[selected]['key'], ''))
+                continue
+            if key in (curses.KEY_DOWN, 9, 10, 13, curses.KEY_ENTER):
+                selected = min(len(fields) - 1, selected + 1)
+                cursor = len(values.get(fields[selected]['key'], ''))
+                continue
+            if key in (getattr(curses, 'KEY_BTAB', -999),):
+                selected = max(0, selected - 1)
+                cursor = len(values.get(fields[selected]['key'], ''))
+                continue
+            if preset_values and ord('1') <= key <= ord(str(min(9, len(preset_values)))):
+                values[fields[selected]['key']] = preset_values[key - ord('1')]
+                cursor = len(values[fields[selected]['key']])
+                errors.pop(fields[selected]['key'], None)
+                continue
+            current_key = fields[selected]['key']
+            current_value = values.get(current_key, '')
+            if key == curses.KEY_LEFT:
+                cursor = max(0, cursor - 1)
+                continue
+            if key == curses.KEY_RIGHT:
+                cursor = min(len(current_value), cursor + 1)
+                continue
+            if key == curses.KEY_HOME:
+                cursor = 0
+                continue
+            if key == curses.KEY_END:
+                cursor = len(current_value)
+                continue
+            if key in (21,):
+                values[current_key] = ''
+                cursor = 0
+                errors.pop(current_key, None)
+                continue
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                if cursor > 0:
+                    values[current_key] = current_value[: cursor - 1] + current_value[cursor:]
+                    cursor -= 1
+                    errors.pop(current_key, None)
+                continue
+            if key == curses.KEY_DC:
+                if cursor < len(current_value):
+                    values[current_key] = current_value[:cursor] + current_value[cursor + 1:]
+                    errors.pop(current_key, None)
+                continue
+            if 32 <= key <= 126:
+                values[current_key] = current_value[:cursor] + chr(key) + current_value[cursor:]
+                cursor += 1
+                errors.pop(current_key, None)
+                continue
+    finally:
+        try:
+            curses.curs_set(previous_cursor)
+        except curses.error:
+            pass
+        stdscr.touchwin()
+        stdscr.nodelay(True)
+
+
+def model_form_fields(initial: ModelConfig) -> List[Dict[str, str]]:
+    return [
+        form_field('id', 'id', initial.id, 'required; stable short id'),
+        form_field('name', 'name', initial.name, 'required; user-facing label'),
+        form_field('path', 'path', initial.path, 'GGUF path or vLLM model reference'),
+        form_field('alias', 'alias', initial.alias or initial.id, 'OpenAI-style model name served on the port'),
+        form_field('runtime', 'runtime', getattr(initial, 'runtime', 'llama.cpp'), 'llama.cpp or vllm'),
+        form_field('optimize_mode', 'optimize_mode', getattr(initial, 'optimize_mode', 'max_context_safe'), 'max_context_safe/manual/best/max_context/tokens_per_sec/opencode_ready'),
+        form_field('optimize_tier', 'optimize_tier', getattr(initial, 'optimize_tier', 'moderate'), 'safe/moderate/extreme'),
+        form_field('port', 'port', str(initial.port), 'required integer port'),
+        form_field('host', 'host', initial.host, 'bind host, usually 127.0.0.1'),
+        form_field('ctx', 'ctx', str(initial.ctx), 'total context length'),
+        form_field('ctx_min', 'ctx_min', str(getattr(initial, 'ctx_min', 2048)), 'minimum ctx for adaptive tuning'),
+        form_field('ctx_max', 'ctx_max', str(getattr(initial, 'ctx_max', 131072)), 'maximum ctx for adaptive tuning'),
+        form_field('threads', 'threads', str(initial.threads), 'CPU worker threads'),
+        form_field('ngl', 'ngl', str(initial.ngl), 'GPU layers for llama.cpp'),
+        form_field('temp', 'temp', str(initial.temp), 'sampling temperature'),
+        form_field('parallel', 'parallel', str(initial.parallel), 'parallel request slots'),
+        form_field('memory_reserve_percent', 'memory_reserve_percent', str(getattr(initial, 'memory_reserve_percent', 25)), 'RAM/VRAM headroom percent'),
+        form_field('cache_ram', 'cache_ram', str(initial.cache_ram), 'cache size in MiB, 0 to auto'),
+        form_field('output', 'output', str(initial.output), 'max output tokens'),
+        form_field('enabled', 'enabled', str(initial.enabled).lower(), 'true/false'),
+        form_field('flash_attn', 'flash_attn', str(initial.flash_attn).lower(), 'true/false'),
+        form_field('jinja', 'jinja', str(initial.jinja).lower(), 'true/false'),
+        form_field('favorite', 'favorite', str(getattr(initial, 'favorite', False)).lower(), 'true/false'),
+        form_field('tags', 'tags', ', '.join(list(getattr(initial, 'tags', []) or [])), 'comma-separated: coding/autocomplete/long-context/fast-chat/custom'),
+        form_field('extra_args', 'extra_args', ' '.join(initial.extra_args), 'space-separated extra runtime flags'),
+    ]
+
+
+def parse_model_form_answers(answers: Dict[str, str], initial: Optional[ModelConfig] = None) -> Tuple[Optional[ModelConfig], Dict[str, str]]:
     initial = initial or ModelConfig(id='', name='', path='', alias='', port=8080)
-    answers = prompt_value(stdscr, title, [
-        ('id', initial.id),
-        ('name', initial.name),
-        ('runtime (llama.cpp/vllm)', getattr(initial, 'runtime', 'llama.cpp')),
-        ('optimize_mode (max_context_safe/manual)', getattr(initial, 'optimize_mode', 'max_context_safe')),
-        ('optimize_tier (safe/moderate/extreme)', getattr(initial, 'optimize_tier', 'moderate')),
-        ('path', initial.path),
-        ('alias', initial.alias or initial.id),
-        ('port', str(initial.port)),
-        ('host', initial.host),
-        ('ctx', str(initial.ctx)),
-        ('ctx_min', str(getattr(initial, 'ctx_min', 2048))),
-        ('ctx_max', str(getattr(initial, 'ctx_max', 131072))),
-        ('threads', str(initial.threads)),
-        ('ngl', str(initial.ngl)),
-        ('temp', str(initial.temp)),
-        ('parallel', str(initial.parallel)),
-        ('memory_reserve_percent', str(getattr(initial, 'memory_reserve_percent', 25))),
-        ('cache_ram', str(initial.cache_ram)),
-        ('output', str(initial.output)),
-        ('enabled true/false', str(initial.enabled).lower()),
-        ('flash_attn true/false', str(initial.flash_attn).lower()),
-        ('jinja true/false', str(initial.jinja).lower()),
-        ('extra_args (space-separated)', ' '.join(initial.extra_args)),
-    ])
-    if not answers:
-        return None
-    try:
-        return ModelConfig(
-            id=answers['id'],
-            name=answers['name'],
-            path=answers['path'],
-            alias=answers['alias'],
-            port=int(answers['port']),
-            host=answers['host'],
-            ctx=int(answers['ctx']),
-            ctx_min=int(answers['ctx_min']),
-            ctx_max=int(answers['ctx_max']),
-            threads=int(answers['threads']),
-            ngl=int(answers['ngl']),
-            temp=float(answers['temp']),
-            parallel=int(answers['parallel']),
-            optimize_mode=(answers['optimize_mode (max_context_safe/manual)'].strip() or 'max_context_safe'),
-            optimize_tier=(answers['optimize_tier (safe/moderate/extreme)'].strip() or 'moderate'),
-            memory_reserve_percent=int(answers['memory_reserve_percent']),
-            cache_ram=int(answers['cache_ram']),
-            output=int(answers['output']),
-            enabled=answers['enabled true/false'].lower() == 'true',
-            runtime=(answers['runtime (llama.cpp/vllm)'].strip().lower() or 'llama.cpp'),
-            flash_attn=answers['flash_attn true/false'].lower() == 'true',
-            jinja=answers['jinja true/false'].lower() == 'true',
-            source=getattr(initial, 'source', 'manual'),
-            extra_args=answers['extra_args (space-separated)'].split() if answers['extra_args (space-separated)'] else [],
-        )
-    except Exception:
-        return None
-def prompt_settings(stdscr, app: AppConfig) -> bool:
+    cleaned = {key: str(value or '').strip() for key, value in answers.items()}
+    errors: Dict[str, str] = {}
+    if not cleaned.get('id'):
+        errors['id'] = 'id is required'
+    if not cleaned.get('name'):
+        errors['name'] = 'name is required'
+    if not cleaned.get('path'):
+        errors['path'] = 'path is required'
+    runtime = normalize_choice(cleaned.get('runtime', ''), VALID_RUNTIMES, 'llama.cpp')
+    if runtime != cleaned.get('runtime', '').strip().lower():
+        errors['runtime'] = 'runtime must be llama.cpp or vllm'
+    optimize_mode = cleaned.get('optimize_mode', '').strip().lower() or 'max_context_safe'
+    if optimize_mode not in VALID_OPTIMIZE_MODES:
+        errors['optimize_mode'] = 'unsupported optimize mode'
+    optimize_tier = cleaned.get('optimize_tier', '').strip().lower() or 'moderate'
+    if optimize_tier not in VALID_OPTIMIZE_TIERS:
+        errors['optimize_tier'] = 'tier must be safe, moderate, or extreme'
+
+    def parse_int(name: str, minimum: int = 0) -> int:
+        try:
+            value = int(cleaned.get(name, '0') or 0)
+        except ValueError:
+            errors[name] = 'must be an integer'
+            return 0
+        if value < minimum:
+            errors[name] = f'must be >= {minimum}'
+        return value
+
+    def parse_float(name: str, minimum: float = 0.0) -> float:
+        try:
+            value = float(cleaned.get(name, '0') or 0.0)
+        except ValueError:
+            errors[name] = 'must be a number'
+            return 0.0
+        if value < minimum:
+            errors[name] = f'must be >= {minimum}'
+        return value
+
+    port = parse_int('port', 1)
+    ctx = parse_int('ctx', 1)
+    ctx_min = parse_int('ctx_min', 1)
+    ctx_max = parse_int('ctx_max', ctx_min if ctx_min > 0 else 1)
+    threads = parse_int('threads', 1)
+    ngl = parse_int('ngl', 0)
+    parallel = parse_int('parallel', 1)
+    memory_reserve = parse_int('memory_reserve_percent', 0)
+    cache_ram = parse_int('cache_ram', 0)
+    output = parse_int('output', 1)
+    temp = parse_float('temp', 0.0)
+    if ctx_max and ctx_min and ctx_max < ctx_min:
+        errors['ctx_max'] = 'ctx_max must be >= ctx_min'
+    host = cleaned.get('host', '').strip()
+    if not host:
+        errors['host'] = 'host is required'
+    for key in ('enabled', 'flash_attn', 'jinja', 'favorite'):
+        try:
+            parse_bool_text(cleaned.get(key, ''), key)
+        except ValueError as exc:
+            errors[key] = str(exc)
+    if errors:
+        return None, errors
+    model = ModelConfig(
+        id=cleaned['id'],
+        name=cleaned['name'],
+        path=cleaned['path'],
+        alias=cleaned.get('alias', '').strip() or cleaned['id'],
+        port=port,
+        host=host,
+        ctx=ctx,
+        ctx_min=ctx_min,
+        ctx_max=ctx_max,
+        threads=threads,
+        ngl=ngl,
+        temp=temp,
+        parallel=parallel,
+        optimize_mode=optimize_mode,
+        optimize_tier=optimize_tier,
+        memory_reserve_percent=memory_reserve,
+        cache_ram=cache_ram,
+        output=output,
+        enabled=parse_bool_text(cleaned['enabled'], 'enabled'),
+        runtime=runtime,
+        flash_attn=parse_bool_text(cleaned['flash_attn'], 'flash_attn'),
+        jinja=parse_bool_text(cleaned['jinja'], 'jinja'),
+        favorite=parse_bool_text(cleaned['favorite'], 'favorite'),
+        source=getattr(initial, 'source', 'manual'),
+        last_used_at=str(getattr(initial, 'last_used_at', '') or ''),
+        sort_rank=int(getattr(initial, 'sort_rank', 0) or 0),
+        tags=[item.strip() for item in cleaned.get('tags', '').split(',') if item.strip()],
+        verification_status=str(getattr(initial, 'verification_status', 'unknown') or 'unknown'),
+        verification_at=str(getattr(initial, 'verification_at', '') or ''),
+        verification_fingerprint=str(getattr(initial, 'verification_fingerprint', '') or ''),
+        verification_summary=str(getattr(initial, 'verification_summary', '') or ''),
+        verification_results=dict(getattr(initial, 'verification_results', {}) or {}),
+        extra_args=cleaned.get('extra_args', '').split() if cleaned.get('extra_args') else [],
+    )
+    return model, {}
+
+
+SETTINGS_SECTIONS = [
+    ('runtime', 'Runtime'),
+    ('roots', 'Model Roots'),
+    ('opencode', 'OpenCode'),
+    ('continue', 'Continue'),
+    ('hermes', 'Hermes'),
+    ('ui', 'UI'),
+]
+
+
+def settings_form_fields(app: AppConfig, section: str = 'all') -> List[Dict[str, str]]:
     o = app.opencode
+    continue_settings = app.continue_settings
     hermes = app.hermes
-    answers = prompt_value(stdscr, 'Settings', [
-        ('llama_server', app.llama_server),
-        ('vllm_command', app.vllm_command),
-        ('hf_cache_root', app.hf_cache_root),
-        ('llm_models_cache_root', app.llm_models_cache_root),
-        ('llmfit_cache_root', app.llmfit_cache_root),
-        ('lm_studio_model_roots (comma-separated)', getattr(app, 'lm_studio_model_roots', '')),
-        ('opencode_path', o.path),
-        ('opencode_backup_dir', o.backup_dir),
-        ('default_model_id', o.default_model_id),
-        ('small_model_id', o.small_model_id),
-        ('build_model_id', o.build_model_id),
-        ('plan_model_id', o.plan_model_id),
-        ('instructions (comma-separated)', ', '.join(o.instructions)),
-        ('build_prompt', o.build_prompt),
-        ('plan_prompt', o.plan_prompt),
-        ('timeout', str(o.timeout)),
-        ('chunk_timeout', str(o.chunk_timeout)),
-        ('terminal_command', getattr(o, 'terminal_command', '')),
-        ('last_workspace_path', getattr(o, 'last_workspace_path', '')),
-        ('hermes_command', getattr(hermes, 'command', 'hermes')),
-        ('hermes_home_root', getattr(hermes, 'home_root', '')),
-        ('hermes_default_model_id', getattr(hermes, 'default_model_id', '')),
-        ('hermes_code_model_id', getattr(hermes, 'code_model_id', '')),
-        ('hermes_toolsets (comma-separated)', ', '.join(getattr(hermes, 'toolsets', []) or [])),
-        ('hermes_max_turns', str(getattr(hermes, 'max_turns', 20))),
-        ('hermes_quiet true/false', str(getattr(hermes, 'quiet', True)).lower()),
-        ('hermes_min_context_tokens', str(getattr(hermes, 'min_context_tokens', 64000))),
-        ('hermes_allow_experimental_context_override true/false', str(getattr(hermes, 'allow_experimental_context_override', False)).lower()),
-        ('hermes_experimental_context_override_tokens', str(getattr(hermes, 'experimental_context_override_tokens', 0))),
-        ('hermes_terminal_command', getattr(hermes, 'terminal_command', '')),
-        ('hermes_last_workspace_path', getattr(hermes, 'last_workspace_path', '')),
+    groups = {
+        'runtime': [
+        form_field('llama_server', 'llama_server', app.llama_server, 'command or path to llama.cpp server'),
+        form_field('vllm_command', 'vllm_command', app.vllm_command, 'command used to start vLLM'),
+        ],
+        'roots': [
+        form_field('hf_cache_root', 'hf_cache_root', app.hf_cache_root, 'Hugging Face GGUF cache root'),
+        form_field('llm_models_cache_root', 'llm_models_cache_root', app.llm_models_cache_root, 'local model cache root'),
+        form_field('llmfit_cache_root', 'llmfit_cache_root', app.llmfit_cache_root, 'llmfit cache root'),
+        form_field('lm_studio_model_roots', 'lm_studio_model_roots', getattr(app, 'lm_studio_model_roots', ''), 'comma-separated LM Studio model roots'),
+        ],
+        'opencode': [
+        form_field('opencode_path', 'opencode_path', o.path, 'path to opencode config.json'),
+        form_field('opencode_backup_dir', 'opencode_backup_dir', o.backup_dir, 'backup directory for generated OpenCode configs'),
+        form_field('default_model_id', 'default_model_id', o.default_model_id, 'OpenCode main model id'),
+        form_field('small_model_id', 'small_model_id', o.small_model_id, 'OpenCode small/autocomplete model id'),
+        form_field('build_model_id', 'build_model_id', o.build_model_id, 'OpenCode build model id'),
+        form_field('plan_model_id', 'plan_model_id', o.plan_model_id, 'OpenCode plan model id'),
+        form_field('instructions', 'instructions', ', '.join(o.instructions), 'comma-separated OpenCode instruction files'),
+        form_field('build_prompt', 'build_prompt', o.build_prompt, 'OpenCode build agent prompt'),
+        form_field('plan_prompt', 'plan_prompt', o.plan_prompt, 'OpenCode plan agent prompt'),
+        form_field('timeout', 'timeout', str(o.timeout), 'OpenCode request timeout in ms'),
+        form_field('chunk_timeout', 'chunk_timeout', str(o.chunk_timeout), 'OpenCode chunk timeout in ms'),
+        form_field('terminal_command', 'terminal_command', getattr(o, 'terminal_command', ''), 'custom terminal template using {title} {cwd} {cmd}'),
+        form_field('last_workspace_path', 'last_workspace_path', getattr(o, 'last_workspace_path', ''), 'last OpenCode workspace path'),
+        ],
+        'continue': [
+        form_field('continue_path', 'continue_path', getattr(continue_settings, 'path', ''), 'path to Continue config.yaml'),
+        form_field('continue_backup_dir', 'continue_backup_dir', getattr(continue_settings, 'backup_dir', ''), 'backup directory for generated Continue configs'),
+        form_field('continue_default_model_id', 'continue_default_model_id', getattr(continue_settings, 'default_model_id', ''), 'Continue chat model id; blank uses OpenCode main'),
+        form_field('continue_edit_model_id', 'continue_edit_model_id', getattr(continue_settings, 'edit_model_id', ''), 'Continue edit/apply model id; blank uses OpenCode build'),
+        form_field('continue_autocomplete_model_id', 'continue_autocomplete_model_id', getattr(continue_settings, 'autocomplete_model_id', ''), 'Continue autocomplete model id; blank uses OpenCode small'),
+        form_field('continue_merge_mode', 'continue_merge_mode', getattr(continue_settings, 'merge_mode', 'preserve_sections'), 'preserve_sections or managed_file'),
+        ],
+        'hermes': [
+        form_field('hermes_command', 'hermes_command', getattr(hermes, 'command', 'hermes'), 'Hermes command name or path'),
+        form_field('hermes_home_root', 'hermes_home_root', getattr(hermes, 'home_root', ''), 'Hermes isolated home root'),
+        form_field('hermes_default_model_id', 'hermes_default_model_id', getattr(hermes, 'default_model_id', ''), 'Hermes default model id'),
+        form_field('hermes_code_model_id', 'hermes_code_model_id', getattr(hermes, 'code_model_id', ''), 'Hermes coding model id'),
+        form_field('hermes_toolsets', 'hermes_toolsets', ', '.join(getattr(hermes, 'toolsets', []) or []), 'comma-separated Hermes toolsets'),
+        form_field('hermes_max_turns', 'hermes_max_turns', str(getattr(hermes, 'max_turns', 20)), 'maximum Hermes turns'),
+        form_field('hermes_quiet', 'hermes_quiet', str(getattr(hermes, 'quiet', True)).lower(), 'true/false'),
+        form_field('hermes_min_context_tokens', 'hermes_min_context_tokens', str(getattr(hermes, 'min_context_tokens', 64000)), 'required ctx/slot for Hermes readiness'),
+        form_field('hermes_allow_experimental_context_override', 'hermes_allow_experimental_context_override', str(getattr(hermes, 'allow_experimental_context_override', False)).lower(), 'true/false'),
+        form_field('hermes_experimental_context_override_tokens', 'hermes_experimental_context_override_tokens', str(getattr(hermes, 'experimental_context_override_tokens', 0)), '0 disables override'),
+        form_field('hermes_terminal_command', 'hermes_terminal_command', getattr(hermes, 'terminal_command', ''), 'custom Hermes terminal template'),
+        form_field('hermes_last_workspace_path', 'hermes_last_workspace_path', getattr(hermes, 'last_workspace_path', ''), 'last Hermes workspace path'),
+        ],
+        'ui': [
+        form_field('preferred_sort', 'preferred_sort', getattr(app.ui, 'preferred_sort', 'port'), 'favorites/recent/name/benchmark/context/port'),
+        form_field('detail_density', 'detail_density', getattr(app.ui, 'detail_density', 'simple'), 'simple or advanced'),
+        ],
+    }
+    if section == 'all':
+        fields: List[Dict[str, str]] = []
+        for key, _label in SETTINGS_SECTIONS:
+            fields.extend(groups[key])
+        return fields
+    return list(groups.get(section, []))
+
+
+def settings_form_answers_from_app(app: AppConfig) -> Dict[str, str]:
+    return {field['key']: str(field.get('default', '') or '') for field in settings_form_fields(app, 'all')}
+
+
+def parse_settings_form_answers(answers: Dict[str, str]) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
+    cleaned = {key: str(value or '').strip() for key, value in answers.items()}
+    errors: Dict[str, str] = {}
+
+    def parse_int(name: str, minimum: int = 0) -> int:
+        try:
+            value = int(cleaned.get(name, '0') or 0)
+        except ValueError:
+            errors[name] = 'must be an integer'
+            return 0
+        if value < minimum:
+            errors[name] = f'must be >= {minimum}'
+        return value
+
+    for key in ('hermes_quiet', 'hermes_allow_experimental_context_override'):
+        try:
+            parse_bool_text(cleaned.get(key, ''), key)
+        except ValueError as exc:
+            errors[key] = str(exc)
+    preferred_sort = normalize_choice(cleaned.get('preferred_sort', ''), tuple(key for key, _label in SORT_OPTIONS), 'port')
+    if preferred_sort != (cleaned.get('preferred_sort', '').lower() or 'port'):
+        errors['preferred_sort'] = 'unsupported sort mode'
+    detail_density = normalize_choice(cleaned.get('detail_density', ''), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+    if detail_density != (cleaned.get('detail_density', '').lower() or 'simple'):
+        errors['detail_density'] = 'detail_density must be simple or advanced'
+    continue_merge_mode = cleaned.get('continue_merge_mode', 'preserve_sections') or 'preserve_sections'
+    if continue_merge_mode not in CONTINUE_MERGE_MODES:
+        errors['continue_merge_mode'] = 'must be preserve_sections or managed_file'
+    payload = {
+        'llama_server': cleaned.get('llama_server', ''),
+        'vllm_command': cleaned.get('vllm_command', ''),
+        'hf_cache_root': cleaned.get('hf_cache_root', ''),
+        'llm_models_cache_root': cleaned.get('llm_models_cache_root', ''),
+        'llmfit_cache_root': cleaned.get('llmfit_cache_root', ''),
+        'lm_studio_model_roots': ', '.join([item.strip() for item in cleaned.get('lm_studio_model_roots', '').split(',') if item.strip()]),
+        'opencode': {
+            'path': cleaned.get('opencode_path', ''),
+            'backup_dir': cleaned.get('opencode_backup_dir', ''),
+            'default_model_id': cleaned.get('default_model_id', ''),
+            'small_model_id': cleaned.get('small_model_id', ''),
+            'build_model_id': cleaned.get('build_model_id', ''),
+            'plan_model_id': cleaned.get('plan_model_id', ''),
+            'instructions': [item.strip() for item in cleaned.get('instructions', '').split(',') if item.strip()],
+            'build_prompt': cleaned.get('build_prompt', ''),
+            'plan_prompt': cleaned.get('plan_prompt', ''),
+            'timeout': parse_int('timeout', 1),
+            'chunk_timeout': parse_int('chunk_timeout', 1),
+            'terminal_command': cleaned.get('terminal_command', ''),
+            'last_workspace_path': cleaned.get('last_workspace_path', ''),
+        },
+        'continue': {
+            'path': cleaned.get('continue_path', ''),
+            'backup_dir': cleaned.get('continue_backup_dir', ''),
+            'default_model_id': cleaned.get('continue_default_model_id', ''),
+            'edit_model_id': cleaned.get('continue_edit_model_id', ''),
+            'autocomplete_model_id': cleaned.get('continue_autocomplete_model_id', ''),
+            'merge_mode': continue_merge_mode,
+        },
+        'hermes': {
+            'command': cleaned.get('hermes_command', '') or 'hermes',
+            'home_root': cleaned.get('hermes_home_root', ''),
+            'default_model_id': cleaned.get('hermes_default_model_id', ''),
+            'code_model_id': cleaned.get('hermes_code_model_id', ''),
+            'toolsets': [item.strip() for item in cleaned.get('hermes_toolsets', '').split(',') if item.strip()],
+            'max_turns': parse_int('hermes_max_turns', 1),
+            'quiet': parse_bool_text(cleaned.get('hermes_quiet', 'true') or 'true', 'hermes_quiet') if 'hermes_quiet' not in errors else True,
+            'min_context_tokens': parse_int('hermes_min_context_tokens', 1),
+            'allow_experimental_context_override': (
+                parse_bool_text(cleaned.get('hermes_allow_experimental_context_override', 'false') or 'false', 'hermes_allow_experimental_context_override')
+                if 'hermes_allow_experimental_context_override' not in errors
+                else False
+            ),
+            'experimental_context_override_tokens': parse_int('hermes_experimental_context_override_tokens', 0),
+            'terminal_command': cleaned.get('hermes_terminal_command', ''),
+            'last_workspace_path': cleaned.get('hermes_last_workspace_path', ''),
+        },
+        'ui': {
+            'preferred_sort': preferred_sort,
+            'detail_density': detail_density,
+        },
+    }
+    if errors:
+        return None, errors
+    return payload, {}
+
+
+def workspace_form_fields(default: str) -> List[Dict[str, str]]:
+    return [form_field('workspace', 'workspace', default, 'existing directory path')]
+
+
+def parse_workspace_form_answers(app: AppConfig, answers: Dict[str, str]) -> Tuple[Optional[str], Dict[str, str]]:
+    workspace = str((answers or {}).get('workspace', '') or '').strip()
+    valid, workspace_path, reason = app.validate_workspace_path(workspace)
+    if not valid or workspace_path is None:
+        return None, {'workspace': reason}
+    return str(workspace_path), {}
+
+
+def prompt_model(stdscr, colors, title: str, initial: Optional[ModelConfig] = None) -> Optional[ModelConfig]:
+    initial = initial or ModelConfig(id='', name='', path='', alias='', port=8080)
+    return prompt_form(
+        stdscr,
+        colors,
+        title,
+        model_form_fields(initial),
+        lambda answers: parse_model_form_answers(answers, initial=initial),
+        footer_hint='Model forms stay in the TUI now, and invalid fields keep your typed values.',
+    )
+
+
+def prompt_settings(stdscr, colors, app: AppConfig) -> bool:
+    section = prompt_modal_choice(
+        stdscr,
+        colors,
+        'Settings Section',
+        [(str(idx + 1), label, key) for idx, (key, label) in enumerate(SETTINGS_SECTIONS)] + [('q', 'Cancel', 'cancel')],
+    )
+    if section == 'cancel':
+        return False
+    base_answers = settings_form_answers_from_app(app)
+
+    def validate_section(answers: Dict[str, str]) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
+        merged = dict(base_answers)
+        merged.update(answers)
+        parsed, errors = parse_settings_form_answers(merged)
+        section_keys = {field['key'] for field in settings_form_fields(app, section)}
+        visible_errors = {key: value for key, value in errors.items() if key in section_keys}
+        hidden_errors = {key: value for key, value in errors.items() if key not in section_keys}
+        if visible_errors:
+            return None, visible_errors
+        if hidden_errors:
+            return None, {'settings': 'Open another settings section to fix saved invalid values.'}
+        return parsed, {}
+
+    parsed = prompt_form(
+        stdscr,
+        colors,
+        f'Settings: {dict(SETTINGS_SECTIONS).get(section, section)}',
+        settings_form_fields(app, section),
+        validate_section,
+        footer_hint='Settings are split by section; reopen settings to edit another area.',
+    )
+    if not parsed:
+        return False
+    app.llama_server = parsed['llama_server']
+    app.vllm_command = parsed['vllm_command']
+    app.hf_cache_root = parsed['hf_cache_root']
+    app.llm_models_cache_root = parsed['llm_models_cache_root']
+    app.llmfit_cache_root = parsed['llmfit_cache_root']
+    app.lm_studio_model_roots = parsed['lm_studio_model_roots']
+    for key, value in parsed['opencode'].items():
+        setattr(app.opencode, key, value)
+    for key, value in parsed['continue'].items():
+        setattr(app.continue_settings, key, value)
+    for key, value in parsed['hermes'].items():
+        setattr(app.hermes, key, value)
+    for key, value in parsed['ui'].items():
+        setattr(app.ui, key, value)
+    app.save()
+    return True
+
+
+def prompt_workspace(stdscr, colors, app: AppConfig, runtime: str = 'opencode') -> Optional[str]:
+    default = getattr(app.workspace_settings(runtime), 'last_workspace_path', '') or str(Path.cwd())
+    presets = app.workspace_presets(runtime)
+    return prompt_form(
+        stdscr,
+        colors,
+        'Hermes Workspace' if runtime == 'hermes' else 'OpenCode Workspace',
+        workspace_form_fields(default),
+        lambda answers: parse_workspace_form_answers(app, answers),
+        footer_hint='Pick a recent preset with 1-9, or type a path directly.',
+        presets=presets,
+    )
+
+
+def prompt_search_query(stdscr, colors, current: str) -> Optional[str]:
+    return prompt_form(
+        stdscr,
+        colors,
+        'Search Models',
+        [form_field('search', 'search', current, 'match id, name, alias, path, runtime, source, status')],
+        lambda answers: (str((answers or {}).get('search', '') or ''), {}),
+        footer_hint='Leave blank to clear the current search.',
+    )
+
+
+def browser_filter_fields(runtime_filter: str, source_filter: str, status_filter: str, tag_filter: str = 'all') -> List[Dict[str, str]]:
+    return [
+        form_field('runtime_filter', 'runtime_filter', runtime_filter, 'all/llama.cpp/vllm'),
+        form_field('source_filter', 'source_filter', source_filter, 'all/manual/huggingface/llmfit/llm-models/lm-studio'),
+        form_field('status_filter', 'status_filter', status_filter, 'all/READY/LOADING/STARTING/STOPPED/ERROR/fresh/stale/missing/failed/pending/running'),
+        form_field('tag_filter', 'tag_filter', tag_filter, 'all/coding/autocomplete/long-context/fast-chat/custom tag'),
+    ]
+
+
+def parse_browser_filter_answers(answers: Dict[str, str]) -> Tuple[Optional[Tuple[str, str, str, str]], Dict[str, str]]:
+    cleaned = {key: str(value or '').strip() for key, value in answers.items()}
+    runtime = cleaned.get('runtime_filter', '').lower() or 'all'
+    source = cleaned.get('source_filter', '').lower() or 'all'
+    status = cleaned.get('status_filter', '') or 'all'
+    tag = cleaned.get('tag_filter', '').lower() or 'all'
+    errors: Dict[str, str] = {}
+    if runtime not in dict(FILTER_RUNTIME_OPTIONS):
+        errors['runtime_filter'] = 'unsupported runtime filter'
+    if source not in dict(FILTER_SOURCE_OPTIONS):
+        errors['source_filter'] = 'unsupported source filter'
+    if status not in dict(FILTER_STATUS_OPTIONS):
+        errors['status_filter'] = 'unsupported status filter'
+    if errors:
+        return None, errors
+    return (runtime, source, status, tag), {}
+
+
+def prompt_browser_filters(
+    stdscr,
+    colors,
+    runtime_filter: str,
+    source_filter: str,
+    status_filter: str,
+    tag_filter: str = 'all',
+) -> Optional[Tuple[str, str, str, str]]:
+    return prompt_form(
+        stdscr,
+        colors,
+        'Model Filters',
+        browser_filter_fields(runtime_filter, source_filter, status_filter, tag_filter),
+        parse_browser_filter_answers,
+        footer_hint='Use "all" to clear an individual filter.',
+    )
+
+
+def prompt_sort_mode(stdscr, colors, current: str) -> str:
+    options = [
+        ('1', 'Favorites', 'favorites'),
+        ('2', 'Recent', 'recent'),
+        ('3', 'Name', 'name'),
+        ('4', 'Best Benchmark', 'benchmark'),
+        ('5', 'Highest Context', 'context'),
+        ('6', 'Port', 'port'),
+        ('q', f'Cancel ({sort_mode_label(current)})', 'cancel'),
+    ]
+    return prompt_modal_choice(stdscr, colors, 'Sort Models', options)
+
+
+def prompt_yes_no(stdscr, colors, title: str, body: str) -> bool:
+    result = prompt_modal_choice(stdscr, colors, title, [
+        ('1', f'Yes: {body}', 'yes'),
+        ('q', 'Cancel', 'cancel'),
     ])
-    if not answers:
-        return False
+    return result == 'yes'
+
+
+def help_overlay_lines() -> List[str]:
+    return [
+        'Quick Help',
+        '',
+        'List view',
+        'Enter opens details. / searches. f filters. C clears browser. T sorts. * favorites the selected model.',
+        'a adds models, e edits them, d deletes them, x detects GGUFs, X prunes missing entries.',
+        '',
+        'Detail view',
+        'Enter or l opens launch actions. T opens Try It Out. v toggles Simple/Advanced detail density.',
+        'B runs deep benchmark, F runs fast benchmark, O runs OpenCode workflow, H runs Hermes workflow.',
+        '',
+        'Power tools',
+        ': opens a compact command palette. g/c/G export OpenCode, Continue, and Hermes configs.',
+        'Y verifies the selected model. y runs benchmark-proof verification for stale or missing models.',
+        'The Config Doctor checks runtime commands, export paths, terminal launcher, and proof status.',
+        'z applies the auto profile. R opens results or rankings depending on the view.',
+        '',
+        'The new browser stores favorites, recents, sort preference, and workspace presets automatically.',
+    ]
+
+
+def show_help_overlay(stdscr, colors):
+    h, w = stdscr.getmaxyx()
+    box_w = min(96, max(54, w - 8))
+    box_h = min(max(12, h - 6), 22)
+    if h < 12 or w < 56:
+        return
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(2, (h - box_h) // 2)
+    modal = curses.newwin(box_h, box_w, box_y, box_x)
+    modal.keypad(True)
+    content_h = max(1, box_h - 4)
+    lines = [line for raw in help_overlay_lines() for line in wrap_display_item_lines(raw, box_w - 4)]
+    scroll = 0
+    stdscr.nodelay(False)
     try:
-        app.llama_server = answers['llama_server']
-        app.vllm_command = answers['vllm_command']
-        app.hf_cache_root = answers['hf_cache_root']
-        app.llm_models_cache_root = answers['llm_models_cache_root']
-        app.llmfit_cache_root = answers['llmfit_cache_root']
-        app.lm_studio_model_roots = answers['lm_studio_model_roots (comma-separated)']
-        o.path = answers['opencode_path']
-        o.backup_dir = answers['opencode_backup_dir']
-        o.default_model_id = answers['default_model_id']
-        o.small_model_id = answers['small_model_id']
-        o.build_model_id = answers['build_model_id']
-        o.plan_model_id = answers['plan_model_id']
-        o.instructions = [s.strip() for s in answers['instructions (comma-separated)'].split(',') if s.strip()]
-        o.build_prompt = answers['build_prompt']
-        o.plan_prompt = answers['plan_prompt']
-        o.timeout = int(answers['timeout'])
-        o.chunk_timeout = int(answers['chunk_timeout'])
-        o.terminal_command = answers['terminal_command']
-        o.last_workspace_path = answers['last_workspace_path']
-        hermes.command = answers['hermes_command'].strip() or 'hermes'
-        hermes.home_root = answers['hermes_home_root']
-        hermes.default_model_id = answers['hermes_default_model_id']
-        hermes.code_model_id = answers['hermes_code_model_id']
-        hermes.toolsets = [s.strip() for s in answers['hermes_toolsets (comma-separated)'].split(',') if s.strip()]
-        hermes.max_turns = int(answers['hermes_max_turns'])
-        hermes.quiet = answers['hermes_quiet true/false'].lower() == 'true'
-        hermes.min_context_tokens = int(answers['hermes_min_context_tokens'])
-        hermes.allow_experimental_context_override = answers['hermes_allow_experimental_context_override true/false'].lower() == 'true'
-        hermes.experimental_context_override_tokens = int(answers['hermes_experimental_context_override_tokens'])
-        hermes.terminal_command = answers['hermes_terminal_command']
-        hermes.last_workspace_path = answers['hermes_last_workspace_path']
-        app.save()
-        return True
-    except Exception:
-        return False
-def prompt_workspace(stdscr, app: AppConfig, runtime: str = 'opencode') -> Optional[str]:
-    curses.endwin()
-    settings = app.hermes if runtime == 'hermes' else app.opencode
-    default = getattr(settings, 'last_workspace_path', '') or str(Path.cwd())
+        while True:
+            scroll = clamp_scroll(scroll, len(lines), content_h)
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, 'Help', colors['accent'] | curses.A_BOLD, colors['accent'])
+            visible = lines[scroll: scroll + content_h]
+            for idx, line in enumerate(visible):
+                attr = colors['accent'] | curses.A_BOLD if line in ('Quick Help', 'List view', 'Detail view', 'Power tools') else curses.A_NORMAL
+                safe_addstr(modal, 2 + idx, 2, line[: box_w - 4], attr)
+            safe_addstr(modal, box_h - 2, 2, '[Up/Down] scroll  [Esc/q] close'[: box_w - 4], colors['muted'])
+            modal.refresh()
+            key = modal.getch()
+            if key in (27, ord('q')):
+                return
+            if key in (curses.KEY_UP, ord('k')):
+                scroll -= 1
+            elif key in (curses.KEY_DOWN, ord('j')):
+                scroll += 1
+            elif key == curses.KEY_PPAGE:
+                scroll -= content_h
+            elif key == curses.KEY_NPAGE:
+                scroll += content_h
+    finally:
+        stdscr.touchwin()
+        stdscr.nodelay(True)
+
+
+def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = None) -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = [('Config Doctor', 'heading')]
+    llama_ok = app.command_exists(app.llama_server)
+    vllm_ok = app.command_exists(app.vllm_command)
+    hermes_ok = app.command_exists(getattr(app.hermes, 'command', 'hermes') or 'hermes')
+    items.extend([
+        (f'llama-server: {"ok" if llama_ok else "missing"}  {app.llama_server}', 'success' if llama_ok else 'error'),
+        (f'vLLM: {"ok" if vllm_ok else "missing"}  {app.vllm_command}', 'success' if vllm_ok else 'warning'),
+        (f'Hermes: {"ok" if hermes_ok else "missing"}  {getattr(app.hermes, "command", "hermes") or "hermes"}', 'success' if hermes_ok else 'warning'),
+        (f'OpenCode config: {app.opencode.path or "<unset>"}', 'success' if app.opencode.path else 'warning'),
+        (f'Continue config: {getattr(app.continue_settings, "path", "") or "<unset>"} mode={getattr(app.continue_settings, "merge_mode", "preserve_sections")}', 'success' if getattr(app.continue_settings, 'path', '') else 'warning'),
+        (f'Hermes home: {getattr(app.hermes, "home_root", "") or "<unset>"}', 'success' if getattr(app.hermes, 'home_root', '') else 'warning'),
+    ])
+    terminal = app.detect_terminal_launcher()
+    items.append((f'terminal launcher: {terminal or "<not detected>"}', 'success' if terminal else 'warning'))
+    code_ok = app.command_exists('code')
+    items.append((f'VS Code CLI: {"ok" if code_ok else "missing"}', 'success' if code_ok else 'warning'))
+    statuses: Dict[str, int] = {}
+    for model in list(getattr(app, 'models', []) or []):
+        status = str(getattr(model, 'verification_status', 'unknown') or 'unknown')
+        statuses[status] = statuses.get(status, 0) + 1
+    status_line = ' '.join(f'{key}:{value}' for key, value in sorted(statuses.items())) or 'none'
+    items.append((f'model verification: {status_line}', 'success' if statuses.get('passed') else 'muted'))
+    pending = app.benchmark_proof_model_ids(force=False)
+    items.append((f'benchmark proof needed: {len(pending)} model(s)', 'warning' if pending else 'success'))
+    if active_model:
+        result = getattr(active_model, 'verification_results', {}) or {}
+        cap = result.get('cap', {}) if isinstance(result, dict) else {}
+        items.extend([
+            ('', 'normal'),
+            (f'active model: {active_model.id}', 'heading'),
+            (f'verification: {getattr(active_model, "verification_status", "unknown")} {getattr(active_model, "verification_summary", "")}', 'normal'),
+            (f'cap: factor={cap.get("limiting_factor", "-")} configured={cap.get("configured_ctx", "-")} slot={cap.get("ctx_per_slot", "-")} safe={cap.get("estimated_safe_context", "-")} measured={cap.get("measured_max_context", "-")}', 'normal'),
+        ])
+    return items
+
+
+def show_config_doctor_overlay(stdscr, colors, app: AppConfig, active_model: Optional[ModelConfig] = None):
+    h, w = stdscr.getmaxyx()
+    box_w = min(108, max(62, w - 8))
+    box_h = min(max(12, h - 6), 24)
+    if h < 12 or w < 64:
+        return
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(2, (h - box_h) // 2)
+    modal = curses.newwin(box_h, box_w, box_y, box_x)
+    modal.keypad(True)
+    content_h = max(1, box_h - 4)
+    rows = config_doctor_items(app, active_model=active_model)
+    items = []
+    for text, kind in rows:
+        attr = (
+            colors['accent'] | curses.A_BOLD if kind == 'heading'
+            else colors['success'] | curses.A_BOLD if kind == 'success'
+            else colors['warning'] if kind == 'warning'
+            else colors['error'] | curses.A_BOLD if kind == 'error'
+            else colors['muted'] if kind == 'muted'
+            else curses.A_NORMAL
+        )
+        items.extend((line, attr) for line in wrap_display_item_lines(text, box_w - 4))
+    scroll = 0
+    stdscr.nodelay(False)
     try:
-        value = input(f'\nWorkspace path [{default}]: ').strip()
-    except KeyboardInterrupt:
-        value = ''
-    stdscr.clear()
-    stdscr.refresh()
-    return value or default
+        while True:
+            visible, scroll, _older, _newer, _total = scrollable_pane_item_view(items, box_w - 4, content_h, scroll)
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, 'Config Doctor', colors['accent'] | curses.A_BOLD, colors['accent'])
+            for idx, (line, attr) in enumerate(visible):
+                safe_addstr(modal, 2 + idx, 2, line[: box_w - 4], attr)
+            safe_addstr(modal, box_h - 2, 2, '[PgUp/PgDn] scroll  [Esc/q] close'[: box_w - 4], colors['muted'])
+            modal.refresh()
+            key = modal.getch()
+            if key in (27, ord('q')):
+                return
+            action = RIGHT_PANE_SCROLL_KEYS.get(key, '')
+            if action:
+                scroll = adjust_scroll_offset(scroll, action, len(items), content_h)
+    finally:
+        stdscr.touchwin()
+        stdscr.nodelay(True)
+
+
+def measured_profile_line(model: ModelConfig, key: str, label: str) -> str:
+    profile = dict((getattr(model, 'measured_profiles', {}) or {}).get(key) or {})
+    if not profile or str(profile.get('status', 'ok') or 'ok') != 'ok':
+        return f'{label}: not measured'
+    ctx_slot = int(profile.get('ctx_per_slot', profile.get('ctx', 0)) or 0)
+    tps = float(profile.get('tokens_per_sec', 0.0) or 0.0)
+    parallel = int(profile.get('parallel', 1) or 1)
+    return f'{label}: {tps:.2f} tok/s  ctx/slot={ctx_slot}  par={parallel}'
+
+
+def compare_overlay_lines(app: AppConfig, left: ModelConfig, right: ModelConfig) -> List[str]:
+    return [
+        'Model Compare',
+        '',
+        f'left:  {left.name} [{left.id}]',
+        f'right: {right.name} [{right.id}]',
+        '',
+        f'runtime/source: {display_runtime(left)} / {getattr(left, "source", "manual")}   |   {display_runtime(right)} / {getattr(right, "source", "manual")}',
+        f'favorite/freshness: {"yes" if getattr(left, "favorite", False) else "no"} / {benchmark_freshness_display(app, left)}   |   {"yes" if getattr(right, "favorite", False) else "no"} / {benchmark_freshness_display(app, right)}',
+        f'ctx/output: {left.ctx}/{left.output}   |   {right.ctx}/{right.output}',
+        f'threads/ngl/parallel: {left.threads}/{left.ngl}/{left.parallel}   |   {right.threads}/{right.ngl}/{right.parallel}',
+        f'roles: {app.role_badges(left.id)}   |   {app.role_badges(right.id)}',
+        f'last used: {getattr(left, "last_used_at", "") or "-"}   |   {getattr(right, "last_used_at", "") or "-"}',
+        '',
+        measured_profile_line(left, 'auto', 'Auto') + '   |   ' + measured_profile_line(right, 'auto', 'Auto'),
+        measured_profile_line(left, 'fast_chat', 'Fast') + '   |   ' + measured_profile_line(right, 'fast_chat', 'Fast'),
+        measured_profile_line(left, 'long_context', 'Long') + '   |   ' + measured_profile_line(right, 'long_context', 'Long'),
+        measured_profile_line(left, 'opencode_ready', 'Code') + '   |   ' + measured_profile_line(right, 'opencode_ready', 'Code'),
+    ]
+
+
+def show_compare_overlay(stdscr, colors, app: AppConfig, left: Optional[ModelConfig], right: Optional[ModelConfig]):
+    if not left or not right:
+        return
+    h, w = stdscr.getmaxyx()
+    box_w = min(108, max(60, w - 8))
+    box_h = min(max(12, h - 6), 20)
+    if h < 12 or w < 62:
+        return
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(2, (h - box_h) // 2)
+    modal = curses.newwin(box_h, box_w, box_y, box_x)
+    modal.keypad(True)
+    content_h = max(1, box_h - 4)
+    lines = [line for raw in compare_overlay_lines(app, left, right) for line in wrap_display_item_lines(raw, box_w - 4)]
+    scroll = 0
+    stdscr.nodelay(False)
+    try:
+        while True:
+            scroll = clamp_scroll(scroll, len(lines), content_h)
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, 'Compare', colors['accent'] | curses.A_BOLD, colors['accent'])
+            visible = lines[scroll: scroll + content_h]
+            for idx, line in enumerate(visible):
+                attr = colors['accent'] | curses.A_BOLD if line in ('Model Compare',) else curses.A_NORMAL
+                safe_addstr(modal, 2 + idx, 2, line[: box_w - 4], attr)
+            safe_addstr(modal, box_h - 2, 2, '[Up/Down] scroll  [Esc/q] close'[: box_w - 4], colors['muted'])
+            modal.refresh()
+            key = modal.getch()
+            if key in (27, ord('q')):
+                return
+            if key in (curses.KEY_UP, ord('k')):
+                scroll -= 1
+            elif key in (curses.KEY_DOWN, ord('j')):
+                scroll += 1
+    finally:
+        stdscr.touchwin()
+        stdscr.nodelay(True)
+
+
+def prompt_command_palette(stdscr, colors) -> str:
+    return prompt_modal_choice(stdscr, colors, 'Command Palette', [
+        ('1', 'Search models', 'search'),
+        ('2', 'Set filters', 'filters'),
+        ('3', 'Sort models', 'sort'),
+        ('4', 'Toggle favorite', 'favorite'),
+        ('5', 'Toggle detail density', 'density'),
+        ('6', 'Open help', 'help'),
+        ('7', 'Open settings', 'settings'),
+        ('8', 'Detect models', 'detect'),
+        ('9', 'Compare with machine pick', 'compare'),
+        ('o', 'Export OpenCode config', 'export_opencode'),
+        ('c', 'Export Continue config', 'export_continue'),
+        ('g', 'Export Hermes config', 'export_hermes'),
+        ('v', 'Verify selected model', 'verify_selected'),
+        ('a', 'Verify all benchmark proof', 'verify_all'),
+        ('!', 'Open config doctor', 'config_doctor'),
+        ('q', 'Cancel', 'cancel'),
+    ])
 def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str, str]]) -> str:
     h, w = stdscr.getmaxyx()
     box_w = min(68, max(48, w - 8))
@@ -2040,6 +2981,12 @@ def tui(stdscr, app: AppConfig):
     stdscr.nodelay(True)
     stdscr.keypad(True)
     selected = 0
+    list_search = ''
+    filter_runtime = 'all'
+    filter_source = 'all'
+    filter_status = 'all'
+    filter_tag = 'all'
+    sort_mode = normalize_choice(getattr(app.ui, 'preferred_sort', 'port'), tuple(key for key, _label in SORT_OPTIONS), 'port')
     view_mode = 'list'
     detail_model_id = ''
     message = 'Ready.'
@@ -2062,6 +3009,7 @@ def tui(stdscr, app: AppConfig):
     try_status = 'idle'
     try_error = ''
     try_response_index: Optional[int] = None
+    try_launched_model_id = ''
     try_live_metrics = new_try_live_metrics()
     try_input_scroll = 0
     try_transcript_scroll = 0
@@ -2071,6 +3019,10 @@ def tui(stdscr, app: AppConfig):
     results_run_index = 0
     machine_summary_cache: Dict[str, object] = {}
     machine_summary_cache_at = 0.0
+    load_warnings = list(getattr(app, 'load_warnings', []) or [])
+    if load_warnings:
+        message = load_warnings[0]
+        error_history.extend(load_warnings[-BENCHMARK_FEED_LIMIT:])
 
     def invalidate_machine_summary():
         nonlocal machine_summary_cache_at
@@ -2083,6 +3035,26 @@ def tui(stdscr, app: AppConfig):
             machine_summary_cache = machine_best_summary(app)
             machine_summary_cache_at = now
         return machine_summary_cache
+
+    def compare_partner_model(current: Optional[ModelConfig]) -> Optional[ModelConfig]:
+        if not current:
+            return None
+        summary = current_machine_summary()
+        pick_id = str(((summary or {}).get('machine_pick') or {}).get('model_id', '') or '')
+        if pick_id and pick_id != current.id:
+            partner = app.get_model(pick_id)
+            if partner:
+                return partner
+        for row in list((summary or {}).get('rows', []) or []):
+            candidate_id = str(row.get('model_id', '') or '')
+            if candidate_id and candidate_id != current.id:
+                partner = app.get_model(candidate_id)
+                if partner:
+                    return partner
+        for candidate in current_browser_models() + list(getattr(app, 'models', []) or []):
+            if candidate.id != current.id:
+                return candidate
+        return None
 
     def reset_right_tabs(view: str = ''):
         nonlocal right_tab_by_view, right_tab_scrolls
@@ -2104,6 +3076,34 @@ def tui(stdscr, app: AppConfig):
 
     def action_running() -> bool:
         return action_thread is not None and action_thread.is_alive()
+
+    def current_browser_models() -> List[ModelConfig]:
+        return browser_models(
+            app,
+            statuses,
+            search=list_search,
+            runtime_filter=filter_runtime,
+            source_filter=filter_source,
+            status_filter=filter_status,
+            tag_filter=filter_tag,
+            sort_mode=sort_mode,
+        )
+
+    def clamp_selected():
+        nonlocal selected
+        models = current_browser_models()
+        if not models:
+            selected = 0
+            return
+        selected = max(0, min(selected, len(models) - 1))
+
+    def select_model_in_browser(model_id: str):
+        nonlocal selected
+        models = current_browser_models()
+        for idx, model in enumerate(models):
+            if model.id == model_id:
+                selected = idx
+                return
 
     def start_background_action(
         model: ModelConfig,
@@ -2182,10 +3182,11 @@ def tui(stdscr, app: AppConfig):
             message = f'⏳ {label} started for {model.id}. Progress is in the log window.'
 
     def selected_model() -> Optional[ModelConfig]:
-        if not app.models:
+        models = current_browser_models()
+        if not models:
             return None
-        idx = max(0, min(selected, len(app.models) - 1))
-        return app.models[idx]
+        idx = max(0, min(selected, len(models) - 1))
+        return models[idx]
 
     def active_detail_model() -> Optional[ModelConfig]:
         if view_mode in ('detail', 'try', 'benchmark', 'results') and detail_model_id:
@@ -2231,10 +3232,11 @@ def tui(stdscr, app: AppConfig):
 
     def open_try_view(model: ModelConfig):
         nonlocal view_mode, detail_model_id, message, try_thread, try_token, try_session, try_input_scroll, try_transcript_scroll
-        nonlocal try_messages, try_input, try_status, try_error, try_response_index
+        nonlocal try_messages, try_input, try_status, try_error, try_response_index, try_launched_model_id
         if action_running():
             message = '⏳ Wait for the current launch or benchmark before opening Try it out.'
             return
+        app.mark_model_used(model.id)
         reset_right_tabs('try')
         view_mode = 'try'
         detail_model_id = model.id
@@ -2246,6 +3248,7 @@ def tui(stdscr, app: AppConfig):
         try_transcript_scroll = 0
         try_error = ''
         try_response_index = None
+        try_launched_model_id = ''
         clear_try_live_metrics(try_live_metrics)
         try_token = CancelToken()
         status, detail = app.health(model)
@@ -2257,6 +3260,9 @@ def tui(stdscr, app: AppConfig):
         try_status = 'starting'
         message = f'{model.id}: starting try-out server...'
         token = try_token
+        will_launch = not (status in ('LOADING', 'STARTING') or app.get_pid(model))
+        if will_launch:
+            try_launched_model_id = model.id
 
         def progress(text: str):
             line = compact_message(text)
@@ -2265,7 +3271,7 @@ def tui(stdscr, app: AppConfig):
 
         def runner():
             try:
-                if status in ('LOADING', 'STARTING') or app.get_pid(model):
+                if not will_launch:
                     progress(f'{model.id} is starting; waiting for chat readiness...')
                     ok, result = app.wait_until_ready(model, timeout=180, cancel_token=token)
                 else:
@@ -2357,14 +3363,17 @@ def tui(stdscr, app: AppConfig):
 
     def exit_try_view():
         nonlocal view_mode, message, last_refresh, try_thread, try_token, try_session, try_input, try_input_scroll, try_transcript_scroll
-        nonlocal try_status, try_error, try_response_index
+        nonlocal try_status, try_error, try_response_index, try_launched_model_id
         model = active_detail_model()
         if try_token is not None:
             try_token.cancel('leaving try-out')
         try_session += 1
         stop_msg = 'no model selected'
         if model:
-            _ok, stop_msg = stop_try_model(app, model)
+            if should_stop_try_model(try_launched_model_id, model):
+                _ok, stop_msg = stop_try_model(app, model)
+            else:
+                stop_msg = 'left pre-existing server running'
             append_model_log(app, model, f'try-it-out exit: {stop_msg}')
             message = f'{model.id}: try-out closed; {stop_msg}'
         else:
@@ -2379,6 +3388,7 @@ def tui(stdscr, app: AppConfig):
         try_status = 'idle'
         try_error = ''
         try_response_index = None
+        try_launched_model_id = ''
         clear_try_live_metrics(try_live_metrics)
         statuses.clear()
         last_refresh = 0.0
@@ -2404,10 +3414,12 @@ def tui(stdscr, app: AppConfig):
             return
         if launch_mode in ('opencode', 'full_stack', 'hermes', 'hermes_full_stack'):
             runtime = 'hermes' if launch_mode in ('hermes', 'hermes_full_stack') else 'opencode'
-            workspace = prompt_workspace(stdscr, app, runtime=runtime)
+            workspace = prompt_workspace(stdscr, colors, app, runtime=runtime)
             if not workspace:
                 message = f'{"Hermes" if runtime == "hermes" else "OpenCode"} launch cancelled.'
                 return
+            app.remember_workspace_preset(runtime, workspace)
+            app.mark_model_used(model.id)
             label = (
                 'Hermes full-stack launch'
                 if launch_mode == 'hermes_full_stack'
@@ -2435,6 +3447,7 @@ def tui(stdscr, app: AppConfig):
             return
         if launch_mode in SIMPLE_PROFILE_ACTIONS:
             mode, tier, label = simple_profile_action(launch_mode)
+            app.mark_model_used(model.id)
             start_background_action(
                 model,
                 f'{label} launch',
@@ -2456,6 +3469,7 @@ def tui(stdscr, app: AppConfig):
             if tier == 'cancel':
                 message = 'Launch cancelled.'
                 return
+            app.mark_model_used(model.id)
             start_background_action(
                 model,
                 f'{profile_label(advanced_mode)} / {tier_label(tier)} launch',
@@ -2469,6 +3483,7 @@ def tui(stdscr, app: AppConfig):
                 ),
             )
         else:
+            app.mark_model_used(model.id)
             start_background_action(
                 model,
                 'model launch',
@@ -2573,12 +3588,13 @@ def tui(stdscr, app: AppConfig):
             statuses = {m.id: app.health(m) for m in app.models}
             last_refresh = now
 
+        browser_list = current_browser_models()
         if app.models:
-            selected = max(0, min(selected, len(app.models) - 1))
+            clamp_selected()
             if view_mode in ('detail', 'try', 'benchmark', 'results'):
                 current_detail = app.get_model(detail_model_id)
                 if not current_detail:
-                    detail_model_id = app.models[selected].id
+                    detail_model_id = browser_list[selected].id if browser_list else ''
         else:
             selected = 0
             view_mode = 'list'
@@ -2907,12 +3923,27 @@ def tui(stdscr, app: AppConfig):
             else:
                 hermes_summary = 'not run yet; press H for Hermes workflow'
             hardware = app.hardware_profile().short_summary()
+            detail_density = normalize_choice(getattr(app.ui, 'detail_density', 'simple'), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+            freshness = benchmark_freshness_display(app, model)
+            verification_status = getattr(model, 'verification_status', 'unknown') or 'unknown'
+            verification_summary = getattr(model, 'verification_summary', '') or 'not verified'
+            tags_text = ', '.join(list(getattr(model, 'tags', []) or [])) or '-'
+            cap = dict((getattr(model, 'verification_results', {}) or {}).get('cap') or {})
+            cap_text = (
+                f'cap: {cap.get("limiting_factor", "-")} '
+                f'configured={cap.get("configured_ctx", "-")} slot={cap.get("ctx_per_slot", context_per_slot(model))} '
+                f'safe={cap.get("estimated_safe_context", "-")} measured={cap.get("measured_max_context", "-")}'
+            )
             detail_rows = [
-                ('[Esc] back   [Enter/l] actions   [T] try   [B] deep bench   [F] fast bench   [O] opencode bench   [H] hermes bench   [R] results   [z] auto', colors['accent'] | curses.A_BOLD),
+                ('[Esc] back   [Enter/l] actions   [T] try   [B] deep bench   [F] fast bench   [O] opencode bench   [H] hermes bench   [R] results   [z] auto   [v] detail density', colors['accent'] | curses.A_BOLD),
                 ('', curses.A_NORMAL),
                 (f'name: {model.name}', curses.A_BOLD),
                 (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
                 (f'quant/type: {extract_quant(model)} / {classify_model_type(model)}', curses.A_NORMAL),
+                (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {freshness}', curses.A_NORMAL),
+                (f'tags: {tags_text}', curses.A_NORMAL),
+                (f'verification: {verification_status} / {verification_summary}', colors['success'] | curses.A_BOLD if verification_status == 'passed' else colors['warning'] if verification_status in ('warning', 'needs_benchmark', 'unknown') else colors['error'] | curses.A_BOLD),
+                (cap_text, curses.A_NORMAL),
                 (f'path: {model.path}', curses.A_NORMAL),
                 (f'alias/bind: {model.alias} / http://{model.host}:{model.port}', curses.A_NORMAL),
                 (f'status: {status} ({detail})', status_attr(colors, status)),
@@ -2922,6 +3953,8 @@ def tui(stdscr, app: AppConfig):
                 (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
                 (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
                 (f'ctx range: {getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)}', curses.A_NORMAL),
+                (f'last used: {getattr(model, "last_used_at", "") or "-"}', curses.A_NORMAL),
+                (f'detail density: {detail_density_label(detail_density)}', curses.A_NORMAL),
                 (f'hardware: {hardware}', curses.A_NORMAL),
                 (f'last benchmark: {benchmark_summary}', colors['warning'] if benchmark_score <= 0 else colors['success'] | curses.A_BOLD),
                 (f'opencode benchmark: {opencode_summary}', colors['warning'] if opencode_score <= 0 else colors['success'] | curses.A_BOLD),
@@ -2930,89 +3963,108 @@ def tui(stdscr, app: AppConfig):
                 (' '.join(app.build_command(model)), curses.A_NORMAL),
                 ('', curses.A_NORMAL),
             ]
-            benchmark_rows = list(getattr(model, 'last_benchmark_results', []) or [])
-            if not benchmark_rows and benchmark_score > 0:
-                preset_tier = (getattr(model, 'last_benchmark_profile', '') or 'winner/-').split()[0]
-                preset, _, tier = preset_tier.partition('/')
-                benchmark_rows = [{
-                    'preset': preset or 'winner',
-                    'tier': tier or '-',
-                    'status': 'ok',
-                    'tokens_per_sec': benchmark_score,
-                    'seconds': benchmark_seconds,
-                    'ctx': model.ctx,
-                    'parallel': model.parallel,
-                    'threads': model.threads,
-                    'ngl': model.ngl,
-                }]
-            detail_rows.extend([('', curses.A_NORMAL), ('server benchmark table:', colors['accent'] | curses.A_BOLD)])
-            if benchmark_rows:
-                detail_rows.extend(benchmark_ranking_items(
-                    {
-                        'kind': 'server',
-                        'records': benchmark_rows,
-                        'winners': getattr(model, 'measured_profiles', {}) or {},
-                    },
-                    width=left_w - 5,
-                    success_attr=colors['success'] | curses.A_BOLD,
-                    warning_attr=colors['warning'],
-                    error_attr=colors['error'],
-                    heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
-                    normal_attr=curses.A_NORMAL,
-                ))
-            else:
-                detail_rows.append((' no benchmark rows yet; server start is still available', colors['warning']))
+            if detail_density == 'advanced':
+                benchmark_rows = list(getattr(model, 'last_benchmark_results', []) or [])
+                if not benchmark_rows and benchmark_score > 0:
+                    preset_tier = (getattr(model, 'last_benchmark_profile', '') or 'winner/-').split()[0]
+                    preset, _, tier = preset_tier.partition('/')
+                    benchmark_rows = [{
+                        'preset': preset or 'winner',
+                        'tier': tier or '-',
+                        'status': 'ok',
+                        'tokens_per_sec': benchmark_score,
+                        'seconds': benchmark_seconds,
+                        'ctx': model.ctx,
+                        'parallel': model.parallel,
+                        'threads': model.threads,
+                        'ngl': model.ngl,
+                    }]
+                detail_rows.extend([('', curses.A_NORMAL), ('server benchmark table:', colors['accent'] | curses.A_BOLD)])
+                if benchmark_rows:
+                    detail_rows.extend(benchmark_ranking_items(
+                        {
+                            'kind': 'server',
+                            'records': benchmark_rows,
+                            'winners': getattr(model, 'measured_profiles', {}) or {},
+                        },
+                        width=left_w - 5,
+                        success_attr=colors['success'] | curses.A_BOLD,
+                        warning_attr=colors['warning'],
+                        error_attr=colors['error'],
+                        heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
+                        normal_attr=curses.A_NORMAL,
+                    ))
+                else:
+                    detail_rows.append((' no benchmark rows yet; server start is still available', colors['warning']))
 
-            opencode_rows = list(getattr(model, 'last_opencode_benchmark_results', []) or [])
-            detail_rows.extend([('', curses.A_NORMAL), ('opencode workflow table:', colors['accent'] | curses.A_BOLD)])
-            if opencode_rows:
-                detail_rows.extend(benchmark_ranking_items(
-                    {'kind': 'opencode', 'records': opencode_rows, 'winners': {}},
-                    width=left_w - 5,
-                    success_attr=colors['success'] | curses.A_BOLD,
-                    warning_attr=colors['warning'],
-                    error_attr=colors['error'],
-                    heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
-                    normal_attr=curses.A_NORMAL,
-                ))
-            else:
-                detail_rows.append((' no opencode workflow rows yet; press O to run', colors['warning']))
+                opencode_rows = list(getattr(model, 'last_opencode_benchmark_results', []) or [])
+                detail_rows.extend([('', curses.A_NORMAL), ('opencode workflow table:', colors['accent'] | curses.A_BOLD)])
+                if opencode_rows:
+                    detail_rows.extend(benchmark_ranking_items(
+                        {'kind': 'opencode', 'records': opencode_rows, 'winners': {}},
+                        width=left_w - 5,
+                        success_attr=colors['success'] | curses.A_BOLD,
+                        warning_attr=colors['warning'],
+                        error_attr=colors['error'],
+                        heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
+                        normal_attr=curses.A_NORMAL,
+                    ))
+                else:
+                    detail_rows.append((' no opencode workflow rows yet; press O to run', colors['warning']))
 
-            hermes_rows = list(getattr(model, 'last_hermes_benchmark_results', []) or [])
-            detail_rows.extend([('', curses.A_NORMAL), ('hermes workflow table:', colors['accent'] | curses.A_BOLD)])
-            if hermes_rows:
-                detail_rows.extend(benchmark_ranking_items(
-                    {'kind': 'hermes', 'records': hermes_rows, 'winners': {}},
-                    width=left_w - 5,
-                    success_attr=colors['success'] | curses.A_BOLD,
-                    warning_attr=colors['warning'],
-                    error_attr=colors['error'],
-                    heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
-                    normal_attr=curses.A_NORMAL,
-                ))
+                hermes_rows = list(getattr(model, 'last_hermes_benchmark_results', []) or [])
+                detail_rows.extend([('', curses.A_NORMAL), ('hermes workflow table:', colors['accent'] | curses.A_BOLD)])
+                if hermes_rows:
+                    detail_rows.extend(benchmark_ranking_items(
+                        {'kind': 'hermes', 'records': hermes_rows, 'winners': {}},
+                        width=left_w - 5,
+                        success_attr=colors['success'] | curses.A_BOLD,
+                        warning_attr=colors['warning'],
+                        error_attr=colors['error'],
+                        heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
+                        normal_attr=curses.A_NORMAL,
+                    ))
+                else:
+                    detail_rows.append((' no Hermes workflow rows yet; press H to run', colors['warning']))
             else:
-                detail_rows.append((' no Hermes workflow rows yet; press H to run', colors['warning']))
+                detail_rows.extend([
+                    ('benchmark tables hidden in Simple mode; press v for Advanced details.', colors['muted']),
+                    (f'server rows: {len(getattr(model, "last_benchmark_results", []) or [])}', colors['muted']),
+                    (f'opencode rows: {len(getattr(model, "last_opencode_benchmark_results", []) or [])}', colors['muted']),
+                    (f'hermes rows: {len(getattr(model, "last_hermes_benchmark_results", []) or [])}', colors['muted']),
+                ])
 
             detail_items = scrollable_pane_wrapped_items(detail_rows, left_w - 5)
             for i, (line, attr) in enumerate(detail_items[:content_rows]):
                 safe_addstr(stdscr, box_top + 2 + i, 3, line[: left_w - 4], attr)
-        elif app.models:
-            header = ' ID              PRT  ST        RLS  ENG        QNT      TYPE   NAME'
+        elif browser_list:
+            header = ' ID              PRT  ST        BN    RLS  ENG        QNT      TYPE   NAME'
             if content_rows > 0:
-                safe_addstr(stdscr, box_top + 2, 3, header, colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD)
-            start_idx, end_idx = visible_selection_window(len(app.models), selected, visible_rows)
+                summary = (
+                    f'search={list_search or "-"}  runtime={filter_option_label(FILTER_RUNTIME_OPTIONS, filter_runtime)}  '
+                    f'source={filter_option_label(FILTER_SOURCE_OPTIONS, filter_source)}  '
+                    f'status={filter_option_label(FILTER_STATUS_OPTIONS, filter_status)}  '
+                    f'tag={filter_tag}  sort={sort_mode_label(sort_mode)}'
+                )
+                safe_addstr(stdscr, box_top + 2, 3, ellipsize(summary, left_w - 4), colors['muted'])
+            if content_rows > 1:
+                safe_addstr(stdscr, box_top + 3, 3, header, colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD)
+            start_idx, end_idx = visible_selection_window(len(browser_list), selected, max(0, visible_rows - 1))
             for idx in range(start_idx, end_idx):
-                model = app.models[idx]
+                model = browser_list[idx]
                 status, _ = statuses.get(model.id, ('?', ''))
                 roles = app.role_badges(model.id)
                 engine = display_runtime(model)[:10]
                 quant = extract_quant(model)[:8]
                 model_type = classify_model_type(model)[:6]
-                name_col_width = max(10, left_w - 70)
+                freshness = benchmark_freshness_short(app, model)
+                name_col_width = max(10, left_w - 75)
+                favorite_prefix = '★ ' if getattr(model, 'favorite', False) and name_col_width >= 14 else ''
                 best_badge = ' BEST' if model.id == machine_pick_id and name_col_width >= 15 else ''
-                display_name = (model.name or model.id)[: max(1, name_col_width - len(best_badge))] + best_badge
-                line = f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  {roles:3}  {engine:10} {quant:8} {model_type:6} {display_name}'
-                row_y = box_top + 3 + idx - start_idx
+                display_name = favorite_prefix + (model.name or model.id)
+                display_name = display_name[: max(1, name_col_width - len(best_badge))] + best_badge
+                line = f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  {freshness:4}  {roles:3}  {engine:10} {quant:8} {model_type:6} {display_name}'
+                row_y = box_top + 4 + idx - start_idx
                 if idx == selected:
                     try:
                         safe_addstr(stdscr, row_y, 3, line[: left_w - 3], colors['selection'] | curses.A_BOLD)
@@ -3022,18 +4074,25 @@ def tui(stdscr, app: AppConfig):
                     safe_addstr(stdscr, row_y, 3, line[: left_w - 3])
                     status_x = 3 + 1 + 14 + 1 + 4 + 2
                     safe_addstr(stdscr, row_y, status_x, f'{status_symbol(status)} {status[:6]:6}', status_attr(colors, status))
-            if visible_rows > 0 and len(app.models) > visible_rows:
-                bar_h = visible_rows
+            if visible_rows > 1 and len(browser_list) > max(1, visible_rows - 1):
+                bar_h = max(1, visible_rows - 1)
                 track_x = left_w - 1
                 for i in range(bar_h):
-                    safe_addch(stdscr, box_top + 3 + i, track_x, '│', colors['muted'])
-                thumb_h = max(1, int(bar_h * (visible_rows / max(1, len(app.models)))))
-                thumb_top = int((start_idx / max(1, len(app.models) - visible_rows)) * max(0, bar_h - thumb_h))
+                    safe_addch(stdscr, box_top + 4 + i, track_x, '│', colors['muted'])
+                thumb_h = max(1, int(bar_h * (bar_h / max(1, len(browser_list)))))
+                thumb_top = int((start_idx / max(1, len(browser_list) - bar_h)) * max(0, bar_h - thumb_h))
                 for i in range(thumb_h):
-                    safe_addch(stdscr, box_top + 3 + thumb_top + i, track_x, '█', colors['accent'] | curses.A_BOLD)
-        else:
+                    safe_addch(stdscr, box_top + 4 + thumb_top + i, track_x, '█', colors['accent'] | curses.A_BOLD)
+        elif app.models:
             if content_rows > 1:
-                safe_addstr(stdscr, box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
+                safe_addstr(stdscr, box_top + 3, 3, 'No models match the current search/filter set.', colors['warning'] | curses.A_BOLD)
+                safe_addstr(stdscr, box_top + 5, 3, 'Press / to search, f to filter, and C to clear the browser.', colors['muted'])
+        else:
+            if content_rows > 2:
+                safe_addstr(stdscr, box_top + 3, 3, 'Welcome to llama-tui. No models are configured yet.', colors['warning'] | curses.A_BOLD)
+                safe_addstr(stdscr, box_top + 5, 3, 'Press x to detect GGUFs from your managed roots.', colors['muted'])
+                safe_addstr(stdscr, box_top + 6, 3, 'Press a to add a manual llama.cpp or vLLM model.', colors['muted'])
+                safe_addstr(stdscr, box_top + 7, 3, 'Press o to review paths, exports, and UI defaults.', colors['muted'])
 
         if view_mode == 'machine_results' and right_tabs:
             summary = machine_summary or current_machine_summary()
@@ -3298,6 +4357,8 @@ def tui(stdscr, app: AppConfig):
             list_right_items: List[Tuple[str, int]] = [
                 (f'name: {model.name}', curses.A_BOLD),
                 (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {benchmark_freshness_display(app, model)}', curses.A_NORMAL),
+                (f'tags/verification: {", ".join(list(getattr(model, "tags", []) or [])) or "-"} / {getattr(model, "verification_status", "unknown")}', curses.A_NORMAL),
                 (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
                 (f'quant/type: {extract_quant(model)} / {classify_model_type(model)}', curses.A_NORMAL),
                 (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
@@ -3305,6 +4366,7 @@ def tui(stdscr, app: AppConfig):
                 (f'benchmark: {getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', curses.A_NORMAL),
                 (f'status: {status} ({detail})', status_attr(colors, status)),
                 (f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
+                (f'browser: search={list_search or "-"} runtime={filter_runtime} source={filter_source} status={filter_status} tag={filter_tag} sort={sort_mode}', colors['muted']),
                 ('', curses.A_NORMAL),
                 ('last log lines:', colors['accent'] | curses.A_BOLD),
             ]
@@ -3334,11 +4396,11 @@ def tui(stdscr, app: AppConfig):
             footer = '[Esc] models  [D] deep all  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab  [M] refresh rankings.'
         elif view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] actions  [T] try  [B] deep bench  [F] fast bench  [O] opencode  [H] hermes  [R] results'
-            footer2 = 'Tab/] next tab  Shift-Tab/[ prev tab  [Up/Down/PgUp/PgDn/Home/End] scroll tab  [z] auto  [q] quit'
+            footer = '[Esc] models  [Enter/l] actions  [T] try  [B/F/O/H] benchmarks  [R] results  [v] density'
+            footer2 = 'Tab/] next tab  Shift-Tab/[ prev tab  [g/c/G] exports  [Y/y] verify  [:] palette  [?] help'
         else:
-            footer = '[Enter] details  [z] auto profile  [B] benchmark best  [D] deep all  [R/M] machine ranks'
-            footer2 = '[Up/Down] models  [a/e/d] models  [x/X] detect/prune  [r] sync  [S] stop-all  [q] quit'
+            footer = '[Enter] details  [/] search  [f] filter  [T] sort  [C] clear browser  [*] favorite'
+            footer2 = '[a/e/d] models  [x/X] detect/prune  [R/M] ranks  [Y/y] verify  [:] palette  [?] help  [q] quit'
         if action_running():
             footer = '[A] abort active action   ' + footer
         safe_addstr(stdscr, h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
@@ -3359,6 +4421,48 @@ def tui(stdscr, app: AppConfig):
             right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, tab_direction)
             message = f'Right tab: {right_tab_label(right_tab_by_view[view_mode], len(error_source_lines))}.'
             continue
+        if key == ord('?'):
+            show_help_overlay(stdscr, colors)
+            message = 'Help closed.'
+            continue
+        if key == ord('V'):
+            model = active_detail_model() if view_mode != 'list' else selected_model()
+            partner = compare_partner_model(model)
+            if model and partner:
+                show_compare_overlay(stdscr, colors, app, model, partner)
+                message = f'Compared {model.id} against {partner.id}.'
+            else:
+                message = 'Need at least two models for compare.'
+            continue
+        if key == ord(':'):
+            action = prompt_command_palette(stdscr, colors)
+            palette_keys = {
+                'search': ord('/'),
+                'filters': ord('f'),
+                'sort': ord('T'),
+                'favorite': ord('*'),
+                'density': ord('v'),
+                'help': ord('?'),
+                'settings': ord('o'),
+                'detect': ord('x'),
+                'compare': ord('V'),
+                'export_opencode': ord('g'),
+                'export_continue': ord('c'),
+                'export_hermes': ord('G'),
+                'verify_selected': ord('Y'),
+                'verify_all': ord('y'),
+            }
+            if action in palette_keys:
+                key = palette_keys[action]
+            elif action == 'clear_browser':
+                key = ord('C')
+            elif action == 'config_doctor':
+                show_config_doctor_overlay(stdscr, colors, app, active_detail_model() or selected_model())
+                message = 'Config Doctor closed.'
+                continue
+            else:
+                message = 'Command palette cancelled.'
+                continue
         if view_mode == 'try':
             transcript_scroll_action = try_transcript_scroll_action(key)
             if transcript_scroll_action:
@@ -3418,6 +4522,62 @@ def tui(stdscr, app: AppConfig):
             if action_token is not None:
                 action_token.cancel('user requested abort')
             message = '⏳ Aborting active action and cleaning up managed processes...'
+            continue
+        if view_mode == 'list' and key == ord('/'):
+            updated_search = prompt_search_query(stdscr, colors, list_search)
+            if updated_search is not None:
+                list_search = updated_search
+                selected = 0
+                message = f'Search set to: {list_search or "all models"}.'
+            else:
+                message = 'Search cancelled.'
+            continue
+        if view_mode == 'list' and key == ord('f'):
+            filters = prompt_browser_filters(stdscr, colors, filter_runtime, filter_source, filter_status, filter_tag)
+            if filters is not None:
+                filter_runtime, filter_source, filter_status, filter_tag = filters
+                selected = 0
+                message = (
+                    f'Filters set: {filter_option_label(FILTER_RUNTIME_OPTIONS, filter_runtime)}, '
+                    f'{filter_option_label(FILTER_SOURCE_OPTIONS, filter_source)}, '
+                    f'{filter_option_label(FILTER_STATUS_OPTIONS, filter_status)}, tag={filter_tag}.'
+                )
+            else:
+                message = 'Filter changes cancelled.'
+            continue
+        if view_mode == 'list' and key == ord('C'):
+            list_search = ''
+            filter_runtime = 'all'
+            filter_source = 'all'
+            filter_status = 'all'
+            filter_tag = 'all'
+            selected = 0
+            message = 'Browser search and filters cleared.'
+            continue
+        if view_mode == 'list' and key == ord('T'):
+            chosen_sort = prompt_sort_mode(stdscr, colors, sort_mode)
+            if chosen_sort != 'cancel':
+                sort_mode = chosen_sort
+                app.ui.preferred_sort = chosen_sort
+                app.save()
+                selected = 0
+                message = f'Sort mode: {sort_mode_label(chosen_sort)}.'
+            else:
+                message = 'Sort unchanged.'
+            continue
+        if key == ord('*'):
+            model = active_detail_model() if view_mode != 'list' else selected_model()
+            if model:
+                favorite, status_text = app.toggle_favorite(model.id)
+                message = f'{model.id}: {status_text}.'
+            else:
+                message = 'No model selected to favorite.'
+            continue
+        if view_mode == 'detail' and key == ord('v'):
+            current_density = normalize_choice(getattr(app.ui, 'detail_density', 'simple'), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+            app.ui.detail_density = 'advanced' if current_density == 'simple' else 'simple'
+            app.save()
+            message = f'Detail density: {detail_density_label(app.ui.detail_density)}.'
             continue
         if view_mode == 'benchmark' and key in (ord('W'), ord('w')):
             show_benchmark_wiki(stdscr, colors)
@@ -3480,10 +4640,10 @@ def tui(stdscr, app: AppConfig):
                 if not should_quit:
                     continue
             break
-        if key in (curses.KEY_UP, ord('k')) and app.models and view_mode == 'list':
+        if key in (curses.KEY_UP, ord('k')) and browser_list and view_mode == 'list':
             selected = max(0, selected - 1)
-        elif key in (curses.KEY_DOWN, ord('j')) and app.models and view_mode == 'list':
-            selected = min(len(app.models) - 1, selected + 1)
+        elif key in (curses.KEY_DOWN, ord('j')) and browser_list and view_mode == 'list':
+            selected = min(len(browser_list) - 1, selected + 1)
         elif key == ord('r'):
             count, items = app.detect_models()
             statuses = {m.id: app.health(m) for m in app.models}
@@ -3491,7 +4651,7 @@ def tui(stdscr, app: AppConfig):
             message = items[0] if items else (f'Synced {count} model(s)' if count else 'Synced.')
         elif key == ord('S'):
             message = '; '.join(app.stop_all())[: max(20, w - 4)]
-        elif key in (10, 13, curses.KEY_ENTER) and app.models:
+        elif key in (10, 13, curses.KEY_ENTER) and (active_detail_model() or browser_list):
             model = active_detail_model()
             if not model:
                 continue
@@ -3499,11 +4659,11 @@ def tui(stdscr, app: AppConfig):
                 begin_model_launch(model)
             else:
                 open_model_details(model)
-        elif key == ord('l') and app.models and view_mode == 'detail':
+        elif key == ord('l') and active_model and view_mode == 'detail':
             model = active_detail_model()
             if model:
                 begin_model_launch(model)
-        elif key in (ord('T'), ord('t')) and app.models and view_mode == 'detail':
+        elif key in (ord('T'), ord('t')) and active_model and view_mode == 'detail':
             model = active_detail_model()
             if model:
                 open_try_view(model)
@@ -3511,10 +4671,33 @@ def tui(stdscr, app: AppConfig):
             open_machine_results()
         elif key == ord('R') and app.models and view_mode == 'list':
             open_machine_results()
-        elif key == ord('R') and app.models and view_mode in ('detail', 'benchmark', 'results'):
+        elif key == ord('R') and active_model and view_mode in ('detail', 'benchmark', 'results'):
             model = active_detail_model()
             if model:
                 open_results_view(model)
+        elif key == ord('Y') and (active_detail_model() or selected_model()):
+            model = active_detail_model() or selected_model()
+            result = app.verify_model(model)
+            message = f'{model.id}: verification {result.get("status")} - {compact_message(str(result.get("summary", "")))}'
+        elif key == ord('y') and app.models:
+            pending = app.benchmark_proof_model_ids(force=False)
+            anchor = selected_model() or app.models[0]
+            if not pending:
+                message = 'All enabled models already have fresh benchmark proof.'
+                continue
+            invalidate_machine_summary()
+            start_background_action(
+                anchor,
+                f'verify benchmark proof ({len(pending)} pending)',
+                lambda progress, token: benchmark_all_models_deep(
+                    app,
+                    progress=progress,
+                    cancel_token=token,
+                    force=False,
+                ),
+                done_event='benchmark_done',
+                run_kind='server_all',
+            )
         elif key == ord('D') and app.models:
             choice = prompt_deep_benchmark_all(stdscr, colors)
             if choice == 'cancel':
@@ -3616,37 +4799,34 @@ def tui(stdscr, app: AppConfig):
                 run_kind='hermes',
             )
         elif key == ord('a'):
-            model = prompt_model(stdscr, 'Add model')
+            model = prompt_model(stdscr, colors, 'Add model')
             if model:
                 if not getattr(model, 'default_benchmark_status', ''):
                     model.default_benchmark_status = 'pending'
                 app.add_or_update(model)
-                selected = len(app.models) - 1
+                select_model_in_browser(model.id)
                 invalidate_machine_summary()
                 message = f'Added {model.id} with safe defaults. Open details to start now; press B for measured settings.'
         elif key == ord('e') and app.models:
-            current = active_detail_model() or app.models[selected]
-            updated = prompt_model(stdscr, f'Edit {current.id}', current)
+            current = active_detail_model() or selected_model()
+            updated = prompt_model(stdscr, colors, f'Edit {current.id}', current) if current else None
             if updated:
                 if updated.id != current.id:
                     app.delete(current.id)
                 if not getattr(updated, 'default_benchmark_status', ''):
                     updated.default_benchmark_status = 'pending'
                 app.add_or_update(updated)
-                selected = min(selected, len(app.models) - 1)
+                select_model_in_browser(updated.id)
                 if view_mode == 'detail':
                     detail_model_id = updated.id
                 invalidate_machine_summary()
                 message = f'Updated {updated.id}.'
         elif key == ord('d') and app.models:
-            delete_model = active_detail_model() or app.models[selected]
-            curses.endwin()
-            ans = input(f'Delete {delete_model.id} from llama-tui config? [y/N]: ').strip().lower()
-            stdscr.clear(); stdscr.refresh()
-            if ans == 'y':
+            delete_model = active_detail_model() or selected_model()
+            if delete_model and prompt_yes_no(stdscr, colors, 'Delete Model', f'remove {delete_model.id} from llama-tui config'):
                 target_id = delete_model.id
                 ok, msg = app.delete(target_id)
-                selected = max(0, min(selected, len(app.models) - 1))
+                clamp_selected()
                 if view_mode == 'detail':
                     view_mode = 'list'
                     detail_model_id = ''
@@ -3659,38 +4839,41 @@ def tui(stdscr, app: AppConfig):
             message = items[0] if items else (f'Detected {count} new model(s)' if count else 'No new GGUFs found.')
             if count:
                 message = f'{message} | safe defaults set; start now or press B for measured settings.'
-            selected = min(selected, len(app.models) - 1 if app.models else 0)
+            clamp_selected()
             invalidate_machine_summary()
         elif key == ord('X'):
             count, removed = app.prune_missing_models()
             message = f'Pruned {count}: {", ".join(removed[:5])}' if count else 'No missing models to prune.'
-            selected = max(0, min(selected, len(app.models) - 1))
+            clamp_selected()
             invalidate_machine_summary()
         elif key == ord('g'):
             ok, msg = app.generate_opencode()
             message = msg
+        elif key == ord('c'):
+            ok, msg = app.generate_continue_config()
+            message = msg
         elif key == ord('G') and app.models:
-            model = active_detail_model() or app.models[selected]
+            model = active_detail_model() or selected_model()
             ok, msg = app.generate_hermes_config(model)
             message = msg
         elif key == ord('o'):
-            if prompt_settings(stdscr, app):
+            if prompt_settings(stdscr, colors, app):
                 message = 'Settings saved.'
             else:
                 message = 'Settings unchanged.'
         elif key == ord('m') and app.models:
-            model = active_detail_model() or app.models[selected]
+            model = active_detail_model() or selected_model()
             app.set_role('main', model.id)
             message = f'{model.id} set as main model.'
         elif key == ord('s') and app.models:
-            model = active_detail_model() or app.models[selected]
+            model = active_detail_model() or selected_model()
             app.set_role('small', model.id)
             message = f'{model.id} set as small model.'
         elif key == ord('b') and app.models:
-            model = active_detail_model() or app.models[selected]
+            model = active_detail_model() or selected_model()
             app.set_role('build', model.id)
             message = f'{model.id} set as build model.'
         elif key == ord('p') and app.models:
-            model = active_detail_model() or app.models[selected]
+            model = active_detail_model() or selected_model()
             app.set_role('plan', model.id)
             message = f'{model.id} set as plan model.'

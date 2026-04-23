@@ -49,6 +49,15 @@ class ModelConfig:
     runtime: str = 'llama.cpp'
     source: str = 'manual'
     extra_args: List[str] = field(default_factory=list)
+    favorite: bool = False
+    last_used_at: str = ''
+    sort_rank: int = 0
+    tags: List[str] = field(default_factory=list)
+    verification_status: str = 'unknown'
+    verification_at: str = ''
+    verification_fingerprint: str = ''
+    verification_summary: str = ''
+    verification_results: Dict[str, object] = field(default_factory=dict)
 
 @dataclass
 class OpencodeSettings:
@@ -65,6 +74,16 @@ class OpencodeSettings:
     plan_model_id: str = ''
     terminal_command: str = ''
     last_workspace_path: str = ''
+    workspace_presets: List[str] = field(default_factory=list)
+
+@dataclass
+class ContinueSettings:
+    path: str = ''
+    backup_dir: str = ''
+    default_model_id: str = ''
+    edit_model_id: str = ''
+    autocomplete_model_id: str = ''
+    merge_mode: str = 'preserve_sections'
 
 @dataclass
 class HermesSettings:
@@ -80,3 +99,10 @@ class HermesSettings:
     min_context_tokens: int = 64000
     experimental_context_override_tokens: int = 0
     allow_experimental_context_override: bool = False
+    workspace_presets: List[str] = field(default_factory=list)
+
+
+@dataclass
+class UiSettings:
+    preferred_sort: str = 'port'
+    detail_density: str = 'simple'

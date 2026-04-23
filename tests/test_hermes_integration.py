@@ -50,6 +50,14 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn('context_length: 8192', config_path.read_text())
         self.assertTrue(str(config_path).startswith(str(Path(self.tmp.name))))
 
+        config_path.write_text('old hermes config', encoding='utf-8')
+        ok, msg = self.app.generate_hermes_config(self.model)
+        backups = list((config_path.parent / 'backups').glob('config.*.yaml'))
+
+        self.assertTrue(ok, msg)
+        self.assertTrue(backups)
+        self.assertEqual(backups[0].read_text(encoding='utf-8'), 'old hermes config')
+
     def test_hermes_settings_round_trip_context_policy(self):
         self.app.hermes.min_context_tokens = 64000
         self.app.hermes.allow_experimental_context_override = True
