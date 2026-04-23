@@ -1215,11 +1215,16 @@ class AppConfig:
             if self._process_gone(pid, watched_pgid):
                 self._clear_pid_tracking(model_id, pid)
                 return True, 'stopped'
+        force_pgid = pgid
+        force_signaled_group = signaled_group
         try:
-            watched_pgid, signaled_group = self._send_signal(pid, signal.SIGKILL, use_group)
+            force_pgid, force_signaled_group = self._send_signal(pid, signal.SIGKILL, use_group)
         except OSError:
-            pass
-        watched_pgid = watched_pgid if signaled_group else None
+            if not self._pid_alive(pid):
+                self._clear_pid_tracking(model_id, pid)
+                self._reap_pid(pid)
+                return True, 'already stopped'
+        watched_pgid = force_pgid if force_signaled_group else None
         for _ in range(20):
             time.sleep(0.1)
             if self._process_gone(pid, watched_pgid):

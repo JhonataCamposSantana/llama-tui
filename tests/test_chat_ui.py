@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from llama_tui.chat import build_chat_payload, parse_openai_sse_lines, stream_chat_completion
+from llama_tui.chat import build_chat_payload, parse_openai_sse_lines, stream_chat_completion, stream_chat_events
 from llama_tui.control import CancelToken, CancelledError
 from llama_tui.models import ModelConfig
 from llama_tui.ui import (
@@ -32,6 +32,7 @@ from llama_tui.ui import (
     benchmark_wiki_lines,
     benchmark_command_lines,
     build_try_live_stat_lines,
+    build_try_transcript_items,
     clamp_scroll,
     deep_benchmark_all_options,
     finish_try_live_metrics,
@@ -63,6 +64,7 @@ from llama_tui.ui import (
     try_input_max_scroll,
     try_input_row_count,
     try_input_view,
+    try_transcript_scroll_action,
     try_input_wrapped_lines,
     update_try_live_metrics,
     visible_selection_window,
@@ -105,6 +107,17 @@ class ChatPayloadTests(unittest.TestCase):
             [('chunk', 'hel'), ('chunk', 'lo'), ('done', '')],
         )
 
+    def test_sse_parser_emits_reasoning_chunks(self):
+        lines = [
+            'data: {"choices":[{"delta":{"reasoning":"plan","reasoning_content":" more","content":"answer"}}]}\n',
+            'data: [DONE]\n',
+        ]
+
+        self.assertEqual(
+            list(parse_openai_sse_lines(lines)),
+            [('reasoning', 'plan more'), ('chunk', 'answer'), ('done', '')],
+        )
+
     def test_stream_chat_completion_obeys_cancel_token(self):
         model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny-local', port=18080)
         token = CancelToken()
@@ -128,6 +141,27 @@ class ChatPayloadTests(unittest.TestCase):
             token.cancel('test cancel')
             with self.assertRaises(CancelledError):
                 next(stream)
+
+    def test_stream_chat_events_preserves_reasoning_and_chunks(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny-local', port=18080)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"reasoning":"think"}}]}\n',
+                    b'data: {"choices":[{"delta":{"content":"answer"}}]}\n',
+                ])
+
+        with patch('llama_tui.chat.request.urlopen', return_value=FakeResponse()):
+            events = list(stream_chat_events(model, [{'role': 'user', 'content': 'hi'}]))
+
+        self.assertEqual(events, [('reasoning', 'think'), ('chunk', 'answer')])
 
 
 class ProfileUiTests(unittest.TestCase):
@@ -273,6 +307,63 @@ class ProfileUiTests(unittest.TestCase):
         self.assertEqual(right_tab_scroll_key('benchmark', 'missing'), 'benchmark:progress')
         self.assertEqual(right_tab_label('errors', 3), 'Errors 3')
         self.assertEqual(right_tab_label('logs', 3), 'Logs')
+        self.assertEqual(try_transcript_scroll_action(16), 'older')
+        self.assertEqual(try_transcript_scroll_action(14), 'newer')
+        self.assertEqual(try_transcript_scroll_action(ord('x')), '')
+
+    def test_try_transcript_builder_includes_reasoning(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny-local', port=18080)
+        items = build_try_transcript_items(
+            model,
+            [
+                {'role': 'user', 'content': 'Hello'},
+                {'role': 'assistant', 'reasoning': 'Checking options', 'content': 'Hi there'},
+            ],
+            'ready',
+            40,
+            user_attr=1,
+            assistant_attr=2,
+            muted_attr=3,
+        )
+
+        lines = [line for line, _attr in items]
+        self.assertIn('you> Hello', lines)
+        self.assertIn('tiny-local> [reasoning] Checking options', lines)
+        self.assertIn('tiny-local> Hi there', lines)
+
+    def test_try_transcript_builder_shows_reasoning_only_notice_without_placeholder(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny-local', port=18080)
+        items = build_try_transcript_items(
+            model,
+            [
+                {'role': 'assistant', 'reasoning': 'Checking options', 'content': '', 'final_notice': '[no final answer returned]'},
+            ],
+            'ready',
+            80,
+            user_attr=1,
+            assistant_attr=2,
+            muted_attr=3,
+        )
+
+        self.assertIn(('tiny-local> [reasoning] Checking options', 3), items)
+        self.assertIn(('tiny-local> [no final answer returned]', 3), items)
+        self.assertFalse(any(line == 'tiny-local> ...' for line, _attr in items))
+
+    def test_try_transcript_builder_preserves_empty_response_fallback(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny-local', port=18080)
+        items = build_try_transcript_items(
+            model,
+            [
+                {'role': 'assistant', 'reasoning': '', 'content': '(no content returned)'},
+            ],
+            'ready',
+            80,
+            user_attr=1,
+            assistant_attr=2,
+            muted_attr=3,
+        )
+
+        self.assertIn(('tiny-local> (no content returned)', 2), items)
 
     def test_header_dashboard_layout_is_responsive(self):
         enabled, left_w, right_x, right_w = header_dashboard_layout(150)
@@ -362,8 +453,8 @@ class ProfileUiTests(unittest.TestCase):
     def test_deep_benchmark_all_menu_options(self):
         options = deep_benchmark_all_options()
 
-        self.assertEqual(options[0], ('1', 'Benchmark missing/stale/failed managed models', 'missing'))
-        self.assertEqual(options[1], ('2', 'Force refresh every managed model', 'force'))
+        self.assertEqual(options[0], ('1', 'Safer adaptive batch for missing/stale/failed models', 'missing'))
+        self.assertEqual(options[1], ('2', 'Safer adaptive batch force refresh for every model', 'force'))
         self.assertEqual(options[-1], ('q', 'Cancel', 'cancel'))
 
     def test_header_dashboard_content_builder(self):

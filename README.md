@@ -142,7 +142,7 @@ Useful per-model fields:
 - `T`: open Try it out from model details.
 - `B`: run the quality-first smart benchmark.
 - `F`: run the faster benchmark.
-- `D`: run Deep Benchmark All for missing, stale, failed, or aborted managed models; the modal also offers a force refresh.
+- `D`: run the safer adaptive Deep Benchmark All for missing, stale, failed, or aborted managed models; the modal also offers a force refresh.
 - `R` on the model list or `M` from the main views: open Machine Rankings.
 - `O`: benchmark the selected model with an OpenCode workflow from details.
 - `A`: abort the active launch or benchmark action and clean up managed processes.
@@ -179,7 +179,7 @@ If the model is stopped, llama-tui asks how to launch it:
 
 If a model is already running, the details action menu offers stop, Try it out, OpenCode launch, full-stack launch, or cancel.
 
-`Start server now` uses the saved model settings guarded by safe launch checks. It does not require benchmark data. `Try it out` is available from the action menu and as `T` on model details. It opens an integrated chat console inside llama-tui. The left pane is a temporary transcript plus a five-row wrapped prompt editor; the right pane keeps the active launch profile, server logs, and live stats visible. Press `Enter` to send, `Up / Down` to scroll long prompt text, `Ctrl+U` to clear the input, and `Esc` to leave. Leaving Try-It-Out always stops the selected model, even if it was already running before you entered the console.
+`Start server now` uses the saved model settings guarded by safe launch checks. It does not require benchmark data. `Try it out` is available from the action menu and as `T` on model details. It opens an integrated chat console inside llama-tui. The left pane is a temporary transcript plus a five-row wrapped prompt editor; the right pane keeps the active launch profile, server logs, and live stats visible. Press `Enter` to send, `Up / Down` to scroll long prompt text, `Ctrl+U` to clear the input, `Ctrl+P/N/B/F/A/E` to scroll the conversation transcript, and `Esc` to leave. Streamed reasoning is shown inline above the final answer when the model provides it. Leaving Try-It-Out always stops the selected model, even if it was already running before you entered the console.
 
 For `llama.cpp`, llama-tui builds a command like:
 
@@ -307,7 +307,7 @@ If the full model fits, `ngl=999` is still used. If not, llama-tui chooses a par
 
 Press `B` on a stopped model to run the adaptive benchmark. It can take a while by design; the target budget is about 20 minutes per model, and `A` can abort it.
 
-Press `D` to run Deep Benchmark All. The default batch walks the registered models, skips fresh benchmark results, skips disabled entries, skips unmanaged external servers, and benchmarks pending, stale, failed, aborted, or missing measured profiles. If a model is already running under llama-tui management, the batch stops it for the benchmark and restores it on normal completion. The force-refresh option reruns every enabled managed model. Because this is the same quality-first benchmark as `B`, expect it to take a long time on large model libraries.
+Press `D` to run Deep Benchmark All. The default batch walks the registered models, skips fresh benchmark results, skips disabled entries, skips unmanaged external servers, and benchmarks pending, stale, failed, aborted, or missing measured profiles. If a model is already running under llama-tui management, the batch stops it for the benchmark and restores it on normal completion. The force-refresh option reruns every enabled managed model. This uses a safer adaptive batch benchmark instead of the full single-model quality-first run behind `B`, so it is better suited to large model libraries and lower-memory machines.
 
 The benchmark runner:
 

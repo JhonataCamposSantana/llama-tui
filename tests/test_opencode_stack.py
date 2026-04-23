@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -15,6 +16,7 @@ from llama_tui.benchmark import (
     adaptive_record_from_candidate,
     annotate_spectrum_records,
     apply_measured_profile,
+    benchmark_all_models_runner,
     benchmark_all_models_deep,
     benchmark_config_fingerprint,
     benchmark_profile_is_fresh,
@@ -148,6 +150,44 @@ class FakeBenchmarkApp:
         return True, 'stopped'
 
 
+class StopPidRegressionTests(unittest.TestCase):
+    def test_stop_pid_handles_sigkill_send_failure_without_internal_crash(self):
+        class FakeStopApp:
+            def __init__(self):
+                self.cleared = []
+                self.reaped = []
+                self.process_gone_checks = []
+
+            def _pid_alive(self, _pid):
+                return True
+
+            def _clear_pid_tracking(self, model_id, pid):
+                self.cleared.append((model_id, pid))
+
+            def _reap_pid(self, pid):
+                self.reaped.append(pid)
+
+            def _send_signal(self, _pid, sig, _use_group):
+                if sig == signal.SIGTERM:
+                    return 4321, True
+                raise OSError('sigkill failed')
+
+            def _process_gone(self, pid, watched_pgid):
+                self.process_gone_checks.append((pid, watched_pgid))
+                return False
+
+        app = FakeStopApp()
+        with patch('llama_tui.app.time.sleep', return_value=None):
+            ok, msg = AppConfig._stop_pid(app, 'tiny', 999, use_group=True)
+
+        self.assertFalse(ok)
+        self.assertEqual(msg, 'did not stop cleanly')
+        self.assertEqual(app.cleared, [])
+        self.assertEqual(app.reaped, [])
+        self.assertTrue(app.process_gone_checks)
+        self.assertTrue(all(watched_pgid == 4321 for _pid, watched_pgid in app.process_gone_checks))
+
+
 class DeepBenchmarkAllTests(unittest.TestCase):
     def fake_runner(self, calls):
         def runner(app, model, progress=None, cancel_token=None):
@@ -252,6 +292,18 @@ class DeepBenchmarkAllTests(unittest.TestCase):
         self.assertEqual(restore_calls, ['managed'])
         self.assertEqual(app.stop_calls, [('managed', True)])
         self.assertIn('1 restored', msg)
+
+    def test_batch_runner_uses_adaptive_benchmark_with_safer_budget(self):
+        app = FakeBenchmarkApp([])
+        model = benchmarked_model('pending', status='pending')
+
+        with patch('llama_tui.benchmark.benchmark_adaptive_profiles', return_value=(True, 'ok')) as adaptive:
+            ok, msg = benchmark_all_models_runner(app, model, progress=None, cancel_token=None)
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'ok')
+        adaptive.assert_called_once()
+        self.assertEqual(adaptive.call_args.kwargs['time_budget_seconds'], 6 * 60)
 
     def test_machine_best_summary_uses_fresh_profiles_only(self):
         fast = benchmarked_model('fast', tokens_per_sec=100.0, ctx=8192)

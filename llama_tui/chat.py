@@ -41,6 +41,11 @@ def _content_text(content) -> str:
     return str(content)
 
 
+def _delta_text(delta: Dict[str, object], *keys: str) -> str:
+    parts = [_content_text(delta.get(key)) for key in keys if key in delta]
+    return ''.join(part for part in parts if part)
+
+
 def parse_openai_sse_lines(lines: Iterable[str]) -> Iterator[Tuple[str, str]]:
     for raw_line in lines:
         line = raw_line.decode('utf-8', errors='replace') if isinstance(raw_line, bytes) else str(raw_line)
@@ -62,6 +67,9 @@ def parse_openai_sse_lines(lines: Iterable[str]) -> Iterator[Tuple[str, str]]:
             continue
         first = choices[0] or {}
         delta = first.get('delta') or {}
+        reasoning = _delta_text(delta, 'reasoning', 'reasoning_content')
+        if reasoning:
+            yield 'reasoning', reasoning
         text = _content_text(delta.get('content'))
         if not text and 'text' in first:
             text = _content_text(first.get('text'))
@@ -69,11 +77,11 @@ def parse_openai_sse_lines(lines: Iterable[str]) -> Iterator[Tuple[str, str]]:
             yield 'chunk', text
 
 
-def stream_chat_completion(
+def stream_chat_events(
     model: ModelConfig,
     messages: List[Dict[str, str]],
     cancel_token: CancelToken | None = None,
-) -> Iterator[str]:
+) -> Iterator[Tuple[str, str]]:
     check_cancelled(cancel_token)
     body = json.dumps(build_chat_payload(model, messages, stream=True)).encode('utf-8')
     req = request.Request(
@@ -90,4 +98,14 @@ def stream_chat_completion(
                 if event == 'done':
                     return
                 if text:
-                    yield text
+                    yield event, text
+
+
+def stream_chat_completion(
+    model: ModelConfig,
+    messages: List[Dict[str, str]],
+    cancel_token: CancelToken | None = None,
+) -> Iterator[str]:
+    for event, text in stream_chat_events(model, messages, cancel_token=cancel_token):
+        if event == 'chunk':
+            yield text

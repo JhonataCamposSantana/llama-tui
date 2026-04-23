@@ -24,7 +24,7 @@ from .benchmark import (
     start_model_with_progress,
     sync_opencode_after_tuning,
 )
-from .chat import stream_chat_completion
+from .chat import stream_chat_events
 from .constants import LOGO, REFRESH_SECONDS
 from .control import CancelToken, CancelledError
 from .discovery import classify_model_type, display_runtime, extract_quant
@@ -70,6 +70,14 @@ SIMPLE_PROFILE_ACTIONS = {
 }
 
 TRY_INPUT_ROWS = 5
+TRY_TRANSCRIPT_SCROLL_KEYS = {
+    16: 'older',
+    14: 'newer',
+    2: 'page_older',
+    6: 'page_newer',
+    1: 'oldest',
+    5: 'newest',
+}
 BENCHMARK_FEED_LIMIT = 80
 BENCHMARK_RECORD_LIMIT = 120
 BENCHMARK_COMMAND_LIMIT = 12
@@ -754,6 +762,54 @@ def build_try_live_stat_lines(
     ]
 
 
+def build_try_transcript_items(
+    model: ModelConfig,
+    messages: List[Dict[str, str]],
+    try_status: str,
+    width: int,
+    user_attr: int = 0,
+    assistant_attr: int = 0,
+    muted_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    body_width = max(1, int(width or 1))
+    transcript_items: List[Tuple[str, int]] = []
+    if not messages:
+        intro = (
+            'Type a prompt when the server is ready. Esc stops this model and returns to details.'
+            if try_status == 'ready'
+            else 'Starting the selected model. Input opens when /v1/models is ready.'
+        )
+        for line in wrap_display_lines(intro, body_width):
+            transcript_items.append((line, muted_attr))
+        return transcript_items
+
+    model_label = model.alias or model.id
+    for item in messages:
+        role = str(item.get('role', '') or '')
+        content = str(item.get('content', '') or '')
+        reasoning = str(item.get('reasoning', '') or '')
+        final_notice = str(item.get('final_notice', '') or '')
+        if role == 'user':
+            prefix = 'you> '
+            attr = user_attr
+        else:
+            prefix = f'{model_label}> '
+            attr = assistant_attr
+        if reasoning:
+            for line in wrap_display_lines(f'{prefix}[reasoning] {reasoning}', body_width):
+                transcript_items.append((line, muted_attr))
+        body_text = content or ('...' if not final_notice else '')
+        if body_text:
+            wrapped = wrap_display_lines(prefix + body_text, body_width)
+            for line in wrapped:
+                transcript_items.append((line, attr))
+        if final_notice:
+            for line in wrap_display_lines(f'{prefix}{final_notice}', body_width):
+                transcript_items.append((line, muted_attr))
+        transcript_items.append(('', assistant_attr))
+    return transcript_items
+
+
 def try_input_wrapped_lines(text: str, width: int) -> List[str]:
     prompt_text = f'> {text}' if text else '> '
     return wrap_display_lines(prompt_text, max(1, width)) or ['> ']
@@ -772,6 +828,10 @@ def try_input_view(text: str, width: int, rows: int, scroll: int) -> Tuple[List[
     while len(visible) < visible_rows:
         visible.append('')
     return visible, clamped_scroll, clamped_scroll > 0, clamped_scroll < max_scroll
+
+
+def try_transcript_scroll_action(key: int) -> str:
+    return TRY_TRANSCRIPT_SCROLL_KEYS.get(key, '')
 
 
 def new_benchmark_run_state(
@@ -1664,8 +1724,8 @@ def launch_options_for_stopped_model(model: ModelConfig) -> List[Tuple[str, str,
 
 def deep_benchmark_all_options() -> List[Tuple[str, str, str]]:
     return [
-        ('1', 'Benchmark missing/stale/failed managed models', 'missing'),
-        ('2', 'Force refresh every managed model', 'force'),
+        ('1', 'Safer adaptive batch for missing/stale/failed models', 'missing'),
+        ('2', 'Safer adaptive batch force refresh for every model', 'force'),
         ('q', 'Cancel', 'cancel'),
     ]
 
@@ -2004,6 +2064,9 @@ def tui(stdscr, app: AppConfig):
     try_response_index: Optional[int] = None
     try_live_metrics = new_try_live_metrics()
     try_input_scroll = 0
+    try_transcript_scroll = 0
+    try_transcript_total = 0
+    try_transcript_rows = 1
     benchmark_state = new_benchmark_run_state()
     results_run_index = 0
     machine_summary_cache: Dict[str, object] = {}
@@ -2167,7 +2230,7 @@ def tui(stdscr, app: AppConfig):
         show_benchmark_hint(model)
 
     def open_try_view(model: ModelConfig):
-        nonlocal view_mode, detail_model_id, message, try_thread, try_token, try_session, try_input_scroll
+        nonlocal view_mode, detail_model_id, message, try_thread, try_token, try_session, try_input_scroll, try_transcript_scroll
         nonlocal try_messages, try_input, try_status, try_error, try_response_index
         if action_running():
             message = '⏳ Wait for the current launch or benchmark before opening Try it out.'
@@ -2180,6 +2243,7 @@ def tui(stdscr, app: AppConfig):
         try_messages = []
         try_input = ''
         try_input_scroll = 0
+        try_transcript_scroll = 0
         try_error = ''
         try_response_index = None
         clear_try_live_metrics(try_live_metrics)
@@ -2239,7 +2303,7 @@ def tui(stdscr, app: AppConfig):
         )
 
     def start_try_chat_send():
-        nonlocal message, try_thread, try_token, try_input, try_input_scroll, try_status, try_error, try_response_index, try_messages
+        nonlocal message, try_thread, try_token, try_input, try_input_scroll, try_status, try_error, try_response_index, try_messages, try_transcript_scroll
         if view_mode != 'try':
             return
         model = active_detail_model()
@@ -2260,11 +2324,15 @@ def tui(stdscr, app: AppConfig):
         session = try_session
         reset_try_live_metrics(try_live_metrics)
         try_messages.append({'role': 'user', 'content': prompt})
-        request_messages = list(try_messages)
-        try_messages.append({'role': 'assistant', 'content': ''})
+        request_messages = [
+            {'role': str(item.get('role', '') or ''), 'content': str(item.get('content', '') or '')}
+            for item in try_messages
+        ]
+        try_messages.append({'role': 'assistant', 'content': '', 'reasoning': '', 'final_notice': ''})
         try_response_index = len(try_messages) - 1
         try_input = ''
         try_input_scroll = 0
+        try_transcript_scroll = 0
         try_error = ''
         try_status = 'responding'
         message = f'{model.id}: streaming response...'
@@ -2272,9 +2340,12 @@ def tui(stdscr, app: AppConfig):
         def runner():
             chunks = 0
             try:
-                for chunk in stream_chat_completion(model, request_messages, cancel_token=token):
-                    chunks += 1
-                    action_queue.put(('chat_chunk', chunk, session))
+                for event_type, chunk in stream_chat_events(model, request_messages, cancel_token=token):
+                    if event_type == 'chunk':
+                        chunks += 1
+                        action_queue.put(('chat_chunk', chunk, session))
+                    elif event_type == 'reasoning':
+                        action_queue.put(('chat_reasoning', chunk, session))
                 action_queue.put(('chat_done', str(chunks), session))
             except CancelledError:
                 action_queue.put(('chat_error', 'chat stream cancelled', session))
@@ -2285,7 +2356,7 @@ def tui(stdscr, app: AppConfig):
         try_thread.start()
 
     def exit_try_view():
-        nonlocal view_mode, message, last_refresh, try_thread, try_token, try_session, try_input, try_input_scroll
+        nonlocal view_mode, message, last_refresh, try_thread, try_token, try_session, try_input, try_input_scroll, try_transcript_scroll
         nonlocal try_status, try_error, try_response_index
         model = active_detail_model()
         if try_token is not None:
@@ -2304,6 +2375,7 @@ def tui(stdscr, app: AppConfig):
         try_token = None
         try_input = ''
         try_input_scroll = 0
+        try_transcript_scroll = 0
         try_status = 'idle'
         try_error = ''
         try_response_index = None
@@ -2412,7 +2484,7 @@ def tui(stdscr, app: AppConfig):
             event = queued_event[0]
             text = queued_event[1] if len(queued_event) > 1 else ''
             event_session = queued_event[2] if len(queued_event) > 2 else None
-            if event in ('try_progress', 'try_ready', 'try_error', 'chat_chunk', 'chat_done', 'chat_error'):
+            if event in ('try_progress', 'try_ready', 'try_error', 'chat_chunk', 'chat_reasoning', 'chat_done', 'chat_error'):
                 if event_session != try_session:
                     continue
                 if event == 'try_progress':
@@ -2436,13 +2508,27 @@ def tui(stdscr, app: AppConfig):
                     update_try_live_metrics(try_live_metrics, text)
                     if try_response_index is not None and 0 <= try_response_index < len(try_messages):
                         try_messages[try_response_index]['content'] += text
+                        try_messages[try_response_index]['final_notice'] = ''
                     message = 'streaming response...'
+                    continue
+                if event == 'chat_reasoning':
+                    if try_response_index is not None and 0 <= try_response_index < len(try_messages):
+                        existing = str(try_messages[try_response_index].get('reasoning', '') or '')
+                        try_messages[try_response_index]['reasoning'] = existing + text
+                    message = 'streaming reasoning...'
                     continue
                 if event == 'chat_done':
                     finish_try_live_metrics(try_live_metrics)
                     if try_response_index is not None and 0 <= try_response_index < len(try_messages):
-                        if not try_messages[try_response_index]['content'].strip():
+                        content = str(try_messages[try_response_index].get('content', '') or '')
+                        reasoning = str(try_messages[try_response_index].get('reasoning', '') or '')
+                        if not content.strip() and reasoning.strip():
+                            try_messages[try_response_index]['final_notice'] = '[no final answer returned]'
+                        elif not content.strip() and not reasoning.strip():
                             try_messages[try_response_index]['content'] = '(no content returned)'
+                            try_messages[try_response_index]['final_notice'] = ''
+                        else:
+                            try_messages[try_response_index]['final_notice'] = ''
                     try_status = 'ready'
                     try_response_index = None
                     try_thread = None
@@ -2453,8 +2539,10 @@ def tui(stdscr, app: AppConfig):
                     try_status = 'error'
                     try_error = text or 'chat stream failed'
                     if try_response_index is not None and 0 <= try_response_index < len(try_messages):
-                        if try_messages[try_response_index]['content'].strip():
-                            try_messages[try_response_index]['content'] += f'\n[error] {try_error}'
+                        content = str(try_messages[try_response_index].get('content', '') or '')
+                        try_messages[try_response_index]['final_notice'] = ''
+                        if content.strip():
+                            try_messages[try_response_index]['content'] = content + f'\n[error] {try_error}'
                         else:
                             try_messages[try_response_index]['content'] = f'[error] {try_error}'
                     try_response_index = None
@@ -2739,30 +2827,31 @@ def tui(stdscr, app: AppConfig):
             input_block_rows = 1 + try_input_rows if try_input_rows > 0 else 0
             input_y = content_bottom - input_block_rows + 1 if input_block_rows else content_bottom + 1
             transcript_h = max(0, (input_y if input_block_rows else content_bottom + 1) - (box_top + 2))
-            transcript_lines: List[Tuple[str, int]] = []
-            if not try_messages:
-                intro = (
-                    'Type a prompt when the server is ready. Esc stops this model and returns to details.'
-                    if try_status == 'ready'
-                    else 'Starting the selected model. Input opens when /v1/models is ready.'
-                )
-                for line in wrap_display_lines(intro, left_w - 6):
-                    transcript_lines.append((line, colors['muted']))
-            for item in try_messages:
-                role = item.get('role', '')
-                content = item.get('content', '')
-                if role == 'user':
-                    prefix = 'you> '
-                    attr = colors['accent'] | curses.A_BOLD
-                else:
-                    prefix = f'{model.alias or model.id}> '
-                    attr = curses.A_NORMAL
-                wrapped = wrap_display_lines(prefix + (content or '...'), left_w - 6)
-                for line in wrapped:
-                    transcript_lines.append((line, attr))
-                transcript_lines.append(('', curses.A_NORMAL))
-            visible_transcript = transcript_lines[-transcript_h:]
-            for i, (line, attr) in enumerate(visible_transcript):
+            transcript_items = build_try_transcript_items(
+                model,
+                try_messages,
+                try_status,
+                left_w - 6,
+                user_attr=colors['accent'] | curses.A_BOLD,
+                assistant_attr=curses.A_NORMAL,
+                muted_attr=colors['muted'],
+            )
+            transcript_visible, try_transcript_scroll, transcript_has_older, transcript_has_newer, try_transcript_total = scrollable_pane_item_view(
+                transcript_items,
+                left_w - 6,
+                transcript_h,
+                try_transcript_scroll,
+                default_attr=curses.A_NORMAL,
+            )
+            try_transcript_rows = max(1, transcript_h)
+            if transcript_h == 1 and transcript_has_older and transcript_has_newer and transcript_visible:
+                transcript_visible[0] = ('^ older / v newer', colors['muted'])
+            else:
+                if transcript_has_older and transcript_visible:
+                    transcript_visible[0] = ('^ older lines above', colors['muted'])
+                if transcript_has_newer and transcript_visible:
+                    transcript_visible[-1] = ('v newer lines below', colors['muted'])
+            for i, (line, attr) in enumerate(transcript_visible[:transcript_h]):
                 safe_addstr(stdscr, box_top + 2 + i, 3, line[: left_w - 5], attr)
             if input_block_rows:
                 input_width = max(1, left_w - 6)
@@ -3234,7 +3323,7 @@ def tui(stdscr, app: AppConfig):
 
         if view_mode == 'try':
             footer = '[Enter] send  Tab/] next tab  Shift-Tab/[ prev tab  [Esc] stop model + exit'
-            footer2 = '[Up/Down] scroll prompt input  [PgUp/PgDn/Home/End] scroll active right tab.'
+            footer2 = '[Up/Down] prompt  [Ctrl+P/N/B/F/A/E] convo  [PgUp/PgDn/Home/End] right tab.'
         elif view_mode == 'benchmark':
             footer = '[Esc] details  [F] fast bench  [R] results  [W] wiki  Tab/] next  Shift-Tab/[ prev  [A] abort'
             footer2 = '[Up/Down/PgUp/PgDn/Home/End] scroll active right tab.'
@@ -3271,6 +3360,16 @@ def tui(stdscr, app: AppConfig):
             message = f'Right tab: {right_tab_label(right_tab_by_view[view_mode], len(error_source_lines))}.'
             continue
         if view_mode == 'try':
+            transcript_scroll_action = try_transcript_scroll_action(key)
+            if transcript_scroll_action:
+                try_transcript_scroll = adjust_scroll_offset(
+                    try_transcript_scroll,
+                    transcript_scroll_action,
+                    try_transcript_total,
+                    try_transcript_rows,
+                )
+                message = 'Conversation: newest lines.' if try_transcript_scroll == 0 else 'Conversation: scrolled back.'
+                continue
             if scroll_action:
                 right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
                 message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'

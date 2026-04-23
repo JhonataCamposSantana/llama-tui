@@ -33,6 +33,7 @@ SAFE_BOOTSTRAP_PRESETS = (
 )
 SAFE_BOOTSTRAP_Q8_TARGET_CTX = 4096
 ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS = 20 * 60
+ALL_MODELS_ADAPTIVE_TIME_BUDGET_SECONDS = 6 * 60
 ADAPTIVE_CONTEXT_ROUNDING = 256
 ADAPTIVE_BINARY_STEPS = 4
 ADAPTIVE_MAX_CONTEXT_PROBES = 12
@@ -3133,6 +3134,21 @@ def benchmark_best_optimization(
     return benchmark_exhaustive_profiles(app, model, progress=progress, cancel_token=cancel_token)
 
 
+def benchmark_all_models_runner(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    return benchmark_adaptive_profiles(
+        app,
+        model,
+        progress=progress,
+        cancel_token=cancel_token,
+        time_budget_seconds=ALL_MODELS_ADAPTIVE_TIME_BUDGET_SECONDS,
+    )
+
+
 def safe_bootstrap_benchmark(
     app: AppConfig,
     model: ModelConfig,
@@ -3191,7 +3207,7 @@ def benchmark_all_models_deep(
     benchmark_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
     start_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
 ) -> Tuple[bool, str]:
-    runner = benchmark_runner or benchmark_best_optimization
+    runner = benchmark_runner or benchmark_all_models_runner
     restarter = start_runner or start_model_with_progress
     models = list(getattr(app, 'models', []) or [])
     total = len(models)
