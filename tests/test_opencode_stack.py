@@ -803,6 +803,8 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertEqual(winners['long_context']['ctx_per_slot'], 32000)
         self.assertEqual(winners['opencode_ready']['ctx_per_slot'], 32000)
         self.assertIn('auto', winners)
+        self.assertIn('selection_score', winners['auto'])
+        self.assertIn('quality score', winners['auto']['selection_reason'])
 
     def test_select_measured_profiles_ignores_probe_rows_for_winners(self):
         profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
@@ -818,6 +820,45 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
 
         self.assertEqual(winners['long_context']['ctx_per_slot'], 8192)
         self.assertEqual(winners['opencode_ready'].get('reused_from'), 'long_context')
+
+    def test_select_measured_profiles_prefers_rows_meeting_opencode_floor(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path=__file__,
+            alias='m',
+            port=18200,
+            output=256,
+            last_opencode_benchmark_results=[{'detail': 'request (12000 tokens) exceeds context'}],
+        )
+        small_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=8192, parallel=1)
+        floor_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=16000, parallel=1)
+        measured = [
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'long_context', 'model': small_model, 'tokens_per_sec': 50.0, 'ctx_per_slot': 8192, 'parallel': 1},
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'long_context', 'model': floor_model, 'tokens_per_sec': 30.0, 'ctx_per_slot': 16000, 'parallel': 1},
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertEqual(winners['opencode_ready']['ctx_per_slot'], 16000)
+        self.assertIn('OpenCode floor 12000', winners['opencode_ready']['selection_reason'])
+
+    def test_select_measured_profiles_auto_uses_quality_score(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, output=256)
+        fast_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=4096, parallel=1)
+        balanced_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=32000, parallel=1)
+        measured = [
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'fast_chat', 'model': fast_model, 'tokens_per_sec': 100.0, 'ctx_per_slot': 4096, 'parallel': 1, 'ram_available': 0},
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'long_context', 'model': balanced_model, 'tokens_per_sec': 70.0, 'ctx_per_slot': 32000, 'parallel': 1, 'ram_available': 16 * 1024**3},
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertEqual(winners['fast_chat']['tokens_per_sec'], 100.0)
+        self.assertEqual(winners['auto']['ctx_per_slot'], 32000)
+        self.assertGreater(winners['auto']['selection_score'], 0.0)
 
     def test_annotates_spectrum_tradeoff_rows(self):
         records = [

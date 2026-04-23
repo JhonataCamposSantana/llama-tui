@@ -1267,6 +1267,8 @@ def adaptive_profile_dict(
         'ram_available': int(record.get('ram_available', 0) or 0),
         'gpu_memory_free': int(record.get('gpu_memory_free', 0) or 0),
         'detail': str(record.get('detail', '')),
+        'selection_score': round(float(record.get('selection_score', 0.0) or 0.0), 4),
+        'selection_reason': str(record.get('selection_reason', '') or ''),
         'benchmarked_at': str(record.get('benchmarked_at') or datetime.now().isoformat(timespec='seconds')),
         'hardware': profile.short_summary(),
     }
@@ -1322,6 +1324,22 @@ def select_measured_profiles(
     fast_floor = chat_min_ctx_per_slot(model)
     opencode_floor = observed_opencode_context_floor(model)
 
+    def headroom_score(item: Dict[str, object]) -> float:
+        ram = int(item.get('ram_available', 0) or 0)
+        vram = int(item.get('gpu_memory_free', 0) or 0)
+        score = min(1.0, (ram / 1024**3) / 8.0) if ram else 0.35
+        if vram:
+            score = max(score, min(1.0, (vram / 1024**3) / 2.0))
+        return max(0.0, min(1.0, score))
+
+    def stability_score(item: Dict[str, object]) -> float:
+        score = 1.0
+        if int(item.get('retry_attempt', 1) or 1) > 1:
+            score -= 0.15
+        if compact_message(str(item.get('detail', '') or '')).lower() not in ('', '1 samples', '2 samples', '3 samples'):
+            score -= 0.05
+        return max(0.0, min(1.0, score))
+
     fast_pool = [item for item in successful if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or successful
     long_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
     opencode_pool = [
@@ -1336,23 +1354,51 @@ def select_measured_profiles(
     def auto_score(item: Dict[str, object]) -> float:
         tps_norm = float(item.get('tokens_per_sec', 0.0) or 0.0) / max_tps
         ctx_norm = int(item.get('ctx_per_slot', 0) or 0) / max_ctx
-        ram = int(item.get('ram_available', 0) or 0)
-        vram = int(item.get('gpu_memory_free', 0) or 0)
-        headroom = min(1.0, (ram / 1024**3) / 8.0)
-        if vram:
-            headroom = max(headroom, min(1.0, (vram / 1024**3) / 2.0))
-        return 0.55 * tps_norm + 0.35 * ctx_norm + 0.10 * headroom
+        return (
+            0.50 * tps_norm
+            + 0.30 * ctx_norm
+            + 0.12 * headroom_score(item)
+            + 0.08 * stability_score(item)
+        )
 
     auto = max(successful, key=auto_score)
-    winners = {
-        'fast_chat': fast,
-        'long_context': long,
-        'opencode_ready': opencode,
-        'auto': auto,
+    winner_specs = {
+        'fast_chat': (
+            fast,
+            float(fast.get('tokens_per_sec', 0.0) or 0.0),
+            f'fastest full measurement with ctx/slot >= {fast_floor}',
+        ),
+        'long_context': (
+            long,
+            float(long.get('ctx_per_slot', 0) or 0),
+            'largest full single-slot context, tok/s as tie-breaker',
+        ),
+        'opencode_ready': (
+            opencode,
+            float(opencode.get('ctx_per_slot', 0) or 0),
+            (
+                f'largest full single-slot context meeting OpenCode floor {opencode_floor}'
+                if opencode_floor and int(opencode.get('ctx_per_slot', 0) or 0) >= opencode_floor
+                else f'best full single-slot fallback; no row met OpenCode floor {opencode_floor}'
+                if opencode_floor
+                else 'best full single-slot fallback; no OpenCode context floor was observed'
+            ),
+        ),
+        'auto': (
+            auto,
+            auto_score(auto),
+            (
+                'quality score: 50% tok/s, 30% ctx/slot, '
+                '12% headroom, 8% stability'
+            ),
+        ),
     }
     profiles = {}
-    for key, item in winners.items():
-        profile_dict = adaptive_profile_dict(key, item['model'], item, profile)
+    for key, (item, selection_score, selection_reason) in winner_specs.items():
+        selected = dict(item)
+        selected['selection_score'] = round(float(selection_score or 0.0), 4)
+        selected['selection_reason'] = selection_reason
+        profile_dict = adaptive_profile_dict(key, item['model'], selected, profile)
         source_objective = str(item.get('objective', '') or '')
         if source_objective and source_objective != key:
             profile_dict['reused_from'] = source_objective

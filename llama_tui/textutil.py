@@ -1,3 +1,4 @@
+import re
 import textwrap
 from pathlib import Path
 from typing import List
@@ -96,13 +97,23 @@ def compact_message(text: str) -> str:
     return ' | '.join(part.strip() for part in str(text).splitlines() if part.strip())
 def is_error_message(text: str) -> bool:
     low = compact_message(text).lower()
-    return bool(low) and (
-        low.startswith('❌')
-        or ' error' in low
-        or 'failed' in low
-        or 'crashed' in low
-        or 'traceback' in low
-    )
+    if not low:
+        return False
+    if low.startswith('❌') or low.startswith('[error]') or low.startswith('error:'):
+        return True
+    if low.startswith(('right tab:', 'focus:', 'no errors captured', 'error captured in')):
+        return False
+    if re.search(r'\b(failed|failure|fatal|crashed|traceback|exception|aborted)\b', low):
+        return True
+    if re.search(r'\b(no|zero)\s+errors?\b', low):
+        return False
+    if re.search(r'\b0\s+errors?\b', low):
+        return False
+    if re.search(r'\bwithout\s+errors?\b', low):
+        return False
+    if re.search(r'\berror[-\s]?free\b', low):
+        return False
+    return bool(re.search(r'\berror\b', low))
 def wrap_display_lines(text: str, width: int) -> List[str]:
     if width <= 0:
         return []

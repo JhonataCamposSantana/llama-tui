@@ -299,10 +299,6 @@ def read_display_file_lines(path: Path) -> List[str]:
         return [f'<failed to read log: {exc}>']
 
 
-def pane_title(title: str, pane: str, focused_pane: str, focus_active: bool = True) -> str:
-    return f'{title} *' if focus_active and pane == focused_pane else title
-
-
 def right_tabs_for_view(view_mode: str) -> List[str]:
     return list(RIGHT_TABS.get(view_mode, []))
 
@@ -331,8 +327,27 @@ def cycle_right_tab(view_mode: str, current_tab: str, direction: int = 1) -> str
     return tabs[(index + int(direction or 1)) % len(tabs)]
 
 
+def right_tab_key_direction(key: int) -> int:
+    if key in (9, ord(']')):
+        return 1
+    if key in (getattr(curses, 'KEY_BTAB', -999), ord('[')):
+        return -1
+    return 0
+
+
 def right_tab_scroll_key(view_mode: str, tab: str) -> str:
     return f'{view_mode}:{normalize_right_tab(view_mode, tab)}'
+
+
+def right_scroll_action_for_view(view_mode: str, key: int) -> str:
+    action = RIGHT_PANE_SCROLL_KEYS.get(key, '')
+    if not action:
+        return ''
+    if view_mode in ('detail', 'benchmark'):
+        return action
+    if view_mode in ('try', 'results') and key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+        return action
+    return ''
 
 
 def right_tab_label(tab: str, error_count: int = 0) -> str:
@@ -369,6 +384,80 @@ def header_dashboard_layout(width: int) -> Tuple[bool, int, int, int]:
     right_w = max(38, available_right_w)
     enabled = total_width >= HEADER_DASHBOARD_MIN_WIDTH and available_right_w >= HEADER_DASHBOARD_MIN_PANEL_WIDTH
     return enabled, left_w, right_x, right_w
+
+
+def body_pane_layout(width: int) -> Tuple[int, int, int]:
+    total_width = max(1, int(width or 1))
+    left_x = 1
+    gap = 2
+    right_margin = 1
+    usable = max(1, total_width - left_x - right_margin)
+    min_left = 44
+    min_right = 32
+    preferred_left = max(76, min(112, (total_width // 2) + 8))
+
+    if usable >= min_left + gap + min_right:
+        left_w = min(preferred_left, usable - gap - min_right)
+        left_w = max(min_left, left_w)
+        right_x = left_x + left_w + gap
+        right_w = max(1, usable - left_w - gap)
+    else:
+        left_w = max(1, min(preferred_left, max(1, usable - gap - 1)))
+        right_x = min(total_width - 2, left_x + left_w + gap)
+        right_w = max(1, total_width - right_x - right_margin)
+
+    if right_x + right_w > total_width:
+        right_w = max(1, total_width - right_x)
+    return left_w, right_x, right_w
+
+
+def body_pane_height(screen_height: int, box_top: int) -> int:
+    return max(2, int(screen_height or 0) - int(box_top or 0) - 4)
+
+
+def body_content_rows(screen_height: int, box_top: int) -> int:
+    return max(0, body_pane_height(screen_height, box_top) - 2)
+
+
+def body_content_bottom(screen_height: int, box_top: int) -> int:
+    return int(box_top or 0) + body_pane_height(screen_height, box_top) - 1
+
+
+def try_input_row_count(content_rows: int, max_rows: int = TRY_INPUT_ROWS) -> int:
+    rows = max(0, int(content_rows or 0))
+    if rows < 3:
+        return 0
+    return min(max(1, int(max_rows or 1)), rows - 2)
+
+
+def visible_selection_window(total: int, selected: int, rows: int) -> Tuple[int, int]:
+    total = max(0, int(total or 0))
+    rows = max(0, int(rows or 0))
+    if total <= 0 or rows <= 0:
+        return 0, 0
+    rows = min(total, rows)
+    selected = max(0, min(int(selected or 0), total - 1))
+    start = max(0, min(selected - rows // 2, total - rows))
+    return start, start + rows
+
+
+def build_error_source_lines(
+    error_history: List[str],
+    benchmark_errors: Optional[List[str]] = None,
+    benchmark_mode: bool = False,
+    status_error: str = '',
+    last_error_message: str = '',
+) -> List[str]:
+    if benchmark_mode and benchmark_errors:
+        source = [compact_message(str(item)) for item in benchmark_errors if compact_message(str(item))]
+    else:
+        source = [compact_message(str(item)) for item in error_history if compact_message(str(item))]
+        status_line = compact_message(status_error)
+        if status_line and (not source or source[-1] != status_line):
+            source.append(status_line)
+        elif compact_message(last_error_message) and not source:
+            source.append(compact_message(last_error_message))
+    return source[-BENCHMARK_FEED_LIMIT:]
 
 
 def header_dashboard_title(view_mode: str) -> str:
@@ -932,6 +1021,56 @@ def ranked_benchmark_records(run: Dict[str, object]) -> List[Tuple[Dict[str, obj
     return sorted(ranked, key=sort_key)
 
 
+def benchmark_run_is_agent(run: Dict[str, object]) -> bool:
+    kind = str((run or {}).get('kind', '') or '')
+    records = list((run or {}).get('records', []) or [])
+    return kind in ('opencode', 'hermes') or any(isinstance(row, dict) and 'score' in row for row in records)
+
+
+def _table_row(values: List[object], widths: List[int]) -> str:
+    cells = []
+    for value, width in zip(values, widths):
+        text = ellipsize(str(value), max(1, int(width or 1)))
+        cells.append(f'{text:{max(1, int(width or 1))}}')
+    return ' '.join(cells).rstrip()
+
+
+def _table_rule(widths: List[int]) -> str:
+    return ' '.join('-' * max(1, int(width or 1)) for width in widths).rstrip()
+
+
+def _table_widths(fixed: List[int], total_width: int) -> List[int]:
+    width = max(1, int(total_width or 1))
+    widths = [max(1, int(item or 1)) for item in fixed]
+    spaces = len(widths)
+    detail_w = max(1, width - sum(widths) - spaces)
+    widths.append(detail_w)
+    while sum(widths) + len(widths) - 1 > width:
+        shrinkable = [idx for idx, value in enumerate(widths[:-1]) if value > 1]
+        if not shrinkable:
+            break
+        target = max(shrinkable, key=lambda idx: widths[idx])
+        widths[target] -= 1
+    return widths
+
+
+def _status_attr_for_record(
+    record: Dict[str, object],
+    success_attr: int,
+    warning_attr: int,
+    error_attr: int,
+    normal_attr: int,
+) -> int:
+    status_kind = benchmark_record_status_kind(record)
+    if status_kind == 'success':
+        return success_attr
+    if status_kind == 'warning':
+        return warning_attr
+    if status_kind == 'error':
+        return error_attr
+    return normal_attr
+
+
 def benchmark_rank_line(rank: int, record: Dict[str, object], labels: List[str]) -> str:
     score_label, score = benchmark_record_score(record)
     seconds = float(record.get('seconds', 0.0) or 0.0)
@@ -949,8 +1088,9 @@ def benchmark_rank_line(rank: int, record: Dict[str, object], labels: List[str])
     return f'{left}  {detail}' if detail else left
 
 
-def benchmark_ranking_items(
+def benchmark_rank_table_items(
     run: Dict[str, object],
+    width: int = 120,
     success_attr: int = 0,
     warning_attr: int = 0,
     error_attr: int = 0,
@@ -962,17 +1102,117 @@ def benchmark_ranking_items(
     ranked = ranked_benchmark_records(run)
     if not ranked:
         return [('No benchmark rows yet.', warning_attr)]
-    items: List[Tuple[str, int]] = [('ranked candidates:', heading_attr)]
+
+    width = max(24, int(width or 120))
+    agent_run = benchmark_run_is_agent(run)
+    items: List[Tuple[str, int]] = []
+    if agent_run:
+        if width >= 100:
+            widths = _table_widths([4, 18, 22, 8, 6, 7, 7, 7], width)
+            headers = ['Rank', 'Role', 'Status', 'Score', 'Sec', 'Pass', 'Ctx', 'Slot', 'Detail']
+            columns = ('rank', 'role', 'status', 'score', 'seconds', 'pass', 'ctx', 'slot', 'detail')
+        elif width >= 72:
+            widths = _table_widths([4, 14, 12, 7, 5, 5, 6], width)
+            headers = ['Rank', 'Role', 'Status', 'Score', 'Sec', 'Pass', 'Ctx', 'Detail']
+            columns = ('rank', 'role', 'status', 'score', 'seconds', 'pass', 'ctx', 'detail')
+        elif width >= 40:
+            widths = _table_widths([4, 10, 10, 6, 5], width)
+            headers = ['Rank', 'Role', 'Status', 'Score', 'Pass', 'Detail']
+            columns = ('rank', 'role', 'status', 'score', 'pass', 'detail')
+        else:
+            widths = _table_widths([4, 8, 6], width)
+            headers = ['Rank', 'Role', 'Score', 'Detail']
+            columns = ('rank', 'role', 'score', 'detail')
+        items.append((_table_row(headers, widths), heading_attr))
+        items.append((_table_rule(widths), heading_attr))
+        for index, (record, labels) in enumerate(ranked, 1):
+            score_label, score = benchmark_record_score(record)
+            seconds = float(record.get('seconds', 0.0) or 0.0)
+            ctx = int(record.get('ctx', 0) or 0)
+            parallel = max(1, int(record.get('parallel', 1) or 1))
+            slot = int(record.get('ctx_per_slot', 0) or 0) or (ctx // parallel)
+            passed = record.get('passed')
+            tasks = record.get('tasks')
+            pass_text = f'{int(passed or 0)}/{int(tasks or 0)}' if passed is not None or tasks is not None else '-'
+            detail = compact_message(str(record.get('detail', '') or ''))
+            record_values = {
+                'rank': f'{index:02d}',
+                'role': ', '.join(labels or ['Measured']),
+                'status': str(record.get('status', '-') or '-'),
+                'score': f'{score:.2f}' if score_label == 'score' else '-',
+                'seconds': f'{seconds:.1f}' if seconds > 0 else '-',
+                'pass': pass_text,
+                'ctx': ctx or '-',
+                'slot': slot or '-',
+                'detail': detail,
+            }
+            values = [record_values[column] for column in columns]
+            items.append((_table_row(values, widths), _status_attr_for_record(record, success_attr, warning_attr, error_attr, normal_attr)))
+        return items
+
+    if width >= 112:
+        widths = _table_widths([4, 20, 14, 8, 6, 7, 7, 3, 8, 14], width)
+        headers = ['Rank', 'Role', 'Status', 'Tok/s', 'Sec', 'Ctx', 'Slot', 'Par', 'Variant', 'Reason', 'Detail']
+        columns = ('rank', 'role', 'status', 'score', 'seconds', 'ctx', 'slot', 'parallel', 'variant', 'reason', 'detail')
+    elif width >= 72:
+        widths = _table_widths([4, 14, 12, 7, 5, 6, 6], width)
+        headers = ['Rank', 'Role', 'Status', 'Tok/s', 'Sec', 'Ctx', 'Slot', 'Detail']
+        columns = ('rank', 'role', 'status', 'score', 'seconds', 'ctx', 'slot', 'detail')
+    elif width >= 40:
+        widths = _table_widths([4, 10, 9, 6, 6], width)
+        headers = ['Rank', 'Role', 'Status', 'Tok/s', 'Ctx', 'Detail']
+        columns = ('rank', 'role', 'status', 'score', 'ctx', 'detail')
+    else:
+        widths = _table_widths([4, 8, 5], width)
+        headers = ['Rank', 'Role', 'Tok/s', 'Detail']
+        columns = ('rank', 'role', 'score', 'detail')
+    items.append((_table_row(headers, widths), heading_attr))
+    items.append((_table_rule(widths), heading_attr))
     for index, (record, labels) in enumerate(ranked, 1):
-        status_kind = benchmark_record_status_kind(record)
-        attr = (
-            success_attr if status_kind == 'success'
-            else warning_attr if status_kind == 'warning'
-            else error_attr if status_kind == 'error'
-            else normal_attr
-        )
-        items.append((benchmark_rank_line(index, record, labels), attr))
+        _score_label, score = benchmark_record_score(record)
+        seconds = float(record.get('seconds', 0.0) or 0.0)
+        ctx = int(record.get('ctx', 0) or 0)
+        parallel = int(record.get('parallel', 0) or 0)
+        slot = int(record.get('ctx_per_slot', 0) or 0) or (ctx // max(1, parallel or 1))
+        reason = str(record.get('selection_reason') or record.get('planner_reason') or record.get('scan_level') or record.get('measurement_type') or '')
+        detail = compact_message(str(record.get('detail', '') or ''))
+        detail_text = detail or (reason if width < 112 else '')
+        record_values = {
+            'rank': f'{index:02d}',
+            'role': ', '.join(labels or ['Measured']),
+            'status': str(record.get('status', '-') or '-'),
+            'score': f'{score:.2f}' if score > 0 else '-',
+            'seconds': f'{seconds:.1f}' if seconds > 0 else '-',
+            'ctx': ctx or '-',
+            'slot': slot or '-',
+            'parallel': parallel or '-',
+            'variant': str(record.get('variant', '') or 'default'),
+            'reason': reason or '-',
+            'detail': detail_text,
+        }
+        values = [record_values[column] for column in columns]
+        items.append((_table_row(values, widths), _status_attr_for_record(record, success_attr, warning_attr, error_attr, normal_attr)))
     return items
+
+
+def benchmark_ranking_items(
+    run: Dict[str, object],
+    width: int = 120,
+    success_attr: int = 0,
+    warning_attr: int = 0,
+    error_attr: int = 0,
+    heading_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    return benchmark_rank_table_items(
+        run,
+        width=width,
+        success_attr=success_attr,
+        warning_attr=warning_attr,
+        error_attr=error_attr,
+        heading_attr=heading_attr,
+        normal_attr=normal_attr,
+    )
 
 
 def benchmark_ranking_rows(run: Dict[str, object]) -> List[str]:
@@ -1245,13 +1485,13 @@ def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str
                 stdscr.touchwin()
                 stdscr.nodelay(True)
                 return value
-def prompt_launch_optimization(stdscr, model: ModelConfig, colors) -> str:
-    return prompt_modal_choice(stdscr, colors, f'Launch {model.id}', [
-        ('1', 'Auto profile', 'auto_profile'),
-        ('2', 'Balanced chat', 'balanced_chat'),
-        ('3', 'Fast chat', 'fast_chat'),
-        ('4', 'Long context', 'long_context'),
-        ('5', 'Keep current settings', 'keep'),
+def launch_options_for_stopped_model(model: ModelConfig) -> List[Tuple[str, str, str]]:
+    return [
+        ('1', 'Start server now', 'keep'),
+        ('2', 'Auto profile', 'auto_profile'),
+        ('3', 'Balanced chat', 'balanced_chat'),
+        ('4', 'Fast chat', 'fast_chat'),
+        ('5', 'Long context', 'long_context'),
         ('6', 'Advanced profiles', 'advanced'),
         ('7', 'Try it out', 'try'),
         ('8', 'Launch model + OpenCode', 'opencode'),
@@ -1259,7 +1499,11 @@ def prompt_launch_optimization(stdscr, model: ModelConfig, colors) -> str:
         ('h', 'Launch model + Hermes', 'hermes'),
         ('v', 'Launch full-stack: Hermes + VS Code', 'hermes_full_stack'),
         ('q', 'Cancel', 'cancel'),
-    ])
+    ]
+
+
+def prompt_launch_optimization(stdscr, model: ModelConfig, colors) -> str:
+    return prompt_modal_choice(stdscr, colors, f'Launch {model.id}', launch_options_for_stopped_model(model))
 def prompt_running_model_action(stdscr, model: ModelConfig, colors) -> str:
     return prompt_modal_choice(stdscr, colors, f'{model.id} is running', [
         ('1', 'Stop model', 'stop'),
@@ -1716,17 +1960,17 @@ def tui(stdscr, app: AppConfig):
         if has_benchmark(model):
             return f'{model.id}: benchmark data loaded.'
         if status == 'pending':
-            return f'{model.id}: safe defaults are set. Press B when you want to benchmark.'
+            return f'{model.id}: safe defaults are set. Start now or press B when you want measured settings.'
         if status in ('failed', 'aborted'):
-            return f'{model.id}: last default benchmark {status}. Press B to run it again.'
-        return f'{model.id}: no benchmark yet. Press B from details to benchmark.'
+            return f'{model.id}: last benchmark {status}. You can still start now; press B to retry benchmarking.'
+        return f'{model.id}: no benchmark yet. Start now or press B from details for measured settings.'
 
     def show_benchmark_hint(model: ModelConfig):
         nonlocal message
         if action_running():
             return
         if model_is_running(model):
-            message = f'{model.id}: no benchmark yet. Stop it and press B from details to benchmark.'
+            message = f'{model.id}: server is running. Benchmarking remains optional.'
             return
         message = benchmark_hint(model)
 
@@ -2060,9 +2304,9 @@ def tui(stdscr, app: AppConfig):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         if h < 18 or w < 88:
-            stdscr.addstr(1, 2, 'Window too small for llama-tui. Stretch it a bit.', colors['warning'] | curses.A_BOLD)
-            stdscr.addstr(3, 2, f'Current size: {w}x{h}')
-            stdscr.addstr(5, 2, '[q] quit', curses.A_BOLD)
+            safe_addstr(stdscr, 1, 2, 'Window too small for llama-tui. Stretch it a bit.', colors['warning'] | curses.A_BOLD)
+            safe_addstr(stdscr, 3, 2, f'Current size: {w}x{h}')
+            safe_addstr(stdscr, 5, 2, '[q] quit', curses.A_BOLD)
             stdscr.refresh()
             key = stdscr.getch()
             if key in (ord('q'), 27):
@@ -2071,17 +2315,18 @@ def tui(stdscr, app: AppConfig):
             continue
 
         y = 0
-        dashboard_enabled, left_w, right_x, right_w = header_dashboard_layout(w)
+        dashboard_enabled, header_left_w, header_right_x, header_right_w = header_dashboard_layout(w)
+        left_w, right_x, right_w = body_pane_layout(w)
         if w >= 100:
             for line in LOGO:
-                stdscr.addstr(y, 2, line[:w-4], colors['banner'] | curses.A_BOLD)
+                safe_addstr(stdscr, y, 2, line[:w-4], colors['banner'] | curses.A_BOLD)
                 y += 1
-            title_x = min(w - 28, max(30, left_w - 28)) if dashboard_enabled else min(w - 28, 60)
-            stdscr.addstr(1, title_x, 'local model control plane', colors['accent'] | curses.A_BOLD)
+            title_x = min(w - 28, max(30, header_left_w - 28)) if dashboard_enabled else min(w - 28, 60)
+            safe_addstr(stdscr, 1, title_x, 'local model control plane', colors['accent'] | curses.A_BOLD)
             header_y = y + 1
         else:
-            stdscr.addstr(0, 2, 'llama-tui', colors['banner'] | curses.A_BOLD)
-            stdscr.addstr(0, 14, 'local model control plane', colors['accent'] | curses.A_BOLD)
+            safe_addstr(stdscr, 0, 2, 'llama-tui', colors['banner'] | curses.A_BOLD)
+            safe_addstr(stdscr, 0, 14, 'local model control plane', colors['accent'] | curses.A_BOLD)
             header_y = 2
 
         counts = {'READY': 0, 'LOADING': 0, 'STARTING': 0, 'STOPPED': 0, 'ERROR': 0}
@@ -2089,14 +2334,7 @@ def tui(stdscr, app: AppConfig):
             if st in counts:
                 counts[st] += 1
 
-        msg_attr = colors['accent'] | curses.A_BOLD
         message_is_error = is_error_message(message)
-        if message_is_error:
-            msg_attr = colors['warning'] | curses.A_BOLD
-        elif message.startswith('✅'):
-            msg_attr = colors['success'] | curses.A_BOLD
-        elif message.startswith('⏳'):
-            msg_attr = colors['warning'] | curses.A_BOLD
         header_message = (
             compact_message(message)
             if message_is_error and view_mode == 'try'
@@ -2108,7 +2346,7 @@ def tui(stdscr, app: AppConfig):
         config_h = max(4, box_top - header_y - 1)
         dashboard_y = 1 if dashboard_enabled and w >= 100 else header_y
         dashboard_h = max(HEADER_DASHBOARD_HEIGHT, box_top - dashboard_y - 1)
-        left_header_width = max(24, (right_x - 3) if dashboard_enabled else (w - 3))
+        left_header_width = max(24, (header_right_x - 3) if dashboard_enabled else (w - 3))
         config_items = build_header_config_items(app, header_message, left_header_width - 4)
         draw_header_config_box(
             stdscr,
@@ -2131,14 +2369,14 @@ def tui(stdscr, app: AppConfig):
                 str(benchmark_state.get('label') or message),
                 app.hardware_profile().short_summary(),
                 error_history,
-                right_w - 4,
+                header_right_w - 4,
             )
             draw_header_dashboard(
                 stdscr,
                 dashboard_y,
-                right_x,
+                header_right_x,
                 dashboard_h,
-                right_w,
+                header_right_w,
                 header_dashboard_title(view_mode),
                 dashboard_items,
                 colors,
@@ -2154,25 +2392,27 @@ def tui(stdscr, app: AppConfig):
             for label, value in chips:
                 text = f' {label}:{value} '
                 if chip_x + len(text) < w - 2:
-                    stdscr.addstr(chip_y, chip_x, text, chip_attr(colors, label))
+                    safe_addstr(stdscr, chip_y, chip_x, text, chip_attr(colors, label))
                     chip_x += len(text) + 1
 
-        try_input_rows = TRY_INPUT_ROWS
-        visible_rows = max(8, h - box_top - 6)
-        right_total_h = max(4, h - box_top - 4)
+        pane_h = body_pane_height(h, box_top)
+        content_rows = body_content_rows(h, box_top)
+        content_bottom = body_content_bottom(h, box_top)
+        try_input_rows = try_input_row_count(content_rows)
+        visible_rows = max(0, content_rows - 1)
+        right_total_h = pane_h
         status_error = f'{active_model.id}: status ERROR ({active_status[1]})' if active_model and active_status[0] == 'ERROR' else ''
         try_mode = view_mode == 'try'
         benchmark_mode = view_mode == 'benchmark'
         results_mode = view_mode == 'results'
         benchmark_errors = list(benchmark_state.get('errors', []) or [])
-        if benchmark_mode and benchmark_errors:
-            error_source_lines = [str(item) for item in benchmark_errors]
-        else:
-            error_source_lines = list(error_history)
-            if status_error and (not error_source_lines or error_source_lines[-1] != status_error):
-                error_source_lines.append(status_error)
-            elif last_error_message and not error_source_lines:
-                error_source_lines.append(last_error_message)
+        error_source_lines = build_error_source_lines(
+            error_history,
+            benchmark_errors=benchmark_errors,
+            benchmark_mode=benchmark_mode,
+            status_error=status_error,
+            last_error_message=last_error_message,
+        )
         error_text = '\n'.join(error_source_lines)
         right_tabs = right_tabs_for_view(view_mode)
         right_active_tab = normalize_right_tab(view_mode, right_tab_by_view.get(view_mode, '')) if right_tabs else ''
@@ -2184,7 +2424,7 @@ def tui(stdscr, app: AppConfig):
         right_scroll = int(right_tab_scrolls.get(right_tab_key, 0) or 0)
 
         left_title = 'Try It Out' if try_mode else 'Benchmark' if benchmark_mode else 'Results' if results_mode else 'Model Details' if view_mode == 'detail' else 'Models'
-        draw_box(stdscr, box_top, 1, h - box_top - 4, left_w, left_title, colors['accent'] | curses.A_BOLD, colors['accent'])
+        draw_box(stdscr, box_top, 1, pane_h, left_w, left_title, colors['accent'] | curses.A_BOLD, colors['accent'])
         if right_tabs:
             draw_tabbed_panel(
                 stdscr,
@@ -2206,7 +2446,7 @@ def tui(stdscr, app: AppConfig):
             runs = benchmark_runs_for_model(model)
             if runs:
                 results_run_index = max(0, min(results_run_index, len(runs) - 1))
-            content_h = max(1, h - box_top - 7)
+            content_h = content_rows
             header_lines = [
                 (f'model: {model.name or model.id}', curses.A_BOLD),
                 (f'runs: {len(runs)} latest benchmark run(s)', colors['accent'] | curses.A_BOLD),
@@ -2215,18 +2455,21 @@ def tui(stdscr, app: AppConfig):
             ]
             y_cursor = box_top + 2
             for line, attr in header_lines[:content_h]:
-                stdscr.addstr(y_cursor, 3, line[: left_w - 5], attr)
+                safe_addstr(stdscr, y_cursor, 3, line[: left_w - 5], attr)
                 y_cursor += 1
             if not runs:
-                stdscr.addstr(y_cursor, 3, 'No benchmark history yet. Press B from details to run one.', colors['warning'])
+                if y_cursor <= content_bottom:
+                    safe_addstr(stdscr, y_cursor, 3, 'No benchmark history yet. Press B from details to run one.', colors['warning'])
             else:
-                visible = runs[: max(1, content_h - len(header_lines))]
-                for idx, run in enumerate(visible):
-                    if y_cursor >= box_top + 2 + content_h:
+                run_rows = max(0, content_h - min(len(header_lines), content_h))
+                start_idx, end_idx = visible_selection_window(len(runs), results_run_index, run_rows)
+                for idx in range(start_idx, end_idx):
+                    if y_cursor > content_bottom:
                         break
+                    run = runs[idx]
                     line = benchmark_run_line(run, idx, selected=(idx == results_run_index))
                     attr = colors['selection'] | curses.A_BOLD if idx == results_run_index else curses.A_NORMAL
-                    stdscr.addstr(y_cursor, 3, ellipsize(line, left_w - 5), attr)
+                    safe_addstr(stdscr, y_cursor, 3, ellipsize(line, left_w - 5), attr)
                     y_cursor += 1
         elif view_mode == 'benchmark' and active_model:
             model = active_model
@@ -2239,7 +2482,7 @@ def tui(stdscr, app: AppConfig):
             pct = int(round(benchmark_progress_fraction(completed, total) * 100))
             bar = progress_bar_text(completed, total, max(10, min(34, left_w - 62)))
             feed = list(benchmark_state.get('feed', []) or [])
-            content_h = max(1, h - box_top - 7)
+            content_h = content_rows
             summary_lines = [
                 (f'model: {model.name or model.id}', curses.A_BOLD),
                 (f'run: {run_kind}   status: {status_text}   elapsed: {benchmark_elapsed_text(benchmark_state)}', colors['accent'] | curses.A_BOLD),
@@ -2251,27 +2494,27 @@ def tui(stdscr, app: AppConfig):
             ]
             y_cursor = box_top + 2
             for line, attr in summary_lines[:content_h]:
-                stdscr.addstr(y_cursor, 3, line[: left_w - 5], attr)
+                safe_addstr(stdscr, y_cursor, 3, line[: left_w - 5], attr)
                 y_cursor += 1
-            rows_available = max(0, box_top + 2 + content_h - y_cursor)
+            rows_available = max(0, content_bottom - y_cursor + 1)
             feed_target = max(0, rows_available)
-            if not feed and y_cursor < box_top + 2 + content_h:
-                stdscr.addstr(y_cursor, 3, 'waiting for benchmark updates...', colors['muted'])
+            if not feed and y_cursor <= content_bottom:
+                safe_addstr(stdscr, y_cursor, 3, 'waiting for benchmark updates...', colors['muted'])
                 y_cursor += 1
             for line in feed[-feed_target:]:
-                if y_cursor >= box_top + 2 + content_h:
+                if y_cursor > content_bottom:
                     break
                 attr = colors['error'] if is_error_message(str(line)) else colors['muted']
                 for wrapped in wrap_display_item_lines(str(line), left_w - 5):
-                    if y_cursor >= box_top + 2 + content_h:
+                    if y_cursor > content_bottom:
                         break
-                    stdscr.addstr(y_cursor, 3, wrapped[: left_w - 5], attr)
+                    safe_addstr(stdscr, y_cursor, 3, wrapped[: left_w - 5], attr)
                     y_cursor += 1
         elif view_mode == 'try' and active_model:
             model = active_model
-            try_input_rows = min(TRY_INPUT_ROWS, max(1, h - box_top - 8))
-            input_y = max(box_top + 5, h - try_input_rows - 5)
-            transcript_h = max(1, input_y - box_top - 3)
+            input_block_rows = 1 + try_input_rows if try_input_rows > 0 else 0
+            input_y = content_bottom - input_block_rows + 1 if input_block_rows else content_bottom + 1
+            transcript_h = max(0, (input_y if input_block_rows else content_bottom + 1) - (box_top + 2))
             transcript_lines: List[Tuple[str, int]] = []
             if not try_messages:
                 intro = (
@@ -2296,38 +2539,39 @@ def tui(stdscr, app: AppConfig):
                 transcript_lines.append(('', curses.A_NORMAL))
             visible_transcript = transcript_lines[-transcript_h:]
             for i, (line, attr) in enumerate(visible_transcript):
-                stdscr.addstr(box_top + 2 + i, 3, line[: left_w - 5], attr)
-            input_width = max(1, left_w - 6)
-            input_lines, try_input_scroll, has_more_above, has_more_below = try_input_view(
-                try_input,
-                input_width,
-                try_input_rows,
-                try_input_scroll,
-            )
-            marker = ''
-            if has_more_above:
-                marker += ' ^'
-            if has_more_below:
-                marker += ' v'
-            divider_label = f' input{marker} '
-            divider = (divider_label + '-' * max(1, left_w - 5))[: max(1, left_w - 5)]
-            stdscr.addstr(input_y, 3, divider[: left_w - 5], colors['muted'])
-            if try_status == 'ready':
-                input_attr = colors['panel'] | curses.A_BOLD
-                for row_idx, input_line in enumerate(input_lines[:try_input_rows]):
-                    stdscr.addstr(input_y + 1 + row_idx, 3, input_line[: left_w - 5], input_attr)
-            elif try_status == 'responding':
-                input_line = 'streaming response... Esc cancels and stops the model'
-                input_attr = colors['warning'] | curses.A_BOLD
-                stdscr.addstr(input_y + 1, 3, input_line[: left_w - 5], input_attr)
-            elif try_status == 'error':
-                input_line = f'error: {try_error or "chat failed"}'
-                input_attr = colors['error'] | curses.A_BOLD
-                stdscr.addstr(input_y + 1, 3, input_line[: left_w - 5], input_attr)
-            else:
-                input_line = 'waiting for server readiness...'
-                input_attr = colors['warning'] | curses.A_BOLD
-                stdscr.addstr(input_y + 1, 3, input_line[: left_w - 5], input_attr)
+                safe_addstr(stdscr, box_top + 2 + i, 3, line[: left_w - 5], attr)
+            if input_block_rows:
+                input_width = max(1, left_w - 6)
+                input_lines, try_input_scroll, has_more_above, has_more_below = try_input_view(
+                    try_input,
+                    input_width,
+                    try_input_rows,
+                    try_input_scroll,
+                )
+                marker = ''
+                if has_more_above:
+                    marker += ' ^'
+                if has_more_below:
+                    marker += ' v'
+                divider_label = f' input{marker} '
+                divider = (divider_label + '-' * max(1, left_w - 5))[: max(1, left_w - 5)]
+                safe_addstr(stdscr, input_y, 3, divider[: left_w - 5], colors['muted'])
+                if try_status == 'ready':
+                    input_attr = colors['panel'] | curses.A_BOLD
+                    for row_idx, input_line in enumerate(input_lines[:try_input_rows]):
+                        safe_addstr(stdscr, input_y + 1 + row_idx, 3, input_line[: left_w - 5], input_attr)
+                elif try_status == 'responding':
+                    input_line = 'streaming response... Esc cancels and stops the model'
+                    input_attr = colors['warning'] | curses.A_BOLD
+                    safe_addstr(stdscr, input_y + 1, 3, input_line[: left_w - 5], input_attr)
+                elif try_status == 'error':
+                    input_line = f'error: {try_error or "chat failed"}'
+                    input_attr = colors['error'] | curses.A_BOLD
+                    safe_addstr(stdscr, input_y + 1, 3, input_line[: left_w - 5], input_attr)
+                else:
+                    input_line = 'waiting for server readiness...'
+                    input_attr = colors['warning'] | curses.A_BOLD
+                    safe_addstr(stdscr, input_y + 1, 3, input_line[: left_w - 5], input_attr)
         elif view_mode == 'detail' and active_model:
             model = active_model
             status, detail = statuses.get(model.id, ('?', ''))
@@ -2340,7 +2584,7 @@ def tui(stdscr, app: AppConfig):
             if benchmark_score > 0:
                 benchmark_summary = f'{benchmark_score:.2f} tok/s in {benchmark_seconds:.2f}s'
             else:
-                benchmark_summary = 'not run yet; press B when ready'
+                benchmark_summary = 'not run yet; benchmark optional'
             if opencode_score > 0:
                 opencode_summary = f'{opencode_score:.2f} score in {opencode_seconds:.2f}s'
             else:
@@ -2372,8 +2616,6 @@ def tui(stdscr, app: AppConfig):
                 ('command preview:', colors['accent'] | curses.A_BOLD),
                 (' '.join(app.build_command(model)), curses.A_NORMAL),
                 ('', curses.A_NORMAL),
-                ('benchmark table:', colors['accent'] | curses.A_BOLD),
-                (f' {"OBJECTIVE":16} {"TOK/S":>8} {"SEC":>5} {"CTX":>6} {"SLOT":>6} {"PAR":>3} {"NGL":>4} STATUS', colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD),
             ]
             benchmark_rows = list(getattr(model, 'last_benchmark_results', []) or [])
             if not benchmark_rows and benchmark_score > 0:
@@ -2390,112 +2632,62 @@ def tui(stdscr, app: AppConfig):
                     'threads': model.threads,
                     'ngl': model.ngl,
                 }]
+            detail_rows.extend([('', curses.A_NORMAL), ('server benchmark table:', colors['accent'] | curses.A_BOLD)])
             if benchmark_rows:
-                benchmark_rows = sorted(
-                    benchmark_rows,
-                    key=lambda row: float(row.get('tokens_per_sec', 0.0) or 0.0),
-                    reverse=True,
-                )
-            for row in benchmark_rows:
-                row_score = float(row.get('tokens_per_sec', 0.0) or 0.0)
-                row_seconds = float(row.get('seconds', 0.0) or 0.0)
-                tok = f'{row_score:.2f}' if row_score > 0 else '-'
-                secs = f'{row_seconds:.1f}' if row_seconds > 0 else '-'
-                objective = profile_label(str(row.get('objective') or row.get('preset', '-')))[:16]
-                status_text = str(row.get('status', '-'))
-                ctx_value = int(row.get("ctx", 0) or 0)
-                parallel_value = int(row.get("parallel", 0) or 0)
-                slot_value = int(row.get("ctx_per_slot", 0) or 0) or (ctx_value // max(1, parallel_value or 1))
-                line = (
-                    f' {objective:16} {tok:>8} {secs:>5} '
-                    f'{ctx_value:6} {slot_value:6} {parallel_value:3} '
-                    f'{int(row.get("ngl", 0) or 0):4} {status_text}'
-                )
-                attr = colors['success'] | curses.A_BOLD if status_text == 'ok' else colors['error']
-                detail_rows.append((line, attr))
-            if not benchmark_rows:
-                detail_rows.append((' no benchmark rows yet; press B to run one manually', colors['warning']))
+                detail_rows.extend(benchmark_ranking_items(
+                    {
+                        'kind': 'server',
+                        'records': benchmark_rows,
+                        'winners': getattr(model, 'measured_profiles', {}) or {},
+                    },
+                    width=left_w - 5,
+                    success_attr=colors['success'] | curses.A_BOLD,
+                    warning_attr=colors['warning'],
+                    error_attr=colors['error'],
+                    heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
+                    normal_attr=curses.A_NORMAL,
+                ))
+            else:
+                detail_rows.append((' no benchmark rows yet; server start is still available', colors['warning']))
 
             opencode_rows = list(getattr(model, 'last_opencode_benchmark_results', []) or [])
-            detail_rows.extend([
-                ('', curses.A_NORMAL),
-                ('opencode workflow table:', colors['accent'] | curses.A_BOLD),
-                (f' {"PROFILE":16} {"TIER":9} {"SCORE":>8} {"SEC":>5} {"PASS":>5} {"CTX":>6} {"SLOT":>6} STATUS', colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD),
-            ])
+            detail_rows.extend([('', curses.A_NORMAL), ('opencode workflow table:', colors['accent'] | curses.A_BOLD)])
             if opencode_rows:
-                opencode_rows = sorted(
-                    opencode_rows,
-                    key=lambda row: float(row.get('score', 0.0) or 0.0),
-                    reverse=True,
-                )
-            for row in opencode_rows:
-                row_score = float(row.get('score', 0.0) or 0.0)
-                row_seconds = float(row.get('seconds', 0.0) or 0.0)
-                preset = profile_label(str(row.get('preset', '-')))[:16]
-                tier = tier_label(str(row.get('tier', '-')))[:9]
-                status_text = str(row.get('status', '-'))
-                pass_text = f'{int(row.get("passed", 0) or 0)}/{int(row.get("tasks", 0) or 0)}'
-                ctx_value = int(row.get("ctx", 0) or 0)
-                slot_value = int(row.get("ctx_per_slot", 0) or 0) or (ctx_value // max(1, int(row.get("parallel", 1) or 1)))
-                line = (
-                    f' {preset:16} {tier:9} {row_score:8.2f} {row_seconds:5.1f} '
-                    f'{pass_text:>5} {ctx_value:6} {slot_value:6} {status_text}'
-                )
-                attr = (
-                    colors['success'] | curses.A_BOLD
-                    if status_text in ('tests passed', 'ok')
-                    else colors['warning']
-                    if status_text in ('tests failed', 'context too small', 'partial')
-                    else colors['error']
-                )
-                detail_rows.append((line, attr))
-            if not opencode_rows:
+                detail_rows.extend(benchmark_ranking_items(
+                    {'kind': 'opencode', 'records': opencode_rows, 'winners': {}},
+                    width=left_w - 5,
+                    success_attr=colors['success'] | curses.A_BOLD,
+                    warning_attr=colors['warning'],
+                    error_attr=colors['error'],
+                    heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
+                    normal_attr=curses.A_NORMAL,
+                ))
+            else:
                 detail_rows.append((' no opencode workflow rows yet; press O to run', colors['warning']))
 
             hermes_rows = list(getattr(model, 'last_hermes_benchmark_results', []) or [])
-            detail_rows.extend([
-                ('', curses.A_NORMAL),
-                ('hermes workflow table:', colors['accent'] | curses.A_BOLD),
-                (f' {"PROFILE":16} {"TIER":9} {"SCORE":>8} {"SEC":>5} {"PASS":>5} {"CTX":>6} {"SLOT":>6} STATUS', colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD),
-            ])
+            detail_rows.extend([('', curses.A_NORMAL), ('hermes workflow table:', colors['accent'] | curses.A_BOLD)])
             if hermes_rows:
-                hermes_rows = sorted(
-                    hermes_rows,
-                    key=lambda row: float(row.get('score', 0.0) or 0.0),
-                    reverse=True,
-                )
-            for row in hermes_rows:
-                row_score = float(row.get('score', 0.0) or 0.0)
-                row_seconds = float(row.get('seconds', 0.0) or 0.0)
-                preset = profile_label(str(row.get('preset', '-')))[:16]
-                tier = tier_label(str(row.get('tier', '-')))[:9]
-                status_text = str(row.get('status', '-'))
-                pass_text = f'{int(row.get("passed", 0) or 0)}/{int(row.get("tasks", 0) or 0)}'
-                ctx_value = int(row.get("ctx", 0) or 0)
-                slot_value = int(row.get("ctx_per_slot", 0) or 0) or (ctx_value // max(1, int(row.get("parallel", 1) or 1)))
-                line = (
-                    f' {preset:16} {tier:9} {row_score:8.2f} {row_seconds:5.1f} '
-                    f'{pass_text:>5} {ctx_value:6} {slot_value:6} {status_text}'
-                )
-                attr = (
-                    colors['success'] | curses.A_BOLD
-                    if status_text in ('tests passed', 'ok')
-                    else colors['warning']
-                    if status_text in ('tests failed', 'context too small', 'partial')
-                    else colors['error']
-                )
-                detail_rows.append((line, attr))
-            if not hermes_rows:
+                detail_rows.extend(benchmark_ranking_items(
+                    {'kind': 'hermes', 'records': hermes_rows, 'winners': {}},
+                    width=left_w - 5,
+                    success_attr=colors['success'] | curses.A_BOLD,
+                    warning_attr=colors['warning'],
+                    error_attr=colors['error'],
+                    heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
+                    normal_attr=curses.A_NORMAL,
+                ))
+            else:
                 detail_rows.append((' no Hermes workflow rows yet; press H to run', colors['warning']))
 
-            detail_rows = scrollable_pane_wrapped_items(detail_rows, left_w - 5)
-            for i, (line, attr) in enumerate(detail_rows[: h - box_top - 7]):
-                stdscr.addstr(box_top + 2 + i, 3, line[: left_w - 4], attr)
+            detail_items = scrollable_pane_wrapped_items(detail_rows, left_w - 5)
+            for i, (line, attr) in enumerate(detail_items[:content_rows]):
+                safe_addstr(stdscr, box_top + 2 + i, 3, line[: left_w - 4], attr)
         elif app.models:
             header = ' ID              PRT  ST        RLS  ENG        QNT      TYPE   NAME'
-            stdscr.addstr(box_top + 2, 3, header, colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD)
-            start_idx = max(0, selected - visible_rows + 3)
-            end_idx = min(len(app.models), start_idx + visible_rows)
+            if content_rows > 0:
+                safe_addstr(stdscr, box_top + 2, 3, header, colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD)
+            start_idx, end_idx = visible_selection_window(len(app.models), selected, visible_rows)
             for idx in range(start_idx, end_idx):
                 model = app.models[idx]
                 status, _ = statuses.get(model.id, ('?', ''))
@@ -2508,24 +2700,25 @@ def tui(stdscr, app: AppConfig):
                 row_y = box_top + 3 + idx - start_idx
                 if idx == selected:
                     try:
-                        stdscr.addstr(row_y, 3, line[: left_w - 3], colors['selection'] | curses.A_BOLD)
+                        safe_addstr(stdscr, row_y, 3, line[: left_w - 3], colors['selection'] | curses.A_BOLD)
                     except curses.error:
-                        stdscr.addstr(row_y, 3, line[: left_w - 3], curses.A_REVERSE)
+                        safe_addstr(stdscr, row_y, 3, line[: left_w - 3], curses.A_REVERSE)
                 else:
-                    stdscr.addstr(row_y, 3, line[: left_w - 3])
+                    safe_addstr(stdscr, row_y, 3, line[: left_w - 3])
                     status_x = 3 + 1 + 14 + 1 + 4 + 2
-                    stdscr.addstr(row_y, status_x, f'{status_symbol(status)} {status[:6]:6}', status_attr(colors, status))
-            if len(app.models) > visible_rows:
-                bar_h = max(1, visible_rows)
+                    safe_addstr(stdscr, row_y, status_x, f'{status_symbol(status)} {status[:6]:6}', status_attr(colors, status))
+            if visible_rows > 0 and len(app.models) > visible_rows:
+                bar_h = visible_rows
                 track_x = left_w - 1
                 for i in range(bar_h):
-                    stdscr.addch(box_top + 3 + i, track_x, '│', colors['muted'])
+                    safe_addch(stdscr, box_top + 3 + i, track_x, '│', colors['muted'])
                 thumb_h = max(1, int(bar_h * (visible_rows / max(1, len(app.models)))))
                 thumb_top = int((start_idx / max(1, len(app.models) - visible_rows)) * max(0, bar_h - thumb_h))
                 for i in range(thumb_h):
-                    stdscr.addch(box_top + 3 + thumb_top + i, track_x, '█', colors['accent'] | curses.A_BOLD)
+                    safe_addch(stdscr, box_top + 3 + thumb_top + i, track_x, '█', colors['accent'] | curses.A_BOLD)
         else:
-            stdscr.addstr(box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
+            if content_rows > 1:
+                safe_addstr(stdscr, box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
 
         if active_model and right_tabs:
             model = active_model
@@ -2573,45 +2766,45 @@ def tui(stdscr, app: AppConfig):
                         ('', curses.A_NORMAL),
                         ('server benchmark rows:', colors['accent'] | curses.A_BOLD),
                     ]
-                    rows = sorted(
-                        list(getattr(model, 'last_benchmark_results', []) or []),
-                        key=lambda row: float(row.get('tokens_per_sec', 0.0) or 0.0),
-                        reverse=True,
-                    )
+                    rows = list(getattr(model, 'last_benchmark_results', []) or [])
                     if rows:
-                        for row in rows[:30]:
-                            right_items.extend(benchmark_record_display_items(
-                                row,
-                                colors['success'] if row.get('status') == 'ok' else colors['warning'],
-                            ))
+                        right_items.extend(benchmark_ranking_items(
+                            {'kind': 'server', 'records': rows, 'winners': getattr(model, 'measured_profiles', {}) or {}},
+                            width=right_content_w,
+                            success_attr=colors['success'] | curses.A_BOLD,
+                            warning_attr=colors['warning'],
+                            error_attr=colors['error'],
+                            heading_attr=colors['accent'] | curses.A_BOLD,
+                            normal_attr=curses.A_NORMAL,
+                        ))
                     else:
                         right_items.append(('no server benchmark rows yet', colors['muted']))
                     right_items.extend([('', curses.A_NORMAL), ('opencode workflow rows:', colors['accent'] | curses.A_BOLD)])
-                    opencode_rows = sorted(
-                        list(getattr(model, 'last_opencode_benchmark_results', []) or []),
-                        key=lambda row: float(row.get('score', 0.0) or 0.0),
-                        reverse=True,
-                    )
+                    opencode_rows = list(getattr(model, 'last_opencode_benchmark_results', []) or [])
                     if opencode_rows:
-                        for row in opencode_rows[:30]:
-                            right_items.extend(benchmark_record_display_items(
-                                row,
-                                colors['success'] if row.get('status') in ('ok', 'tests passed') else colors['warning'],
-                            ))
+                        right_items.extend(benchmark_ranking_items(
+                            {'kind': 'opencode', 'records': opencode_rows, 'winners': {}},
+                            width=right_content_w,
+                            success_attr=colors['success'] | curses.A_BOLD,
+                            warning_attr=colors['warning'],
+                            error_attr=colors['error'],
+                            heading_attr=colors['accent'] | curses.A_BOLD,
+                            normal_attr=curses.A_NORMAL,
+                        ))
                     else:
                         right_items.append(('no opencode workflow rows yet', colors['muted']))
                     right_items.extend([('', curses.A_NORMAL), ('hermes workflow rows:', colors['accent'] | curses.A_BOLD)])
-                    hermes_rows = sorted(
-                        list(getattr(model, 'last_hermes_benchmark_results', []) or []),
-                        key=lambda row: float(row.get('score', 0.0) or 0.0),
-                        reverse=True,
-                    )
+                    hermes_rows = list(getattr(model, 'last_hermes_benchmark_results', []) or [])
                     if hermes_rows:
-                        for row in hermes_rows[:30]:
-                            right_items.extend(benchmark_record_display_items(
-                                row,
-                                colors['success'] if row.get('status') in ('ok', 'tests passed') else colors['warning'],
-                            ))
+                        right_items.extend(benchmark_ranking_items(
+                            {'kind': 'hermes', 'records': hermes_rows, 'winners': {}},
+                            width=right_content_w,
+                            success_attr=colors['success'] | curses.A_BOLD,
+                            warning_attr=colors['warning'],
+                            error_attr=colors['error'],
+                            heading_attr=colors['accent'] | curses.A_BOLD,
+                            normal_attr=curses.A_NORMAL,
+                        ))
                     else:
                         right_items.append(('no Hermes workflow rows yet', colors['muted']))
 
@@ -2642,6 +2835,7 @@ def tui(stdscr, app: AppConfig):
                     }
                     right_items = benchmark_ranking_items(
                         run,
+                        width=right_content_w,
                         success_attr=colors['success'] | curses.A_BOLD,
                         warning_attr=colors['warning'],
                         error_attr=colors['error'],
@@ -2710,6 +2904,7 @@ def tui(stdscr, app: AppConfig):
                 elif right_active_tab == 'rankings':
                     right_items = benchmark_ranking_items(
                         run,
+                        width=right_content_w,
                         success_attr=colors['success'] | curses.A_BOLD,
                         warning_attr=colors['warning'],
                         error_attr=colors['error'],
@@ -2773,24 +2968,24 @@ def tui(stdscr, app: AppConfig):
             )
 
         if view_mode == 'try':
-            footer = '[Enter] send  [Tab/[/]] right tabs  [PgUp/PgDn] scroll tab  [Esc] stop model + exit'
-            footer2 = '[Up/Down] scroll prompt input. Right pane uses Profile, Logs, Errors, Stats, and Command tabs.'
+            footer = '[Enter] send  Tab/] next tab  Shift-Tab/[ prev tab  [Esc] stop model + exit'
+            footer2 = '[Up/Down] scroll prompt input  [PgUp/PgDn/Home/End] scroll active right tab.'
         elif view_mode == 'benchmark':
-            footer = '[Esc] details  [F] fast bench  [R] results  [W] wiki  [Tab/[/]] right tabs  [A] abort active benchmark'
+            footer = '[Esc] details  [F] fast bench  [R] results  [W] wiki  Tab/] next  Shift-Tab/[ prev  [A] abort'
             footer2 = '[Up/Down/PgUp/PgDn/Home/End] scroll active right tab.'
         elif view_mode == 'results':
-            footer = '[Esc] details  [Up/Down] select run  [Tab/[/]] right tabs'
+            footer = '[Esc] details  [Up/Down] select run  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab.'
         elif view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] actions  [T] try  [B] deep bench  [F] fast bench  [O] opencode  [H] hermes  [R] results  [z] auto'
-            footer2 = '[Tab/[/]] right tabs  [Up/Down/PgUp/PgDn] scroll tab  [m/s/b/p] roles  [g] gen opencode  [G] gen hermes  [S] stop-all  [q] quit'
+            footer = '[Esc] models  [Enter/l] actions  [T] try  [B] deep bench  [F] fast bench  [O] opencode  [H] hermes  [R] results'
+            footer2 = 'Tab/] next tab  Shift-Tab/[ prev tab  [Up/Down/PgUp/PgDn/Home/End] scroll tab  [z] auto  [q] quit'
         else:
             footer = '[Enter] details  [z] auto profile  [B] benchmark best  [x] detect  [X] prune'
-            footer2 = '[a/e/d] models  [m/s/b/p] set roles  [r] sync inventory  [S] stop-all  [q] quit'
+            footer2 = '[Up/Down] models  [a/e/d] models  [m/s/b/p] roles  [r] sync inventory  [S] stop-all  [q] quit'
         if action_running():
             footer = '[A] abort active action   ' + footer
-        stdscr.addstr(h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
-        stdscr.addstr(h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
+        safe_addstr(stdscr, h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
+        safe_addstr(stdscr, h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
         stdscr.refresh()
 
         try:
@@ -2801,17 +2996,14 @@ def tui(stdscr, app: AppConfig):
         if key == -1:
             time.sleep(0.05)
             continue
-        scroll_action = RIGHT_PANE_SCROLL_KEYS.get(key, '')
-        if active_model and view_mode in ('detail', 'benchmark', 'try', 'results') and key in (9, ord(']')):
-            right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, 1)
-            message = f'Right tab: {right_tab_label(right_tab_by_view[view_mode], len(error_source_lines))}.'
-            continue
-        if active_model and view_mode in ('detail', 'benchmark', 'try', 'results') and key in (getattr(curses, 'KEY_BTAB', -999), ord('[')):
-            right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, -1)
+        scroll_action = right_scroll_action_for_view(view_mode, key)
+        tab_direction = right_tab_key_direction(key)
+        if active_model and view_mode in ('detail', 'benchmark', 'try', 'results') and tab_direction:
+            right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, tab_direction)
             message = f'Right tab: {right_tab_label(right_tab_by_view[view_mode], len(error_source_lines))}.'
             continue
         if view_mode == 'try':
-            if key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            if scroll_action:
                 right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
                 message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
                 continue
@@ -2820,6 +3012,9 @@ def tui(stdscr, app: AppConfig):
                 continue
             if key in (curses.KEY_UP, curses.KEY_DOWN):
                 if try_status == 'ready':
+                    if try_input_rows <= 0:
+                        message = 'Try-out input needs a taller terminal.'
+                        continue
                     input_width = max(1, left_w - 6)
                     max_scroll = try_input_max_scroll(try_input, input_width, try_input_rows)
                     if key == curses.KEY_UP:
@@ -2867,7 +3062,7 @@ def tui(stdscr, app: AppConfig):
                 view_mode = 'detail'
                 message = 'Back to model details.'
                 continue
-            if key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            if scroll_action:
                 right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
                 message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
                 continue
@@ -2884,7 +3079,7 @@ def tui(stdscr, app: AppConfig):
             right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
             message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
             continue
-        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END, ord('j'), ord('k'), ord('R'), ord('W'), ord('w'), ord('['), ord(']'), 9, 27, curses.KEY_BACKSPACE, 127, 8):
+        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END, ord('j'), ord('k'), ord('R'), ord('W'), ord('w'), ord('['), ord(']'), 9, getattr(curses, 'KEY_BTAB', -999), 27, curses.KEY_BACKSPACE, 127, 8):
             message = '⏳ Action is running. Watch the log window; controls unlock when it finishes.'
             continue
         if view_mode == 'benchmark' and key in (27, curses.KEY_BACKSPACE, 127, 8):
@@ -3023,7 +3218,7 @@ def tui(stdscr, app: AppConfig):
                     model.default_benchmark_status = 'pending'
                 app.add_or_update(model)
                 selected = len(app.models) - 1
-                message = f'Added {model.id} with safe defaults. Open details and press B to benchmark.'
+                message = f'Added {model.id} with safe defaults. Open details to start now; press B for measured settings.'
         elif key == ord('e') and app.models:
             current = active_detail_model() or app.models[selected]
             updated = prompt_model(stdscr, f'Edit {current.id}', current)
@@ -3056,7 +3251,7 @@ def tui(stdscr, app: AppConfig):
             count, items = app.detect_models()
             message = items[0] if items else (f'Detected {count} new model(s)' if count else 'No new GGUFs found.')
             if count:
-                message = f'{message} | safe defaults set; press B from details to benchmark.'
+                message = f'{message} | safe defaults set; start now or press B for measured settings.'
             selected = min(selected, len(app.models) - 1 if app.models else 0)
         elif key == ord('X'):
             count, removed = app.prune_missing_models()

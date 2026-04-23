@@ -1,3 +1,4 @@
+import curses
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +10,11 @@ from llama_tui.ui import (
     apply_quit_policy,
     adjust_scroll_offset,
     benchmark_ranking_items,
+    body_content_bottom,
+    body_content_rows,
+    body_pane_layout,
+    body_pane_height,
+    build_error_source_lines,
     build_benchmark_progress_items,
     build_error_items,
     build_header_config_items,
@@ -30,6 +36,7 @@ from llama_tui.ui import (
     finish_try_live_metrics,
     new_try_live_metrics,
     new_benchmark_run_state,
+    launch_options_for_stopped_model,
     profile_label,
     progress_bar_text,
     reduce_benchmark_event,
@@ -37,7 +44,9 @@ from llama_tui.ui import (
     cycle_right_tab,
     default_right_tab,
     normalize_right_tab,
+    right_scroll_action_for_view,
     right_tab_label,
+    right_tab_key_direction,
     right_tab_scroll_key,
     right_tabs_for_view,
     should_prompt_quit_keepalive,
@@ -48,11 +57,14 @@ from llama_tui.ui import (
     stop_try_model,
     try_live_metric_snapshot,
     try_input_max_scroll,
+    try_input_row_count,
     try_input_view,
     try_input_wrapped_lines,
     update_try_live_metrics,
+    visible_selection_window,
     wrap_display_item_lines,
 )
+from llama_tui.textutil import is_error_message
 
 
 class ChatPayloadTests(unittest.TestCase):
@@ -268,6 +280,78 @@ class ProfileUiTests(unittest.TestCase):
         small_enabled, _left_w, _right_x, _right_w = header_dashboard_layout(110)
         self.assertFalse(small_enabled)
 
+    def test_body_pane_layout_keeps_panes_inside_supported_widths(self):
+        for width in (88, 100, 124, 150):
+            with self.subTest(width=width):
+                left_w, right_x, right_w = body_pane_layout(width)
+
+                self.assertGreaterEqual(left_w, 1)
+                self.assertGreater(right_x, left_w)
+                self.assertGreaterEqual(right_w, 1)
+                self.assertLessEqual(right_x + right_w, width)
+
+    def test_body_vertical_layout_stays_above_footer(self):
+        box_top = 11
+        for height in range(18, 25):
+            with self.subTest(height=height):
+                pane_h = body_pane_height(height, box_top)
+                rows = body_content_rows(height, box_top)
+                bottom = body_content_bottom(height, box_top)
+                footer_top = height - 2
+                model_rows = max(0, rows - 1)
+                input_rows = try_input_row_count(rows)
+
+                self.assertLess(box_top + pane_h, footer_top)
+                self.assertLess(bottom, footer_top)
+                if model_rows:
+                    self.assertLessEqual(box_top + 3 + model_rows - 1, bottom)
+                if input_rows:
+                    input_y = bottom - input_rows
+                    self.assertLessEqual(input_y + input_rows, bottom)
+
+    def test_selection_window_keeps_selected_row_visible(self):
+        self.assertEqual(visible_selection_window(10, 0, 4), (0, 4))
+        self.assertEqual(visible_selection_window(10, 5, 4), (3, 7))
+        self.assertEqual(visible_selection_window(10, 9, 4), (6, 10))
+
+        selected = 0
+        for _step in range(9):
+            selected += 1
+            start, end = visible_selection_window(10, selected, 4)
+            self.assertLessEqual(start, selected)
+            self.assertLess(selected, end)
+
+    def test_results_run_window_uses_real_indices(self):
+        runs = [
+            {'id': f'run-{idx}', 'status': 'done', 'summary': f'summary {idx}'}
+            for idx in range(10)
+        ]
+        selected = 8
+        start, end = visible_selection_window(len(runs), selected, 4)
+        lines = [
+            benchmark_run_line(runs[idx], idx, selected=(idx == selected))
+            for idx in range(start, end)
+        ]
+
+        self.assertTrue(any(line.startswith('> 09') and 'run-8' in line for line in lines))
+        self.assertFalse(any('run-0' in line for line in lines))
+
+    def test_right_tab_key_routing_restores_tab_switching(self):
+        self.assertEqual(right_tab_key_direction(9), 1)
+        self.assertEqual(right_tab_key_direction(ord(']')), 1)
+        self.assertEqual(right_tab_key_direction(getattr(curses, 'KEY_BTAB', -999)), -1)
+        self.assertEqual(right_tab_key_direction(ord('[')), -1)
+        self.assertEqual(right_tab_key_direction(getattr(curses, 'KEY_F6', 270)), 0)
+
+    def test_right_scroll_key_routing_is_view_specific(self):
+        self.assertEqual(right_scroll_action_for_view('detail', ord('j')), 'newer')
+        self.assertEqual(right_scroll_action_for_view('benchmark', ord('k')), 'older')
+        self.assertEqual(right_scroll_action_for_view('results', curses.KEY_NPAGE), 'page_newer')
+        self.assertEqual(right_scroll_action_for_view('try', curses.KEY_PPAGE), 'page_older')
+        self.assertEqual(right_scroll_action_for_view('results', ord('j')), '')
+        self.assertEqual(right_scroll_action_for_view('try', curses.KEY_UP), '')
+        self.assertEqual(right_scroll_action_for_view('list', curses.KEY_NPAGE), '')
+
     def test_header_dashboard_content_builder(self):
         model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
         state = new_benchmark_run_state(model.id, 'hermes', 'Hermes workflow', now=10.0)
@@ -346,6 +430,29 @@ class ProfileUiTests(unittest.TestCase):
         self.assertEqual(logs, [('server line', 2)])
         self.assertEqual(errors, [('boom', 1)])
         self.assertIn(('No errors captured for this model/run.', 4), empty_errors)
+
+    def test_ui_labels_do_not_become_error_history(self):
+        self.assertFalse(is_error_message('Right tab: Errors 3.'))
+        self.assertFalse(is_error_message('No errors captured for this model/run.'))
+        self.assertFalse(is_error_message('Focus: Right pane.'))
+        self.assertFalse(is_error_message('0 errors in this run'))
+        self.assertFalse(is_error_message('error-free launch'))
+        self.assertFalse(is_error_message('completed without error'))
+        self.assertTrue(is_error_message('error: chat failed'))
+        self.assertTrue(is_error_message('0 errors reported, but server failed later'))
+        self.assertTrue(is_error_message('error-free until it crashed'))
+        self.assertEqual(build_error_source_lines([], benchmark_errors=[], benchmark_mode=False), [])
+        self.assertEqual(
+            build_error_source_lines(['boom'], status_error='tiny: status ERROR (oom)'),
+            ['boom', 'tiny: status ERROR (oom)'],
+        )
+
+    def test_stopped_launch_menu_starts_without_benchmark_first(self):
+        model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
+        options = launch_options_for_stopped_model(model)
+
+        self.assertEqual(options[0], ('1', 'Start server now', 'keep'))
+        self.assertIn(('2', 'Auto profile', 'auto_profile'), options)
 
     def test_benchmark_progress_content_builder_includes_runtime_fields(self):
         model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
@@ -687,14 +794,16 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('server-1', benchmark_run_line(run, 0, selected=True))
         lines = '\n'.join(benchmark_ranking_rows(run))
 
-        self.assertIn('#01 [Winner, Fastest]', lines)
-        self.assertIn('40.00 tok/s', lines)
-        self.assertIn('[Break Point]', lines)
-        self.assertLess(lines.index('[Winner, Fastest]'), lines.index('[Break Point]'))
+        self.assertIn('Rank Role', lines)
+        self.assertIn('Winner, Fastest', lines)
+        self.assertIn('40.00', lines)
+        self.assertIn('Break Point', lines)
+        self.assertLess(lines.index('Winner, Fastest'), lines.index('Break Point'))
 
         items = benchmark_ranking_items(run, success_attr=1, warning_attr=2, error_attr=3, heading_attr=4)
-        self.assertEqual(items[0], ('ranked candidates:', 4))
-        self.assertTrue(any('[Break Point]' in line and attr == 3 for line, attr in items))
+        self.assertTrue(items[0][0].startswith('Rank Role'))
+        self.assertEqual(items[0][1], 4)
+        self.assertTrue(any('Break Point' in line and attr == 3 for line, attr in items))
 
     def test_agent_ranking_rows_sort_passed_tasks_before_failures(self):
         run = {
@@ -711,8 +820,66 @@ class BenchmarkDashboardTests(unittest.TestCase):
         lines = benchmark_ranking_rows(run)
         text = '\n'.join(lines)
 
-        self.assertIn('#01 [Winner, Passed] tests passed 120.00 score', text)
-        self.assertIn('#02 [Failed] hermes command failed', text)
+        self.assertIn('Rank Role', text)
+        self.assertIn('Winner, Passed', text)
+        self.assertIn('tests passed', text)
+        self.assertIn('120.00', text)
+        self.assertIn('Failed', text)
+        self.assertIn('hermes command', text)
+
+    def test_server_ranking_table_stays_within_narrow_widths(self):
+        run = {
+            'kind': 'server',
+            'winners': {
+                'fast_chat': {'ctx': 4096, 'ctx_per_slot': 2048, 'parallel': 2, 'tokens_per_sec': 40.0},
+            },
+            'records': [
+                {
+                    'status': 'ok',
+                    'objective': 'fast_chat',
+                    'ctx': 4096,
+                    'ctx_per_slot': 2048,
+                    'parallel': 2,
+                    'tokens_per_sec': 40.0,
+                    'selection_reason': 'fastest stable full measurement',
+                    'detail': 'long detail that must truncate cleanly',
+                },
+            ],
+        }
+
+        for width in range(24, 141):
+            with self.subTest(width=width):
+                lines = [line for line, _attr in benchmark_ranking_items(run, width=width)]
+
+                self.assertTrue(lines[0].startswith('Rank'))
+                self.assertTrue(any('40.00' in line or '40.0' in line for line in lines))
+                self.assertTrue(all(len(line) <= width for line in lines))
+
+    def test_agent_ranking_table_stays_within_narrow_widths(self):
+        run = {
+            'kind': 'opencode',
+            'records': [
+                {
+                    'runtime': 'opencode',
+                    'status': 'tests passed',
+                    'score': 120.0,
+                    'ctx': 8192,
+                    'ctx_per_slot': 8192,
+                    'parallel': 1,
+                    'passed': 3,
+                    'tasks': 3,
+                    'detail': 'all tasks passed with a long truncation detail',
+                },
+            ],
+        }
+
+        for width in range(24, 141):
+            with self.subTest(width=width):
+                lines = [line for line, _attr in benchmark_ranking_items(run, width=width)]
+
+                self.assertTrue(lines[0].startswith('Rank'))
+                self.assertTrue(any('120.00' in line or '120.' in line for line in lines))
+                self.assertTrue(all(len(line) <= width for line in lines))
 
 
 if __name__ == '__main__':

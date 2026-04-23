@@ -136,8 +136,11 @@ Useful per-model fields:
 - `Enter` on the list: open model details.
 - `Enter` or `l` on details: open model actions.
 - `Esc` on details: return to the model list.
+- `Tab` or `]`: switch the right pane to the next tab.
+- `Shift+Tab` or `[`: switch the right pane to the previous tab.
 - `T`: open Try it out from model details.
-- `B`: run the adaptive profile benchmark.
+- `B`: run the quality-first smart benchmark.
+- `F`: run the faster benchmark.
 - `O`: benchmark the selected model with an OpenCode workflow from details.
 - `A`: abort the active launch or benchmark action and clean up managed processes.
 - `z`: apply the Auto profile without benchmarking.
@@ -161,11 +164,11 @@ To start a server, select a model, open details with `Enter`, then press `Enter`
 
 If the model is stopped, llama-tui asks how to launch it:
 
+- Start server now.
 - Auto profile.
 - Balanced chat.
 - Fast chat.
 - Long context.
-- Keep current settings.
 - Advanced profiles.
 - Try it out.
 - Launch model + OpenCode.
@@ -173,7 +176,7 @@ If the model is stopped, llama-tui asks how to launch it:
 
 If a model is already running, the details action menu offers stop, Try it out, OpenCode launch, full-stack launch, or cancel.
 
-`Try it out` is available from the action menu and as `T` on model details. It opens an integrated chat console inside llama-tui. The left pane is a temporary transcript plus a five-row wrapped prompt editor; the right pane keeps the active launch profile, server logs, and live stats visible. Press `Enter` to send, `Up / Down` to scroll long prompt text, `Ctrl+U` to clear the input, and `Esc` to leave. Leaving Try-It-Out always stops the selected model, even if it was already running before you entered the console.
+`Start server now` uses the saved model settings guarded by safe launch checks. It does not require benchmark data. `Try it out` is available from the action menu and as `T` on model details. It opens an integrated chat console inside llama-tui. The left pane is a temporary transcript plus a five-row wrapped prompt editor; the right pane keeps the active launch profile, server logs, and live stats visible. Press `Enter` to send, `Up / Down` to scroll long prompt text, `Ctrl+U` to clear the input, and `Esc` to leave. Leaving Try-It-Out always stops the selected model, even if it was already running before you entered the console.
 
 For `llama.cpp`, llama-tui builds a command like:
 
@@ -244,11 +247,11 @@ GGUF metadata is used to estimate KV cache bytes per token from layer count, KV 
 
 The normal model action menu uses intent labels:
 
+- `Start server now`: start from saved settings with safe launch checks; no benchmark required.
 - `Auto profile`: use the best saved/measured behavior for this PC, with failsafe fallback.
 - `Balanced chat`: tune for responsive chat without being too aggressive.
 - `Fast chat`: push throughput harder.
 - `Long context`: favor the largest stable context window.
-- `Keep current settings`: start exactly from the saved model settings, still guarded by safe launch checks.
 - `Advanced profiles`: expose the underlying intent and aggression controls.
 
 Internally those choices still map to the persisted `optimize_mode` and `optimize_tier` values so existing configs remain compatible.
@@ -330,7 +333,7 @@ Saved benchmark rows include:
 - RAM/VRAM headroom,
 - status and detail.
 
-`Auto profile`, `Fast Chat`, `Long Context`, `Try it out`, and OpenCode stack launches use measured profiles when they exist. If no measured profile exists yet, llama-tui falls back to the estimated safe launch path and says so in the action log.
+Benchmarking is optional for normal server launches. `Auto profile`, `Fast Chat`, `Long Context`, `Try it out`, and OpenCode stack launches use measured profiles when they exist. If no measured profile exists yet, llama-tui falls back to the estimated safe launch path and says so in the action log.
 
 If all candidates fail, the failure details are saved and shown in the model details screen.
 
@@ -347,7 +350,7 @@ lm_studio_model_roots
 
 LM Studio defaults are read from `LM_STUDIO_HOME`, then `~/.lmstudio-home-pointer`, then `~/.lmstudio`. llama-tui scans only the user model folders, `models` and `hub/models`, by default; internal bundled models are skipped unless you add that path manually.
 
-Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. Nothing benchmarks automatically in the background; open the model details and press `B` when you want measured settings. Discovery does not special-case model families or filenames.
+Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. That pending marker means “unbenchmarked,” not blocked: you can start the server immediately, and nothing benchmarks automatically in the background. Open the model details and press `B` when you want measured settings. Discovery does not special-case model families or filenames.
 
 Press `X` to prune registry entries whose model files disappeared.
 
@@ -397,6 +400,8 @@ Run tests:
 
 ```bash
 python3 -m unittest discover -s tests
+# or, from the repository root:
+python3 -m unittest discover
 ```
 
 Run import smoke checks:
