@@ -1406,6 +1406,187 @@ def select_measured_profiles(
     return profiles
 
 
+def benchmark_profile_is_fresh(app: AppConfig, model: ModelConfig) -> bool:
+    if not getattr(model, 'enabled', True):
+        return False
+    if (getattr(model, 'default_benchmark_status', '') or '').strip().lower() != 'done':
+        return False
+    saved_fingerprint = str(getattr(model, 'benchmark_fingerprint', '') or '')
+    if not saved_fingerprint:
+        return False
+    try:
+        if saved_fingerprint != app.model_fingerprint(model):
+            return False
+    except Exception:
+        return False
+    auto_profile = get_measured_profile(model, 'auto')
+    if not auto_profile:
+        return False
+    return (
+        float(auto_profile.get('tokens_per_sec', 0.0) or 0.0) > 0.0
+        and int(auto_profile.get('ctx_per_slot', auto_profile.get('ctx', 0)) or 0) > 0
+    )
+
+
+def deep_benchmark_model_decision(app: AppConfig, model: ModelConfig, force: bool = False) -> Tuple[bool, str]:
+    if not getattr(model, 'enabled', True):
+        return False, 'disabled'
+    if force:
+        return True, 'force refresh'
+    if benchmark_profile_is_fresh(app, model):
+        return False, 'fresh benchmark'
+
+    status = (getattr(model, 'default_benchmark_status', '') or '').strip().lower()
+    saved_fingerprint = str(getattr(model, 'benchmark_fingerprint', '') or '')
+    try:
+        current_fingerprint = app.model_fingerprint(model)
+    except Exception:
+        current_fingerprint = ''
+    if status in ('pending', 'failed', 'aborted', 'running'):
+        return True, status or 'pending'
+    if saved_fingerprint and current_fingerprint and saved_fingerprint != current_fingerprint:
+        return True, 'stale fingerprint'
+    if not get_measured_profile(model, 'auto'):
+        return True, 'missing measured auto profile'
+    return True, 'missing fresh benchmark'
+
+
+def _machine_headroom_score(profile: Dict[str, object]) -> float:
+    ram = int(profile.get('ram_available', 0) or 0)
+    vram = int(profile.get('gpu_memory_free', 0) or 0)
+    score = min(1.0, (ram / 1024**3) / 8.0) if ram else 0.35
+    if vram:
+        score = max(score, min(1.0, (vram / 1024**3) / 2.0))
+    return max(0.0, min(1.0, score))
+
+
+def _machine_stability_score(profile: Dict[str, object]) -> float:
+    score = 1.0
+    if int(profile.get('retry_attempt', 1) or 1) > 1:
+        score -= 0.15
+    detail = compact_message(str(profile.get('detail', '') or '')).lower()
+    if detail not in ('', '1 samples', '2 samples', '3 samples'):
+        score -= 0.05
+    return max(0.0, min(1.0, score))
+
+
+def machine_benchmark_rows(app: AppConfig, models: Optional[List[ModelConfig]] = None) -> List[Dict[str, object]]:
+    source_models = list(models if models is not None else getattr(app, 'models', []) or [])
+    rows: List[Dict[str, object]] = []
+    for model in source_models:
+        if not benchmark_profile_is_fresh(app, model):
+            continue
+        auto = get_measured_profile(model, 'auto')
+        fast = get_measured_profile(model, 'fast_chat')
+        long = get_measured_profile(model, 'long_context')
+        opencode = get_measured_profile(model, 'opencode_ready')
+        if not auto:
+            continue
+        opencode_floor = observed_opencode_context_floor(model)
+        auto_ctx_slot = int(auto.get('ctx_per_slot', auto.get('ctx', 0)) or 0)
+        row = {
+            'model_id': model.id,
+            'name': getattr(model, 'name', '') or model.id,
+            'runtime': getattr(model, 'runtime', 'llama.cpp'),
+            'quant': str(getattr(model, 'path', '') or ''),
+            'auto_tokens_per_sec': float(auto.get('tokens_per_sec', 0.0) or 0.0),
+            'auto_ctx_per_slot': auto_ctx_slot,
+            'auto_parallel': int(auto.get('parallel', 1) or 1),
+            'fast_tokens_per_sec': float(fast.get('tokens_per_sec', auto.get('tokens_per_sec', 0.0)) or 0.0),
+            'long_ctx_per_slot': int(long.get('ctx_per_slot', auto_ctx_slot) or 0),
+            'opencode_ctx_per_slot': int(opencode.get('ctx_per_slot', auto_ctx_slot) or 0),
+            'opencode_floor': int(opencode_floor or 0),
+            'opencode_meets_floor': bool(not opencode_floor or int(opencode.get('ctx_per_slot', auto_ctx_slot) or 0) >= opencode_floor),
+            'ram_available': int(auto.get('ram_available', 0) or 0),
+            'gpu_memory_free': int(auto.get('gpu_memory_free', 0) or 0),
+            'stability_score': _machine_stability_score(auto),
+            'headroom_score': _machine_headroom_score(auto),
+            'benchmarked_at': str(auto.get('benchmarked_at') or getattr(model, 'default_benchmark_at', '') or ''),
+            'selection_reason': str(auto.get('selection_reason', '') or 'fresh measured auto profile'),
+        }
+        rows.append(row)
+
+    max_tps = max([float(row.get('auto_tokens_per_sec', 0.0) or 0.0) for row in rows] or [0.0]) or 1.0
+    max_ctx = max([int(row.get('auto_ctx_per_slot', 0) or 0) for row in rows] or [0]) or 1
+    for row in rows:
+        tps_norm = float(row.get('auto_tokens_per_sec', 0.0) or 0.0) / max_tps
+        ctx_norm = int(row.get('auto_ctx_per_slot', 0) or 0) / max_ctx
+        score = (
+            0.50 * tps_norm
+            + 0.30 * ctx_norm
+            + 0.12 * float(row.get('headroom_score', 0.0) or 0.0)
+            + 0.08 * float(row.get('stability_score', 0.0) or 0.0)
+        )
+        row['machine_score'] = round(score * 100.0, 2)
+        row['machine_reason'] = '50% speed, 30% ctx/slot, 12% headroom, 8% stability'
+    return sorted(rows, key=lambda row: (-float(row.get('machine_score', 0.0) or 0.0), str(row.get('model_id', ''))))
+
+
+def _machine_winner(rows: List[Dict[str, object]], key: str) -> Dict[str, object]:
+    if not rows:
+        return {}
+    if key == 'fastest_chat':
+        winner = max(rows, key=lambda row: (float(row.get('fast_tokens_per_sec', 0.0) or 0.0), float(row.get('machine_score', 0.0) or 0.0)))
+        return {
+            'label': 'Fastest Chat',
+            'model_id': winner.get('model_id', ''),
+            'metric': f'{float(winner.get("fast_tokens_per_sec", 0.0) or 0.0):.2f} tok/s',
+            'reason': 'highest measured Fast Chat throughput',
+            'row': dict(winner),
+        }
+    if key == 'longest_context':
+        winner = max(rows, key=lambda row: (int(row.get('long_ctx_per_slot', 0) or 0), float(row.get('auto_tokens_per_sec', 0.0) or 0.0)))
+        return {
+            'label': 'Longest Context',
+            'model_id': winner.get('model_id', ''),
+            'metric': f'{int(winner.get("long_ctx_per_slot", 0) or 0)} ctx/slot',
+            'reason': 'largest measured Long Context ctx/slot',
+            'row': dict(winner),
+        }
+    if key == 'opencode_ready':
+        meets_floor = [row for row in rows if bool(row.get('opencode_meets_floor'))]
+        pool = meets_floor or rows
+        winner = max(pool, key=lambda row: (int(row.get('opencode_ctx_per_slot', 0) or 0), float(row.get('auto_tokens_per_sec', 0.0) or 0.0)))
+        floor = int(winner.get('opencode_floor', 0) or 0)
+        if meets_floor and floor:
+            reason = f'meets observed OpenCode floor {floor}'
+        elif meets_floor:
+            reason = 'best measured OpenCode-ready profile; no floor observed'
+        else:
+            reason = f'fallback: no model met observed OpenCode floor {floor}'
+        return {
+            'label': 'OpenCode-ready',
+            'model_id': winner.get('model_id', ''),
+            'metric': f'{int(winner.get("opencode_ctx_per_slot", 0) or 0)} ctx/slot',
+            'reason': reason,
+            'row': dict(winner),
+        }
+    winner = max(rows, key=lambda row: (float(row.get('machine_score', 0.0) or 0.0), float(row.get('auto_tokens_per_sec', 0.0) or 0.0)))
+    return {
+        'label': 'Machine Pick',
+        'model_id': winner.get('model_id', ''),
+        'metric': f'{float(winner.get("machine_score", 0.0) or 0.0):.2f}',
+        'reason': str(winner.get('machine_reason', '') or 'weighted machine score'),
+        'row': dict(winner),
+    }
+
+
+def machine_best_summary(app: AppConfig, models: Optional[List[ModelConfig]] = None) -> Dict[str, object]:
+    rows = machine_benchmark_rows(app, models=models)
+    categories = {
+        'fastest_chat': _machine_winner(rows, 'fastest_chat'),
+        'longest_context': _machine_winner(rows, 'longest_context'),
+        'opencode_ready': _machine_winner(rows, 'opencode_ready'),
+        'machine_pick': _machine_winner(rows, 'machine_pick'),
+    }
+    return {
+        'rows': rows,
+        'categories': categories,
+        'machine_pick': categories.get('machine_pick') or {},
+        'benchmarked_count': len(rows),
+    }
+
+
 def record_matches_profile(record: Dict[str, object], profile: Dict[str, object]) -> bool:
     if not record or not profile:
         return False
@@ -2969,3 +3150,251 @@ def safe_bootstrap_benchmark(
         cancel_token=cancel_token,
         update_default_status=True,
     )
+
+
+def _get_model_pid(app: AppConfig, model: ModelConfig, discover: bool = True, managed_only: bool = False) -> Optional[int]:
+    try:
+        return app.get_pid(model, discover=discover, managed_only=managed_only)
+    except TypeError:
+        return app.get_pid(model)
+
+
+def _batch_summary_record(
+    model: ModelConfig,
+    status: str,
+    detail: str,
+    reason: str = '',
+) -> Dict[str, object]:
+    profile = get_measured_profile(model, 'auto')
+    return {
+        'objective': 'deep_all',
+        'model_id': model.id,
+        'status': status,
+        'tokens_per_sec': round(float(profile.get('tokens_per_sec', 0.0) or 0.0), 2),
+        'seconds': round(float(profile.get('seconds', 0.0) or 0.0), 2),
+        'ctx': int(profile.get('ctx', getattr(model, 'ctx', 0)) or 0),
+        'ctx_per_slot': int(profile.get('ctx_per_slot', ctx_per_slot(model)) or 0),
+        'parallel': int(profile.get('parallel', getattr(model, 'parallel', 1)) or 1),
+        'variant': str(profile.get('variant', '') or 'auto'),
+        'measurement_type': 'batch',
+        'planner_reason': reason,
+        'detail': concise_failure(detail, limit=500),
+        'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+    }
+
+
+def benchmark_all_models_deep(
+    app: AppConfig,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+    force: bool = False,
+    benchmark_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
+    start_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
+) -> Tuple[bool, str]:
+    runner = benchmark_runner or benchmark_best_optimization
+    restarter = start_runner or start_model_with_progress
+    models = list(getattr(app, 'models', []) or [])
+    total = len(models)
+    completed = 0
+    skipped = 0
+    failed = 0
+    restored = 0
+    benchmarked = 0
+    summary_records: List[Dict[str, object]] = []
+
+    def emit_batch(
+        event: str,
+        message: str,
+        model: Optional[ModelConfig] = None,
+        phase: str = '',
+        record: Optional[Dict[str, object]] = None,
+        records: Optional[List[Dict[str, object]]] = None,
+    ):
+        if not progress:
+            return
+        payload: Dict[str, object] = {
+            'event': event,
+            'run_kind': 'server_all',
+            'model_id': model.id if model else '',
+            'message': compact_message(message),
+            'phase': phase or compact_message(message),
+            'completed': completed,
+            'total': total,
+            'candidate': model.id if model else '',
+            'batch_completed': completed,
+            'batch_total': total,
+            'batch_skipped': skipped,
+            'batch_failed': failed,
+            'batch_restored': restored,
+        }
+        if record is not None:
+            payload['record'] = dict(record)
+        if records is not None:
+            payload['records'] = [dict(item) for item in records]
+        progress(payload)
+
+    def forward_inner(model: ModelConfig, index: int, payload: object):
+        if not progress:
+            return
+        prefix = f'[{index}/{total}] {model.id}: '
+        if isinstance(payload, dict):
+            forwarded = dict(payload)
+            event = str(forwarded.get('event', '') or '')
+            if event in ('benchmark_started', 'benchmark_done', 'benchmark_error', 'benchmark_aborted'):
+                forwarded['event'] = 'benchmark_phase'
+            forwarded['run_kind'] = 'server_all'
+            forwarded['model_id'] = model.id
+            forwarded['completed'] = completed
+            forwarded['total'] = total
+            forwarded['batch_completed'] = completed
+            forwarded['batch_total'] = total
+            forwarded['batch_skipped'] = skipped
+            forwarded['batch_failed'] = failed
+            forwarded['batch_restored'] = restored
+            message = compact_message(str(forwarded.get('message') or forwarded.get('phase') or event or 'benchmark update'))
+            forwarded['message'] = prefix + message if message else prefix.rstrip()
+            forwarded['phase'] = str(forwarded.get('phase') or 'benchmarking')
+            candidate = compact_message(str(forwarded.get('candidate', '') or ''))
+            forwarded['candidate'] = f'{model.id} {candidate}'.strip()
+            if isinstance(forwarded.get('record'), dict):
+                record = dict(forwarded.get('record') or {})
+                record.setdefault('model_id', model.id)
+                forwarded['record'] = record
+            if isinstance(forwarded.get('records'), list):
+                records = []
+                for item in forwarded.get('records') or []:
+                    if isinstance(item, dict):
+                        record = dict(item)
+                        record.setdefault('model_id', model.id)
+                        records.append(record)
+                forwarded['records'] = records
+            progress(forwarded)
+            return
+        emit_batch('benchmark_phase', prefix + compact_message(str(payload)), model, phase='benchmarking')
+
+    if total <= 0:
+        msg = 'No models configured for deep benchmark all.'
+        emit_batch('benchmark_done', msg, phase='complete')
+        return True, msg
+
+    label = 'force refresh' if force else 'missing/stale/failed'
+    emit_batch(
+        'benchmark_started',
+        f'deep benchmark all started: {total} model(s), mode={label}',
+        phase='starting',
+    )
+
+    try:
+        for index, original_model in enumerate(models, start=1):
+            check_cancelled(cancel_token)
+            model = app.get_model(original_model.id) or original_model
+            include, reason = deep_benchmark_model_decision(app, model, force=force)
+            if not include:
+                skipped += 1
+                completed += 1
+                record = _batch_summary_record(model, 'skipped', reason, reason=reason)
+                summary_records.append(record)
+                emit_batch('benchmark_result', f'{model.id} skipped: {reason}', model, phase='skipped', record=record)
+                continue
+
+            restore_after = False
+            status, detail = app.health(model)
+            managed_pid = _get_model_pid(app, model, discover=False, managed_only=True)
+            any_pid = managed_pid or _get_model_pid(app, model)
+            running = status in ('READY', 'LOADING', 'STARTING') or bool(any_pid)
+            if running and not managed_pid:
+                skipped += 1
+                completed += 1
+                detail_text = f'unmanaged server is running ({detail})'
+                record = _batch_summary_record(model, 'skipped', detail_text, reason='unmanaged running')
+                summary_records.append(record)
+                emit_batch('benchmark_result', f'{model.id} skipped: {detail_text}', model, phase='skipped', record=record)
+                continue
+            if running and managed_pid:
+                emit_batch('benchmark_phase', f'{model.id}: stopping managed server before benchmark', model, phase='stopping')
+                stop_ok, stop_msg = app.stop(model, managed_only=True)
+                if not stop_ok:
+                    failed += 1
+                    completed += 1
+                    record = _batch_summary_record(model, 'stop failed', stop_msg, reason='managed stop failed')
+                    summary_records.append(record)
+                    emit_batch('benchmark_result', f'{model.id} stop failed: {stop_msg}', model, phase='failed', record=record)
+                    continue
+                restore_after = True
+                sleep_with_cancel(0.3, cancel_token)
+
+            emit_batch('benchmark_phase', f'{model.id}: deep benchmark started ({reason})', model, phase='benchmarking')
+            ok = False
+            result = ''
+            try:
+                ok, result = runner(
+                    app,
+                    model,
+                    progress=lambda payload, model=model, index=index: forward_inner(model, index, payload),
+                    cancel_token=cancel_token,
+                )
+                if cancel_token is not None and cancel_token.is_cancelled():
+                    raise CancelledError(cancel_token.reason)
+            except CancelledError:
+                raise
+            except Exception as exc:
+                ok = False
+                result = f'deep benchmark failed: {exc}'
+
+            saved_model = app.get_model(model.id) or model
+            if ok:
+                benchmarked += 1
+                record = _batch_summary_record(saved_model, 'ok', result, reason=reason)
+            else:
+                failed += 1
+                record = _batch_summary_record(saved_model, 'failed', result, reason=reason)
+            summary_records.append(record)
+            emit_batch(
+                'benchmark_result',
+                f'{model.id}: {"done" if ok else "failed"} - {concise_failure(result)}',
+                saved_model,
+                phase='benchmark complete',
+                record=record,
+            )
+
+            if restore_after:
+                check_cancelled(cancel_token)
+                emit_batch('benchmark_phase', f'{model.id}: restoring managed server', saved_model, phase='restoring')
+                restore_ok, restore_msg = restarter(
+                    app,
+                    saved_model,
+                    progress=lambda text, model=saved_model: emit_batch(
+                        'benchmark_phase',
+                        f'{model.id}: restore: {compact_message(str(text))}',
+                        model,
+                        phase='restoring',
+                    ),
+                    cancel_token=cancel_token,
+                )
+                if restore_ok:
+                    restored += 1
+                    emit_batch('benchmark_phase', f'{model.id}: restored managed server', saved_model, phase='restored')
+                else:
+                    failed += 1
+                    emit_batch('benchmark_phase', f'{model.id}: restore failed: {restore_msg}', saved_model, phase='restore failed')
+
+            completed += 1
+            emit_batch('benchmark_phase', f'{model.id}: batch step complete', saved_model, phase='model complete')
+    except CancelledError:
+        msg = '⚠ aborted; managed processes stopped'
+        emit_batch('benchmark_aborted', msg, phase='aborted', records=summary_records)
+        return False, msg
+
+    summary = machine_best_summary(app)
+    pick = summary.get('machine_pick') if isinstance(summary, dict) else {}
+    pick_id = str((pick or {}).get('model_id', '') or '')
+    pick_text = f' Machine Pick: {pick_id}.' if pick_id else ''
+    prefix = '✅' if failed == 0 else '❌'
+    result_word = 'complete' if failed == 0 else 'completed with failures'
+    msg = (
+        f'{prefix} deep benchmark all {result_word}: {benchmarked} benchmarked, '
+        f'{skipped} skipped, {failed} failed, {restored} restored.'
+        f'{pick_text}'
+    )
+    emit_batch('benchmark_done', msg, phase='complete', records=summary_records)
+    return failed == 0, msg

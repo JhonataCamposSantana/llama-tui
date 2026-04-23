@@ -15,6 +15,7 @@ The project is intentionally small: it uses only the Python standard library, st
 - Read GGUF metadata to estimate KV cache memory and safe context sizes.
 - Auto-tune context size, CPU threads, GPU layer offload, KV cache type, batch size, and vLLM scheduler limits.
 - Benchmark adaptive profiles and persist measured Fast Chat, Long Context, OpenCode-ready, and Auto results.
+- Run Deep Benchmark All across managed models and show machine-wide winners.
 - Benchmark OpenCode coding workflows against disposable fixture projects.
 - Try a model from inside the TUI with a temporary streaming chat console.
 - Assign OpenCode roles: main, small, build, and plan.
@@ -141,6 +142,8 @@ Useful per-model fields:
 - `T`: open Try it out from model details.
 - `B`: run the quality-first smart benchmark.
 - `F`: run the faster benchmark.
+- `D`: run Deep Benchmark All for missing, stale, failed, or aborted managed models; the modal also offers a force refresh.
+- `R` on the model list or `M` from the main views: open Machine Rankings.
 - `O`: benchmark the selected model with an OpenCode workflow from details.
 - `A`: abort the active launch or benchmark action and clean up managed processes.
 - `z`: apply the Auto profile without benchmarking.
@@ -304,6 +307,8 @@ If the full model fits, `ngl=999` is still used. If not, llama-tui chooses a par
 
 Press `B` on a stopped model to run the adaptive benchmark. It can take a while by design; the target budget is about 20 minutes per model, and `A` can abort it.
 
+Press `D` to run Deep Benchmark All. The default batch walks the registered models, skips fresh benchmark results, skips disabled entries, skips unmanaged external servers, and benchmarks pending, stale, failed, aborted, or missing measured profiles. If a model is already running under llama-tui management, the batch stops it for the benchmark and restores it on normal completion. The force-refresh option reruns every enabled managed model. Because this is the same quality-first benchmark as `B`, expect it to take a long time on large model libraries.
+
 The benchmark runner:
 
 1. Probes current hardware.
@@ -334,6 +339,8 @@ Saved benchmark rows include:
 - status and detail.
 
 Benchmarking is optional for normal server launches. `Auto profile`, `Fast Chat`, `Long Context`, `Try it out`, and OpenCode stack launches use measured profiles when they exist. If no measured profile exists yet, llama-tui falls back to the estimated safe launch path and says so in the action log.
+
+Machine Rankings are computed from fresh measured profiles without changing the config schema. The overview shows `Fastest Chat`, `Longest Context`, `OpenCode-ready`, and one `Machine Pick`. The Machine Pick uses a weighted score for speed, context per slot, RAM/VRAM headroom, and stability.
 
 If all candidates fail, the failure details are saved and shown in the model details screen.
 

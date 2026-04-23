@@ -10,12 +10,16 @@ from .app import AppConfig
 from .benchmark import (
     append_model_log,
     apply_measured_profile,
+    benchmark_all_models_deep,
     benchmark_best_optimization,
     benchmark_fast_profiles,
+    benchmark_profile_is_fresh,
+    deep_benchmark_model_decision,
     estimate_text_tokens,
     launch_hermes_stack,
     launch_opencode_stack,
     launch_with_failsafe,
+    machine_best_summary,
     record_matches_profile,
     start_model_with_progress,
     sync_opencode_after_tuning,
@@ -87,6 +91,7 @@ RIGHT_TABS = {
     'benchmark': ['progress', 'results', 'commands', 'logs', 'errors'],
     'try': ['profile', 'logs', 'errors', 'stats', 'command'],
     'results': ['run_summary', 'rankings', 'failures'],
+    'machine_results': ['overview', 'rankings', 'failures'],
 }
 RIGHT_TAB_LABELS = {
     'summary': 'Summary',
@@ -102,6 +107,7 @@ RIGHT_TAB_LABELS = {
     'run_summary': 'Run Summary',
     'rankings': 'Rankings',
     'failures': 'Failures',
+    'overview': 'Overview',
 }
 SERVER_WINNER_LABELS = {
     'fast_chat': ('Winner', 'Fastest'),
@@ -130,6 +136,7 @@ RIGHT_DEFAULT_TAB = {
     'benchmark': 'progress',
     'try': 'profile',
     'results': 'run_summary',
+    'machine_results': 'overview',
 }
 
 VIEW_LABELS = {
@@ -138,6 +145,7 @@ VIEW_LABELS = {
     'benchmark': 'Benchmark',
     'try': 'Try It Out',
     'results': 'Results',
+    'machine_results': 'Machine Rankings',
 }
 
 BENCHMARK_WIKI_SECTIONS = [
@@ -345,7 +353,7 @@ def right_scroll_action_for_view(view_mode: str, key: int) -> str:
         return ''
     if view_mode in ('detail', 'benchmark'):
         return action
-    if view_mode in ('try', 'results') and key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+    if view_mode in ('try', 'results', 'machine_results') and key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
         return action
     return ''
 
@@ -562,9 +570,23 @@ def build_benchmark_progress_items(
     records = list(state.get('records', []) or [])
     latest = records[-1] if records else {}
     current_slot = int(getattr(model, 'ctx', 0) or 0) // max(1, int(getattr(model, 'parallel', 1) or 1))
+    run_kind = str(state.get('run_kind') or 'server')
+    if run_kind == 'server_all':
+        status_detail = (
+            f'batch skipped={int(state.get("batch_skipped", 0) or 0)} '
+            f'failed={int(state.get("batch_failed", 0) or 0)} '
+            f'restored={int(state.get("batch_restored", 0) or 0)}'
+        )
+        model_line = f'model: {state.get("model_id") or "all managed models"}'
+        runtime_line = 'runtime: deep benchmark all'
+        pid_line = status_detail
+    else:
+        model_line = f'model: {model.id}'
+        runtime_line = f'runtime: {display_runtime(model)}  ctx/slot={current_slot}  par={getattr(model, "parallel", 1)}'
+        pid_line = f'pid: {pid or "-"}  {detail}'
     items = [
-        (f'model: {model.id}', normal_attr),
-        (f'run: {state.get("run_kind") or "server"}', normal_attr),
+        (model_line, normal_attr),
+        (f'run: {run_kind}', normal_attr),
         (f'status: {state.get("status") or "idle"} / server {status}', accent_attr),
         (f'elapsed: {benchmark_elapsed_text(state)}', normal_attr),
         (f'progress: {progress_bar_text(completed, total, max(8, width - 18))} {int(round(fraction * 100))}%', accent_attr),
@@ -572,8 +594,8 @@ def build_benchmark_progress_items(
         (f'phase: {state.get("phase") or "-"}', normal_attr),
         (f'candidate: {state.get("candidate") or "-"}', normal_attr),
         (f'profile: {model_profile_summary(model)}', normal_attr),
-        (f'runtime: {display_runtime(model)}  ctx/slot={current_slot}  par={getattr(model, "parallel", 1)}', normal_attr),
-        (f'pid: {pid or "-"}  {detail}', normal_attr),
+        (runtime_line, normal_attr),
+        (pid_line, normal_attr),
     ]
     if latest:
         items.extend([
@@ -1219,6 +1241,133 @@ def benchmark_ranking_rows(run: Dict[str, object]) -> List[str]:
     return [line for line, _attr in benchmark_ranking_items(run)]
 
 
+def machine_category_items(
+    summary: Dict[str, object],
+    accent_attr: int = 0,
+    success_attr: int = 0,
+    warning_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    rows = list((summary or {}).get('rows', []) or [])
+    if not rows:
+        return [('No fresh benchmarked models yet. Press D to run Deep Benchmark All.', warning_attr)]
+    categories = dict((summary or {}).get('categories', {}) or {})
+    order = ('machine_pick', 'fastest_chat', 'longest_context', 'opencode_ready')
+    items: List[Tuple[str, int]] = [
+        ('Best model for this machine', accent_attr),
+        (f'fresh benchmarked models: {len(rows)}', normal_attr),
+        ('', normal_attr),
+    ]
+    for key in order:
+        winner = categories.get(key) or {}
+        if not winner:
+            continue
+        label = str(winner.get('label', key.replace('_', ' ').title()) or '')
+        model_id = str(winner.get('model_id', '') or '-')
+        metric = str(winner.get('metric', '') or '-')
+        reason = compact_message(str(winner.get('reason', '') or ''))
+        attr = success_attr if key == 'machine_pick' else normal_attr
+        items.append((f'{label}: {model_id}  {metric}', attr))
+        if reason:
+            items.append((f'  {reason}', warning_attr if reason.startswith('fallback') else normal_attr))
+    return items
+
+
+def machine_row_badges(row: Dict[str, object], summary: Dict[str, object]) -> List[str]:
+    categories = dict((summary or {}).get('categories', {}) or {})
+    badge_specs = (
+        ('machine_pick', 'Pick'),
+        ('fastest_chat', 'Fast'),
+        ('longest_context', 'Ctx'),
+        ('opencode_ready', 'Code'),
+    )
+    model_id = str(row.get('model_id', '') or '')
+    badges: List[str] = []
+    for key, label in badge_specs:
+        winner = categories.get(key) or {}
+        if str(winner.get('model_id', '') or '') == model_id and label not in badges:
+            badges.append(label)
+    return badges
+
+
+def machine_ranking_items(
+    summary: Dict[str, object],
+    width: int = 120,
+    success_attr: int = 0,
+    heading_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    rows = list((summary or {}).get('rows', []) or [])
+    if not rows:
+        return [('No machine rankings yet. Run Deep Benchmark All first.', normal_attr)]
+    width = max(24, int(width or 120))
+    if width >= 112:
+        widths = _table_widths([4, 13, 18, 7, 7, 7, 7, 7], width)
+        headers = ['Rank', 'Badge', 'Model', 'Score', 'Auto', 'Fast', 'Ctx', 'OCtx', 'Reason']
+        columns = ('rank', 'badge', 'model', 'score', 'auto', 'fast', 'ctx', 'octx', 'reason')
+    elif width >= 72:
+        widths = _table_widths([4, 10, 16, 7, 7, 7], width)
+        headers = ['Rank', 'Badge', 'Model', 'Score', 'Auto', 'Ctx', 'Reason']
+        columns = ('rank', 'badge', 'model', 'score', 'auto', 'ctx', 'reason')
+    elif width >= 40:
+        widths = _table_widths([4, 14, 6, 7], width)
+        headers = ['Rank', 'Model', 'Score', 'Auto', 'Detail']
+        columns = ('rank', 'model', 'score', 'auto', 'detail')
+    else:
+        widths = _table_widths([4, 10, 6], width)
+        headers = ['Rank', 'Model', 'Score', 'Detail']
+        columns = ('rank', 'model', 'score', 'detail')
+
+    items: List[Tuple[str, int]] = [(_table_row(headers, widths), heading_attr), (_table_rule(widths), heading_attr)]
+    pick_id = str(((summary or {}).get('machine_pick') or {}).get('model_id', '') or '')
+    for index, row in enumerate(rows, 1):
+        badges = ','.join(machine_row_badges(row, summary)) or '-'
+        model_id = str(row.get('model_id', '') or '-')
+        auto_tps = float(row.get('auto_tokens_per_sec', 0.0) or 0.0)
+        fast_tps = float(row.get('fast_tokens_per_sec', 0.0) or 0.0)
+        machine_score = float(row.get('machine_score', 0.0) or 0.0)
+        ctx_slot = int(row.get('auto_ctx_per_slot', 0) or 0)
+        long_ctx = int(row.get('long_ctx_per_slot', 0) or 0)
+        opencode_ctx = int(row.get('opencode_ctx_per_slot', 0) or 0)
+        reason = compact_message(str(row.get('machine_reason') or row.get('selection_reason') or ''))
+        values_by_column = {
+            'rank': f'{index:02d}',
+            'badge': badges,
+            'model': model_id,
+            'score': f'{machine_score:.2f}',
+            'auto': f'{auto_tps:.2f}',
+            'fast': f'{fast_tps:.2f}',
+            'ctx': long_ctx or ctx_slot or '-',
+            'octx': opencode_ctx or '-',
+            'reason': reason,
+            'detail': f'{badges} {auto_tps:.2f}t/s ctx={ctx_slot}',
+        }
+        values = [values_by_column[column] for column in columns]
+        attr = success_attr if model_id == pick_id else normal_attr
+        items.append((_table_row(values, widths), attr))
+    return items
+
+
+def machine_gap_items(
+    app: AppConfig,
+    summary: Dict[str, object],
+    warning_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    fresh_ids = {str(row.get('model_id', '') or '') for row in list((summary or {}).get('rows', []) or [])}
+    items: List[Tuple[str, int]] = []
+    for model in getattr(app, 'models', []) or []:
+        if model.id in fresh_ids:
+            continue
+        include, reason = deep_benchmark_model_decision(app, model, force=False)
+        status = (getattr(model, 'default_benchmark_status', '') or 'unbenchmarked').strip() or 'unbenchmarked'
+        attr = warning_attr if include or not benchmark_profile_is_fresh(app, model) else normal_attr
+        items.append((f'{model.id}: {status} - {reason}', attr))
+    if not items:
+        return [('All enabled models have fresh machine-ranking data.', normal_attr)]
+    return items
+
+
 def reduce_benchmark_event(
     state: Dict[str, object],
     payload: Dict[str, object],
@@ -1240,7 +1389,18 @@ def reduce_benchmark_event(
         state.update(new_benchmark_run_state(now=timestamp))
 
     state['updated_at'] = timestamp
-    for key in ('model_id', 'run_kind', 'phase', 'candidate', 'message'):
+    for key in (
+        'model_id',
+        'run_kind',
+        'phase',
+        'candidate',
+        'message',
+        'batch_completed',
+        'batch_total',
+        'batch_skipped',
+        'batch_failed',
+        'batch_restored',
+    ):
         value = payload.get(key)
         if value not in (None, ''):
             state[key] = value
@@ -1502,8 +1662,18 @@ def launch_options_for_stopped_model(model: ModelConfig) -> List[Tuple[str, str,
     ]
 
 
+def deep_benchmark_all_options() -> List[Tuple[str, str, str]]:
+    return [
+        ('1', 'Benchmark missing/stale/failed managed models', 'missing'),
+        ('2', 'Force refresh every managed model', 'force'),
+        ('q', 'Cancel', 'cancel'),
+    ]
+
+
 def prompt_launch_optimization(stdscr, model: ModelConfig, colors) -> str:
     return prompt_modal_choice(stdscr, colors, f'Launch {model.id}', launch_options_for_stopped_model(model))
+def prompt_deep_benchmark_all(stdscr, colors) -> str:
+    return prompt_modal_choice(stdscr, colors, 'Deep Benchmark All', deep_benchmark_all_options())
 def prompt_running_model_action(stdscr, model: ModelConfig, colors) -> str:
     return prompt_modal_choice(stdscr, colors, f'{model.id} is running', [
         ('1', 'Stop model', 'stop'),
@@ -1836,6 +2006,20 @@ def tui(stdscr, app: AppConfig):
     try_input_scroll = 0
     benchmark_state = new_benchmark_run_state()
     results_run_index = 0
+    machine_summary_cache: Dict[str, object] = {}
+    machine_summary_cache_at = 0.0
+
+    def invalidate_machine_summary():
+        nonlocal machine_summary_cache_at
+        machine_summary_cache_at = 0.0
+
+    def current_machine_summary(force: bool = False) -> Dict[str, object]:
+        nonlocal machine_summary_cache, machine_summary_cache_at
+        now = time.time()
+        if force or not machine_summary_cache or now - machine_summary_cache_at > 15.0:
+            machine_summary_cache = machine_best_summary(app)
+            machine_summary_cache_at = now
+        return machine_summary_cache
 
     def reset_right_tabs(view: str = ''):
         nonlocal right_tab_by_view, right_tab_scrolls
@@ -2039,6 +2223,20 @@ def tui(stdscr, app: AppConfig):
         results_run_index = 0
         run_count = len(benchmark_runs_for_model(model))
         message = f'{model.id}: {run_count} benchmark result run(s).'
+
+    def open_machine_results():
+        nonlocal view_mode, detail_model_id, message
+        reset_right_tabs('machine_results')
+        view_mode = 'machine_results'
+        detail_model_id = ''
+        summary = current_machine_summary(force=True)
+        rows = list(summary.get('rows', []) or [])
+        pick = summary.get('machine_pick') or {}
+        pick_id = str(pick.get('model_id', '') or '')
+        message = (
+            f'Machine Rankings: {len(rows)} fresh benchmarked model(s). '
+            f'Machine Pick: {pick_id or "-"}'
+        )
 
     def start_try_chat_send():
         nonlocal message, try_thread, try_token, try_input, try_input_scroll, try_status, try_error, try_response_index, try_messages
@@ -2280,6 +2478,7 @@ def tui(stdscr, app: AppConfig):
                 action_thread = None
                 action_token = None
                 last_refresh = 0.0
+                invalidate_machine_summary()
 
         now = time.time()
         if now - last_refresh > REFRESH_SECONDS:
@@ -2298,6 +2497,8 @@ def tui(stdscr, app: AppConfig):
             detail_model_id = ''
 
         active_model = active_detail_model()
+        machine_summary = current_machine_summary() if view_mode in ('list', 'machine_results') else {}
+        machine_pick_id = str(((machine_summary or {}).get('machine_pick') or {}).get('model_id', '') or '')
         if is_error_message(message):
             remember_error(message)
 
@@ -2405,6 +2606,7 @@ def tui(stdscr, app: AppConfig):
         try_mode = view_mode == 'try'
         benchmark_mode = view_mode == 'benchmark'
         results_mode = view_mode == 'results'
+        machine_results_mode = view_mode == 'machine_results'
         benchmark_errors = list(benchmark_state.get('errors', []) or [])
         error_source_lines = build_error_source_lines(
             error_history,
@@ -2423,7 +2625,7 @@ def tui(stdscr, app: AppConfig):
         right_tab_key = right_tab_scroll_key(view_mode, right_active_tab)
         right_scroll = int(right_tab_scrolls.get(right_tab_key, 0) or 0)
 
-        left_title = 'Try It Out' if try_mode else 'Benchmark' if benchmark_mode else 'Results' if results_mode else 'Model Details' if view_mode == 'detail' else 'Models'
+        left_title = 'Try It Out' if try_mode else 'Benchmark' if benchmark_mode else 'Machine Rankings' if machine_results_mode else 'Results' if results_mode else 'Model Details' if view_mode == 'detail' else 'Models'
         draw_box(stdscr, box_top, 1, pane_h, left_w, left_title, colors['accent'] | curses.A_BOLD, colors['accent'])
         if right_tabs:
             draw_tabbed_panel(
@@ -2441,7 +2643,24 @@ def tui(stdscr, app: AppConfig):
         else:
             draw_box(stdscr, box_top, right_x, right_panel_h, right_w, 'Details / Logs / Roles', colors['accent'] | curses.A_BOLD, colors['accent'])
 
-        if view_mode == 'results' and active_model:
+        if view_mode == 'machine_results':
+            summary = machine_summary or current_machine_summary()
+            category_rows = machine_category_items(
+                summary,
+                accent_attr=colors['accent'] | curses.A_BOLD,
+                success_attr=colors['success'] | curses.A_BOLD,
+                warning_attr=colors['warning'],
+                normal_attr=curses.A_NORMAL,
+            )
+            y_cursor = box_top + 2
+            for line, attr in category_rows[:content_rows]:
+                if y_cursor > content_bottom:
+                    break
+                safe_addstr(stdscr, y_cursor, 3, line[: left_w - 5], attr)
+                y_cursor += 1
+            if y_cursor <= content_bottom:
+                safe_addstr(stdscr, y_cursor, 3, '[D] deep benchmark all   [Esc] models', colors['muted'])
+        elif view_mode == 'results' and active_model:
             model = active_model
             runs = benchmark_runs_for_model(model)
             if runs:
@@ -2474,6 +2693,11 @@ def tui(stdscr, app: AppConfig):
         elif view_mode == 'benchmark' and active_model:
             model = active_model
             run_kind = str(benchmark_state.get('run_kind') or 'server')
+            benchmark_model_label = (
+                f'all managed models / current: {benchmark_state.get("model_id") or "-"}'
+                if run_kind == 'server_all'
+                else (model.name or model.id)
+            )
             status_text = str(benchmark_state.get('status') or 'idle')
             phase = str(benchmark_state.get('phase') or '-')
             candidate = str(benchmark_state.get('candidate') or '-')
@@ -2484,7 +2708,7 @@ def tui(stdscr, app: AppConfig):
             feed = list(benchmark_state.get('feed', []) or [])
             content_h = content_rows
             summary_lines = [
-                (f'model: {model.name or model.id}', curses.A_BOLD),
+                (f'model: {benchmark_model_label}', curses.A_BOLD),
                 (f'run: {run_kind}   status: {status_text}   elapsed: {benchmark_elapsed_text(benchmark_state)}', colors['accent'] | curses.A_BOLD),
                 (f'phase: {phase}', curses.A_NORMAL),
                 (f'candidate: {candidate}', curses.A_NORMAL),
@@ -2696,7 +2920,9 @@ def tui(stdscr, app: AppConfig):
                 quant = extract_quant(model)[:8]
                 model_type = classify_model_type(model)[:6]
                 name_col_width = max(10, left_w - 70)
-                line = f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  {roles:3}  {engine:10} {quant:8} {model_type:6} {model.name[:name_col_width]}'
+                best_badge = ' BEST' if model.id == machine_pick_id and name_col_width >= 15 else ''
+                display_name = (model.name or model.id)[: max(1, name_col_width - len(best_badge))] + best_badge
+                line = f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  {roles:3}  {engine:10} {quant:8} {model_type:6} {display_name}'
                 row_y = box_top + 3 + idx - start_idx
                 if idx == selected:
                     try:
@@ -2720,7 +2946,46 @@ def tui(stdscr, app: AppConfig):
             if content_rows > 1:
                 safe_addstr(stdscr, box_top + 3, 3, 'No models yet. Press x to detect GGUFs or a to add a llama.cpp/vLLM model.', colors['warning'])
 
-        if active_model and right_tabs:
+        if view_mode == 'machine_results' and right_tabs:
+            summary = machine_summary or current_machine_summary()
+            if right_active_tab == 'overview':
+                right_items = machine_category_items(
+                    summary,
+                    accent_attr=colors['accent'] | curses.A_BOLD,
+                    success_attr=colors['success'] | curses.A_BOLD,
+                    warning_attr=colors['warning'],
+                    normal_attr=curses.A_NORMAL,
+                )
+            elif right_active_tab == 'rankings':
+                right_items = machine_ranking_items(
+                    summary,
+                    width=right_content_w,
+                    success_attr=colors['success'] | curses.A_BOLD,
+                    heading_attr=colors['accent'] | curses.A_BOLD,
+                    normal_attr=curses.A_NORMAL,
+                )
+            elif right_active_tab == 'failures':
+                right_items = machine_gap_items(
+                    app,
+                    summary,
+                    warning_attr=colors['warning'],
+                    normal_attr=curses.A_NORMAL,
+                )
+            else:
+                right_items = [('Machine rankings: no content yet.', colors['muted'])]
+            right_scroll, right_tab_scroll_total, right_tab_scroll_rows = draw_scrollable_items(
+                stdscr,
+                box_top,
+                right_x,
+                right_panel_h,
+                right_w,
+                right_items,
+                right_scroll,
+                colors,
+                curses.A_NORMAL,
+            )
+            right_tab_scrolls[right_tab_key] = right_scroll
+        elif active_model and right_tabs:
             model = active_model
             status, detail = statuses.get(model.id, ('?', ''))
             pid = app.get_pid(model)
@@ -2976,12 +3241,15 @@ def tui(stdscr, app: AppConfig):
         elif view_mode == 'results':
             footer = '[Esc] details  [Up/Down] select run  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab.'
+        elif view_mode == 'machine_results':
+            footer = '[Esc] models  [D] deep all  Tab/] next tab  Shift-Tab/[ prev tab'
+            footer2 = '[PgUp/PgDn/Home/End] scroll active right tab  [M] refresh rankings.'
         elif view_mode == 'detail':
             footer = '[Esc] models  [Enter/l] actions  [T] try  [B] deep bench  [F] fast bench  [O] opencode  [H] hermes  [R] results'
             footer2 = 'Tab/] next tab  Shift-Tab/[ prev tab  [Up/Down/PgUp/PgDn/Home/End] scroll tab  [z] auto  [q] quit'
         else:
-            footer = '[Enter] details  [z] auto profile  [B] benchmark best  [x] detect  [X] prune'
-            footer2 = '[Up/Down] models  [a/e/d] models  [m/s/b/p] roles  [r] sync inventory  [S] stop-all  [q] quit'
+            footer = '[Enter] details  [z] auto profile  [B] benchmark best  [D] deep all  [R/M] machine ranks'
+            footer2 = '[Up/Down] models  [a/e/d] models  [x/X] detect/prune  [r] sync  [S] stop-all  [q] quit'
         if action_running():
             footer = '[A] abort active action   ' + footer
         safe_addstr(stdscr, h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
@@ -2998,7 +3266,7 @@ def tui(stdscr, app: AppConfig):
             continue
         scroll_action = right_scroll_action_for_view(view_mode, key)
         tab_direction = right_tab_key_direction(key)
-        if active_model and view_mode in ('detail', 'benchmark', 'try', 'results') and tab_direction:
+        if right_tabs and tab_direction:
             right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, tab_direction)
             message = f'Right tab: {right_tab_label(right_tab_by_view[view_mode], len(error_source_lines))}.'
             continue
@@ -3056,6 +3324,16 @@ def tui(stdscr, app: AppConfig):
             show_benchmark_wiki(stdscr, colors)
             message = 'Benchmark wiki closed.'
             continue
+        if view_mode == 'machine_results':
+            if key in (27, curses.KEY_BACKSPACE, 127, 8):
+                reset_right_tabs('machine_results')
+                view_mode = 'list'
+                message = 'Back to model list.'
+                continue
+            if scroll_action:
+                right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
+                message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
+                continue
         if view_mode == 'results':
             if key in (27, curses.KEY_BACKSPACE, 127, 8):
                 reset_right_tabs('detail')
@@ -3079,7 +3357,7 @@ def tui(stdscr, app: AppConfig):
             right_tab_scrolls[right_tab_key] = adjust_scroll_offset(right_scroll, scroll_action, right_tab_scroll_total, right_tab_scroll_rows)
             message = 'Right tab: newest lines.' if right_tab_scrolls[right_tab_key] == 0 else 'Right tab: scrolled back.'
             continue
-        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END, ord('j'), ord('k'), ord('R'), ord('W'), ord('w'), ord('['), ord(']'), 9, getattr(curses, 'KEY_BTAB', -999), 27, curses.KEY_BACKSPACE, 127, 8):
+        if action_running() and key not in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END, ord('j'), ord('k'), ord('R'), ord('M'), ord('W'), ord('w'), ord('['), ord(']'), 9, getattr(curses, 'KEY_BTAB', -999), 27, curses.KEY_BACKSPACE, 127, 8):
             message = '⏳ Action is running. Watch the log window; controls unlock when it finishes.'
             continue
         if view_mode == 'benchmark' and key in (27, curses.KEY_BACKSPACE, 127, 8):
@@ -3110,6 +3388,7 @@ def tui(stdscr, app: AppConfig):
         elif key == ord('r'):
             count, items = app.detect_models()
             statuses = {m.id: app.health(m) for m in app.models}
+            invalidate_machine_summary()
             message = items[0] if items else (f'Synced {count} model(s)' if count else 'Synced.')
         elif key == ord('S'):
             message = '; '.join(app.stop_all())[: max(20, w - 4)]
@@ -3129,10 +3408,35 @@ def tui(stdscr, app: AppConfig):
             model = active_detail_model()
             if model:
                 open_try_view(model)
+        elif key == ord('M') and app.models:
+            open_machine_results()
+        elif key == ord('R') and app.models and view_mode == 'list':
+            open_machine_results()
         elif key == ord('R') and app.models and view_mode in ('detail', 'benchmark', 'results'):
             model = active_detail_model()
             if model:
                 open_results_view(model)
+        elif key == ord('D') and app.models:
+            choice = prompt_deep_benchmark_all(stdscr, colors)
+            if choice == 'cancel':
+                message = 'Deep benchmark all cancelled.'
+                continue
+            force = choice == 'force'
+            anchor = selected_model() or app.models[0]
+            label = 'deep benchmark all (force)' if force else 'deep benchmark all'
+            invalidate_machine_summary()
+            start_background_action(
+                anchor,
+                label,
+                lambda progress, token, force=force: benchmark_all_models_deep(
+                    app,
+                    progress=progress,
+                    cancel_token=token,
+                    force=force,
+                ),
+                done_event='benchmark_done',
+                run_kind='server_all',
+            )
         elif key == ord('z') and app.models:
             model = active_detail_model()
             if not model:
@@ -3146,6 +3450,7 @@ def tui(stdscr, app: AppConfig):
                 tune_msg = f'Auto profile applied from estimate: {apply_best_optimization(model, tier=tier, profile=profile)}'
             app.add_or_update(model)
             sync_msg = sync_opencode_after_tuning(app)
+            invalidate_machine_summary()
             message = f'{tune_msg} | {sync_msg}'
         elif key == ord('B') and app.models:
             model = active_detail_model()
@@ -3218,6 +3523,7 @@ def tui(stdscr, app: AppConfig):
                     model.default_benchmark_status = 'pending'
                 app.add_or_update(model)
                 selected = len(app.models) - 1
+                invalidate_machine_summary()
                 message = f'Added {model.id} with safe defaults. Open details to start now; press B for measured settings.'
         elif key == ord('e') and app.models:
             current = active_detail_model() or app.models[selected]
@@ -3231,6 +3537,7 @@ def tui(stdscr, app: AppConfig):
                 selected = min(selected, len(app.models) - 1)
                 if view_mode == 'detail':
                     detail_model_id = updated.id
+                invalidate_machine_summary()
                 message = f'Updated {updated.id}.'
         elif key == ord('d') and app.models:
             delete_model = active_detail_model() or app.models[selected]
@@ -3244,6 +3551,7 @@ def tui(stdscr, app: AppConfig):
                 if view_mode == 'detail':
                     view_mode = 'list'
                     detail_model_id = ''
+                invalidate_machine_summary()
                 message = f'{target_id}: {msg}'
             else:
                 message = 'Delete cancelled.'
@@ -3253,10 +3561,12 @@ def tui(stdscr, app: AppConfig):
             if count:
                 message = f'{message} | safe defaults set; start now or press B for measured settings.'
             selected = min(selected, len(app.models) - 1 if app.models else 0)
+            invalidate_machine_summary()
         elif key == ord('X'):
             count, removed = app.prune_missing_models()
             message = f'Pruned {count}: {", ".join(removed[:5])}' if count else 'No missing models to prune.'
             selected = max(0, min(selected, len(app.models) - 1))
+            invalidate_machine_summary()
         elif key == ord('g'):
             ok, msg = app.generate_opencode()
             message = msg

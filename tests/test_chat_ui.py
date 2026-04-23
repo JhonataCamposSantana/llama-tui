@@ -33,7 +33,11 @@ from llama_tui.ui import (
     benchmark_command_lines,
     build_try_live_stat_lines,
     clamp_scroll,
+    deep_benchmark_all_options,
     finish_try_live_metrics,
+    machine_category_items,
+    machine_gap_items,
+    machine_ranking_items,
     new_try_live_metrics,
     new_benchmark_run_state,
     launch_options_for_stopped_model,
@@ -254,9 +258,11 @@ class ProfileUiTests(unittest.TestCase):
         self.assertEqual(right_tabs_for_view('benchmark'), ['progress', 'results', 'commands', 'logs', 'errors'])
         self.assertEqual(right_tabs_for_view('try'), ['profile', 'logs', 'errors', 'stats', 'command'])
         self.assertEqual(right_tabs_for_view('results'), ['run_summary', 'rankings', 'failures'])
+        self.assertEqual(right_tabs_for_view('machine_results'), ['overview', 'rankings', 'failures'])
 
         self.assertEqual(default_right_tab('detail'), 'summary')
         self.assertEqual(default_right_tab('benchmark'), 'progress')
+        self.assertEqual(default_right_tab('machine_results'), 'overview')
         self.assertEqual(normalize_right_tab('detail', 'missing'), 'summary')
 
     def test_right_tab_cycling_and_scroll_keys(self):
@@ -348,9 +354,17 @@ class ProfileUiTests(unittest.TestCase):
         self.assertEqual(right_scroll_action_for_view('benchmark', ord('k')), 'older')
         self.assertEqual(right_scroll_action_for_view('results', curses.KEY_NPAGE), 'page_newer')
         self.assertEqual(right_scroll_action_for_view('try', curses.KEY_PPAGE), 'page_older')
+        self.assertEqual(right_scroll_action_for_view('machine_results', curses.KEY_END), 'newest')
         self.assertEqual(right_scroll_action_for_view('results', ord('j')), '')
         self.assertEqual(right_scroll_action_for_view('try', curses.KEY_UP), '')
         self.assertEqual(right_scroll_action_for_view('list', curses.KEY_NPAGE), '')
+
+    def test_deep_benchmark_all_menu_options(self):
+        options = deep_benchmark_all_options()
+
+        self.assertEqual(options[0], ('1', 'Benchmark missing/stale/failed managed models', 'missing'))
+        self.assertEqual(options[1], ('2', 'Force refresh every managed model', 'force'))
+        self.assertEqual(options[-1], ('q', 'Cancel', 'cancel'))
 
     def test_header_dashboard_content_builder(self):
         model = ModelConfig(id='tiny', name='Tiny', path='tiny.gguf', alias='tiny', port=18080)
@@ -629,6 +643,47 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertEqual(benchmark_elapsed_text(state, now=15.0), '00:05')
         self.assertEqual(benchmark_elapsed_text(state, now=99.0), '00:05')
 
+    def test_reducer_preserves_deep_all_batch_counters(self):
+        state = new_benchmark_run_state(now=10.0)
+        reduce_benchmark_event(
+            state,
+            {
+                'event': 'benchmark_started',
+                'run_kind': 'server_all',
+                'model_id': '',
+                'message': 'deep benchmark all started',
+                'completed': 0,
+                'total': 3,
+                'batch_skipped': 0,
+                'batch_failed': 0,
+                'batch_restored': 0,
+            },
+            now=10.0,
+        )
+        reduce_benchmark_event(
+            state,
+            {
+                'event': 'benchmark_phase',
+                'run_kind': 'server_all',
+                'model_id': 'second',
+                'message': '[2/3] second: candidate ok',
+                'completed': 1,
+                'total': 3,
+                'batch_skipped': 1,
+                'batch_failed': 0,
+                'batch_restored': 1,
+            },
+            now=12.0,
+        )
+
+        self.assertTrue(state['active'])
+        self.assertEqual(state['run_kind'], 'server_all')
+        self.assertEqual(state['model_id'], 'second')
+        self.assertEqual(state['completed'], 1)
+        self.assertEqual(state['total'], 3)
+        self.assertEqual(state['batch_skipped'], 1)
+        self.assertEqual(state['batch_restored'], 1)
+
     def test_reducer_tracks_benchmark_commands_separately(self):
         state = new_benchmark_run_state(now=10.0)
         reduce_benchmark_event(
@@ -880,6 +935,78 @@ class BenchmarkDashboardTests(unittest.TestCase):
                 self.assertTrue(lines[0].startswith('Rank'))
                 self.assertTrue(any('120.00' in line or '120.' in line for line in lines))
                 self.assertTrue(all(len(line) <= width for line in lines))
+
+    def test_machine_ranking_table_and_overview_items(self):
+        summary = {
+            'rows': [
+                {
+                    'model_id': 'balanced',
+                    'machine_score': 91.25,
+                    'auto_tokens_per_sec': 70.0,
+                    'fast_tokens_per_sec': 80.0,
+                    'auto_ctx_per_slot': 32000,
+                    'long_ctx_per_slot': 64000,
+                    'opencode_ctx_per_slot': 64000,
+                    'machine_reason': '50% speed, 30% ctx/slot, 12% headroom, 8% stability',
+                },
+                {
+                    'model_id': 'speedy',
+                    'machine_score': 88.5,
+                    'auto_tokens_per_sec': 100.0,
+                    'fast_tokens_per_sec': 140.0,
+                    'auto_ctx_per_slot': 4096,
+                    'long_ctx_per_slot': 8192,
+                    'opencode_ctx_per_slot': 8192,
+                    'machine_reason': 'fast but smaller context',
+                },
+            ],
+            'categories': {
+                'machine_pick': {'label': 'Machine Pick', 'model_id': 'balanced', 'metric': '91.25', 'reason': 'weighted score'},
+                'fastest_chat': {'label': 'Fastest Chat', 'model_id': 'speedy', 'metric': '140.00 tok/s', 'reason': 'highest measured Fast Chat throughput'},
+                'longest_context': {'label': 'Longest Context', 'model_id': 'balanced', 'metric': '64000 ctx/slot', 'reason': 'largest measured Long Context ctx/slot'},
+                'opencode_ready': {'label': 'OpenCode-ready', 'model_id': 'balanced', 'metric': '64000 ctx/slot', 'reason': 'meets observed OpenCode floor 32000'},
+            },
+            'machine_pick': {'model_id': 'balanced'},
+        }
+
+        overview = '\n'.join(line for line, _attr in machine_category_items(summary))
+
+        self.assertIn('Machine Pick: balanced', overview)
+        self.assertIn('Fastest Chat: speedy', overview)
+
+        for width in range(24, 121):
+            with self.subTest(width=width):
+                lines = [line for line, _attr in machine_ranking_items(summary, width=width)]
+
+                self.assertTrue(lines[0].startswith('Rank'))
+                self.assertTrue(any('balanced' in line for line in lines))
+                self.assertTrue(all(len(line) <= width for line in lines))
+
+    def test_machine_gap_items_report_non_fresh_models(self):
+        fresh = ModelConfig(id='fresh', name='Fresh', path='fresh.gguf', alias='fresh', port=18080)
+        fresh.default_benchmark_status = 'done'
+        fresh.benchmark_fingerprint = 'fp-fresh'
+        fresh.measured_profiles = {
+            'auto': {'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1},
+        }
+        stale = ModelConfig(id='stale', name='Stale', path='stale.gguf', alias='stale', port=18081)
+        stale.default_benchmark_status = 'done'
+        stale.benchmark_fingerprint = 'old'
+        stale.measured_profiles = {
+            'auto': {'status': 'ok', 'tokens_per_sec': 45.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1},
+        }
+
+        class FakeApp:
+            models = [fresh, stale]
+
+            def model_fingerprint(self, model):
+                return f'fp-{model.id}'
+
+        summary = {'rows': [{'model_id': 'fresh'}]}
+        text = '\n'.join(line for line, _attr in machine_gap_items(FakeApp(), summary))
+
+        self.assertIn('stale', text)
+        self.assertNotIn('fresh:', text)
 
 
 if __name__ == '__main__':

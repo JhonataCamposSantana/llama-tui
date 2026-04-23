@@ -15,7 +15,9 @@ from llama_tui.benchmark import (
     adaptive_record_from_candidate,
     annotate_spectrum_records,
     apply_measured_profile,
+    benchmark_all_models_deep,
     benchmark_config_fingerprint,
+    benchmark_profile_is_fresh,
     benchmark_exhaustive_candidate_with_retry,
     benchmark_exhaustive_profiles,
     benchmark_fast_profiles,
@@ -26,6 +28,8 @@ from llama_tui.benchmark import (
     exhaustive_parallel_values,
     fast_benchmark_contexts,
     fast_benchmark_parallel_values,
+    machine_best_summary,
+    machine_benchmark_rows,
     model_from_measured_profile,
     parallel_refinement_values,
     parse_context_requirement,
@@ -71,6 +75,206 @@ def process_active(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def measured_profile(tokens_per_sec: float, ctx: int, ram_gib: int = 8):
+    return {
+        'status': 'ok',
+        'tokens_per_sec': tokens_per_sec,
+        'seconds': 1.0,
+        'ctx': ctx,
+        'ctx_per_slot': ctx,
+        'parallel': 1,
+        'ram_available': ram_gib * 1024**3,
+        'benchmarked_at': '2026-04-23T00:00:00',
+    }
+
+
+def benchmarked_model(model_id: str, tokens_per_sec: float = 50.0, ctx: int = 8192, status: str = 'done'):
+    model = ModelConfig(id=model_id, name=model_id.title(), path=f'{model_id}.gguf', alias=model_id, port=18000 + len(model_id))
+    model.default_benchmark_status = status
+    model.benchmark_fingerprint = f'fp-{model_id}'
+    auto = measured_profile(tokens_per_sec, ctx)
+    model.measured_profiles = {
+        'auto': dict(auto),
+        'fast_chat': dict(auto, tokens_per_sec=tokens_per_sec + 10.0),
+        'long_context': dict(auto, ctx=ctx, ctx_per_slot=ctx),
+        'opencode_ready': dict(auto, ctx=ctx, ctx_per_slot=ctx),
+    }
+    return model
+
+
+class FakeBenchmarkApp:
+    def __init__(self, models):
+        self.models = list(models)
+        self.health_by_id = {model.id: ('STOPPED', 'stopped') for model in self.models}
+        self.managed_running = set()
+        self.unmanaged_running = set()
+        self.stop_calls = []
+        self.saved = []
+
+    def model_fingerprint(self, model):
+        return f'fp-{model.id}'
+
+    def get_model(self, model_id):
+        return next((model for model in self.models if model.id == model_id), None)
+
+    def add_or_update(self, model):
+        for idx, existing in enumerate(self.models):
+            if existing.id == model.id:
+                self.models[idx] = model
+                self.saved.append(model.id)
+                return
+        self.models.append(model)
+        self.saved.append(model.id)
+
+    def health(self, model):
+        if model.id in self.managed_running or model.id in self.unmanaged_running:
+            return 'READY', 'responding'
+        return self.health_by_id.get(model.id, ('STOPPED', 'stopped'))
+
+    def get_pid(self, model, discover=True, managed_only=False):
+        if model.id in self.managed_running:
+            return 1000 + len(model.id)
+        if managed_only or not discover:
+            return None
+        if model.id in self.unmanaged_running:
+            return 2000 + len(model.id)
+        return None
+
+    def stop(self, model, managed_only=False):
+        self.stop_calls.append((model.id, managed_only))
+        self.managed_running.discard(model.id)
+        return True, 'stopped'
+
+
+class DeepBenchmarkAllTests(unittest.TestCase):
+    def fake_runner(self, calls):
+        def runner(app, model, progress=None, cancel_token=None):
+            calls.append(model.id)
+            saved = ModelConfig(**asdict(model))
+            saved.default_benchmark_status = 'done'
+            saved.benchmark_fingerprint = app.model_fingerprint(saved)
+            auto = measured_profile(60.0 + len(calls), 8192 + len(calls) * 1024)
+            saved.measured_profiles = {
+                'auto': dict(auto),
+                'fast_chat': dict(auto, tokens_per_sec=auto['tokens_per_sec'] + 5.0),
+                'long_context': dict(auto),
+                'opencode_ready': dict(auto),
+            }
+            app.add_or_update(saved)
+            if progress:
+                progress({'event': 'benchmark_started', 'message': 'inner start', 'completed': 0, 'total': 1})
+                progress({'event': 'benchmark_done', 'message': 'inner done', 'completed': 1, 'total': 1})
+            return True, 'ok'
+        return runner
+
+    def test_deep_benchmark_all_skips_fresh_and_disabled_by_default(self):
+        fresh = benchmarked_model('fresh')
+        pending = benchmarked_model('pending', status='pending')
+        stale = benchmarked_model('stale')
+        stale.benchmark_fingerprint = 'old'
+        failed = benchmarked_model('failed', status='failed')
+        disabled = benchmarked_model('disabled')
+        disabled.enabled = False
+        app = FakeBenchmarkApp([fresh, pending, stale, failed, disabled])
+        calls = []
+        events = []
+
+        ok, msg = benchmark_all_models_deep(
+            app,
+            progress=events.append,
+            benchmark_runner=self.fake_runner(calls),
+            start_runner=lambda *_args, **_kwargs: (True, 'ready'),
+        )
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, ['pending', 'stale', 'failed'])
+        self.assertIn('3 benchmarked', msg)
+        skipped_messages = '\n'.join(str(event.get('message', '')) for event in events if isinstance(event, dict))
+        self.assertIn('fresh skipped', skipped_messages)
+        self.assertIn('disabled skipped', skipped_messages)
+
+    def test_deep_benchmark_all_force_refreshes_fresh_models(self):
+        fresh = benchmarked_model('fresh')
+        disabled = benchmarked_model('disabled')
+        disabled.enabled = False
+        app = FakeBenchmarkApp([fresh, disabled])
+        calls = []
+
+        ok, msg = benchmark_all_models_deep(
+            app,
+            force=True,
+            benchmark_runner=self.fake_runner(calls),
+            start_runner=lambda *_args, **_kwargs: (True, 'ready'),
+        )
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, ['fresh'])
+
+    def test_deep_benchmark_all_skips_unmanaged_running_model(self):
+        model = benchmarked_model('external', status='pending')
+        app = FakeBenchmarkApp([model])
+        app.unmanaged_running.add('external')
+        calls = []
+
+        ok, msg = benchmark_all_models_deep(
+            app,
+            benchmark_runner=self.fake_runner(calls),
+            start_runner=lambda *_args, **_kwargs: (True, 'ready'),
+        )
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, [])
+        self.assertIn('1 skipped', msg)
+
+    def test_deep_benchmark_all_stops_and_restores_managed_running_model(self):
+        model = benchmarked_model('managed', status='pending')
+        app = FakeBenchmarkApp([model])
+        app.managed_running.add('managed')
+        calls = []
+        restore_calls = []
+
+        def restarter(app, model, progress=None, cancel_token=None):
+            restore_calls.append(model.id)
+            if progress:
+                progress('ready')
+            return True, 'ready'
+
+        ok, msg = benchmark_all_models_deep(
+            app,
+            benchmark_runner=self.fake_runner(calls),
+            start_runner=restarter,
+        )
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, ['managed'])
+        self.assertEqual(restore_calls, ['managed'])
+        self.assertEqual(app.stop_calls, [('managed', True)])
+        self.assertIn('1 restored', msg)
+
+    def test_machine_best_summary_uses_fresh_profiles_only(self):
+        fast = benchmarked_model('fast', tokens_per_sec=100.0, ctx=8192)
+        balanced = benchmarked_model('balanced', tokens_per_sec=75.0, ctx=64000)
+        balanced.measured_profiles['auto']['ram_available'] = 16 * 1024**3
+        balanced.measured_profiles['long_context']['ctx_per_slot'] = 64000
+        balanced.measured_profiles['long_context']['ctx'] = 64000
+        balanced.measured_profiles['opencode_ready']['ctx_per_slot'] = 64000
+        balanced.measured_profiles['opencode_ready']['ctx'] = 64000
+        stale = benchmarked_model('stale', tokens_per_sec=500.0, ctx=131072)
+        stale.benchmark_fingerprint = 'old'
+        app = FakeBenchmarkApp([fast, balanced, stale])
+
+        rows = machine_benchmark_rows(app)
+        summary = machine_best_summary(app)
+
+        self.assertEqual({row['model_id'] for row in rows}, {'fast', 'balanced'})
+        self.assertTrue(benchmark_profile_is_fresh(app, fast))
+        self.assertFalse(benchmark_profile_is_fresh(app, stale))
+        self.assertEqual(summary['categories']['fastest_chat']['model_id'], 'fast')
+        self.assertEqual(summary['categories']['longest_context']['model_id'], 'balanced')
+        self.assertEqual(summary['categories']['opencode_ready']['model_id'], 'balanced')
+        self.assertEqual(summary['machine_pick']['model_id'], 'balanced')
 
 
 class OpencodeStackHelperTests(unittest.TestCase):
