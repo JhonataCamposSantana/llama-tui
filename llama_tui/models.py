@@ -37,6 +37,7 @@ class ModelConfig:
     benchmark_fingerprint: str = ''
     default_benchmark_status: str = ''
     default_benchmark_at: str = ''
+    engine_benchmark_store: Dict[str, Dict[str, object]] = field(default_factory=dict)
     last_opencode_benchmark_score: float = 0.0
     last_opencode_benchmark_seconds: float = 0.0
     last_opencode_benchmark_profile: str = ''

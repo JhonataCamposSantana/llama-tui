@@ -36,6 +36,7 @@ from .gguf import apply_architecture_info, detect_architecture_info
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
 from .models import ContinueSettings, HermesSettings, ModelConfig, OpencodeSettings, UiSettings
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
+from .runtime_profiles import RuntimeProfile, make_runtime_profile
 from .textutil import compact_message, important_log_excerpt
 
 
@@ -79,6 +80,15 @@ CONTINUE_MANAGED_BEGIN = '  # BEGIN llama-tui managed models'
 CONTINUE_MANAGED_END = '  # END llama-tui managed models'
 CONTINUE_MERGE_MODES = ('preserve_sections', 'managed_file')
 VERIFICATION_STATUSES = ('unknown', 'running', 'passed', 'warning', 'failed', 'needs_benchmark')
+ENGINE_BENCHMARK_FIELDS = (
+    'last_benchmark_tokens_per_sec',
+    'last_benchmark_seconds',
+    'last_benchmark_profile',
+    'last_benchmark_results',
+    'benchmark_fingerprint',
+    'default_benchmark_status',
+    'default_benchmark_at',
+)
 
 
 def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cmd: str) -> List[str]:
@@ -232,10 +242,11 @@ def desktop_terminal_guess() -> str:
 
 
 class AppConfig:
-    def __init__(self, config_path: Path):
+    def __init__(self, config_path: Path, runtime_profile: Optional[RuntimeProfile] = None):
         self.config_path = config_path
         self.llama_server = os.environ.get('LLAMA_SERVER', DEFAULT_LLAMA_SERVER)
         self.vllm_command = DEFAULT_VLLM_COMMAND
+        self.runtime_profile = runtime_profile or make_runtime_profile('llama.cpp', self.llama_server)
         self.hf_cache_root = str(DEFAULT_HF_CACHE)
         self.llmfit_cache_root = str(DEFAULT_LLMFIT_CACHE)
         self.llm_models_cache_root = str(DEFAULT_LLM_MODELS_CACHE)
@@ -264,6 +275,14 @@ class AppConfig:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
+        chosen_profile = runtime_profile or self.runtime_profile
+        self.runtime_profile = make_runtime_profile(
+            chosen_profile.engine,
+            self.llama_server,
+            ctx_override=chosen_profile.context_override,
+            kv_mode=chosen_profile.kv_mode,
+        )
+        self._activate_engine_benchmark_views()
 
     def load(self):
         if not self.config_path.exists():
@@ -339,6 +358,7 @@ class AppConfig:
             self.save()
 
     def save(self):
+        self._persist_engine_benchmark_views()
         self._normalize_model_ranks()
         data = {
             'llama_server': self.llama_server,
@@ -355,6 +375,60 @@ class AppConfig:
         }
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+
+    def _default_engine_benchmark_payload(self) -> Dict[str, object]:
+        return {
+            'last_benchmark_tokens_per_sec': 0.0,
+            'last_benchmark_seconds': 0.0,
+            'last_benchmark_profile': '',
+            'last_benchmark_results': [],
+            'benchmark_fingerprint': '',
+            'default_benchmark_status': '',
+            'default_benchmark_at': '',
+        }
+
+    def active_engine_key_for_model(self, model: ModelConfig) -> str:
+        runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+        if runtime == 'vllm':
+            return 'vllm'
+        if self.runtime_profile.engine == 'buun':
+            return 'buun'
+        return 'llama.cpp'
+
+    def _benchmark_payload_for_model(self, model: ModelConfig) -> Dict[str, object]:
+        return {field: getattr(model, field) for field in ENGINE_BENCHMARK_FIELDS}
+
+    def _apply_benchmark_payload(self, model: ModelConfig, payload: Dict[str, object]):
+        defaults = self._default_engine_benchmark_payload()
+        for field in ENGINE_BENCHMARK_FIELDS:
+            value = payload.get(field, defaults[field])
+            if isinstance(defaults[field], list):
+                value = list(value) if isinstance(value, list) else []
+            setattr(model, field, value)
+
+    def _persist_engine_benchmark_views(self):
+        for model in self.models:
+            store = getattr(model, 'engine_benchmark_store', {}) or {}
+            store[self.active_engine_key_for_model(model)] = self._benchmark_payload_for_model(model)
+            model.engine_benchmark_store = store
+
+    def _activate_engine_benchmark_views(self):
+        changed = False
+        for model in self.models:
+            store = dict(getattr(model, 'engine_benchmark_store', {}) or {})
+            # One-time legacy migration: seed historical values under canonical runtime key.
+            if not store and (
+                float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0
+                or (getattr(model, 'default_benchmark_status', '') or '').strip()
+            ):
+                runtime_key = 'vllm' if (getattr(model, 'runtime', 'llama.cpp') or '').strip().lower() == 'vllm' else 'llama.cpp'
+                store[runtime_key] = self._benchmark_payload_for_model(model)
+                changed = True
+            model.engine_benchmark_store = store
+            active_key = self.active_engine_key_for_model(model)
+            self._apply_benchmark_payload(model, store.get(active_key, {}))
+        if changed:
+            self._persist_engine_benchmark_views()
 
     def _archive_broken_config_file(self) -> Optional[Path]:
         if not self.config_path.exists():
@@ -518,7 +592,7 @@ class AppConfig:
 
     def runtime_binary_version(self, model: ModelConfig) -> str:
         runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
-        command = self.llama_server if runtime == 'llama.cpp' else self.vllm_command if runtime == 'vllm' else runtime
+        command = self.runtime_server_command(runtime)
         key = f'{runtime}:{command}'
         if key in self._runtime_version_cache:
             return self._runtime_version_cache[key]
@@ -540,6 +614,16 @@ class AppConfig:
             line = ''
         self._runtime_version_cache[key] = line
         return line
+
+    def runtime_server_command(self, runtime: str) -> str:
+        if runtime == 'vllm':
+            return self.vllm_command
+        if runtime == 'llama.cpp':
+            return self.runtime_profile.server_command or self.llama_server
+        return runtime
+
+    def runtime_indicator(self) -> str:
+        return self.runtime_profile.header_indicator()
 
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
@@ -597,7 +681,9 @@ class AppConfig:
             },
             'runtime_config': {
                 'extra_args': list(getattr(model, 'extra_args', []) or []),
-                'llama_server': self.llama_server if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' else '',
+                'engine_key': self.active_engine_key_for_model(model),
+                'kv_mode': self.runtime_profile.kv_mode if self.active_engine_key_for_model(model) == 'buun' else '',
+                'llama_server': self.runtime_server_command('llama.cpp') if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' else '',
                 'vllm_command': self.vllm_command if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else '',
                 'binary_version': self.runtime_binary_version(model),
             },
@@ -1370,9 +1456,14 @@ class AppConfig:
                 )
                 and ('serve' in parts or any('api_server' in part for part in parts))
             )
-        prefixes = self.command_prefix(self.llama_server)
-        target = os.path.basename(prefixes[0]) if prefixes else os.path.basename(self.llama_server)
-        return any(os.path.basename(part) == target for part in parts)
+        candidate_commands = [self.llama_server, self.runtime_server_command('llama.cpp')]
+        targets = set()
+        for command in candidate_commands:
+            prefixes = self.command_prefix(command)
+            target = os.path.basename(prefixes[0]) if prefixes else os.path.basename(command or '')
+            if target:
+                targets.add(target)
+        return any(os.path.basename(part) in targets for part in parts)
 
     def available_memory_bytes(self) -> int:
         return read_meminfo_bytes().get('MemAvailable', 0)
@@ -1380,9 +1471,15 @@ class AppConfig:
     def _estimate_kv_bytes_per_token(self, model: ModelConfig) -> int:
         return estimate_kv_bytes_per_token(model)
 
+    def requested_context_for_launch(self, model: ModelConfig) -> int:
+        runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+        if runtime == 'llama.cpp' and self.runtime_profile.context_override is not None:
+            return max(1, int(self.runtime_profile.context_override))
+        return max(1, int(getattr(model, 'ctx', 8192)))
+
     def safe_launch_profile(self, model: ModelConfig) -> Tuple[bool, Dict[str, int], str]:
         mode = (getattr(model, 'optimize_mode', 'max_context_safe') or 'max_context_safe').strip().lower()
-        requested_ctx = max(1, int(getattr(model, 'ctx', 8192)))
+        requested_ctx = self.requested_context_for_launch(model)
         requested_parallel = max(1, int(getattr(model, 'parallel', 1)))
         if mode == 'manual' or mode.startswith('measured_'):
             label = 'measured profile' if mode.startswith('measured_') else 'manual mode'
@@ -1816,7 +1913,7 @@ class AppConfig:
             cmd += model.extra_args
             return cmd
 
-        cmd = self.command_prefix(self.llama_server) + [
+        cmd = self.command_prefix(self.runtime_server_command('llama.cpp')) + [
             '-m', model.path,
             '--alias', model.alias,
             '--host', model.host,
@@ -1832,12 +1929,13 @@ class AppConfig:
             cmd += ['--flash-attn', 'on']
         if model.jinja:
             cmd += ['--jinja']
+        cmd += self.runtime_profile.llama_extra_args()
         cmd += model.extra_args
         return cmd
 
     def start(self, model: ModelConfig) -> Tuple[bool, str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
-        command = self.vllm_command if runtime == 'vllm' else self.llama_server
+        command = self.runtime_server_command(runtime)
         label = 'vLLM command' if runtime == 'vllm' else 'llama-server'
         if not self.command_exists(command):
             return False, f'{label} not found: {command}'

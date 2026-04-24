@@ -722,6 +722,7 @@ def build_header_config_items(app: AppConfig, message: str, width: int) -> List[
     lines = [
         (f'config: {app.config_path}', 'muted'),
         (f'llama-server: {app.llama_server}', 'muted'),
+        (app.runtime_indicator(), 'muted'),
         (f'vllm: {app.vllm_command}', 'muted'),
         (f'opencode: {app.opencode.path or "<unset>"}  continue: {continue_path}  hermes: {getattr(app.hermes, "command", "hermes")}', 'muted'),
         (f'roots: {roots_summary}', 'muted'),
