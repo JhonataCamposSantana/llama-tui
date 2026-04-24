@@ -8,8 +8,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib import request
 
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
-from .gguf import set_model_extra_arg, strip_extra_args
-from .hardware import HardwareProfile
+from .gguf import architecture_label, set_model_extra_arg, strip_extra_args
+from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
 from .models import ModelConfig
 from .optimize import (
     apply_hardware_baseline,
@@ -17,6 +17,7 @@ from .optimize import (
     apply_optimization_preset,
     estimate_safe_context_for_profile,
     choose_best_preset,
+    model_is_moe,
     select_best_tier,
 )
 from .textutil import compact_message
@@ -143,6 +144,136 @@ def emit_benchmark_event(
     progress(payload)
 
 
+def architecture_payload(model: ModelConfig) -> Dict[str, object]:
+    return {
+        'architecture_type': getattr(model, 'architecture_type', 'unknown') or 'unknown',
+        'architecture': getattr(model, 'architecture', '') or '',
+        'architecture_label': architecture_label(model),
+        'model_family': getattr(model, 'model_family', '') or '',
+        'expert_count': int(getattr(model, 'expert_count', 0) or 0),
+        'expert_used_count': int(getattr(model, 'expert_used_count', 0) or 0),
+        'expert_shared_count': int(getattr(model, 'expert_shared_count', 0) or 0),
+        'active_expert_ratio': float(getattr(model, 'active_expert_ratio', 0.0) or 0.0),
+        'classification_confidence': float(getattr(model, 'classification_confidence', 0.0) or 0.0),
+        'classification_source': getattr(model, 'classification_source', '') or '',
+    }
+
+
+def process_pressure_payload(snapshot: Optional[ProcessPressureSnapshot]) -> Dict[str, object]:
+    if snapshot is None:
+        return {}
+    return {
+        'process_pressure_level': snapshot.pressure_level,
+        'process_pressure_score': float(snapshot.pressure_score or 0.0),
+        'process_pressure_detail': snapshot.detail or process_pressure_label(snapshot),
+        'process_load_1m': float(snapshot.load_1m or 0.0),
+        'process_load_ratio': float(snapshot.load_ratio or 0.0),
+        'process_count': int(snapshot.process_count or 0),
+        'process_known': dict(snapshot.known_processes or {}),
+        'process_known_memory': dict(snapshot.known_memory or {}),
+        'process_top_memory': [dict(item) for item in list(snapshot.top_memory or [])[:3]],
+        'process_top_cpu': [dict(item) for item in list(snapshot.top_cpu or [])[:3]],
+    }
+
+
+def current_process_pressure_payload() -> Dict[str, object]:
+    try:
+        return process_pressure_payload(benchmark_current_process_pressure())
+    except Exception:
+        return {}
+
+
+def _record_headroom_score(record: Dict[str, object]) -> float:
+    ram = int(record.get('ram_available', 0) or 0)
+    vram = int(record.get('gpu_memory_free', 0) or 0)
+    score = min(1.0, (ram / 1024**3) / 8.0) if ram else 0.35
+    if vram:
+        score = max(score, min(1.0, (vram / 1024**3) / 2.0))
+    pressure = float(record.get('process_pressure_score', 0.0) or 0.0)
+    if pressure:
+        score *= max(0.45, 1.0 - pressure * 0.35)
+    return max(0.0, min(1.0, score))
+
+
+def _record_stability_score(record: Dict[str, object]) -> float:
+    score = 1.0
+    if int(record.get('retry_attempt', 1) or 1) > 1:
+        score -= 0.15
+    status = str(record.get('status', '') or '').lower()
+    if status not in ('ok', 'probe ok', 'tests passed'):
+        score -= 0.35
+    detail = compact_message(str(record.get('detail', '') or '')).lower()
+    if detail not in ('', '1 samples', '2 samples', '3 samples', 'all tasks passed'):
+        score -= 0.05
+    ready = float(record.get('ready_seconds', 0.0) or 0.0)
+    if ready > 90:
+        score -= 0.10
+    return max(0.0, min(1.0, score))
+
+
+def _tps_curve(record: Dict[str, object]) -> float:
+    tps = float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
+    return max(0.0, min(1.0, tps / (tps + 30.0))) if tps > 0 else 0.0
+
+
+def _ctx_curve(record: Dict[str, object], cap: int) -> float:
+    ctx = int(record.get('ctx_per_slot', record.get('ctx', 0)) or 0)
+    return max(0.0, min(1.0, ctx / max(1, cap)))
+
+
+def score_fast_chat(record: Dict[str, object], model: ModelConfig) -> float:
+    cap = 16384 if model_is_moe(model) else 8192
+    tps = float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
+    return (
+        tps
+        + 4.0 * _record_headroom_score(record)
+        + 2.0 * _record_stability_score(record)
+        + 3.0 * _ctx_curve(record, cap)
+    )
+
+
+def score_long_context(record: Dict[str, object], model: ModelConfig) -> float:
+    cap = max(32768, int(getattr(model, 'ctx_max', 32768) or 32768))
+    return (
+        0.55 * _ctx_curve(record, cap)
+        + 0.20 * _record_headroom_score(record)
+        + 0.15 * _tps_curve(record)
+        + 0.10 * _record_stability_score(record)
+    )
+
+
+def score_opencode_ready(record: Dict[str, object], model: ModelConfig) -> float:
+    ctx = int(record.get('ctx_per_slot', record.get('ctx', 0)) or 0)
+    target = 32768 if model_is_moe(model) else 16384
+    score = (
+        0.40 * _ctx_curve(record, target)
+        + 0.30 * _tps_curve(record)
+        + 0.20 * _record_headroom_score(record)
+        + 0.10 * _record_stability_score(record)
+    )
+    if model_is_moe(model) and ctx < 16384:
+        score *= 0.35
+    if model_is_moe(model) and ctx >= 32768:
+        score += 0.15
+    return score
+
+
+def score_auto(record: Dict[str, object], model: ModelConfig) -> float:
+    if model_is_moe(model) and int(record.get('ngl', 0) or 0) != 999:
+        return (
+            0.35 * score_opencode_ready(record, model)
+            + 0.35 * score_long_context(record, model)
+            + 0.20 * score_fast_chat(record, model)
+            + 0.10 * _record_headroom_score(record)
+        )
+    return (
+        0.50 * _tps_curve(record)
+        + 0.30 * _ctx_curve(record, 32768)
+        + 0.12 * _record_headroom_score(record)
+        + 0.08 * _record_stability_score(record)
+    )
+
+
 def concise_failure(text: str, limit: int = 320) -> str:
     message = compact_message(text)
     if len(message) <= limit:
@@ -258,9 +389,17 @@ def _power_of_two_at_most(value: int, floor: int, ceiling: int) -> int:
     return power
 
 
-def adaptive_batch_sizes(ctx: int, parallel: int, objective: str) -> Tuple[int, int]:
+def adaptive_batch_sizes(ctx: int, parallel: int, objective: str, moe: bool = False) -> Tuple[int, int]:
     ctx = max(1, int(ctx or 1))
     parallel = max(1, int(parallel or 1))
+    if moe and objective == 'fast_chat':
+        batch = _power_of_two_at_most(max(256, ctx // max(1, parallel)), 256, 1024)
+        ubatch = _power_of_two_at_most(max(128, batch // 2), 128, min(batch, 512))
+        return batch, ubatch
+    if moe:
+        batch = _power_of_two_at_most(max(128, ctx // 16), 128, 256)
+        ubatch = _power_of_two_at_most(max(64, batch // 2), 64, min(batch, 128))
+        return batch, ubatch
     if objective == 'fast_chat':
         batch = _power_of_two_at_most(max(256, ctx // max(1, parallel)), 256, 2048)
     else:
@@ -296,7 +435,7 @@ def configure_adaptive_candidate(
     extra_args = _strip_runtime_tuning_args(list(getattr(candidate, 'extra_args', []) or []))
     runtime = getattr(candidate, 'runtime', 'llama.cpp')
     if runtime == 'llama.cpp':
-        batch, ubatch = adaptive_batch_sizes(candidate.ctx, candidate.parallel, objective)
+        batch, ubatch = adaptive_batch_sizes(candidate.ctx, candidate.parallel, objective, moe=model_is_moe(candidate))
         extra_args = _set_extra_arg(extra_args, '--batch-size', str(batch))
         extra_args = _set_extra_arg(extra_args, '--ubatch-size', str(ubatch))
         if variant == 'q8_kv':
@@ -565,7 +704,7 @@ def smart_fast_contexts(successes: List[int], chat_floor: int) -> List[int]:
 def adaptive_parallel_values(model: ModelConfig, profile: HardwareProfile, objective: str, ctx: int, variant: str) -> List[int]:
     if objective != 'fast_chat':
         return [1]
-    max_cpu = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 8)))
+    max_cpu = max(1, min(4 if model_is_moe(model) else 16, int(getattr(profile, 'cpu_logical', 0) or 8)))
     values = []
     parallel = 1
     ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
@@ -1085,8 +1224,9 @@ def _run_server_benchmark_candidates(
     results = []
     failures = []
     benchmark_records: List[Dict[str, object]] = []
+    starting_pressure = current_process_pressure_payload()
     if progress:
-        progress(f'{label} started: {len(candidates)} candidate(s), {profile.short_summary()}')
+        progress(f'{label} started: {len(candidates)} candidate(s), {profile.short_summary()} {starting_pressure.get("process_pressure_detail", "")}')
     if update_default_status:
         running_model = clone_model_config(model)
         running_model.default_benchmark_status = 'running'
@@ -1101,7 +1241,7 @@ def _run_server_benchmark_candidates(
         elapsed: float = 0.0,
         detail: str = '',
     ):
-        benchmark_records.append({
+        record = {
             'preset': preset,
             'tier': tier,
             'status': status,
@@ -1113,7 +1253,10 @@ def _run_server_benchmark_candidates(
             'ngl': int(getattr(candidate, 'ngl', 0) or 0),
             'detail': concise_failure(detail, limit=500),
             'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
-        })
+        }
+        record.update(architecture_payload(candidate))
+        record.update(current_process_pressure_payload())
+        benchmark_records.append(record)
 
     current: Optional[Tuple[str, str, ModelConfig]] = None
     try:
@@ -1253,7 +1396,7 @@ def adaptive_profile_dict(
     record: Dict[str, object],
     profile: HardwareProfile,
 ) -> Dict[str, object]:
-    return {
+    profile_dict = {
         'status': 'ok',
         'objective': key,
         'ctx': int(getattr(candidate, 'ctx', 0) or 0),
@@ -1279,6 +1422,20 @@ def adaptive_profile_dict(
         'benchmarked_at': str(record.get('benchmarked_at') or datetime.now().isoformat(timespec='seconds')),
         'hardware': profile.short_summary(),
     }
+    profile_dict.update(architecture_payload(candidate))
+    for key in (
+        'process_pressure_level',
+        'process_pressure_score',
+        'process_pressure_detail',
+        'process_load_1m',
+        'process_load_ratio',
+        'process_count',
+        'process_known',
+        'process_known_memory',
+    ):
+        if key in record:
+            profile_dict[key] = record.get(key)
+    return profile_dict
 
 
 def chat_min_ctx_per_slot(model: ModelConfig) -> int:
@@ -1329,23 +1486,7 @@ def select_measured_profiles(
     max_tps = max(float(item.get('tokens_per_sec', 0.0) or 0.0) for item in successful) or 1.0
     max_ctx = max(int(item.get('ctx_per_slot', 0) or 0) for item in successful) or 1
     fast_floor = chat_min_ctx_per_slot(model)
-    opencode_floor = observed_opencode_context_floor(model)
-
-    def headroom_score(item: Dict[str, object]) -> float:
-        ram = int(item.get('ram_available', 0) or 0)
-        vram = int(item.get('gpu_memory_free', 0) or 0)
-        score = min(1.0, (ram / 1024**3) / 8.0) if ram else 0.35
-        if vram:
-            score = max(score, min(1.0, (vram / 1024**3) / 2.0))
-        return max(0.0, min(1.0, score))
-
-    def stability_score(item: Dict[str, object]) -> float:
-        score = 1.0
-        if int(item.get('retry_attempt', 1) or 1) > 1:
-            score -= 0.15
-        if compact_message(str(item.get('detail', '') or '')).lower() not in ('', '1 samples', '2 samples', '3 samples'):
-            score -= 0.05
-        return max(0.0, min(1.0, score))
+    opencode_floor = max(observed_opencode_context_floor(model), 16384 if model_is_moe(model) else 0)
 
     fast_pool = [item for item in successful if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or successful
     long_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
@@ -1354,21 +1495,11 @@ def select_measured_profiles(
         if int(item.get('parallel', 1) or 1) == 1 and int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor
     ] or [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
 
-    fast = max(fast_pool, key=lambda item: (float(item.get('tokens_per_sec', 0.0) or 0.0), int(item.get('ctx_per_slot', 0) or 0)))
-    long = max(long_pool, key=lambda item: (int(item.get('ctx_per_slot', 0) or 0), float(item.get('tokens_per_sec', 0.0) or 0.0)))
-    opencode = max(opencode_pool, key=lambda item: (int(item.get('ctx_per_slot', 0) or 0), float(item.get('tokens_per_sec', 0.0) or 0.0)))
+    fast = max(fast_pool, key=lambda item: (score_fast_chat(item, model), float(item.get('tokens_per_sec', 0.0) or 0.0)))
+    long = max(long_pool, key=lambda item: (score_long_context(item, model), int(item.get('ctx_per_slot', 0) or 0)))
+    opencode = max(opencode_pool, key=lambda item: (score_opencode_ready(item, model), int(item.get('ctx_per_slot', 0) or 0)))
 
-    def auto_score(item: Dict[str, object]) -> float:
-        tps_norm = float(item.get('tokens_per_sec', 0.0) or 0.0) / max_tps
-        ctx_norm = int(item.get('ctx_per_slot', 0) or 0) / max_ctx
-        return (
-            0.50 * tps_norm
-            + 0.30 * ctx_norm
-            + 0.12 * headroom_score(item)
-            + 0.08 * stability_score(item)
-        )
-
-    auto = max(successful, key=auto_score)
+    auto = max(successful, key=lambda item: score_auto(item, model))
     winner_specs = {
         'fast_chat': (
             fast,
@@ -1393,10 +1524,9 @@ def select_measured_profiles(
         ),
         'auto': (
             auto,
-            auto_score(auto),
+            score_auto(auto, model),
             (
-                'quality score: 50% tok/s, 30% ctx/slot, '
-                '12% headroom, 8% stability'
+                'quality score: architecture-aware tok/s, ctx/slot, process headroom, and stability'
             ),
         ),
     }
@@ -1464,6 +1594,9 @@ def _machine_headroom_score(profile: Dict[str, object]) -> float:
     score = min(1.0, (ram / 1024**3) / 8.0) if ram else 0.35
     if vram:
         score = max(score, min(1.0, (vram / 1024**3) / 2.0))
+    pressure = float(profile.get('process_pressure_score', 0.0) or 0.0)
+    if pressure:
+        score *= max(0.45, 1.0 - pressure * 0.35)
     return max(0.0, min(1.0, score))
 
 
@@ -1495,6 +1628,8 @@ def machine_benchmark_rows(app: AppConfig, models: Optional[List[ModelConfig]] =
             'model_id': model.id,
             'name': getattr(model, 'name', '') or model.id,
             'runtime': getattr(model, 'runtime', 'llama.cpp'),
+            'architecture': architecture_label(model),
+            'architecture_type': getattr(model, 'architecture_type', 'unknown') or 'unknown',
             'quant': str(getattr(model, 'path', '') or ''),
             'auto_tokens_per_sec': float(auto.get('tokens_per_sec', 0.0) or 0.0),
             'auto_ctx_per_slot': auto_ctx_slot,
@@ -1506,6 +1641,9 @@ def machine_benchmark_rows(app: AppConfig, models: Optional[List[ModelConfig]] =
             'opencode_meets_floor': bool(not opencode_floor or int(opencode.get('ctx_per_slot', auto_ctx_slot) or 0) >= opencode_floor),
             'ram_available': int(auto.get('ram_available', 0) or 0),
             'gpu_memory_free': int(auto.get('gpu_memory_free', 0) or 0),
+            'process_pressure_level': auto.get('process_pressure_level', ''),
+            'process_pressure_score': float(auto.get('process_pressure_score', 0.0) or 0.0),
+            'process_pressure_detail': str(auto.get('process_pressure_detail', '') or ''),
             'stability_score': _machine_stability_score(auto),
             'headroom_score': _machine_headroom_score(auto),
             'benchmarked_at': str(auto.get('benchmarked_at') or getattr(model, 'default_benchmark_at', '') or ''),
@@ -1533,7 +1671,8 @@ def machine_benchmark_rows(app: AppConfig, models: Optional[List[ModelConfig]] =
             f'ctx/slot {int(row.get("auto_ctx_per_slot", 0) or 0)} '
             f'({int(round(ctx_norm * 100))}% of highest), '
             f'headroom {int(round(headroom * 100))}%, '
-            f'stability {int(round(stability * 100))}%'
+            f'stability {int(round(stability * 100))}%, '
+            f'pressure {row.get("process_pressure_level") or "unknown"}'
         )
     return sorted(rows, key=lambda row: (-float(row.get('machine_score', 0.0) or 0.0), str(row.get('model_id', ''))))
 
@@ -1743,7 +1882,7 @@ def build_benchmark_run(
     elapsed = 0.0
     for row in records:
         elapsed += float(row.get('seconds', 0.0) or 0.0)
-    return {
+    run = {
         'id': run_id,
         'kind': kind,
         'status': status,
@@ -1757,6 +1896,8 @@ def build_benchmark_run(
         'failed': len(failed),
         'hardware': hardware,
     }
+    run.update(current_process_pressure_payload())
+    return run
 
 
 def adaptive_record_from_candidate(
@@ -1768,14 +1909,27 @@ def adaptive_record_from_candidate(
     detail: str = '',
     ram_available: int = 0,
     gpu_memory_free: int = 0,
+    startup_seconds: float = 0.0,
+    ready_seconds: float = 0.0,
+    warmup_seconds: float = 0.0,
+    prompt_tokens: int = 0,
+    generated_tokens: int = 0,
+    process_snapshots: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> Dict[str, object]:
-    return {
+    record = {
         'objective': objective,
         'preset': objective,
         'tier': 'measured',
         'status': status,
         'tokens_per_sec': round(float(tokens_per_sec), 2),
+        'decode_tokens_per_sec': round(float(tokens_per_sec), 2),
+        'total_tokens_per_sec': round(float(tokens_per_sec), 2),
         'seconds': round(float(seconds), 2),
+        'startup_seconds': round(float(startup_seconds), 2),
+        'ready_seconds': round(float(ready_seconds), 2),
+        'warmup_seconds': round(float(warmup_seconds), 2),
+        'prompt_tokens': int(prompt_tokens or 0),
+        'generated_tokens': int(generated_tokens or 0),
         'ctx': int(getattr(candidate, 'ctx', 0) or 0),
         'ctx_per_slot': ctx_per_slot(candidate),
         'parallel': int(getattr(candidate, 'parallel', 0) or 0),
@@ -1791,6 +1945,18 @@ def adaptive_record_from_candidate(
         'detail': concise_failure(detail, limit=500),
         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
     }
+    record.update(architecture_payload(candidate))
+    if process_snapshots:
+        record['process_snapshots'] = {key: dict(value) for key, value in process_snapshots.items()}
+        if process_snapshots.get('after_generation'):
+            record.update(process_snapshots['after_generation'])
+        elif process_snapshots.get('after_ready'):
+            record.update(process_snapshots['after_ready'])
+        elif process_snapshots.get('before'):
+            record.update(process_snapshots['before'])
+    else:
+        record.update(current_process_pressure_payload())
+    return record
 
 
 def benchmark_adaptive_candidate(
@@ -1801,14 +1967,36 @@ def benchmark_adaptive_candidate(
     cancel_token: Optional[CancelToken],
 ) -> Tuple[Dict[str, object], Optional[Dict[str, object]]]:
     check_cancelled(cancel_token)
+    process_snapshots: Dict[str, Dict[str, object]] = {'before': current_process_pressure_payload()}
+    start_at = time.monotonic()
     ok, msg = app.start(candidate)
+    startup_seconds = time.monotonic() - start_at
     if not ok:
-        record = adaptive_record_from_candidate(candidate, objective, 'start failed', detail=msg)
+        process_snapshots['after_start'] = current_process_pressure_payload()
+        record = adaptive_record_from_candidate(
+            candidate,
+            objective,
+            'start failed',
+            detail=msg,
+            startup_seconds=startup_seconds,
+            process_snapshots=process_snapshots,
+        )
         return record, None
     try:
+        ready_start = time.monotonic()
         ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
+        ready_seconds = time.monotonic() - ready_start
+        process_snapshots['after_ready'] = current_process_pressure_payload()
         if not ready_ok:
-            return adaptive_record_from_candidate(candidate, objective, 'not ready', detail=ready_msg), None
+            return adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'not ready',
+                detail=ready_msg,
+                startup_seconds=startup_seconds,
+                ready_seconds=ready_seconds,
+                process_snapshots=process_snapshots,
+            ), None
         if int(getattr(candidate, 'last_good_ctx', 0) or 0) > 0:
             candidate.ctx = int(candidate.last_good_ctx)
         if int(getattr(candidate, 'last_good_parallel', 0) or 0) > 0:
@@ -1818,12 +2006,14 @@ def benchmark_adaptive_candidate(
                 f'adaptive {objective} ready: ctx={candidate.ctx} slot={ctx_per_slot(candidate)} '
                 f'parallel={candidate.parallel}; measuring...'
             )
+        warmup_start = time.monotonic()
         benchmark_completion(
             candidate,
             max_tokens=BENCHMARK_WARMUP_TOKENS,
             timeout=BENCHMARK_WARMUP_TIMEOUT,
             cancel_token=cancel_token,
         )
+        warmup_seconds = time.monotonic() - warmup_start
         bench_ok, bench = benchmark_completion_suite(
             candidate,
             max_tokens=BENCHMARK_SAMPLE_TOKENS,
@@ -1831,8 +2021,19 @@ def benchmark_adaptive_candidate(
             cancel_token=cancel_token,
         )
         if not bench_ok:
-            return adaptive_record_from_candidate(candidate, objective, 'benchmark failed', detail=str(bench.get('error', 'unknown error'))), None
+            process_snapshots['after_generation'] = current_process_pressure_payload()
+            return adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'benchmark failed',
+                detail=str(bench.get('error', 'unknown error')),
+                startup_seconds=startup_seconds,
+                ready_seconds=ready_seconds,
+                warmup_seconds=warmup_seconds,
+                process_snapshots=process_snapshots,
+            ), None
         snap = app.hardware_profile(refresh=True)
+        process_snapshots['after_generation'] = current_process_pressure_payload()
         score = float(bench.get('tokens_per_sec', 0.0) or 0.0)
         elapsed = float(bench.get('elapsed', 0.0) or 0.0)
         record = adaptive_record_from_candidate(
@@ -1844,6 +2045,12 @@ def benchmark_adaptive_candidate(
             detail=f'{int(bench.get("sample_count", 1) or 1)} samples',
             ram_available=int(getattr(snap, 'memory_available', 0) or 0),
             gpu_memory_free=int(getattr(snap, 'gpu_memory_free', 0) or 0),
+            startup_seconds=startup_seconds,
+            ready_seconds=ready_seconds,
+            warmup_seconds=warmup_seconds,
+            prompt_tokens=int(bench.get('prompt_tokens', 0) or 0),
+            generated_tokens=int(bench.get('completion_tokens', 0) or 0),
+            process_snapshots=process_snapshots,
         )
         measured = dict(record)
         measured['model'] = ModelConfig(**asdict(candidate))
@@ -2060,8 +2267,8 @@ def parallel_refinement_values(profile: HardwareProfile, best_parallel: int, tes
     return sorted(values)
 
 
-def fast_benchmark_parallel_values(profile: HardwareProfile) -> List[int]:
-    max_parallel = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 1)))
+def fast_benchmark_parallel_values(profile: HardwareProfile, model: Optional[ModelConfig] = None) -> List[int]:
+    max_parallel = max(1, min(4 if model is not None and model_is_moe(model) else 16, int(getattr(profile, 'cpu_logical', 0) or 1)))
     return [value for value in FAST_BENCHMARK_PARALLEL_TARGETS if value <= max_parallel] or [1]
 
 
@@ -2108,6 +2315,11 @@ def benchmark_config_fingerprint(candidate: ModelConfig) -> str:
         'jinja': bool(getattr(candidate, 'jinja', True)),
         'memory_reserve_percent': int(getattr(candidate, 'memory_reserve_percent', 0) or 0),
         'extra_args': list(getattr(candidate, 'extra_args', []) or []),
+        'architecture_type': getattr(candidate, 'architecture_type', 'unknown') or 'unknown',
+        'architecture': getattr(candidate, 'architecture', '') or '',
+        'expert_count': int(getattr(candidate, 'expert_count', 0) or 0),
+        'expert_used_count': int(getattr(candidate, 'expert_used_count', 0) or 0),
+        'active_expert_ratio': float(getattr(candidate, 'active_expert_ratio', 0.0) or 0.0),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
@@ -2424,10 +2636,21 @@ def benchmark_exhaustive_profiles(
     upsert_benchmark_run(running_model, running_run)
     app.add_or_update(running_model)
 
+    pressure_payload = current_process_pressure_payload()
+    moe_note = ''
+    if model_is_moe(model):
+        moe_note = (
+            f'MoE detected from {getattr(model, "classification_source", "unknown") or "unknown"}: '
+            f'{int(getattr(model, "expert_count", 0) or 0)} experts, '
+            f'{int(getattr(model, "expert_used_count", 0) or 0)} active. '
+            'Using conservative memory/offload search. '
+        )
     start_msg = (
         f'smart bounded benchmark started: ctx={ctx_min}..{ctx_max}, '
         f'chat_floor={chat_floor}, opencode_floor={opencode_floor or "none"}, '
-        f'soft_budget={SMART_BENCHMARK_SOFT_BUDGET_SECONDS // 60}m, {profile.short_summary()}'
+        f'soft_budget={SMART_BENCHMARK_SOFT_BUDGET_SECONDS // 60}m, '
+        f'arch={architecture_label(model)}, {moe_note}{profile.short_summary()} '
+        f'{pressure_payload.get("process_pressure_detail", "")}'
     )
     if progress:
         progress(start_msg)
@@ -2555,7 +2778,7 @@ def benchmark_exhaustive_profiles(
 
     def run_fast_chat_race(ctx: int, variant: str):
         nonlocal completed, current
-        max_parallel = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 1)))
+        max_parallel = max(1, min(4 if model_is_moe(model) else 16, int(getattr(profile, 'cpu_logical', 0) or 1)))
         parallel_values = [value for value in (1, 2, 4, 8, 16) if value <= max_parallel]
         best_parallel = 0
         best_tps = 0.0
@@ -2747,7 +2970,7 @@ def benchmark_fast_profiles(
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'server-fast-{datetime.now().strftime("%Y%m%d%H%M%S")}'
     contexts = fast_benchmark_contexts(model, profile)
-    parallel_values = fast_benchmark_parallel_values(profile)
+    parallel_values = fast_benchmark_parallel_values(profile, model)
     total = max(1, len(contexts) * (2 + len(parallel_values)) * 2)
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
@@ -2760,9 +2983,12 @@ def benchmark_fast_profiles(
     upsert_benchmark_run(running_model, running_run)
     app.add_or_update(running_model)
 
+    pressure_payload = current_process_pressure_payload()
     start_msg = (
         f'fast benchmark started: contexts={",".join(str(ctx) for ctx in contexts)}, '
-        f'parallel={",".join(str(value) for value in parallel_values)}, default variant, {profile.short_summary()}'
+        f'parallel={",".join(str(value) for value in parallel_values)}, default variant, '
+        f'arch={architecture_label(model)}, {profile.short_summary()} '
+        f'{pressure_payload.get("process_pressure_detail", "")}'
     )
     if progress:
         progress(start_msg)
@@ -2966,14 +3192,23 @@ def benchmark_adaptive_profiles(
     running_model = ModelConfig(**asdict(model))
     running_model.default_benchmark_status = 'running'
     app.add_or_update(running_model)
+    pressure_payload = current_process_pressure_payload()
     if progress:
-        progress(f'adaptive benchmark started: budget≈{int(time_budget_seconds // 60)}m, {profile.short_summary()}')
+        progress(
+            f'adaptive benchmark started: budget≈{int(time_budget_seconds // 60)}m, '
+            f'arch={architecture_label(model)}, {profile.short_summary()} '
+            f'{pressure_payload.get("process_pressure_detail", "")}'
+        )
     emit_benchmark_event(
         progress,
         'benchmark_started',
         model,
         'server',
-        message=f'adaptive benchmark started: budget≈{int(time_budget_seconds // 60)}m, {profile.short_summary()}',
+        message=(
+            f'adaptive benchmark started: budget≈{int(time_budget_seconds // 60)}m, '
+            f'arch={architecture_label(model)}, {profile.short_summary()} '
+            f'{pressure_payload.get("process_pressure_detail", "")}'
+        ),
         phase='starting',
         completed=0,
         total=0,
@@ -3197,7 +3432,7 @@ def _batch_summary_record(
     reason: str = '',
 ) -> Dict[str, object]:
     profile = get_measured_profile(model, 'auto')
-    return {
+    record = {
         'objective': 'deep_all',
         'model_id': model.id,
         'status': status,
@@ -3212,6 +3447,9 @@ def _batch_summary_record(
         'detail': concise_failure(detail, limit=500),
         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
     }
+    record.update(architecture_payload(model))
+    record.update(current_process_pressure_payload())
+    return record
 
 
 def benchmark_all_models_deep(
@@ -3309,9 +3547,10 @@ def benchmark_all_models_deep(
         return True, msg
 
     label = 'force refresh' if force else 'missing/stale/failed'
+    pressure_payload = current_process_pressure_payload()
     emit_batch(
         'benchmark_started',
-        f'deep benchmark all started: {total} model(s), mode={label}',
+        f'deep benchmark all started: {total} model(s), mode={label}, {pressure_payload.get("process_pressure_detail", "")}',
         phase='starting',
     )
 

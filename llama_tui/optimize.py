@@ -1,15 +1,16 @@
 import os
 from typing import Optional
 
-from .discovery import classify_model_type, extract_quant
+from .discovery import extract_quant
 from .gguf import (
+    estimate_layer_weight_bytes_from_tensor_descriptors,
     estimate_kv_bytes_per_token,
     gguf_layer_count,
     has_extra_flag,
     model_file_size,
     selected_cache_type,
 )
-from .hardware import HardwareProfile
+from .hardware import HardwareProfile, benchmark_current_process_pressure
 from .models import ModelConfig
 
 GPU_WEIGHT_BUDGET_BY_TIER = {
@@ -26,6 +27,11 @@ GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER = {
     'safe': 0.45,
     'moderate': 0.58,
     'extreme': 0.70,
+}
+MOE_GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER = {
+    'safe': 0.36,
+    'moderate': 0.48,
+    'extreme': 0.58,
 }
 MAX_CONTEXT_RESERVE_BY_TIER = {
     'safe': 35,
@@ -82,6 +88,21 @@ TOKENS_PER_SEC_UBATCH_BY_TIER = {
     'moderate': '512',
     'extreme': '1024',
 }
+MOE_TOKENS_PER_SEC_PARALLEL_BY_TIER = {
+    'safe': 1,
+    'moderate': 2,
+    'extreme': 4,
+}
+MOE_TOKENS_PER_SEC_BATCH_BY_TIER = {
+    'safe': '256',
+    'moderate': '512',
+    'extreme': '1024',
+}
+MOE_TOKENS_PER_SEC_UBATCH_BY_TIER = {
+    'safe': '128',
+    'moderate': '256',
+    'extreme': '512',
+}
 TOKENS_PER_SEC_VLLM_UTIL_BY_TIER = {
     'safe': '0.70',
     'moderate': '0.80',
@@ -99,6 +120,54 @@ TOKENS_PER_SEC_VLLM_BATCHED_TOKENS_BY_TIER = {
 }
 
 
+def model_is_moe(model: ModelConfig) -> bool:
+    return (getattr(model, 'architecture_type', '') or '').strip().lower() == 'moe'
+def model_uses_cpu_execution(model: ModelConfig, profile: Optional[HardwareProfile] = None) -> bool:
+    runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+    if runtime in ('vllm', 'ollama'):
+        return False
+    try:
+        ngl = int(getattr(model, 'ngl', 0) or 0)
+    except Exception:
+        ngl = 0
+    if ngl <= 0:
+        return True
+    return bool(profile and not profile.has_usable_gpu())
+def process_pressure_score(profile: Optional[HardwareProfile]) -> float:
+    try:
+        snapshot = benchmark_current_process_pressure()
+        if float(snapshot.pressure_score or 0.0) > 0.0:
+            return max(0.0, min(1.0, float(snapshot.pressure_score)))
+    except Exception:
+        pass
+    if not profile:
+        return 0.0
+    score = 0.0
+    try:
+        load_1m = os.getloadavg()[0]
+        logical = max(1, int(getattr(profile, 'cpu_logical', 0) or os.cpu_count() or 1))
+        score = max(score, min(1.0, load_1m / logical))
+    except Exception:
+        pass
+    if profile.memory_total > 0:
+        score = max(score, 1.0 - min(1.0, profile.memory_available / profile.memory_total))
+    if profile.gpu_memory_total > 0:
+        score = max(score, 1.0 - min(1.0, profile.gpu_memory_free / profile.gpu_memory_total))
+    return max(0.0, min(1.0, score))
+def process_pressure_budget_factor(profile: Optional[HardwareProfile]) -> float:
+    score = process_pressure_score(profile)
+    if score >= 0.80:
+        return 0.78
+    if score >= 0.45:
+        return 0.88
+    return 1.0
+def process_pressure_reserve_bonus(profile: Optional[HardwareProfile]) -> int:
+    score = process_pressure_score(profile)
+    if score >= 0.80:
+        return 12
+    if score >= 0.45:
+        return 6
+    return 0
 def model_likely_fits_gpu(model: ModelConfig, profile: Optional[HardwareProfile], tier: str) -> bool:
     if not profile or not profile.has_usable_gpu():
         return False
@@ -106,6 +175,9 @@ def model_likely_fits_gpu(model: ModelConfig, profile: Optional[HardwareProfile]
     if size <= 0:
         return False
     gpu_weight_budget = GPU_WEIGHT_BUDGET_BY_TIER.get(tier, GPU_WEIGHT_BUDGET_BY_TIER['moderate'])
+    if model_is_moe(model):
+        gpu_weight_budget *= 0.92
+    gpu_weight_budget *= process_pressure_budget_factor(profile)
     return size <= int(profile.gpu_memory_free * gpu_weight_budget)
 def gpu_reserve_percent_for_tier(tier: str) -> int:
     return GPU_RESERVE_BY_TIER.get(tier, GPU_RESERVE_BY_TIER['moderate'])
@@ -125,16 +197,38 @@ def choose_gpu_layers_for_profile(model: ModelConfig, profile: Optional[Hardware
     if layer_count <= 0 or size <= 0:
         return 0
 
-    reserve_pct = gpu_reserve_percent_for_tier(tier)
-    usable_gpu = int(profile.gpu_memory_free * ((100 - reserve_pct) / 100.0))
-    workspace = estimate_gpu_workspace_bytes(profile)
+    reserve_pct = gpu_reserve_percent_for_tier(tier) + process_pressure_reserve_bonus(profile)
+    if model_is_moe(model):
+        reserve_pct += 8
+    usable_gpu = int(
+        profile.gpu_memory_free
+        * ((100 - min(80, reserve_pct)) / 100.0)
+        * process_pressure_budget_factor(profile)
+    )
+    workspace = estimate_gpu_workspace_bytes(profile, model)
     min_ctx = max(256, int(getattr(model, 'ctx_min', 2048)))
     kv_floor = estimate_kv_bytes_per_token(model) * min_ctx
     weight_budget = usable_gpu - workspace - kv_floor
     if weight_budget <= 256 * 1024**2:
         return 0
 
+    if model_is_moe(model):
+        layer_bytes = estimate_layer_weight_bytes_from_tensor_descriptors(getattr(model, 'path', '') or '')
+        if layer_bytes:
+            used = 0
+            layers = 0
+            for layer_size in layer_bytes:
+                if int(layer_size or 0) <= 0:
+                    continue
+                if used + int(layer_size) > weight_budget:
+                    break
+                used += int(layer_size)
+                layers += 1
+            return max(0, min(layer_count, layers))
+
     per_layer = max(1, size / max(1, layer_count))
+    if model_is_moe(model):
+        per_layer *= 1.18
     layers = int(weight_budget / per_layer)
     return max(0, min(layer_count, layers))
 def kv_cache_uses_gpu(model: ModelConfig, profile: Optional[HardwareProfile]) -> bool:
@@ -148,11 +242,13 @@ def kv_cache_uses_gpu(model: ModelConfig, profile: Optional[HardwareProfile]) ->
         return int(getattr(model, 'ngl', 0) or 0) != 0
     except Exception:
         return True
-def estimate_gpu_workspace_bytes(profile: HardwareProfile) -> int:
+def estimate_gpu_workspace_bytes(profile: HardwareProfile, model: Optional[ModelConfig] = None) -> int:
     total = profile.gpu_memory_total or profile.gpu_memory_free
     if total <= 0:
         return 0
-    return min(max(512 * 1024**2, int(total * 0.08)), 2 * 1024**3)
+    fraction = 0.10 if model is not None and model_is_moe(model) else 0.08
+    ceiling = 3 * 1024**3 if model is not None and model_is_moe(model) else 2 * 1024**3
+    return min(max(512 * 1024**2, int(total * fraction)), ceiling)
 def estimate_gpu_weight_bytes(model: ModelConfig, profile: HardwareProfile, tier: str, usable_gpu: int) -> int:
     size = model_file_size(model)
     if size <= 0:
@@ -165,13 +261,19 @@ def estimate_gpu_weight_bytes(model: ModelConfig, profile: HardwareProfile, tier
     except Exception:
         ngl = 0
     if layer_count > 0 and 0 < ngl < layer_count:
+        if model_is_moe(model):
+            layer_bytes = estimate_layer_weight_bytes_from_tensor_descriptors(getattr(model, 'path', '') or '')
+            if layer_bytes:
+                return min(int(sum(layer_bytes[:ngl]) * 1.12), int(usable_gpu * 0.85))
         return min(int(size * (ngl / layer_count) * 1.15), int(usable_gpu * 0.85))
     if model_likely_fits_gpu(model, profile, tier):
         return min(int(size * 1.08), int(usable_gpu * 0.85))
-    offload_fraction = GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER.get(
+    table = MOE_GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER if model_is_moe(model) else GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER
+    offload_fraction = table.get(
         tier,
-        GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER['moderate'],
+        table['moderate'],
     )
+    offload_fraction *= process_pressure_budget_factor(profile)
     return min(int(usable_gpu * offload_fraction), int(size * 0.95))
 def estimate_gpu_context_for_profile(
     model: ModelConfig,
@@ -182,11 +284,17 @@ def estimate_gpu_context_for_profile(
     if not profile or not kv_cache_uses_gpu(model, profile):
         return None
     tier = getattr(model, 'optimize_tier', 'moderate')
-    reserve_pct = effective_gpu_reserve_percent(reserve_pct, tier)
-    usable_gpu = int(profile.gpu_memory_free * ((100 - reserve_pct) / 100.0))
+    reserve_pct = effective_gpu_reserve_percent(reserve_pct, tier) + process_pressure_reserve_bonus(profile)
+    if model_is_moe(model):
+        reserve_pct += 8
+    usable_gpu = int(
+        profile.gpu_memory_free
+        * ((100 - min(80, reserve_pct)) / 100.0)
+        * process_pressure_budget_factor(profile)
+    )
     if usable_gpu <= 0:
         return 0
-    workspace = estimate_gpu_workspace_bytes(profile)
+    workspace = estimate_gpu_workspace_bytes(profile, model)
     weights = estimate_gpu_weight_bytes(model, profile, tier, usable_gpu)
     kv_budget = usable_gpu - workspace - weights
     if kv_budget <= 0:
@@ -200,7 +308,9 @@ def estimate_ram_model_overhead(model: ModelConfig, profile: HardwareProfile) ->
     if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp':
         # GGUF weights are mmap-backed, so MemAvailable should not be charged for
         # the whole file. Keep headroom for page churn, tokenizer data, and CPU layers.
-        return min(int(size * 0.20), 2 * 1024**3, int((profile.memory_total or size) * 0.15))
+        fraction = 0.28 if model_is_moe(model) else 0.20
+        cap = 3 * 1024**3 if model_is_moe(model) else 2 * 1024**3
+        return min(int(size * fraction), cap, int((profile.memory_total or size) * 0.18))
     return min(int(size * 0.50), 4 * 1024**3)
 def choose_threads_for_profile(model: ModelConfig, profile: Optional[HardwareProfile], tier: str) -> int:
     logical = (profile.cpu_logical if profile else 0) or (os.cpu_count() or 1)
@@ -209,8 +319,12 @@ def choose_threads_for_profile(model: ModelConfig, profile: Optional[HardwarePro
     if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
         return int(getattr(model, 'threads', 1) or 1)
 
+    pressure = process_pressure_score(profile)
     if model_likely_fits_gpu(model, profile, tier):
-        return max(2, min(physical, 8))
+        cap = 6 if model_is_moe(model) or pressure >= 0.45 else 8
+        return max(2, min(physical, cap))
+    if model_is_moe(model) and pressure >= 0.45:
+        return max(2, min(physical, max(2, physical - 2)))
     if tier == 'safe':
         return max(2, min(logical, max(2, physical - 2)))
     if tier == 'extreme':
@@ -231,7 +345,12 @@ def estimate_safe_context_for_profile(
     kv_per_token = max(1, estimate_kv_bytes_per_token(model))
     reserve_pct = max(5, min(70, reserve_pct))
     if profile.memory_available > 0:
-        usable_ram = int(profile.memory_available * ((100 - reserve_pct) / 100.0))
+        reserve_pct += process_pressure_reserve_bonus(profile)
+        usable_ram = int(
+            profile.memory_available
+            * ((100 - min(80, reserve_pct)) / 100.0)
+            * process_pressure_budget_factor(profile)
+        )
         if getattr(model, 'runtime', 'llama.cpp') != 'vllm' and not model_likely_fits_gpu(model, profile, getattr(model, 'optimize_tier', 'moderate')):
             usable_ram -= estimate_ram_model_overhead(model, profile)
         if usable_ram > 0:
@@ -282,7 +401,7 @@ def select_best_tier(model: ModelConfig, profile: Optional[HardwareProfile]) -> 
 def choose_best_preset(model: ModelConfig, profile: Optional[HardwareProfile]) -> str:
     runtime = getattr(model, 'runtime', 'llama.cpp')
     quant = extract_quant(model).lower()
-    model_type = classify_model_type(model)
+    architecture_type = (getattr(model, 'architecture_type', '') or '').strip().lower()
     size = model_file_size(model)
     available = profile.memory_available if profile else 0
     if runtime == 'vllm':
@@ -291,12 +410,14 @@ def choose_best_preset(model: ModelConfig, profile: Optional[HardwareProfile]) -
         ctx_min = max(256, int(getattr(model, 'ctx_min', 2048)))
         ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072)))
         tps_ctx = estimate_safe_context_for_profile(model, profile, 30, 4, ctx_min, min(ctx_max, 12288))
+        if architecture_type == 'moe' and not model_likely_fits_gpu(model, profile, 'moderate'):
+            return 'max_context'
         if model_likely_fits_gpu(model, profile, 'moderate') and tps_ctx >= max(ctx_min, 4096):
             return 'tokens_per_sec'
         return 'max_context'
     if size and available and size > int(available * 0.55):
         return 'max_context'
-    if model_type == 'CPU' or 'q2' in quant or 'q3' in quant:
+    if architecture_type == 'moe' or model_uses_cpu_execution(model, profile) or 'q2' in quant or 'q3' in quant:
         return 'max_context'
     return 'tokens_per_sec'
 def apply_hardware_baseline(model: ModelConfig, profile: Optional[HardwareProfile], tier: str):
@@ -356,6 +477,9 @@ def apply_optimization_preset(
         model.optimize_mode = 'max_context_safe'
         model.parallel = 1
         model.memory_reserve_percent = max(MAX_CONTEXT_RESERVE_BY_TIER[tier], int(getattr(model, 'memory_reserve_percent', 25)))
+        if model_is_moe(model):
+            model.memory_reserve_percent = max(model.memory_reserve_percent, MAX_CONTEXT_RESERVE_BY_TIER[tier] + 8)
+        model.memory_reserve_percent = min(80, model.memory_reserve_percent + process_pressure_reserve_bonus(profile))
         model.ctx = max(int(getattr(model, 'ctx', 8192)), MAX_CONTEXT_TARGET_BY_TIER[tier])
         model.ctx = max(ctx_min, min(model.ctx, ctx_max))
         model.output = min(max(model.output, 2048), 4096)
@@ -380,12 +504,21 @@ def apply_optimization_preset(
     if preset == 'tokens_per_sec':
         model.optimize_mode = 'max_context_safe'
         model.memory_reserve_percent = max(TOKENS_PER_SEC_RESERVE_BY_TIER[tier], int(getattr(model, 'memory_reserve_percent', 25)))
+        if model_is_moe(model):
+            model.memory_reserve_percent = max(model.memory_reserve_percent, TOKENS_PER_SEC_RESERVE_BY_TIER[tier] + 8)
+        model.memory_reserve_percent = min(80, model.memory_reserve_percent + process_pressure_reserve_bonus(profile))
         model.ctx = max(ctx_min, min(TOKENS_PER_SEC_CONTEXT_BY_TIER[tier], ctx_max))
-        model.parallel = max(1, min(TOKENS_PER_SEC_PARALLEL_BY_TIER[tier], int(getattr(model, 'parallel', 1)) + 1))
+        parallel_table = MOE_TOKENS_PER_SEC_PARALLEL_BY_TIER if model_is_moe(model) else TOKENS_PER_SEC_PARALLEL_BY_TIER
+        if process_pressure_score(profile) >= 0.45:
+            model.parallel = 1 if model_is_moe(model) else max(1, min(2, int(getattr(model, 'parallel', 1) or 1)))
+        else:
+            model.parallel = max(1, min(parallel_table[tier], int(getattr(model, 'parallel', 1)) + 1))
         model.output = min(model.output, 2048)
         if runtime == 'llama.cpp':
-            set_flag('--batch-size', TOKENS_PER_SEC_BATCH_BY_TIER[tier])
-            set_flag('--ubatch-size', TOKENS_PER_SEC_UBATCH_BY_TIER[tier])
+            batch_table = MOE_TOKENS_PER_SEC_BATCH_BY_TIER if model_is_moe(model) else TOKENS_PER_SEC_BATCH_BY_TIER
+            ubatch_table = MOE_TOKENS_PER_SEC_UBATCH_BY_TIER if model_is_moe(model) else TOKENS_PER_SEC_UBATCH_BY_TIER
+            set_flag('--batch-size', batch_table[tier])
+            set_flag('--ubatch-size', ubatch_table[tier])
             strip_flags('--cache-type-k', '--cache-type-v')
         elif runtime == 'vllm':
             set_flag('--gpu-memory-utilization', TOKENS_PER_SEC_VLLM_UTIL_BY_TIER[tier])

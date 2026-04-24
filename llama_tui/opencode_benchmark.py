@@ -15,10 +15,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .benchmark import (
     adaptive_context_upper_bound,
+    architecture_payload,
     configure_adaptive_candidate,
     clone_model_config,
     concise_failure,
     ctx_per_slot,
+    current_process_pressure_payload,
     emit_benchmark_event,
     model_from_measured_profile,
     parse_context_requirement,
@@ -349,6 +351,11 @@ def opencode_candidate_models(model: ModelConfig, profile) -> List[Tuple[str, st
             max(ctx_min, upper // 2),
             upper,
         ]))
+        if (getattr(model, 'architecture_type', '') or '').strip().lower() == 'moe':
+            points = sorted(set(points + [
+                max(ctx_min, min(upper, 16384)),
+                max(ctx_min, min(upper, 32768)),
+            ]))
         for ctx in points:
             candidate = configure_adaptive_candidate(model, profile, OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE, ctx, 1, variant)
             label = OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE if variant == 'default' else f'{OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE}_{variant}'
@@ -365,6 +372,12 @@ def sample_memory(app) -> Dict[str, int]:
         'ram_available': int(mem_available or 0),
         'gpu_memory_free': int(profile.gpu_memory_free or 0),
     }
+
+
+def benchmark_record_context(model: ModelConfig) -> Dict[str, object]:
+    payload = architecture_payload(model)
+    payload.update(current_process_pressure_payload())
+    return payload
 
 
 def run_process_with_metrics(
@@ -762,6 +775,7 @@ def benchmark_opencode_workflow(
     profile = app.hardware_profile(refresh=True)
     candidates = opencode_candidate_models(model, profile)
     vscode = detect_vscode_pressure()
+    pressure_payload = current_process_pressure_payload()
     records: List[Dict[str, object]] = []
     results: List[Dict[str, object]] = []
     total_steps = max(1, len(candidates) * max(1, len(OPENCODE_WORKFLOW_TASKS)))
@@ -783,6 +797,7 @@ def benchmark_opencode_workflow(
             'detail': f'not OpenCode-ready: cannot fit minimum ctx={ctx_min}',
             'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
         }
+        record.update(benchmark_record_context(model))
         records.append(record)
         recorded_model = clone_model_config(model)
         recorded_model.last_opencode_benchmark_results = records
@@ -814,7 +829,9 @@ def benchmark_opencode_workflow(
     if progress:
         progress(
             f'OpenCode benchmark (headless) started: {len(candidates)} candidate(s), '
-            f'vscode={vscode["processes"]} proc/{vscode["rss_mib"]} MiB, {profile.short_summary()}'
+            f'vscode={vscode["processes"]} proc/{vscode["rss_mib"]} MiB, '
+            f'arch={architecture_payload(model).get("architecture_label", "Unknown")}, '
+            f'{profile.short_summary()} {pressure_payload.get("process_pressure_detail", "")}'
         )
     emit_benchmark_event(
         progress,
@@ -823,7 +840,9 @@ def benchmark_opencode_workflow(
         'opencode',
         message=(
             f'OpenCode benchmark (headless) started: {len(candidates)} candidate(s), '
-            f'vscode={vscode["processes"]} proc/{vscode["rss_mib"]} MiB, {profile.short_summary()}'
+            f'vscode={vscode["processes"]} proc/{vscode["rss_mib"]} MiB, '
+            f'arch={architecture_payload(model).get("architecture_label", "Unknown")}, '
+            f'{profile.short_summary()} {pressure_payload.get("process_pressure_detail", "")}'
         ),
         phase='OpenCode benchmark (headless)',
         completed=0,
@@ -873,6 +892,7 @@ def benchmark_opencode_workflow(
                     'ngl': int(getattr(candidate, 'ngl', 0) or 0),
                     'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                 }
+                record.update(benchmark_record_context(candidate))
                 records.append(record)
                 if progress:
                     progress(f'opencode candidate {attempt}/{len(candidates)} failed to start: {concise_failure(msg)}')
@@ -911,6 +931,7 @@ def benchmark_opencode_workflow(
                         'ngl': int(getattr(candidate, 'ngl', 0) or 0),
                         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                     }
+                    record.update(benchmark_record_context(candidate))
                     records.append(record)
                     if progress:
                         progress(f'opencode candidate {attempt}/{len(candidates)} not ready: {concise_failure(ready_msg)}')
@@ -947,6 +968,7 @@ def benchmark_opencode_workflow(
                         'ngl': int(getattr(candidate, 'ngl', 0) or 0),
                         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                     }
+                    record.update(benchmark_record_context(candidate))
                     records.append(record)
                     if progress:
                         progress(f'opencode provider check failed: {concise_failure(provider_msg)}')
@@ -1034,6 +1056,7 @@ def benchmark_opencode_workflow(
                     'detail': concise_failure(detail, limit=500),
                     'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                 }
+                record.update(benchmark_record_context(candidate))
                 records.append(record)
                 if score > 0:
                     results.append({
@@ -1068,7 +1091,7 @@ def benchmark_opencode_workflow(
         if current is not None:
             preset, tier, candidate = current
             app.stop(candidate, managed_only=True)
-            records.append({
+            record = {
                 'preset': preset,
                 'tier': tier,
                 'status': 'aborted',
@@ -1083,7 +1106,9 @@ def benchmark_opencode_workflow(
                 'threads': int(getattr(candidate, 'threads', 0) or 0),
                 'ngl': int(getattr(candidate, 'ngl', 0) or 0),
                 'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
-            })
+            }
+            record.update(benchmark_record_context(candidate))
+            records.append(record)
         recorded_model = clone_model_config(model)
         recorded_model.last_opencode_benchmark_results = records
         app.add_or_update(recorded_model)

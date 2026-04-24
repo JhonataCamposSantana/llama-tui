@@ -11,7 +11,7 @@ The project is intentionally small: it uses only the Python standard library, st
 - Detect `.gguf` files from Hugging Face, `llmfit`, LM Studio, and local model caches.
 - Track server PID files, logs, and process groups under `~/.cache/llama-tui`.
 - Clean up llama-tui-managed servers on stop, benchmark completion, and TUI exit.
-- Probe CPU, RAM, and NVIDIA VRAM with `/proc` and `nvidia-smi`.
+- Probe CPU, RAM, NVIDIA VRAM, and current process pressure with `/proc` and `nvidia-smi`.
 - Read GGUF metadata to estimate KV cache memory and safe context sizes.
 - Auto-tune context size, CPU threads, GPU layer offload, KV cache type, batch size, and vLLM scheduler limits.
 - Benchmark adaptive profiles and persist measured Fast Chat, Long Context, OpenCode-ready, and Auto results.
@@ -257,7 +257,7 @@ llama-tui reads:
 - CPU logical and physical-ish core counts from `/proc/cpuinfo`.
 - RAM availability from `/proc/meminfo`.
 - NVIDIA GPU name, total VRAM, and free VRAM from `nvidia-smi`.
-- GGUF architecture metadata directly from the model file.
+- GGUF architecture metadata directly from the model file, including Dense vs MoE and expert metadata when available.
 
 GGUF metadata is used to estimate KV cache bytes per token from layer count, KV heads, key/value dimensions, and cache type. This is much better than estimating from file size alone.
 
@@ -327,13 +327,13 @@ Press `D` to run Deep Benchmark All. The default batch walks the registered mode
 The benchmark runner:
 
 1. Probes current hardware.
-2. Estimates a model-specific context ceiling from RAM, VRAM, GGUF metadata, runtime settings, and KV-cache size.
+2. Estimates a model-specific context ceiling from RAM, VRAM, current process pressure, GGUF metadata, runtime settings, and KV-cache size.
 3. Probes context with exponential growth and binary refinement.
 4. Tests dynamic context, parallel, batch, and KV-cache variants one server at a time.
 5. Waits for `/v1/models` to become ready.
 6. Warms the model with a short completion.
 7. Runs a two-prompt chat-completions suite.
-8. Scores measured candidates by generated tokens per second, context per slot, and headroom.
+8. Scores measured candidates by generated tokens per second, context per slot, process-aware headroom, and stability.
 9. Stops the managed server process group after every candidate.
 10. Saves measured `Fast Chat`, `Long Context`, `OpenCode-ready`, and `Auto` profiles back to `models.json`.
 
@@ -344,18 +344,21 @@ Pressing `A` while a launch or benchmark is running requests cancellation. The a
 Saved benchmark rows include:
 
 - measured objective,
+- architecture type and detection source,
 - tokens/sec,
 - elapsed seconds,
 - context,
 - context per slot,
 - parallel,
 - GPU layers,
-- RAM/VRAM headroom,
+- RAM/VRAM/process-pressure headroom,
 - status and detail.
 
 Benchmarking is optional for normal server launches. `Auto profile`, `Fast Chat`, `Long Context`, `Try it out`, and OpenCode stack launches use measured profiles when they exist. If no measured profile exists yet, llama-tui falls back to the estimated safe launch path and says so in the action log.
 
-Machine Rankings are computed from fresh measured profiles without changing the config schema. The overview shows `Fastest Chat`, `Longest Context`, `OpenCode-ready`, and one `Machine Pick`. The Machine Pick uses a weighted score for speed, context per slot, RAM/VRAM headroom, and stability.
+Benchmarks intentionally observe the current workload. If VS Code, browsers, Docker, OpenCode, Hermes, or other heavy processes are running, llama-tui treats that as part of the target environment and favors profiles with enough RAM/VRAM/CPU headroom for that real machine state. Closing or opening major apps can intentionally change the recommended profile.
+
+Machine Rankings are computed from fresh measured profiles. The overview shows `Fastest Chat`, `Longest Context`, `OpenCode-ready`, and one `Machine Pick`. The Machine Pick uses a weighted score for speed, context per slot, RAM/VRAM/process headroom, and stability.
 
 If all candidates fail, the failure details are saved and shown in the model details screen.
 
@@ -385,7 +388,9 @@ lm_studio_model_roots
 
 LM Studio defaults are read from `LM_STUDIO_HOME`, then `~/.lmstudio-home-pointer`, then `~/.lmstudio`. llama-tui scans only the user model folders, `models` and `hub/models`, by default; internal bundled models are skipped unless you add that path manually.
 
-Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. That pending marker means “unbenchmarked,” not blocked: you can start the server immediately, and nothing benchmarks automatically in the background. Open the model details and press `B` when you want measured settings. Discovery does not special-case model families or filenames.
+Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, architecture labels, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. That pending marker means “unbenchmarked,” not blocked: you can start the server immediately, and nothing benchmarks automatically in the background. Open the model details and press `B` when you want measured settings.
+
+Dense vs MoE detection is metadata-first. llama-tui reads GGUF `general.architecture` and expert metadata such as `{arch}.expert_count` and `{arch}.expert_used_count`; if metadata is incomplete, it can inspect tensor descriptors by name without reading tensor data; filename patterns such as `30B-A3B` are only a weak fallback. MoE benchmark mode keeps memory estimates based on the full loaded GGUF, keeps KV-cache estimates attention/layer-driven, and scores OpenCode-style profiles by stable context before raw tokens/sec.
 
 Press `X` to prune registry entries whose model files disappeared.
 

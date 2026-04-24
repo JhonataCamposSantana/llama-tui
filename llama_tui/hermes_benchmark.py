@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .benchmark import (
+    architecture_payload,
     build_benchmark_run,
     clone_model_config,
     concise_failure,
     ctx_per_slot,
+    current_process_pressure_payload,
     emit_benchmark_event,
     parse_context_requirement,
     upsert_benchmark_run,
@@ -83,6 +85,12 @@ def hermes_context_record_fields(app, model: ModelConfig) -> Dict[str, object]:
         'experimental_context_override': bool(policy.get('experimental_context_override', False)),
         'context_detail': str(policy.get('context_detail', '') or ''),
     }
+
+
+def hermes_benchmark_record_context(model: ModelConfig) -> Dict[str, object]:
+    payload = architecture_payload(model)
+    payload.update(current_process_pressure_payload())
+    return payload
 
 
 def isolated_hermes_env(app, model: ModelConfig, home: Path) -> Dict[str, str]:
@@ -400,13 +408,18 @@ def benchmark_hermes_workflow(
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'hermes-{datetime.now().strftime("%Y%m%d-%H%M%S")}'
     current: Optional[Tuple[str, str, ModelConfig]] = None
+    pressure_payload = current_process_pressure_payload()
 
     emit_benchmark_event(
         progress,
         'benchmark_started',
         model,
         'hermes',
-        message='Hermes workflow benchmark (headless)',
+        message=(
+            'Hermes workflow benchmark (headless): '
+            f'arch={architecture_payload(model).get("architecture_label", "Unknown")} '
+            f'{pressure_payload.get("process_pressure_detail", "")}'
+        ),
         phase='preflight',
         completed=0,
         total=total_steps,
@@ -417,6 +430,7 @@ def benchmark_hermes_workflow(
         return False, msg
     for record in skipped_records:
         completed_steps += 1
+        record.update(hermes_benchmark_record_context(model))
         records.append(record)
         emit_benchmark_event(
             progress,
@@ -486,6 +500,7 @@ def benchmark_hermes_workflow(
                     'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                     **hermes_context_record_fields(app, candidate),
                 }
+                record.update(hermes_benchmark_record_context(candidate))
                 records.append(record)
                 emit_benchmark_event(
                     progress,
@@ -525,6 +540,7 @@ def benchmark_hermes_workflow(
                         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                         **hermes_context_record_fields(app, candidate),
                     }
+                    record.update(hermes_benchmark_record_context(candidate))
                     records.append(record)
                     emit_benchmark_event(
                         progress,
@@ -589,6 +605,7 @@ def benchmark_hermes_workflow(
                     'detail': concise_failure(' | '.join(detail_parts), limit=600),
                     **context_fields,
                 }
+                record.update(hermes_benchmark_record_context(candidate))
                 records.append(record)
                 if passed > 0:
                     results.append({
@@ -620,7 +637,7 @@ def benchmark_hermes_workflow(
         if current is not None:
             preset, tier, candidate = current
             app.stop(candidate, managed_only=True)
-            records.append({
+            record = {
                 'runtime': 'hermes',
                 'preset': preset,
                 'tier': tier,
@@ -637,7 +654,9 @@ def benchmark_hermes_workflow(
                 'ngl': int(getattr(candidate, 'ngl', 0) or 0),
                 'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                 **hermes_context_record_fields(app, candidate),
-            })
+            }
+            record.update(hermes_benchmark_record_context(candidate))
+            records.append(record)
         recorded_model = clone_model_config(model)
         recorded_model.last_hermes_benchmark_results = records
         run = build_benchmark_run(run_id, 'hermes', 'aborted', records, {}, started_at, datetime.now().isoformat(timespec='seconds'), profile.short_summary())

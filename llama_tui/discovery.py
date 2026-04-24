@@ -1,8 +1,14 @@
 import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import List
 
-from .gguf import read_gguf_metadata
+from .gguf import (
+    apply_architecture_info,
+    architecture_label,
+    detect_architecture_info,
+    read_gguf_metadata,
+)
 from .models import ModelConfig
 
 GENERIC_DISCOVERY_CTX = 2048
@@ -67,6 +73,19 @@ def display_runtime(model: ModelConfig) -> str:
         'ollama': 'Ollama',
     }
     return mapping.get(runtime, runtime or 'unknown')
+def display_offload(model: ModelConfig) -> str:
+    runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+    if runtime in ('vllm', 'ollama'):
+        return 'GPU'
+    try:
+        ngl = int(getattr(model, 'ngl', 0) or 0)
+    except Exception:
+        ngl = 0
+    if ngl <= 0:
+        return 'CPU'
+    if ngl >= 999:
+        return 'GPU full'
+    return 'GPU partial'
 def extract_quant(model: ModelConfig) -> str:
     text = ' '.join([
         getattr(model, 'name', '') or '',
@@ -79,29 +98,9 @@ def extract_quant(model: ModelConfig) -> str:
         return '-'
     return match.group(1).upper()
 def classify_model_type(model: ModelConfig) -> str:
-    text = ' '.join([
-        getattr(model, 'name', '') or '',
-        getattr(model, 'alias', '') or '',
-        getattr(model, 'path', '') or '',
-    ]).lower()
-
-    if (
-        re.search(r'\bmoe\b', text)
-        or re.search(r'\ba\d+b\b', text)
-        or any(token in text for token in ('mixtral', 'switch', 'mixture-of-experts', 'mixture of experts'))
-    ):
-        return 'MoE'
-
-    runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
-    if runtime == 'vllm':
-        return 'GPU'
-    if runtime == 'ollama':
-        return 'GPU'
-
-    try:
-        return 'CPU' if int(getattr(model, 'ngl', 0)) == 0 else 'GPU'
-    except Exception:
-        return 'Dense'
+    if (getattr(model, 'architecture_type', '') or '').strip().lower() in ('dense', 'moe'):
+        return architecture_label(model)
+    return architecture_label(apply_architecture_info(ModelConfig(**asdict(model)), detect_architecture_info(model)))
 def detected_model_from_path(path: Path, existing_models: List[ModelConfig], source: str = 'manual') -> ModelConfig:
     stem = path.stem
     name = pretty_name_from_filename(stem)
@@ -117,7 +116,7 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
     while port in ports:
         port += 1
     ctx_max = gguf_context_max(path)
-    return ModelConfig(
+    model = ModelConfig(
         id=model_id,
         name=name,
         path=str(path),
@@ -138,5 +137,7 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
         optimize_tier='safe',
         memory_reserve_percent=GENERIC_DISCOVERY_MEMORY_RESERVE,
         default_benchmark_status='pending',
+        source=source,
         extra_args=[],
     )
+    return apply_architecture_info(model, detect_architecture_info(model))

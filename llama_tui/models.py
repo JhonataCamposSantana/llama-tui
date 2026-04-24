@@ -48,6 +48,20 @@ class ModelConfig:
     enabled: bool = True
     runtime: str = 'llama.cpp'
     source: str = 'manual'
+    architecture: str = ''
+    architecture_type: str = 'unknown'
+    model_family: str = ''
+    expert_count: int = 0
+    expert_used_count: int = 0
+    expert_shared_count: int = 0
+    expert_group_count: int = 0
+    expert_group_used_count: int = 0
+    moe_every_n_layers: int = 0
+    leading_dense_block_count: int = 0
+    active_expert_ratio: float = 0.0
+    classification_confidence: float = 0.0
+    classification_source: str = ''
+    classification_reason: str = ''
     extra_args: List[str] = field(default_factory=list)
     favorite: bool = False
     last_used_at: str = ''

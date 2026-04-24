@@ -32,6 +32,7 @@ from .discovery import (
 )
 from .control import CancelToken, check_cancelled, sleep_with_cancel
 from .gguf import estimate_kv_bytes_per_token, read_gguf_metadata
+from .gguf import apply_architecture_info, detect_architecture_info
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
 from .models import ContinueSettings, HermesSettings, ModelConfig, OpencodeSettings, UiSettings
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
@@ -257,6 +258,7 @@ class AppConfig:
         self._hardware_profile_at = 0.0
         self._owned_pids: set[int] = set()
         self._runtime_check_cache: Dict[str, Tuple[bool, str]] = {}
+        self._runtime_version_cache: Dict[str, str] = {}
         self._shutdown_cleanup_done = False
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -317,6 +319,8 @@ class AppConfig:
         for m in self.models:
             if not getattr(m, 'sort_rank', 0):
                 m.sort_rank = self.next_sort_rank()
+                roots_changed = True
+            if self.enrich_model_architecture(m):
                 roots_changed = True
             inferred = self.infer_model_source(m)
             if m.source != inferred:
@@ -397,6 +401,25 @@ class AppConfig:
         payload['cache_ram'] = int(payload.get('cache_ram', 0) or 0)
         payload['output'] = int(payload.get('output', 4096) or 4096)
         payload['temp'] = float(payload.get('temp', 0.7) or 0.7)
+        payload['architecture'] = str(payload.get('architecture', '') or '')
+        payload['architecture_type'] = str(payload.get('architecture_type', 'unknown') or 'unknown').strip().lower()
+        if payload['architecture_type'] not in ('dense', 'moe', 'unknown'):
+            payload['architecture_type'] = 'unknown'
+        payload['model_family'] = str(payload.get('model_family', '') or '')
+        for key in (
+            'expert_count',
+            'expert_used_count',
+            'expert_shared_count',
+            'expert_group_count',
+            'expert_group_used_count',
+            'moe_every_n_layers',
+            'leading_dense_block_count',
+        ):
+            payload[key] = int(payload.get(key, 0) or 0)
+        payload['active_expert_ratio'] = float(payload.get('active_expert_ratio', 0.0) or 0.0)
+        payload['classification_confidence'] = float(payload.get('classification_confidence', 0.0) or 0.0)
+        payload['classification_source'] = str(payload.get('classification_source', '') or '')
+        payload['classification_reason'] = str(payload.get('classification_reason', '') or '')
         payload['favorite'] = bool(payload.get('favorite', False))
         payload['last_used_at'] = str(payload.get('last_used_at', '') or '')
         payload['sort_rank'] = int(payload.get('sort_rank', index + 1) or (index + 1))
@@ -413,6 +436,31 @@ class AppConfig:
         verification_results = payload.get('verification_results', {})
         payload['verification_results'] = verification_results if isinstance(verification_results, dict) else {}
         return ModelConfig(**dataclass_payload(ModelConfig, payload))
+
+    def enrich_model_architecture(self, model: ModelConfig) -> bool:
+        if (getattr(model, 'classification_source', '') or '') == 'manual':
+            return False
+        current_type = (getattr(model, 'architecture_type', '') or 'unknown').strip().lower()
+        current_conf = float(getattr(model, 'classification_confidence', 0.0) or 0.0)
+        try:
+            detected = detect_architecture_info(model)
+        except Exception:
+            return False
+        should_update = (
+            current_type not in ('dense', 'moe')
+            or not getattr(model, 'classification_source', '')
+            or float(detected.confidence or 0.0) > current_conf
+            or (
+                current_type == 'moe'
+                and int(getattr(model, 'expert_count', 0) or 0) <= 0
+                and int(detected.expert_count or 0) > 0
+            )
+        )
+        if not should_update:
+            return False
+        before = asdict(model)
+        apply_architecture_info(model, detected)
+        return asdict(model) != before
 
     def _normalize_model_ranks(self) -> bool:
         changed = False
@@ -468,6 +516,31 @@ class AppConfig:
             self._hardware_profile_at = now
         return self._hardware_profile
 
+    def runtime_binary_version(self, model: ModelConfig) -> str:
+        runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
+        command = self.llama_server if runtime == 'llama.cpp' else self.vllm_command if runtime == 'vllm' else runtime
+        key = f'{runtime}:{command}'
+        if key in self._runtime_version_cache:
+            return self._runtime_version_cache[key]
+        parts = shlex.split(command) if command else []
+        if not parts:
+            self._runtime_version_cache[key] = ''
+            return ''
+        try:
+            result = subprocess.run(
+                [*parts, '--version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            line = compact_message((result.stdout or '').splitlines()[0] if result.stdout else '')
+        except Exception:
+            line = ''
+        self._runtime_version_cache[key] = line
+        return line
+
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
         path = Path(target).expanduser()
@@ -501,11 +574,33 @@ class AppConfig:
                 f'{arch}.attention.head_count_kv',
                 f'{arch}.attention.key_length',
                 f'{arch}.attention.value_length',
+                f'{arch}.expert_count',
+                f'{arch}.expert_used_count',
+                f'{arch}.expert_shared_count',
+                f'{arch}.expert_group_count',
+                f'{arch}.expert_group_used_count',
+                f'{arch}.moe_every_n_layers',
+                f'{arch}.leading_dense_block_count',
             ])
         payload = {
             'runtime': getattr(model, 'runtime', 'llama.cpp'),
             'target': stat_data,
             'metadata': {key: metadata.get(key) for key in metadata_keys if key in metadata},
+            'architecture': {
+                'architecture': getattr(model, 'architecture', ''),
+                'architecture_type': getattr(model, 'architecture_type', 'unknown'),
+                'expert_count': int(getattr(model, 'expert_count', 0) or 0),
+                'expert_used_count': int(getattr(model, 'expert_used_count', 0) or 0),
+                'active_expert_ratio': float(getattr(model, 'active_expert_ratio', 0.0) or 0.0),
+                'classification_source': getattr(model, 'classification_source', ''),
+                'classification_confidence': float(getattr(model, 'classification_confidence', 0.0) or 0.0),
+            },
+            'runtime_config': {
+                'extra_args': list(getattr(model, 'extra_args', []) or []),
+                'llama_server': self.llama_server if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' else '',
+                'vllm_command': self.vllm_command if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else '',
+                'binary_version': self.runtime_binary_version(model),
+            },
         }
         encoded = json.dumps(payload, sort_keys=True, default=str).encode('utf-8')
         return hashlib.sha256(encoded).hexdigest()[:24]
@@ -555,6 +650,10 @@ class AppConfig:
             'metadata_ok': False,
             'native_context': 0,
             'kv_bytes_per_token': 0,
+            'architecture_type': getattr(model, 'architecture_type', 'unknown'),
+            'architecture': getattr(model, 'architecture', ''),
+            'classification_source': getattr(model, 'classification_source', ''),
+            'classification_confidence': float(getattr(model, 'classification_confidence', 0.0) or 0.0),
         }
         if not target:
             result.update({'status': 'failed', 'reason': 'model target is empty'})
@@ -1854,6 +1953,7 @@ class AppConfig:
         self._shutdown_cleanup_done = True
 
     def add_or_update(self, model: ModelConfig):
+        self.enrich_model_architecture(model)
         for idx, existing in enumerate(self.models):
             if existing.id == model.id:
                 if not getattr(model, 'sort_rank', 0):

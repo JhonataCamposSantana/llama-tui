@@ -27,7 +27,8 @@ from .benchmark import (
 from .chat import stream_chat_events
 from .constants import LOGO, REFRESH_SECONDS
 from .control import CancelToken, CancelledError
-from .discovery import classify_model_type, display_runtime, extract_quant
+from .discovery import classify_model_type, display_offload, display_runtime, extract_quant
+from .gguf import architecture_detail
 from .hermes_benchmark import benchmark_hermes_workflow
 from .hardware import HardwareProfile
 from .models import ModelConfig
@@ -813,7 +814,10 @@ def build_benchmark_progress_items(
         pid_line = status_detail
     else:
         model_line = f'model: {model.id}'
-        runtime_line = f'runtime: {display_runtime(model)}  ctx/slot={current_slot}  par={getattr(model, "parallel", 1)}'
+        runtime_line = (
+            f'arch: {classify_model_type(model)}  runtime: {display_runtime(model)}  '
+            f'offload: {display_offload(model)}  ctx/slot={current_slot}  par={getattr(model, "parallel", 1)}'
+        )
         pid_line = f'pid: {pid or "-"}  {detail}'
     items = [
         (model_line, normal_attr),
@@ -828,6 +832,9 @@ def build_benchmark_progress_items(
         (runtime_line, normal_attr),
         (pid_line, normal_attr),
     ]
+    pressure_detail = str(latest.get('process_pressure_detail', '') or state.get('process_pressure_detail', '') or '')
+    if pressure_detail:
+        items.append((f'process pressure: {compact_message(pressure_detail)}', normal_attr))
     if latest:
         items.extend([
             ('', normal_attr),
@@ -1165,6 +1172,9 @@ def benchmark_row_text(record: Dict[str, object]) -> str:
     context_required = int(record.get('context_required', 0) or 0)
     if context_required:
         suffix_parts.append(f'needs~{context_required}tok')
+    pressure = str(record.get('process_pressure_level', '') or '')
+    if pressure:
+        suffix_parts.append(f'pressure={pressure}')
     suffix = (' ' + ' '.join(suffix_parts)) if suffix_parts else ''
     return (
         f'{label[:18]:18} {score:7.2f} {score_label:5} {seconds:6.1f}s '
@@ -1177,6 +1187,13 @@ def benchmark_record_display_items(record: Dict[str, object], attr: int = 0) -> 
     detail = compact_message(str(record.get('detail', '') or ''))
     if detail:
         items.append((f'  detail: {detail}', attr))
+    pressure_detail = compact_message(str(record.get('process_pressure_detail', '') or ''))
+    if pressure_detail:
+        items.append((f'  process pressure: {pressure_detail}', attr))
+    architecture = str(record.get('architecture_label', '') or '')
+    if architecture:
+        source = str(record.get('classification_source', '') or '')
+        items.append((f'  architecture: {architecture}' + (f' from {source}' if source else ''), attr))
     if any(key in record for key in ('required_context', 'configured_context_length', 'actual_ctx_per_slot')):
         required = int(record.get('required_context', 0) or 0)
         configured = int(record.get('configured_context_length', 0) or 0)
@@ -1610,6 +1627,8 @@ def machine_ranking_items(
     for index, row in enumerate(rows, 1):
         badges = ','.join(machine_row_badges(row, summary)) or '-'
         model_id = str(row.get('model_id', '') or '-')
+        arch = str(row.get('architecture', '') or '')
+        pressure = str(row.get('process_pressure_level', '') or '')
         auto_tps = float(row.get('auto_tokens_per_sec', 0.0) or 0.0)
         fast_tps = float(row.get('fast_tokens_per_sec', 0.0) or 0.0)
         machine_score = float(row.get('machine_score', 0.0) or 0.0)
@@ -1617,6 +1636,8 @@ def machine_ranking_items(
         long_ctx = int(row.get('long_ctx_per_slot', 0) or 0)
         opencode_ctx = int(row.get('opencode_ctx_per_slot', 0) or 0)
         reason = compact_message(str(row.get('machine_reason') or row.get('selection_reason') or ''))
+        if arch and width >= 72:
+            reason = compact_message(f'{arch} {reason}')
         values_by_column = {
             'rank': f'{index:02d}',
             'badge': badges,
@@ -1627,7 +1648,7 @@ def machine_ranking_items(
             'ctx': long_ctx or ctx_slot or '-',
             'octx': opencode_ctx or '-',
             'reason': reason,
-            'detail': f'{badges} {auto_tps:.2f}t/s ctx={ctx_slot}',
+            'detail': f'{badges} {arch} {auto_tps:.2f}t/s ctx={ctx_slot} pressure={pressure or "-"}',
         }
         values = [values_by_column[column] for column in columns]
         attr = success_attr if model_id == pick_id else normal_attr
@@ -3939,7 +3960,9 @@ def tui(stdscr, app: AppConfig):
                 ('', curses.A_NORMAL),
                 (f'name: {model.name}', curses.A_BOLD),
                 (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
-                (f'quant/type: {extract_quant(model)} / {classify_model_type(model)}', curses.A_NORMAL),
+                (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
+                (f'architecture detail: {architecture_detail(model)}', curses.A_NORMAL),
+                (f'quant/source: {extract_quant(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
                 (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {freshness}', curses.A_NORMAL),
                 (f'tags: {tags_text}', curses.A_NORMAL),
                 (f'verification: {verification_status} / {verification_summary}', colors['success'] | curses.A_BOLD if verification_status == 'passed' else colors['warning'] if verification_status in ('warning', 'needs_benchmark', 'unknown') else colors['error'] | curses.A_BOLD),
@@ -4038,7 +4061,7 @@ def tui(stdscr, app: AppConfig):
             for i, (line, attr) in enumerate(detail_items[:content_rows]):
                 safe_addstr(stdscr, box_top + 2 + i, 3, line[: left_w - 4], attr)
         elif browser_list:
-            header = ' ID              PRT  ST        BN    RLS  ENG        QNT      TYPE   NAME'
+            header = ' ID              PRT  ST        BN    RLS  RUNTIME    QNT      ARCH   NAME'
             if content_rows > 0:
                 summary = (
                     f'search={list_search or "-"}  runtime={filter_option_label(FILTER_RUNTIME_OPTIONS, filter_runtime)}  '
@@ -4153,7 +4176,7 @@ def tui(stdscr, app: AppConfig):
                         (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
                         (f'path: {model.path}', curses.A_NORMAL),
                         (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
-                        (f'quant/type: {extract_quant(model)} / {classify_model_type(model)}', curses.A_NORMAL),
+                        (f'quant/architecture/offload: {extract_quant(model)} / {classify_model_type(model)} / {display_offload(model)}', curses.A_NORMAL),
                         (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
                         (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
                         (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
@@ -4360,7 +4383,7 @@ def tui(stdscr, app: AppConfig):
                 (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {benchmark_freshness_display(app, model)}', curses.A_NORMAL),
                 (f'tags/verification: {", ".join(list(getattr(model, "tags", []) or [])) or "-"} / {getattr(model, "verification_status", "unknown")}', curses.A_NORMAL),
                 (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
-                (f'quant/type: {extract_quant(model)} / {classify_model_type(model)}', curses.A_NORMAL),
+                (f'quant/architecture/offload: {extract_quant(model)} / {classify_model_type(model)} / {display_offload(model)}', curses.A_NORMAL),
                 (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
                 (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
                 (f'benchmark: {getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', curses.A_NORMAL),

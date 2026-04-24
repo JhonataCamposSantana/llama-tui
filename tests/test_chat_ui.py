@@ -1163,6 +1163,7 @@ class BenchmarkDashboardTests(unittest.TestCase):
             'scan_level': 'knee_refine',
             'exit_code': 0,
             'context_required': 9616,
+            'process_pressure_level': 'medium',
         })
 
         self.assertIn('Highest Context', row)
@@ -1172,6 +1173,7 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('ok', row)
         self.assertIn('knee_refine', row)
         self.assertIn('needs~9616tok', row)
+        self.assertIn('pressure=medium', row)
 
     def test_benchmark_record_display_items_include_sample_details(self):
         items = benchmark_record_display_items({
@@ -1187,6 +1189,9 @@ class BenchmarkDashboardTests(unittest.TestCase):
             'configured_context_length': 70000,
             'actual_ctx_per_slot': 2048,
             'experimental_context_override': True,
+            'architecture_label': 'MoE 8x2',
+            'classification_source': 'gguf_metadata',
+            'process_pressure_detail': 'pressure=medium apps=ide:1',
             'samples': [{
                 'task': 'fix_calc',
                 'status': 'hermes command failed',
@@ -1202,6 +1207,8 @@ class BenchmarkDashboardTests(unittest.TestCase):
         text = '\n'.join(line for line, _attr in items)
 
         self.assertIn('detail: bad flag', text)
+        self.assertIn('architecture: MoE 8x2 from gguf_metadata', text)
+        self.assertIn('process pressure: pressure=medium apps=ide:1', text)
         self.assertIn('context: required=64000 configured=70000 actual_slot=2048 experimental override', text)
         self.assertIn('command: hermes chat -q fix', text)
         self.assertIn('config: /tmp/hermes/config.yaml', text)
