@@ -1,5 +1,6 @@
 import json
 import re
+import shlex
 import statistics
 import time
 from dataclasses import asdict
@@ -8,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib import request
 
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
-from .gguf import architecture_label, set_model_extra_arg, strip_extra_args
+from .gguf import architecture_label, extra_arg_value, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
 from .models import ModelConfig
 from .optimize import (
@@ -19,6 +20,12 @@ from .optimize import (
     choose_best_preset,
     model_is_moe,
     select_best_tier,
+)
+from .runtime_profiles import (
+    RuntimeProfile,
+    default_engine_capabilities,
+    supported_turbo_kv_profiles,
+    turbo_kv_profile_for_preset,
 )
 from .textutil import compact_message
 
@@ -50,7 +57,9 @@ CONTEXT_KNEE_ROUNDING = 1_024
 BENCHMARK_HISTORY_LIMIT = 10
 FAST_BENCHMARK_CONTEXT_TARGETS = (8_192, 16_384)
 FAST_BENCHMARK_PARALLEL_TARGETS = (1, 2, 4)
+FAST_RUNTIME_PROFILE_BUDGET_SECONDS = 30 * 60
 SMART_BENCHMARK_SOFT_BUDGET_SECONDS = 45 * 60
+FULL_RUNTIME_PROFILE_BUDGET_SECONDS = 120 * 60
 SMART_FRONTIER_MAX_PROBES = 10
 SMART_PARALLEL_IMPROVEMENT_THRESHOLD = 0.08
 SMART_PARALLEL_NON_IMPROVING_LIMIT = 2
@@ -98,11 +107,89 @@ def append_model_log(app: AppConfig, model: ModelConfig, text: str):
     app.append_log(model.id, text)
 
 
-def benchmark_command_preview(app: AppConfig, model: ModelConfig) -> str:
+def benchmark_command_preview(
+    app: AppConfig,
+    model: ModelConfig,
+    runtime_profile: Optional[RuntimeProfile] = None,
+) -> str:
     try:
-        return ' '.join(str(item) for item in app.build_command(model))
+        return shlex.join([str(item) for item in app.build_command(model, runtime_profile=runtime_profile)])
     except Exception:
         return ''
+
+
+FAILURE_CATEGORIES = (
+    'CLI_INVALID',
+    'CUDA_OOM_WEIGHTS',
+    'CUDA_OOM_KV',
+    'KV_MODE_INCOMPATIBLE',
+    'MODEL_LOAD_FAILED',
+    'SERVER_TIMEOUT',
+    'API_TIMEOUT',
+    'PORT_UNREACHABLE',
+    'CHAT_TEMPLATE_ERROR',
+)
+
+
+def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOUT') -> Dict[str, str]:
+    detail = compact_message(text or '')
+    low = detail.lower()
+    category = default_category if default_category in FAILURE_CATEGORIES else 'SERVER_TIMEOUT'
+    reason = detail or category
+    suggested = ''
+    if re.search(r'(unknown|invalid|unrecognized).{0,80}(argument|option|value|flag)', low) or 'requires an argument' in low:
+        category = 'CLI_INVALID'
+        suggested = 'Check the generated command and use syntax supported by this server binary.'
+        if 'flash-attn' in low or '-fa' in low:
+            reason = 'The binary rejected the generated flash-attn syntax.'
+            suggested = 'Use "--flash-attn on" or "-fa on" for builds that require a flash-attn value.'
+    if 'unknown value for --flash-attn' in low:
+        category = 'CLI_INVALID'
+        reason = 'The binary requires --flash-attn to receive a valid value.'
+        suggested = 'Use "--flash-attn on" or "-fa on"; do not emit bare "-fa".'
+    if 'chat template' in low or 'jinja' in low and 'template' in low:
+        category = 'CHAT_TEMPLATE_ERROR'
+        suggested = 'Disable Jinja or adjust the model chat template before benchmarking.'
+    if 'does not divide' in low and ('cache' in low or 'turbo' in low):
+        category = 'KV_MODE_INCOMPATIBLE'
+        reason = detail or 'The selected KV mode is incompatible with this model/head dimension.'
+        suggested = 'Try a different TurboKV mode or benchmark default/q8 KV cache.'
+    if 'cudamalloc failed' in low or 'cuda error' in low and 'out of memory' in low or 'out of memory' in low:
+        if 'kv' in low or 'cache' in low or 'context' in low:
+            category = 'CUDA_OOM_KV'
+            suggested = 'Reduce context, parallelism, or KV cache size; for OpenCode prefer parallel=1.'
+        else:
+            category = 'CUDA_OOM_WEIGHTS'
+            suggested = 'Reduce GPU layers; for heavy MoE models try partial offload such as -ngl 20 and --parallel 1.'
+    if 'failed to load model' in low or ('llama_model_load' in low and 'failed' in low) or 'model load failed' in low:
+        category = 'MODEL_LOAD_FAILED'
+        suggested = suggested or 'Verify the GGUF file and model path, then retry with a smaller launch profile.'
+    if 'connection refused' in low or 'failed to establish a new connection' in low or 'port unreachable' in low:
+        category = 'PORT_UNREACHABLE'
+        suggested = 'The server process did not expose the expected API port.'
+    if 'timed out' in low or 'timeout' in low:
+        category = 'API_TIMEOUT' if default_category == 'API_TIMEOUT' else 'SERVER_TIMEOUT'
+        suggested = suggested or 'Retry with a smaller context or lower GPU layer count.'
+    return {
+        'failure_category': category,
+        'failure_reason': concise_failure(reason, limit=500),
+        'suggested_fix': suggested,
+    }
+
+
+def benchmark_failure_summary(records: List[Dict[str, object]], fallback: str) -> str:
+    for record in records:
+        category = str(record.get('failure_category', '') or '')
+        if not category:
+            continue
+        profile = str(record.get('runtime_profile', '') or record.get('objective', '') or record.get('preset', '') or 'candidate')
+        reason = str(record.get('failure_reason', '') or record.get('detail', '') or category)
+        fix = str(record.get('suggested_fix', '') or '')
+        summary = f'{profile} failed before benchmark: {category} - {concise_failure(reason)}'
+        if fix:
+            summary += f' Suggested fix: {fix}'
+        return summary
+    return fallback
 
 
 def emit_benchmark_event(
@@ -145,7 +232,7 @@ def emit_benchmark_event(
 
 
 def architecture_payload(model: ModelConfig) -> Dict[str, object]:
-    return {
+    payload = {
         'architecture_type': getattr(model, 'architecture_type', 'unknown') or 'unknown',
         'architecture': getattr(model, 'architecture', '') or '',
         'architecture_label': architecture_label(model),
@@ -157,6 +244,41 @@ def architecture_payload(model: ModelConfig) -> Dict[str, object]:
         'classification_confidence': float(getattr(model, 'classification_confidence', 0.0) or 0.0),
         'classification_source': getattr(model, 'classification_source', '') or '',
     }
+    try:
+        metadata = read_gguf_metadata(getattr(model, 'path', '') or '')
+        arch = str(metadata.get('general.architecture') or getattr(model, 'architecture', '') or '')
+        prefix = f'{arch}.' if arch else ''
+
+        def metadata_int(suffix: str) -> int:
+            keys = [f'{prefix}{suffix}'] if prefix else []
+            keys.extend(key for key in metadata if key.endswith(f'.{suffix}') and key not in keys)
+            for key in keys:
+                try:
+                    value = int(metadata.get(key) or 0)
+                except Exception:
+                    value = 0
+                if value > 0:
+                    return value
+            return 0
+
+        payload.update({
+            'model_file_size': int(model_file_size(model) or 0),
+            'native_context_length': int(metadata.get('general.context_length') or metadata_int('context_length') or 0),
+            'attention_key_length': metadata_int('attention.key_length'),
+            'attention_value_length': metadata_int('attention.value_length'),
+            'attention_head_count': metadata_int('attention.head_count'),
+            'attention_head_count_kv': metadata_int('attention.head_count_kv'),
+        })
+    except Exception:
+        payload.update({
+            'model_file_size': int(model_file_size(model) or 0),
+            'native_context_length': 0,
+            'attention_key_length': 0,
+            'attention_value_length': 0,
+            'attention_head_count': 0,
+            'attention_head_count_kv': 0,
+        })
+    return payload
 
 
 def process_pressure_payload(snapshot: Optional[ProcessPressureSnapshot]) -> Dict[str, object]:
@@ -221,6 +343,17 @@ def _ctx_curve(record: Dict[str, object], cap: int) -> float:
     return max(0.0, min(1.0, ctx / max(1, cap)))
 
 
+def _record_kv_quality_penalty(record: Dict[str, object]) -> float:
+    try:
+        explicit = float(record.get('kv_score_penalty', 0.0) or 0.0)
+    except Exception:
+        explicit = 0.0
+    if explicit:
+        return max(0.0, explicit)
+    profile = turbo_kv_profile_for_preset(str(record.get('kv_preset', '') or ''))
+    return max(0.0, float(profile.score_penalty if profile else 0.0))
+
+
 def score_fast_chat(record: Dict[str, object], model: ModelConfig) -> float:
     cap = 16384 if model_is_moe(model) else 8192
     tps = float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
@@ -239,6 +372,7 @@ def score_long_context(record: Dict[str, object], model: ModelConfig) -> float:
         + 0.20 * _record_headroom_score(record)
         + 0.15 * _tps_curve(record)
         + 0.10 * _record_stability_score(record)
+        - _record_kv_quality_penalty(record)
     )
 
 
@@ -255,7 +389,7 @@ def score_opencode_ready(record: Dict[str, object], model: ModelConfig) -> float
         score *= 0.35
     if model_is_moe(model) and ctx >= 32768:
         score += 0.15
-    return score
+    return score - _record_kv_quality_penalty(record)
 
 
 def score_auto(record: Dict[str, object], model: ModelConfig) -> float:
@@ -271,6 +405,7 @@ def score_auto(record: Dict[str, object], model: ModelConfig) -> float:
         + 0.30 * _ctx_curve(record, 32768)
         + 0.12 * _record_headroom_score(record)
         + 0.08 * _record_stability_score(record)
+        - _record_kv_quality_penalty(record)
     )
 
 
@@ -1241,19 +1376,30 @@ def _run_server_benchmark_candidates(
         elapsed: float = 0.0,
         detail: str = '',
     ):
+        runtime_context = runtime_record_context(app, candidate)
         record = {
             'preset': preset,
             'tier': tier,
             'status': status,
             'tokens_per_sec': round(float(score), 2),
+            'decode_tokens_per_sec': round(float(score), 2),
+            'generation_tokens_per_sec': round(float(score), 2),
+            'prompt_tokens_per_sec': 0.0,
             'seconds': round(float(elapsed), 2),
             'ctx': int(getattr(candidate, 'ctx', 0) or 0),
             'parallel': int(getattr(candidate, 'parallel', 0) or 0),
             'threads': int(getattr(candidate, 'threads', 0) or 0),
             'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+            'startup_result': 'READY' if status == 'ok' else 'FAILED',
+            'failure_category': '',
+            'failure_reason': '',
+            'suggested_fix': '',
             'detail': concise_failure(detail, limit=500),
             'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
         }
+        record.update(runtime_context)
+        if status != 'ok':
+            apply_failure_context(record, detail or status, default_category='SERVER_TIMEOUT')
         record.update(architecture_payload(candidate))
         record.update(current_process_pressure_payload())
         benchmark_records.append(record)
@@ -1352,7 +1498,7 @@ def _run_server_benchmark_candidates(
 
     if not results:
         details = '; '.join(failures[:3]) if failures else 'no candidates completed'
-        msg = f'❌ {label} failed: {details}'
+        msg = f'❌ {label} failed: {benchmark_failure_summary(benchmark_records, details)}'
         recorded_model = clone_model_config(model)
         recorded_model.last_benchmark_results = benchmark_records
         if update_default_status:
@@ -1432,6 +1578,17 @@ def adaptive_profile_dict(
         'process_count',
         'process_known',
         'process_known_memory',
+        'engine',
+        'server_bin',
+        'runtime_profile',
+        'kv_preset',
+        'flash_attn_mode',
+        'kv_family',
+        'kv_quality_tier',
+        'kv_compression_tier',
+        'kv_score_penalty',
+        'benchmark_depth',
+        'command',
     ):
         if key in record:
             profile_dict[key] = record.get(key)
@@ -1915,7 +2072,27 @@ def adaptive_record_from_candidate(
     prompt_tokens: int = 0,
     generated_tokens: int = 0,
     process_snapshots: Optional[Dict[str, Dict[str, object]]] = None,
+    engine: str = '',
+    server_bin: str = '',
+    runtime_profile: str = '',
+    kv_preset: str = '',
+    flash_attn_mode: str = '',
+    kv_family: str = 'default',
+    kv_quality_tier: str = '',
+    kv_compression_tier: str = '',
+    kv_score_penalty: float = 0.0,
+    benchmark_depth: str = '',
+    startup_result: str = '',
+    failure_category: str = '',
+    failure_reason: str = '',
+    suggested_fix: str = '',
+    command: str = '',
+    prompt_tokens_per_sec: float = 0.0,
+    peak_vram_used: int = 0,
+    gpu_memory_total: int = 0,
 ) -> Dict[str, object]:
+    if not startup_result:
+        startup_result = 'READY' if status == 'ok' else 'FAILED' if status in ('start failed', 'not ready') else ''
     record = {
         'objective': objective,
         'preset': objective,
@@ -1923,6 +2100,8 @@ def adaptive_record_from_candidate(
         'status': status,
         'tokens_per_sec': round(float(tokens_per_sec), 2),
         'decode_tokens_per_sec': round(float(tokens_per_sec), 2),
+        'generation_tokens_per_sec': round(float(tokens_per_sec), 2),
+        'prompt_tokens_per_sec': round(float(prompt_tokens_per_sec), 2),
         'total_tokens_per_sec': round(float(tokens_per_sec), 2),
         'seconds': round(float(seconds), 2),
         'startup_seconds': round(float(startup_seconds), 2),
@@ -1942,6 +2121,23 @@ def adaptive_record_from_candidate(
         'extra_args': list(getattr(candidate, 'extra_args', []) or []),
         'ram_available': int(ram_available or 0),
         'gpu_memory_free': int(gpu_memory_free or 0),
+        'gpu_memory_total': int(gpu_memory_total or 0),
+        'peak_vram_used': int(peak_vram_used or 0),
+        'engine': engine or getattr(candidate, 'runtime', 'llama.cpp'),
+        'server_bin': server_bin,
+        'runtime_profile': runtime_profile,
+        'kv_preset': kv_preset,
+        'flash_attn_mode': flash_attn_mode,
+        'kv_family': kv_family,
+        'kv_quality_tier': kv_quality_tier,
+        'kv_compression_tier': kv_compression_tier,
+        'kv_score_penalty': round(float(kv_score_penalty or 0.0), 4),
+        'benchmark_depth': benchmark_depth,
+        'startup_result': startup_result,
+        'failure_category': failure_category,
+        'failure_reason': concise_failure(failure_reason, limit=500),
+        'suggested_fix': suggested_fix,
+        'command': command,
         'detail': concise_failure(detail, limit=500),
         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
     }
@@ -1959,17 +2155,97 @@ def adaptive_record_from_candidate(
     return record
 
 
+def runtime_record_context(
+    app: AppConfig,
+    candidate: ModelConfig,
+    runtime_profile: Optional[RuntimeProfile] = None,
+    command: str = '',
+) -> Dict[str, object]:
+    try:
+        profile = runtime_profile or app.runtime_profile_from_model(
+            candidate,
+            int(getattr(candidate, 'ctx', 0) or 0),
+            int(getattr(candidate, 'parallel', 1) or 1),
+            int(getattr(candidate, 'ngl', 0) or 0),
+        )
+    except Exception:
+        profile = runtime_profile
+    if not command:
+        command = benchmark_command_preview(app, candidate, profile)
+    engine = ''
+    server_bin = ''
+    if hasattr(app, 'active_engine_key_for_model'):
+        try:
+            engine = app.active_engine_key_for_model(candidate)
+        except Exception:
+            engine = ''
+    if not engine and profile is not None:
+        engine = profile.engine_id
+    if hasattr(app, 'runtime_server_command'):
+        try:
+            server_bin = app.runtime_server_command('llama.cpp')
+        except Exception:
+            server_bin = ''
+    kv_preset = getattr(profile, 'kv_preset', '') if profile is not None else ''
+    turbo_profile = turbo_kv_profile_for_preset(kv_preset)
+    kv_family = getattr(profile, 'kv_family', '') if profile is not None else ''
+    if not kv_family:
+        if turbo_profile is not None:
+            kv_family = 'turbo'
+        elif kv_preset and kv_preset != 'default':
+            kv_family = 'cache'
+        else:
+            kv_family = 'default'
+    return {
+        'engine': engine or getattr(candidate, 'runtime', 'llama.cpp'),
+        'server_bin': server_bin,
+        'runtime_profile': getattr(profile, 'name', '') if profile is not None else '',
+        'kv_preset': kv_preset,
+        'flash_attn_mode': getattr(profile, 'flash_attn', '') if profile is not None else '',
+        'kv_family': kv_family,
+        'kv_quality_tier': (
+            getattr(profile, 'kv_quality_tier', '') if profile is not None and getattr(profile, 'kv_quality_tier', '') else
+            turbo_profile.quality_tier if turbo_profile is not None else ''
+        ),
+        'kv_compression_tier': (
+            getattr(profile, 'kv_compression_tier', '') if profile is not None and getattr(profile, 'kv_compression_tier', '') else
+            turbo_profile.compression_tier if turbo_profile is not None else ''
+        ),
+        'kv_score_penalty': (
+            getattr(profile, 'kv_score_penalty', 0.0) if profile is not None and getattr(profile, 'kv_score_penalty', 0.0) else
+            turbo_profile.score_penalty if turbo_profile is not None else 0.0
+        ),
+        'benchmark_depth': getattr(profile, 'benchmark_depth', '') if profile is not None else '',
+        'command': command,
+    }
+
+
+def apply_failure_context(record: Dict[str, object], detail: str, default_category: str = 'SERVER_TIMEOUT') -> Dict[str, object]:
+    classification = classify_benchmark_failure(detail, default_category=default_category)
+    record.update(classification)
+    record['startup_result'] = 'FAILED'
+    if not record.get('detail'):
+        record['detail'] = concise_failure(detail, limit=500)
+    return record
+
+
 def benchmark_adaptive_candidate(
     app: AppConfig,
     candidate: ModelConfig,
     objective: str,
     progress: Optional[Callable[[str], None]],
     cancel_token: Optional[CancelToken],
+    runtime_profile: Optional[RuntimeProfile] = None,
 ) -> Tuple[Dict[str, object], Optional[Dict[str, object]]]:
     check_cancelled(cancel_token)
     process_snapshots: Dict[str, Dict[str, object]] = {'before': current_process_pressure_payload()}
+    before_hw = app.hardware_profile(refresh=True)
+    runtime_context = runtime_record_context(app, candidate, runtime_profile)
     start_at = time.monotonic()
-    ok, msg = app.start(candidate)
+    if runtime_profile is not None:
+        ok, msg = app.start(candidate, runtime_profile=runtime_profile)
+    else:
+        ok, msg = app.start(candidate)
     startup_seconds = time.monotonic() - start_at
     if not ok:
         process_snapshots['after_start'] = current_process_pressure_payload()
@@ -1980,7 +2256,9 @@ def benchmark_adaptive_candidate(
             detail=msg,
             startup_seconds=startup_seconds,
             process_snapshots=process_snapshots,
+            **runtime_context,
         )
+        apply_failure_context(record, msg, default_category='SERVER_TIMEOUT')
         return record, None
     try:
         ready_start = time.monotonic()
@@ -1988,7 +2266,7 @@ def benchmark_adaptive_candidate(
         ready_seconds = time.monotonic() - ready_start
         process_snapshots['after_ready'] = current_process_pressure_payload()
         if not ready_ok:
-            return adaptive_record_from_candidate(
+            record = adaptive_record_from_candidate(
                 candidate,
                 objective,
                 'not ready',
@@ -1996,11 +2274,15 @@ def benchmark_adaptive_candidate(
                 startup_seconds=startup_seconds,
                 ready_seconds=ready_seconds,
                 process_snapshots=process_snapshots,
-            ), None
+                **runtime_context,
+            )
+            apply_failure_context(record, ready_msg, default_category='SERVER_TIMEOUT')
+            return record, None
         if int(getattr(candidate, 'last_good_ctx', 0) or 0) > 0:
             candidate.ctx = int(candidate.last_good_ctx)
         if int(getattr(candidate, 'last_good_parallel', 0) or 0) > 0:
             candidate.parallel = int(candidate.last_good_parallel)
+        runtime_context['startup_result'] = 'READY'
         if progress:
             progress(
                 f'adaptive {objective} ready: ctx={candidate.ctx} slot={ctx_per_slot(candidate)} '
@@ -2022,7 +2304,7 @@ def benchmark_adaptive_candidate(
         )
         if not bench_ok:
             process_snapshots['after_generation'] = current_process_pressure_payload()
-            return adaptive_record_from_candidate(
+            record = adaptive_record_from_candidate(
                 candidate,
                 objective,
                 'benchmark failed',
@@ -2031,11 +2313,24 @@ def benchmark_adaptive_candidate(
                 ready_seconds=ready_seconds,
                 warmup_seconds=warmup_seconds,
                 process_snapshots=process_snapshots,
-            ), None
+                **runtime_context,
+            )
+            apply_failure_context(record, str(bench.get('error', 'unknown error')), default_category='API_TIMEOUT')
+            return record, None
         snap = app.hardware_profile(refresh=True)
         process_snapshots['after_generation'] = current_process_pressure_payload()
         score = float(bench.get('tokens_per_sec', 0.0) or 0.0)
         elapsed = float(bench.get('elapsed', 0.0) or 0.0)
+        prompt_tps = (int(bench.get('prompt_tokens', 0) or 0) / elapsed) if elapsed > 0 else 0.0
+        min_free = min(
+            value for value in (
+                int(getattr(before_hw, 'gpu_memory_free', 0) or 0),
+                int(getattr(snap, 'gpu_memory_free', 0) or 0),
+            )
+            if value >= 0
+        )
+        total_vram = int(getattr(snap, 'gpu_memory_total', 0) or getattr(before_hw, 'gpu_memory_total', 0) or 0)
+        peak_vram = max(0, total_vram - min_free) if total_vram else 0
         record = adaptive_record_from_candidate(
             candidate,
             objective,
@@ -2045,12 +2340,16 @@ def benchmark_adaptive_candidate(
             detail=f'{int(bench.get("sample_count", 1) or 1)} samples',
             ram_available=int(getattr(snap, 'memory_available', 0) or 0),
             gpu_memory_free=int(getattr(snap, 'gpu_memory_free', 0) or 0),
+            gpu_memory_total=total_vram,
+            peak_vram_used=peak_vram,
             startup_seconds=startup_seconds,
             ready_seconds=ready_seconds,
             warmup_seconds=warmup_seconds,
             prompt_tokens=int(bench.get('prompt_tokens', 0) or 0),
+            prompt_tokens_per_sec=prompt_tps,
             generated_tokens=int(bench.get('completion_tokens', 0) or 0),
             process_snapshots=process_snapshots,
+            **runtime_context,
         )
         measured = dict(record)
         measured['model'] = ModelConfig(**asdict(candidate))
@@ -2300,6 +2599,165 @@ def candidate_safe_context_estimate(candidate: ModelConfig, profile: HardwarePro
     )
 
 
+def active_engine_runtime_profiles(
+    app: AppConfig,
+    model: ModelConfig,
+    profile: HardwareProfile,
+    depth: str = 'full',
+) -> List[RuntimeProfile]:
+    benchmark_depth = 'fast' if str(depth or '').strip().lower() == 'fast' else 'full'
+    try:
+        engine = app.active_engine_key_for_model(model)
+    except Exception:
+        engine = getattr(model, 'runtime', 'llama.cpp')
+    if getattr(model, 'runtime', 'llama.cpp') != 'llama.cpp':
+        return []
+    if not str(getattr(model, 'path', '') or '').lower().endswith('.gguf'):
+        return []
+    try:
+        capabilities = app.engine_capabilities()
+    except Exception:
+        capabilities = default_engine_capabilities(engine)
+
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
+    arch = architecture_payload(model)
+    native_ctx = int(arch.get('native_context_length', 0) or 0)
+    if native_ctx > 0:
+        ctx_max = max(ctx_min, min(ctx_max, native_ctx))
+    size = int(arch.get('model_file_size', 0) or model_file_size(model) or 0)
+    has_gpu = bool(profile and profile.has_usable_gpu())
+    vram_free = int(getattr(profile, 'gpu_memory_free', 0) or 0)
+    fits_gpu = bool(has_gpu and size > 0 and size <= int(vram_free * 0.82))
+    heavy_for_gpu = bool(has_gpu and size > 0 and size > int(vram_free * 0.82))
+    moe = model_is_moe(model)
+    turbo_profiles = supported_turbo_kv_profiles(capabilities, benchmark_depth)
+    supports_turbo = bool(
+        engine == 'buun'
+        and getattr(getattr(app, 'runtime_profile', None), 'supports_turbo_kv', False)
+        and capabilities.supports_ctk_ctv
+        and has_gpu
+        and turbo_profiles
+    )
+    supports_cache_kv = bool(capabilities.supports_cache_type_kv and engine != 'buun')
+    base_ctx = max(ctx_min, min(ctx_max, 8192 if (moe or heavy_for_gpu or supports_turbo) else 4096))
+    profiles: List[RuntimeProfile] = []
+    seen = set()
+
+    def kv_for_strategy(strategy: str) -> str:
+        if supports_cache_kv and strategy in ('kv_compression_probe', 'context_growth_sweep'):
+            return 'q8_0/q8_0'
+        return 'default'
+
+    def estimate_partial_ngl() -> int:
+        if not has_gpu:
+            return 0
+        if fits_gpu:
+            return 999
+        if size <= 0 or vram_free <= 0:
+            return 16 if moe else 8
+        layer_hint = int(arch.get('layer_count', 0) or 0)
+        if layer_hint <= 0:
+            layer_hint = 32 if moe else 24
+        ratio = max(0.10, min(0.95, vram_free / max(1, size)))
+        return max(1, min(layer_hint, int(round(layer_hint * ratio))))
+
+    partial_ngl = estimate_partial_ngl()
+    if heavy_for_gpu and partial_ngl > 0:
+        partial_ngl = min(partial_ngl, 64)
+
+    def add(
+        name: str,
+        ctx: int,
+        ngl: int,
+        kv_preset: str,
+        batch: int = 256,
+        ubatch: int = 128,
+        kv_profile=None,
+    ):
+        ctx = max(ctx_min, min(ctx_max, int(ctx or base_ctx)))
+        key = (name, ctx, int(ngl), kv_preset)
+        if key in seen:
+            return
+        seen.add(key)
+        family = 'turbo' if kv_profile is not None else 'cache' if kv_preset and kv_preset != 'default' else 'default'
+        profiles.append(RuntimeProfile(
+            engine_id=engine,
+            name=name,
+            ctx_size=ctx,
+            gpu_layers=int(ngl),
+            parallel=1,
+            kv_preset=kv_preset,
+            flash_attn='on',
+            batch_size=batch,
+            ubatch_size=ubatch,
+            kv_family=family,
+            kv_quality_tier=getattr(kv_profile, 'quality_tier', '') if kv_profile is not None else '',
+            kv_compression_tier=getattr(kv_profile, 'compression_tier', '') if kv_profile is not None else '',
+            kv_score_penalty=float(getattr(kv_profile, 'score_penalty', 0.0) or 0.0) if kv_profile is not None else 0.0,
+            benchmark_depth=benchmark_depth,
+        ))
+
+    add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, 'default', batch=128, ubatch=64)
+    if has_gpu:
+        add('partial_gpu_probe', base_ctx, partial_ngl, kv_for_strategy('partial_gpu_probe'))
+        if supports_turbo:
+            for kv_profile in turbo_profiles:
+                name = 'kv_compression_probe' if kv_profile.kv_preset == 'turbo4/turbo4' else f'kv_compression_probe_{kv_profile.name_slug}'
+                add(name, base_ctx, partial_ngl, kv_profile.kv_preset, kv_profile=kv_profile)
+        elif supports_cache_kv:
+            add('kv_compression_probe', base_ctx, partial_ngl, kv_for_strategy('kv_compression_probe'))
+        if benchmark_depth == 'full':
+            sweep_kv_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), None) if supports_turbo else None
+            sweep_kv = sweep_kv_profile.kv_preset if sweep_kv_profile is not None else kv_for_strategy('gpu_layer_sweep')
+            if fits_gpu:
+                add('gpu_layer_sweep_full', base_ctx, 999, sweep_kv, kv_profile=sweep_kv_profile)
+            else:
+                sweep_center = max(4, partial_ngl)
+                sweep_values = [max(1, sweep_center - 4), sweep_center, sweep_center + 4, sweep_center + 8, sweep_center + 12]
+                for ngl in sorted(set(value for value in sweep_values if value > 0)):
+                    add(f'gpu_layer_sweep_ngl{ngl}', base_ctx, ngl, sweep_kv, kv_profile=sweep_kv_profile)
+    else:
+        if supports_cache_kv:
+            add('kv_compression_probe', base_ctx, 0, kv_for_strategy('kv_compression_probe'))
+
+    context_seed_ngl = partial_ngl if has_gpu else 0
+    context_points = (8192, 16384) if benchmark_depth == 'fast' else (8192, 16384, 24576, 32768)
+    if supports_turbo:
+        growth_profiles = [
+            item for item in turbo_profiles
+            if not item.scalar and (
+                benchmark_depth == 'full'
+                or item.kv_preset in ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq')
+            )
+        ]
+        if benchmark_depth == 'fast':
+            next_ctx = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
+            growth_contexts = (next_ctx,) if next_ctx else ()
+        else:
+            growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
+        for kv_profile in growth_profiles:
+            for ctx in growth_contexts:
+                add(f'context_growth_sweep_{ctx}_{kv_profile.name_slug}', ctx, context_seed_ngl, kv_profile.kv_preset, kv_profile=kv_profile)
+    else:
+        context_kv = kv_for_strategy('context_growth_sweep')
+        for ctx in context_points:
+            if ctx <= ctx_max:
+                add(f'context_growth_sweep_{ctx}', ctx, context_seed_ngl, context_kv)
+    return profiles
+
+
+def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfile) -> ModelConfig:
+    candidate = ModelConfig(**asdict(model))
+    candidate.ctx = max(1, int(runtime_profile.ctx_size or candidate.ctx))
+    candidate.ngl = int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else candidate.ngl)
+    candidate.parallel = max(1, int(runtime_profile.parallel or 1))
+    candidate.flash_attn = str(runtime_profile.flash_attn or 'on').strip().lower() != 'off'
+    candidate.optimize_mode = 'manual'
+    candidate.optimize_tier = 'measured'
+    return candidate
+
+
 def benchmark_config_fingerprint(candidate: ModelConfig) -> str:
     payload = {
         'runtime': getattr(candidate, 'runtime', 'llama.cpp'),
@@ -2320,6 +2778,30 @@ def benchmark_config_fingerprint(candidate: ModelConfig) -> str:
         'expert_count': int(getattr(candidate, 'expert_count', 0) or 0),
         'expert_used_count': int(getattr(candidate, 'expert_used_count', 0) or 0),
         'active_expert_ratio': float(getattr(candidate, 'active_expert_ratio', 0.0) or 0.0),
+    }
+    arch_record = architecture_payload(candidate)
+    for key in (
+        'model_file_size',
+        'native_context_length',
+        'attention_key_length',
+        'attention_value_length',
+        'attention_head_count',
+        'attention_head_count_kv',
+    ):
+        payload[key] = arch_record.get(key, 0)
+    return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+
+def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: RuntimeProfile) -> str:
+    payload = {
+        'candidate': benchmark_config_fingerprint(candidate),
+        'engine_id': runtime_profile.engine_id,
+        'runtime_profile': runtime_profile.name,
+        'kv_preset': runtime_profile.kv_preset,
+        'flash_attn': runtime_profile.flash_attn,
+        'batch_size': int(runtime_profile.batch_size or 0),
+        'ubatch_size': int(runtime_profile.ubatch_size or 0),
+        'extra_args': list(runtime_profile.extra_args or ()),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
@@ -2406,17 +2888,27 @@ def emit_exhaustive_result(
     run_kind: str = 'server',
 ):
     benchmark_label = 'fast benchmark' if run_kind == 'server_fast' else 'smart bounded'
+    status = str(record.get('status', '') or '')
+    if status in ('ok', 'probe ok'):
+        message = (
+            f'{benchmark_label} {record.get("objective")} {status}: '
+            f'{float(record.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s '
+            f'ctx={record.get("ctx")} slot={record.get("ctx_per_slot")} '
+            f'par={record.get("parallel")} variant={record.get("variant")}'
+        )
+    else:
+        category = str(record.get('failure_category', '') or status)
+        message = (
+            f'{benchmark_label} {record.get("objective")} {status}: {category} '
+            f'ctx={record.get("ctx")} slot={record.get("ctx_per_slot")} '
+            f'par={record.get("parallel")} variant={record.get("variant")}'
+        )
     emit_benchmark_event(
         progress,
         'benchmark_result',
         model,
         run_kind,
-        message=(
-            f'{benchmark_label} {record.get("objective")} {record.get("status")}: '
-            f'{float(record.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s '
-            f'ctx={record.get("ctx")} slot={record.get("ctx_per_slot")} '
-            f'par={record.get("parallel")} variant={record.get("variant")}'
-        ),
+        message=message,
         phase=f'measuring {benchmark_label} candidates',
         completed=completed,
         total=total,
@@ -2500,6 +2992,86 @@ def benchmark_exhaustive_candidate_with_retry(
     return False, True, records, measured, completed
 
 
+def benchmark_runtime_profile_with_retry(
+    app: AppConfig,
+    base_model: ModelConfig,
+    runtime_profile: RuntimeProfile,
+    objective: str,
+    progress: Optional[Callable[[object], None]],
+    cancel_token: Optional[CancelToken],
+    completed: int,
+    total: int,
+    run_kind: str = 'server',
+    max_attempts: int = 2,
+    benchmark_depth: str = 'full',
+) -> Tuple[bool, bool, List[Dict[str, object]], List[Dict[str, object]], int]:
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    candidate_label = (
+        f'{runtime_profile.name} ctx={runtime_profile.ctx_size} '
+        f'ngl={runtime_profile.gpu_layers} par={runtime_profile.parallel} kv={runtime_profile.kv_preset}'
+    )
+    attempts = max(1, int(max_attempts or 1))
+    for attempt in range(1, attempts + 1):
+        check_cancelled(cancel_token)
+        candidate = model_for_runtime_profile(base_model, runtime_profile)
+        profile_fingerprint = runtime_profile_config_fingerprint(candidate, runtime_profile)
+        command_preview = benchmark_command_preview(app, candidate, runtime_profile)
+        if progress:
+            progress(f'runtime profile candidate {candidate_label} attempt={attempt}')
+        emit_benchmark_event(
+            progress,
+            'benchmark_candidate',
+            base_model,
+            run_kind,
+            message=f'runtime profile candidate {candidate_label} attempt={attempt}',
+            phase='measuring runtime profiles',
+            completed=completed,
+            total=total,
+            candidate=candidate_label,
+            command=command_preview,
+        )
+        record, measured_item = benchmark_adaptive_candidate(
+            app,
+            candidate,
+            objective,
+            progress,
+            cancel_token,
+            runtime_profile=runtime_profile,
+        )
+        completed += 1
+        ok = record.get('status') == 'ok'
+        enrich_exhaustive_record(
+            record,
+            candidate,
+            runtime_profile.name or 'runtime_profile',
+            attempt,
+            0,
+            scan_level=f'runtime_profile_{benchmark_depth}',
+            break_point=not ok and attempt == attempts,
+            measurement_type='full',
+            planner_reason=runtime_profile.name or 'runtime_profile',
+        )
+        record['config_fingerprint'] = profile_fingerprint
+        record['benchmark_depth'] = runtime_profile.benchmark_depth or benchmark_depth
+        records.append(record)
+        if measured_item:
+            measured_item['variant'] = runtime_profile.name or 'runtime_profile'
+            measured_item['retry_attempt'] = attempt
+            measured_item['scan_level'] = f'runtime_profile_{benchmark_depth}'
+            measured_item['measurement_type'] = 'full'
+            measured_item['planner_reason'] = runtime_profile.name or 'runtime_profile'
+            measured_item['config_fingerprint'] = profile_fingerprint
+            measured_item['benchmark_depth'] = runtime_profile.benchmark_depth or benchmark_depth
+            measured.append(measured_item)
+        emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label, run_kind=run_kind)
+        if ok:
+            return True, False, records, measured, completed
+        if attempt < attempts and progress:
+            progress(f'runtime profile candidate {candidate_label} failed once; retrying to confirm break...')
+    return False, True, records, measured, completed
+
+
 def benchmark_frontier_probe_candidate(
     app: AppConfig,
     candidate: ModelConfig,
@@ -2508,13 +3080,18 @@ def benchmark_frontier_probe_candidate(
     cancel_token: Optional[CancelToken],
 ) -> Tuple[Dict[str, object], bool]:
     check_cancelled(cancel_token)
+    runtime_context = runtime_record_context(app, candidate)
     ok, msg = app.start(candidate)
     if not ok:
-        return adaptive_record_from_candidate(candidate, objective, 'start failed', detail=msg), False
+        record = adaptive_record_from_candidate(candidate, objective, 'start failed', detail=msg, **runtime_context)
+        apply_failure_context(record, msg, default_category='SERVER_TIMEOUT')
+        return record, False
     try:
         ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
         if not ready_ok:
-            return adaptive_record_from_candidate(candidate, objective, 'not ready', detail=ready_msg), False
+            record = adaptive_record_from_candidate(candidate, objective, 'not ready', detail=ready_msg, **runtime_context)
+            apply_failure_context(record, ready_msg, default_category='SERVER_TIMEOUT')
+            return record, False
         if int(getattr(candidate, 'last_good_ctx', 0) or 0) > 0:
             candidate.ctx = int(candidate.last_good_ctx)
         if int(getattr(candidate, 'last_good_parallel', 0) or 0) > 0:
@@ -2528,17 +3105,28 @@ def benchmark_frontier_probe_candidate(
             cancel_token=cancel_token,
         )
         if not warm_ok:
-            return adaptive_record_from_candidate(candidate, objective, 'benchmark failed', detail=str(warm.get('error', 'warmup failed'))), False
+            detail = str(warm.get('error', 'warmup failed'))
+            record = adaptive_record_from_candidate(candidate, objective, 'benchmark failed', detail=detail, startup_result='READY', **runtime_context)
+            apply_failure_context(record, detail, default_category='API_TIMEOUT')
+            return record, False
         snap = app.hardware_profile(refresh=True)
+        elapsed = float(warm.get('elapsed', 0.0) or 0.0)
+        prompt_tps = (int(warm.get('prompt_tokens', 0) or 0) / elapsed) if elapsed > 0 else 0.0
         record = adaptive_record_from_candidate(
             candidate,
             objective,
             'probe ok',
             tokens_per_sec=float(warm.get('tokens_per_sec', 0.0) or 0.0),
-            seconds=float(warm.get('elapsed', 0.0) or 0.0),
+            seconds=elapsed,
             detail='warmup probe',
             ram_available=int(getattr(snap, 'memory_available', 0) or 0),
             gpu_memory_free=int(getattr(snap, 'gpu_memory_free', 0) or 0),
+            gpu_memory_total=int(getattr(snap, 'gpu_memory_total', 0) or 0),
+            startup_result='READY',
+            prompt_tokens=int(warm.get('prompt_tokens', 0) or 0),
+            prompt_tokens_per_sec=prompt_tps,
+            generated_tokens=int(warm.get('completion_tokens', 0) or 0),
+            **runtime_context,
         )
         return record, True
     finally:
@@ -2622,7 +3210,12 @@ def benchmark_exhaustive_profiles(
     ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
     chat_floor = chat_min_ctx_per_slot(model)
     opencode_floor = observed_opencode_context_floor(model)
-    total = max(24, SMART_FRONTIER_MAX_PROBES * 2 + 16)
+    runtime_profiles = active_engine_runtime_profiles(app, model, profile, depth='full')
+    total = max(
+        len(runtime_profiles) * 2 if runtime_profiles else 0,
+        24,
+        SMART_FRONTIER_MAX_PROBES * 2 + 16,
+    )
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
@@ -2649,7 +3242,8 @@ def benchmark_exhaustive_profiles(
         f'smart bounded benchmark started: ctx={ctx_min}..{ctx_max}, '
         f'chat_floor={chat_floor}, opencode_floor={opencode_floor or "none"}, '
         f'soft_budget={SMART_BENCHMARK_SOFT_BUDGET_SECONDS // 60}m, '
-        f'arch={architecture_label(model)}, {moe_note}{profile.short_summary()} '
+        f'arch={architecture_label(model)}, runtime_profiles={len(runtime_profiles)}, '
+        f'{moe_note}{profile.short_summary()} '
         f'{pressure_payload.get("process_pressure_detail", "")}'
     )
     if progress:
@@ -2807,54 +3401,91 @@ def benchmark_exhaustive_profiles(
                     run_full_measurement('fast_chat', ctx, parallel, variant, 'parallel_refine', optional=True)
 
     try:
-        default_successes, default_failures, default_break = run_frontier('default')
-        if not default_successes:
-            default_successes = [ctx_min]
-        default_contexts = smart_measurement_contexts(
-            default_successes,
-            default_failures,
-            ctx_min,
-            ctx_max,
-            chat_floor,
-            opencode_floor,
-        )
-        for ctx in default_contexts:
-            run_full_measurement('long_context', ctx, 1, 'default', 'frontier')
-
-        if opencode_floor:
-            opencode_ctx = _nearest_context_at_or_above(default_successes, opencode_floor)
-            if opencode_ctx and opencode_ctx not in default_contexts:
-                run_full_measurement('long_context', opencode_ctx, 1, 'default', 'opencode_floor', optional=True)
-
-        long_records = [
-            row for row in records
-            if row.get('status') == 'ok'
-            and row.get('objective') == 'long_context'
-            and row.get('variant') == 'default'
-            and row.get('measurement_type') == 'full'
-        ]
-        tested_full_contexts = {int(row.get('ctx', 0) or 0) for row in long_records}
-        for ctx in context_knee_refinement_contexts(long_records, tested_full_contexts, ctx_max)[:2]:
-            run_full_measurement('long_context', ctx, 1, 'default', 'speed_knee', optional=True)
-
-        for ctx in smart_fast_contexts(default_successes, chat_floor):
-            run_fast_chat_race(ctx, 'default')
-
-        default_best_ctx = max(default_successes or [0])
-        if smart_should_try_q8(model, profile, default_best_ctx, default_break) and optional_refinement_allowed():
-            q8_successes, q8_failures, _q8_break = run_frontier('q8_kv', planner_reason='q8_probe')
-            q8_contexts = smart_measurement_contexts(
-                q8_successes,
-                q8_failures,
+        if runtime_profiles:
+            if progress:
+                progress(f'smart bounded using {len(runtime_profiles)} active-engine runtime profile(s)')
+            emit_benchmark_event(
+                progress,
+                'benchmark_phase',
+                model,
+                'server',
+                message=f'active-engine runtime profile search: {len(runtime_profiles)} candidate(s)',
+                phase='runtime profile search',
+                completed=completed,
+                total=total,
+            )
+            runtime_deadline = started_monotonic + FULL_RUNTIME_PROFILE_BUDGET_SECONDS
+            for runtime_profile in runtime_profiles:
+                if time.monotonic() >= runtime_deadline:
+                    if progress:
+                        progress('smart bounded runtime profile budget reached; selecting from measured candidates')
+                    break
+                objective = 'opencode_ready' if runtime_profile.ctx_size >= 16384 else 'long_context'
+                ok, _broke, new_records, new_measured, completed = benchmark_runtime_profile_with_retry(
+                    app,
+                    model,
+                    runtime_profile,
+                    objective,
+                    progress,
+                    cancel_token,
+                    completed,
+                    total,
+                    max_attempts=2,
+                    benchmark_depth='full',
+                )
+                records.extend(new_records)
+                measured.extend(new_measured)
+                for item in new_measured:
+                    full_by_fingerprint[str(item.get('config_fingerprint', '') or '')] = item
+        else:
+            default_successes, default_failures, default_break = run_frontier('default')
+            if not default_successes:
+                default_successes = [ctx_min]
+            default_contexts = smart_measurement_contexts(
+                default_successes,
+                default_failures,
                 ctx_min,
                 ctx_max,
                 chat_floor,
                 opencode_floor,
-            )[:3]
-            for ctx in q8_contexts:
-                run_full_measurement('long_context', ctx, 1, 'q8_kv', 'q8_probe', optional=True)
-            for ctx in smart_fast_contexts(q8_successes, chat_floor)[:1]:
-                run_fast_chat_race(ctx, 'q8_kv')
+            )
+            for ctx in default_contexts:
+                run_full_measurement('long_context', ctx, 1, 'default', 'frontier')
+
+            if opencode_floor:
+                opencode_ctx = _nearest_context_at_or_above(default_successes, opencode_floor)
+                if opencode_ctx and opencode_ctx not in default_contexts:
+                    run_full_measurement('long_context', opencode_ctx, 1, 'default', 'opencode_floor', optional=True)
+
+            long_records = [
+                row for row in records
+                if row.get('status') == 'ok'
+                and row.get('objective') == 'long_context'
+                and row.get('variant') == 'default'
+                and row.get('measurement_type') == 'full'
+            ]
+            tested_full_contexts = {int(row.get('ctx', 0) or 0) for row in long_records}
+            for ctx in context_knee_refinement_contexts(long_records, tested_full_contexts, ctx_max)[:2]:
+                run_full_measurement('long_context', ctx, 1, 'default', 'speed_knee', optional=True)
+
+            for ctx in smart_fast_contexts(default_successes, chat_floor):
+                run_fast_chat_race(ctx, 'default')
+
+            default_best_ctx = max(default_successes or [0])
+            if smart_should_try_q8(model, profile, default_best_ctx, default_break) and optional_refinement_allowed():
+                q8_successes, q8_failures, _q8_break = run_frontier('q8_kv', planner_reason='q8_probe')
+                q8_contexts = smart_measurement_contexts(
+                    q8_successes,
+                    q8_failures,
+                    ctx_min,
+                    ctx_max,
+                    chat_floor,
+                    opencode_floor,
+                )[:3]
+                for ctx in q8_contexts:
+                    run_full_measurement('long_context', ctx, 1, 'q8_kv', 'q8_probe', optional=True)
+                for ctx in smart_fast_contexts(q8_successes, chat_floor)[:1]:
+                    run_fast_chat_race(ctx, 'q8_kv')
     except CancelledError:
         if current is not None:
             app.stop(current, managed_only=True)
@@ -2906,7 +3537,8 @@ def benchmark_exhaustive_profiles(
     if not winners:
         saved.default_benchmark_status = 'failed'
         app.add_or_update(saved)
-        msg = '❌ smart bounded benchmark failed: no measured candidates completed'
+        summary = benchmark_failure_summary(records, 'no measured candidates completed')
+        msg = f'❌ smart bounded benchmark failed: {summary}'
         if progress:
             progress(msg)
         emit_benchmark_event(
@@ -2969,9 +3601,10 @@ def benchmark_fast_profiles(
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'server-fast-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    runtime_profiles = active_engine_runtime_profiles(app, model, profile, depth='fast')
     contexts = fast_benchmark_contexts(model, profile)
     parallel_values = fast_benchmark_parallel_values(profile, model)
-    total = max(1, len(contexts) * (2 + len(parallel_values)) * 2)
+    total = max(1, len(runtime_profiles) if runtime_profiles else len(contexts) * (2 + len(parallel_values)) * 2)
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
@@ -2984,12 +3617,20 @@ def benchmark_fast_profiles(
     app.add_or_update(running_model)
 
     pressure_payload = current_process_pressure_payload()
-    start_msg = (
-        f'fast benchmark started: contexts={",".join(str(ctx) for ctx in contexts)}, '
-        f'parallel={",".join(str(value) for value in parallel_values)}, default variant, '
-        f'arch={architecture_label(model)}, {profile.short_summary()} '
-        f'{pressure_payload.get("process_pressure_detail", "")}'
-    )
+    if runtime_profiles:
+        start_msg = (
+            f'fast benchmark started: runtime_profiles={len(runtime_profiles)}, '
+            f'budget={FAST_RUNTIME_PROFILE_BUDGET_SECONDS // 60}m, '
+            f'arch={architecture_label(model)}, {profile.short_summary()} '
+            f'{pressure_payload.get("process_pressure_detail", "")}'
+        )
+    else:
+        start_msg = (
+            f'fast benchmark started: contexts={",".join(str(ctx) for ctx in contexts)}, '
+            f'parallel={",".join(str(value) for value in parallel_values)}, default variant, '
+            f'arch={architecture_label(model)}, {profile.short_summary()} '
+            f'{pressure_payload.get("process_pressure_detail", "")}'
+        )
     if progress:
         progress(start_msg)
     emit_benchmark_event(
@@ -3004,63 +3645,42 @@ def benchmark_fast_profiles(
     )
 
     try:
-        chat_floor = chat_min_ctx_per_slot(model)
-        for ctx in contexts:
-            check_cancelled(cancel_token)
-            current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, 'default')
-            ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                app,
-                model,
-                profile,
-                'long_context',
-                ctx,
-                1,
-                'default',
-                progress,
-                cancel_token,
-                completed,
-                total,
-                scan_level='fast',
-                run_kind='server_fast',
-            )
-            records.extend(new_records)
-            measured.extend(new_measured)
-            if not ok and broke:
-                if progress:
-                    progress(f'fast benchmark stopped at confirmed context break ctx={ctx}')
-                break
-
-            current = configure_adaptive_candidate(model, profile, 'opencode_ready', ctx, 1, 'default')
-            ok, _broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
-                app,
-                model,
-                profile,
-                'opencode_ready',
-                ctx,
-                1,
-                'default',
-                progress,
-                cancel_token,
-                completed,
-                total,
-                scan_level='fast',
-                run_kind='server_fast',
-            )
-            records.extend(new_records)
-            measured.extend(new_measured)
-
-            for parallel in parallel_values:
+        if runtime_profiles:
+            deadline = time.monotonic() + FAST_RUNTIME_PROFILE_BUDGET_SECONDS
+            for runtime_profile in runtime_profiles:
                 check_cancelled(cancel_token)
-                if ctx // max(1, parallel) < chat_floor:
-                    continue
-                current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, 'default')
+                if time.monotonic() >= deadline:
+                    if progress:
+                        progress('fast runtime profile budget reached; selecting from measured candidates')
+                    break
+                objective = 'opencode_ready' if runtime_profile.ctx_size >= 16384 else 'long_context'
+                ok, _broke, new_records, new_measured, completed = benchmark_runtime_profile_with_retry(
+                    app,
+                    model,
+                    runtime_profile,
+                    objective,
+                    progress,
+                    cancel_token,
+                    completed,
+                    total,
+                    run_kind='server_fast',
+                    max_attempts=1,
+                    benchmark_depth='fast',
+                )
+                records.extend(new_records)
+                measured.extend(new_measured)
+        else:
+            chat_floor = chat_min_ctx_per_slot(model)
+            for ctx in contexts:
+                check_cancelled(cancel_token)
+                current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, 'default')
                 ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
                     app,
                     model,
                     profile,
-                    'fast_chat',
+                    'long_context',
                     ctx,
-                    parallel,
+                    1,
                     'default',
                     progress,
                     cancel_token,
@@ -3073,8 +3693,54 @@ def benchmark_fast_profiles(
                 measured.extend(new_measured)
                 if not ok and broke:
                     if progress:
-                        progress(f'fast benchmark stopped parallel sweep ctx={ctx} parallel={parallel}')
+                        progress(f'fast benchmark stopped at confirmed context break ctx={ctx}')
                     break
+
+                current = configure_adaptive_candidate(model, profile, 'opencode_ready', ctx, 1, 'default')
+                ok, _broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                    app,
+                    model,
+                    profile,
+                    'opencode_ready',
+                    ctx,
+                    1,
+                    'default',
+                    progress,
+                    cancel_token,
+                    completed,
+                    total,
+                    scan_level='fast',
+                    run_kind='server_fast',
+                )
+                records.extend(new_records)
+                measured.extend(new_measured)
+
+                for parallel in parallel_values:
+                    check_cancelled(cancel_token)
+                    if ctx // max(1, parallel) < chat_floor:
+                        continue
+                    current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, 'default')
+                    ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
+                        app,
+                        model,
+                        profile,
+                        'fast_chat',
+                        ctx,
+                        parallel,
+                        'default',
+                        progress,
+                        cancel_token,
+                        completed,
+                        total,
+                        scan_level='fast',
+                        run_kind='server_fast',
+                    )
+                    records.extend(new_records)
+                    measured.extend(new_measured)
+                    if not ok and broke:
+                        if progress:
+                            progress(f'fast benchmark stopped parallel sweep ctx={ctx} parallel={parallel}')
+                        break
     except CancelledError:
         if current is not None:
             app.stop(current, managed_only=True)
@@ -3125,7 +3791,7 @@ def benchmark_fast_profiles(
     if not winners:
         saved.default_benchmark_status = 'failed'
         app.add_or_update(saved)
-        msg = '❌ fast benchmark failed: no measured candidates completed'
+        msg = f'❌ fast benchmark failed: {benchmark_failure_summary(records, "no measured candidates completed")}'
         if progress:
             progress(msg)
         emit_benchmark_event(
@@ -3327,7 +3993,7 @@ def benchmark_adaptive_profiles(
     if not winners:
         saved.default_benchmark_status = 'failed'
         app.add_or_update(saved)
-        msg = '❌ adaptive benchmark failed: no measured candidates completed'
+        msg = f'❌ adaptive benchmark failed: {benchmark_failure_summary(records, "no measured candidates completed")}'
         if progress:
             progress(msg)
         emit_benchmark_event(

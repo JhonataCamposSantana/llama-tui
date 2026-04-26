@@ -60,6 +60,7 @@ from llama_tui.opencode_benchmark import (
     sample_timeout_type,
     score_opencode_samples,
 )
+from llama_tui.runtime_profiles import make_runtime_profile
 
 
 def process_active(pid: int) -> bool:
@@ -578,6 +579,91 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(loaded.ctx, 12345)
         self.assertEqual(loaded.parallel, 3)
         self.assertEqual(loaded.extra_args, ['--batch-size', '512'])
+
+    def test_buun_active_view_does_not_reuse_llama_cpp_benchmarks(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny Model',
+            path='example/tiny-model',
+            alias='tiny-local',
+            port=18080,
+            runtime='llama.cpp',
+            last_benchmark_tokens_per_sec=50.0,
+            last_benchmark_seconds=1.0,
+            last_benchmark_profile='llama.cpp auto 50 tok/s',
+            last_benchmark_results=[{'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 8192, 'parallel': 1}],
+            measured_profiles={'auto': {'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1}},
+            benchmark_runs=[{'id': 'llama-run', 'kind': 'server', 'status': 'done'}],
+            benchmark_fingerprint='llama-fingerprint',
+            default_benchmark_status='done',
+            default_benchmark_at='2026-04-14T12:00:00',
+        )
+        self.app.add_or_update(model)
+
+        buun_app = AppConfig(
+            self.config_path,
+            runtime_profile=make_runtime_profile('buun', 'llama-server'),
+        )
+        loaded = buun_app.get_model('tiny')
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.last_benchmark_tokens_per_sec, 0.0)
+        self.assertEqual(loaded.default_benchmark_status, '')
+        self.assertEqual(loaded.measured_profiles, {})
+        self.assertEqual(loaded.benchmark_runs, [])
+        self.assertIn('llama.cpp', loaded.engine_benchmark_store)
+        self.assertIn('auto', loaded.engine_benchmark_store['llama.cpp']['measured_profiles'])
+        self.assertEqual(machine_best_summary(buun_app)['benchmarked_count'], 0)
+        self.assertFalse(benchmark_profile_is_fresh(buun_app, loaded))
+
+    def test_buun_benchmarks_persist_separately_from_llama_cpp(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny Model',
+            path='example/tiny-model',
+            alias='tiny-local',
+            port=18080,
+            runtime='llama.cpp',
+            last_benchmark_tokens_per_sec=50.0,
+            last_benchmark_seconds=1.0,
+            last_benchmark_profile='llama.cpp auto 50 tok/s',
+            last_benchmark_results=[{'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 8192, 'parallel': 1}],
+            measured_profiles={'auto': {'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1}},
+            benchmark_runs=[{'id': 'llama-run', 'kind': 'server', 'status': 'done'}],
+            benchmark_fingerprint='llama-fingerprint',
+            default_benchmark_status='done',
+            default_benchmark_at='2026-04-14T12:00:00',
+        )
+        self.app.add_or_update(model)
+
+        buun_app = AppConfig(
+            self.config_path,
+            runtime_profile=make_runtime_profile('buun', 'llama-server', kv_key_mode='turbo3_tcq', kv_value_mode='turbo2_tcq'),
+        )
+        buun_model = buun_app.get_model('tiny')
+        buun_model.last_benchmark_tokens_per_sec = 35.0
+        buun_model.last_benchmark_seconds = 2.0
+        buun_model.last_benchmark_profile = 'buun auto 35 tok/s'
+        buun_model.last_benchmark_results = [{'status': 'ok', 'tokens_per_sec': 35.0, 'ctx': 16384, 'parallel': 1}]
+        buun_model.measured_profiles = {'auto': {'status': 'ok', 'tokens_per_sec': 35.0, 'ctx': 16384, 'ctx_per_slot': 16384, 'parallel': 1}}
+        buun_model.benchmark_runs = [{'id': 'buun-run', 'kind': 'server', 'status': 'done'}]
+        buun_model.benchmark_fingerprint = buun_app.model_fingerprint(buun_model)
+        buun_model.default_benchmark_status = 'done'
+        buun_model.default_benchmark_at = '2026-04-14T12:30:00'
+        buun_app.add_or_update(buun_model)
+
+        reloaded_buun = AppConfig(
+            self.config_path,
+            runtime_profile=make_runtime_profile('buun', 'llama-server', kv_key_mode='turbo3_tcq', kv_value_mode='turbo2_tcq'),
+        ).get_model('tiny')
+        reloaded_llama = AppConfig(self.config_path).get_model('tiny')
+
+        self.assertEqual(reloaded_buun.last_benchmark_tokens_per_sec, 35.0)
+        self.assertEqual(reloaded_buun.benchmark_runs[0]['id'], 'buun-run')
+        self.assertEqual(reloaded_buun.measured_profiles['auto']['ctx'], 16384)
+        self.assertEqual(reloaded_llama.last_benchmark_tokens_per_sec, 50.0)
+        self.assertEqual(reloaded_llama.benchmark_runs[0]['id'], 'llama-run')
+        self.assertEqual(reloaded_llama.measured_profiles['auto']['ctx'], 8192)
 
     def test_measured_mode_launch_profile_uses_saved_values(self):
         model = ModelConfig(

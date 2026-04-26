@@ -5,8 +5,10 @@ from typing import List
 
 from .gguf import (
     apply_architecture_info,
+    apply_turboquant_info,
     architecture_label,
     detect_architecture_info,
+    detect_turboquant_info,
     read_gguf_metadata,
 )
 from .models import ModelConfig
@@ -140,4 +142,5 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
         source=source,
         extra_args=[],
     )
-    return apply_architecture_info(model, detect_architecture_info(model))
+    apply_architecture_info(model, detect_architecture_info(model))
+    return apply_turboquant_info(model, detect_turboquant_info(model))

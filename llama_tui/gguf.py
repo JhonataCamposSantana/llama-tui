@@ -51,6 +51,18 @@ class ArchitectureInfo:
     reason: str = ''
 
 
+@dataclass
+class TurboQuantInfo:
+    status: str = 'unknown'
+    head_dim: int = 0
+    key_dim: int = 0
+    value_dim: int = 0
+    source: str = ''
+    reason: str = ''
+
+
+TURBOQUANT_STATUSES = ('native', 'padded', 'unknown', 'not_applicable')
+
 GGUF_EXPERT_SUFFIXES = (
     'expert_count',
     'expert_used_count',
@@ -431,6 +443,75 @@ def detect_architecture_info(model_or_path) -> ArchitectureInfo:
     return info
 
 
+def detect_turboquant_info(model_or_path) -> TurboQuantInfo:
+    if isinstance(model_or_path, ModelConfig):
+        runtime = (getattr(model_or_path, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+        if runtime != 'llama.cpp':
+            return TurboQuantInfo(
+                status='not_applicable',
+                source='runtime',
+                reason=f'TurboQuant applies to llama.cpp GGUF sessions, not {runtime}',
+            )
+
+    path = _target_path(model_or_path)
+    if not str(path):
+        return TurboQuantInfo(status='not_applicable', source='path', reason='model path is empty')
+    if not path.exists():
+        return TurboQuantInfo(status='not_applicable', source='path', reason='model path is missing')
+    if path.suffix.lower() != '.gguf':
+        return TurboQuantInfo(status='not_applicable', source='path', reason='model is not a GGUF file')
+    if 'mmproj' in path.name.lower():
+        return TurboQuantInfo(status='not_applicable', source='path', reason='projection files are not TurboQuant targets')
+
+    metadata = read_gguf_metadata(path)
+    if not metadata:
+        return TurboQuantInfo(status='unknown', source='gguf_metadata', reason='GGUF metadata missing or unreadable')
+
+    arch = str(metadata.get('general.architecture') or '').strip()
+    key_dim = _metadata_int_value(metadata, arch, 'attention.key_length')
+    value_dim = _metadata_int_value(metadata, arch, 'attention.value_length')
+    source = 'gguf_metadata'
+    fallback_dim = 0
+    embedding = _metadata_int_value(metadata, arch, 'embedding_length')
+    head_count = _metadata_int_value(metadata, arch, 'attention.head_count')
+    if embedding > 0 and head_count > 0 and embedding >= head_count and embedding % head_count == 0:
+        fallback_dim = embedding // head_count
+    if key_dim <= 0 and fallback_dim > 0:
+        key_dim = fallback_dim
+        source = 'gguf_metadata_fallback'
+    if value_dim <= 0 and fallback_dim > 0:
+        value_dim = fallback_dim
+        source = 'gguf_metadata_fallback'
+    if key_dim <= 0 or value_dim <= 0:
+        return TurboQuantInfo(
+            status='unknown',
+            key_dim=max(0, key_dim),
+            value_dim=max(0, value_dim),
+            head_dim=max(0, key_dim, value_dim),
+            source=source,
+            reason='attention key/value dimensions were not found',
+        )
+
+    head_dim = key_dim if key_dim == value_dim else max(key_dim, value_dim)
+    native = key_dim % 128 == 0 and value_dim % 128 == 0
+    if native:
+        reason = 'key/value head dims are multiples of 128'
+        status = 'native'
+    else:
+        reason = 'buun zero-padding handles non-128 head dims'
+        status = 'padded'
+    if source == 'gguf_metadata_fallback':
+        reason += ' from embedding_length / attention.head_count'
+    return TurboQuantInfo(
+        status=status,
+        head_dim=head_dim,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        source=source,
+        reason=reason,
+    )
+
+
 def architecture_label(model: ModelConfig) -> str:
     architecture_type = (getattr(model, 'architecture_type', '') or 'unknown').strip().lower()
     if architecture_type == 'moe':
@@ -481,6 +562,46 @@ def architecture_detail(model: ModelConfig) -> str:
     if reason:
         detail += f', {reason}'
     return detail
+
+
+def turboquant_short(model: ModelConfig) -> str:
+    status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+    return {
+        'native': 'NAT',
+        'padded': 'PAD',
+        'unknown': 'UNK',
+        'not_applicable': 'N/A',
+    }.get(status, 'UNK')
+
+
+def turboquant_detail(model: ModelConfig) -> str:
+    status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+    if status not in TURBOQUANT_STATUSES:
+        status = 'unknown'
+    label = 'not applicable' if status == 'not_applicable' else status
+    parts = [label]
+    key_dim = int(getattr(model, 'turboquant_key_dim', 0) or 0)
+    value_dim = int(getattr(model, 'turboquant_value_dim', 0) or 0)
+    if key_dim or value_dim:
+        parts.append(f'key={key_dim or "-"} value={value_dim or "-"}')
+    source = getattr(model, 'turboquant_source', '') or ''
+    if source:
+        parts.append(f'from {source}')
+    reason = getattr(model, 'turboquant_reason', '') or ''
+    if reason:
+        parts.append(reason)
+    return ' '.join(parts)
+
+
+def apply_turboquant_info(model: ModelConfig, info: TurboQuantInfo) -> ModelConfig:
+    status = (info.status or 'unknown').strip().lower()
+    model.turboquant_status = status if status in TURBOQUANT_STATUSES else 'unknown'
+    model.turboquant_head_dim = int(info.head_dim or 0)
+    model.turboquant_key_dim = int(info.key_dim or 0)
+    model.turboquant_value_dim = int(info.value_dim or 0)
+    model.turboquant_source = info.source or ''
+    model.turboquant_reason = info.reason or ''
+    return model
 
 
 def apply_architecture_info(model: ModelConfig, info: ArchitectureInfo) -> ModelConfig:

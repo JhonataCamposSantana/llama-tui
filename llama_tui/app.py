@@ -31,12 +31,26 @@ from .discovery import (
     looks_like_model_reference,
 )
 from .control import CancelToken, check_cancelled, sleep_with_cancel
-from .gguf import estimate_kv_bytes_per_token, read_gguf_metadata
-from .gguf import apply_architecture_info, detect_architecture_info
+from .gguf import estimate_kv_bytes_per_token, extra_arg_value, read_gguf_metadata
+from .gguf import (
+    TURBOQUANT_STATUSES,
+    apply_architecture_info,
+    apply_turboquant_info,
+    detect_architecture_info,
+    detect_turboquant_info,
+    turboquant_detail,
+)
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
 from .models import ContinueSettings, HermesSettings, ModelConfig, OpencodeSettings, UiSettings
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
-from .runtime_profiles import RuntimeProfile, make_runtime_profile
+from .runtime_profiles import (
+    EngineCapabilities,
+    EngineProfile,
+    RuntimeProfile,
+    detect_engine_capabilities,
+    make_runtime_profile,
+    runtime_profile_extra_args,
+)
 from .textutil import compact_message, important_log_excerpt
 
 
@@ -85,6 +99,8 @@ ENGINE_BENCHMARK_FIELDS = (
     'last_benchmark_seconds',
     'last_benchmark_profile',
     'last_benchmark_results',
+    'measured_profiles',
+    'benchmark_runs',
     'benchmark_fingerprint',
     'default_benchmark_status',
     'default_benchmark_at',
@@ -242,7 +258,7 @@ def desktop_terminal_guess() -> str:
 
 
 class AppConfig:
-    def __init__(self, config_path: Path, runtime_profile: Optional[RuntimeProfile] = None):
+    def __init__(self, config_path: Path, runtime_profile: Optional[EngineProfile] = None):
         self.config_path = config_path
         self.llama_server = os.environ.get('LLAMA_SERVER', DEFAULT_LLAMA_SERVER)
         self.vllm_command = DEFAULT_VLLM_COMMAND
@@ -270,17 +286,28 @@ class AppConfig:
         self._owned_pids: set[int] = set()
         self._runtime_check_cache: Dict[str, Tuple[bool, str]] = {}
         self._runtime_version_cache: Dict[str, str] = {}
+        self._engine_capability_cache: Dict[str, EngineCapabilities] = {}
         self._shutdown_cleanup_done = False
+        self._benchmark_views_active = False
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
         chosen_profile = runtime_profile or self.runtime_profile
+        profile_server = self.llama_server
+        if (
+            runtime_profile is not None
+            and chosen_profile.server_command
+            and chosen_profile.server_command != DEFAULT_LLAMA_SERVER
+        ):
+            profile_server = chosen_profile.server_command
         self.runtime_profile = make_runtime_profile(
             chosen_profile.engine,
-            self.llama_server,
+            profile_server,
             ctx_override=chosen_profile.context_override,
             kv_mode=chosen_profile.kv_mode,
+            kv_key_mode=chosen_profile.kv_key_mode,
+            kv_value_mode=chosen_profile.kv_value_mode,
         )
         self._activate_engine_benchmark_views()
 
@@ -341,6 +368,8 @@ class AppConfig:
                 roots_changed = True
             if self.enrich_model_architecture(m):
                 roots_changed = True
+            if self.enrich_model_turboquant(m):
+                roots_changed = True
             inferred = self.infer_model_source(m)
             if m.source != inferred:
                 m.source = inferred
@@ -358,7 +387,8 @@ class AppConfig:
             self.save()
 
     def save(self):
-        self._persist_engine_benchmark_views()
+        if self._benchmark_views_active:
+            self._persist_engine_benchmark_views()
         self._normalize_model_ranks()
         data = {
             'llama_server': self.llama_server,
@@ -382,6 +412,8 @@ class AppConfig:
             'last_benchmark_seconds': 0.0,
             'last_benchmark_profile': '',
             'last_benchmark_results': [],
+            'measured_profiles': {},
+            'benchmark_runs': [],
             'benchmark_fingerprint': '',
             'default_benchmark_status': '',
             'default_benchmark_at': '',
@@ -396,7 +428,20 @@ class AppConfig:
         return 'llama.cpp'
 
     def _benchmark_payload_for_model(self, model: ModelConfig) -> Dict[str, object]:
-        return {field: getattr(model, field) for field in ENGINE_BENCHMARK_FIELDS}
+        return {
+            field: self._copy_benchmark_value(getattr(model, field))
+            for field in ENGINE_BENCHMARK_FIELDS
+        }
+
+    def _copy_benchmark_value(self, value: object) -> object:
+        if isinstance(value, list):
+            return [dict(item) if isinstance(item, dict) else item for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): dict(item) if isinstance(item, dict) else item
+                for key, item in value.items()
+            }
+        return value
 
     def _apply_benchmark_payload(self, model: ModelConfig, payload: Dict[str, object]):
         defaults = self._default_engine_benchmark_payload()
@@ -404,31 +449,50 @@ class AppConfig:
             value = payload.get(field, defaults[field])
             if isinstance(defaults[field], list):
                 value = list(value) if isinstance(value, list) else []
+            elif isinstance(defaults[field], dict):
+                value = dict(value) if isinstance(value, dict) else {}
             setattr(model, field, value)
 
     def _persist_engine_benchmark_views(self):
         for model in self.models:
-            store = getattr(model, 'engine_benchmark_store', {}) or {}
+            store = dict(getattr(model, 'engine_benchmark_store', {}) or {})
             store[self.active_engine_key_for_model(model)] = self._benchmark_payload_for_model(model)
             model.engine_benchmark_store = store
+
+    def _canonical_legacy_engine_key(self, model: ModelConfig) -> str:
+        runtime = (getattr(model, 'runtime', 'llama.cpp') or '').strip().lower()
+        return 'vllm' if runtime == 'vllm' else 'llama.cpp'
+
+    def _has_benchmark_payload(self, model: ModelConfig) -> bool:
+        if float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0:
+            return True
+        if (getattr(model, 'default_benchmark_status', '') or '').strip():
+            return True
+        if getattr(model, 'last_benchmark_results', None):
+            return True
+        if getattr(model, 'measured_profiles', None):
+            return True
+        if getattr(model, 'benchmark_runs', None):
+            return True
+        if (getattr(model, 'benchmark_fingerprint', '') or '').strip():
+            return True
+        return False
 
     def _activate_engine_benchmark_views(self):
         changed = False
         for model in self.models:
             store = dict(getattr(model, 'engine_benchmark_store', {}) or {})
             # One-time legacy migration: seed historical values under canonical runtime key.
-            if not store and (
-                float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0
-                or (getattr(model, 'default_benchmark_status', '') or '').strip()
-            ):
-                runtime_key = 'vllm' if (getattr(model, 'runtime', 'llama.cpp') or '').strip().lower() == 'vllm' else 'llama.cpp'
+            runtime_key = self._canonical_legacy_engine_key(model)
+            if runtime_key not in store and self._has_benchmark_payload(model):
                 store[runtime_key] = self._benchmark_payload_for_model(model)
                 changed = True
             model.engine_benchmark_store = store
             active_key = self.active_engine_key_for_model(model)
             self._apply_benchmark_payload(model, store.get(active_key, {}))
+        self._benchmark_views_active = True
         if changed:
-            self._persist_engine_benchmark_views()
+            self.save()
 
     def _archive_broken_config_file(self) -> Optional[Path]:
         if not self.config_path.exists():
@@ -494,6 +558,13 @@ class AppConfig:
         payload['classification_confidence'] = float(payload.get('classification_confidence', 0.0) or 0.0)
         payload['classification_source'] = str(payload.get('classification_source', '') or '')
         payload['classification_reason'] = str(payload.get('classification_reason', '') or '')
+        payload['turboquant_status'] = str(payload.get('turboquant_status', 'unknown') or 'unknown').strip().lower()
+        if payload['turboquant_status'] not in TURBOQUANT_STATUSES:
+            payload['turboquant_status'] = 'unknown'
+        for key in ('turboquant_head_dim', 'turboquant_key_dim', 'turboquant_value_dim'):
+            payload[key] = int(payload.get(key, 0) or 0)
+        payload['turboquant_source'] = str(payload.get('turboquant_source', '') or '')
+        payload['turboquant_reason'] = str(payload.get('turboquant_reason', '') or '')
         payload['favorite'] = bool(payload.get('favorite', False))
         payload['last_used_at'] = str(payload.get('last_used_at', '') or '')
         payload['sort_rank'] = int(payload.get('sort_rank', index + 1) or (index + 1))
@@ -534,6 +605,30 @@ class AppConfig:
             return False
         before = asdict(model)
         apply_architecture_info(model, detected)
+        return asdict(model) != before
+
+    def enrich_model_turboquant(self, model: ModelConfig) -> bool:
+        if (getattr(model, 'turboquant_source', '') or '') == 'manual':
+            return False
+        try:
+            detected = detect_turboquant_info(model)
+        except Exception:
+            return False
+        before = asdict(model)
+        current_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+        if current_status not in TURBOQUANT_STATUSES:
+            current_status = 'unknown'
+        should_update = (
+            current_status != detected.status
+            or not getattr(model, 'turboquant_source', '')
+            or int(getattr(model, 'turboquant_head_dim', 0) or 0) != int(detected.head_dim or 0)
+            or int(getattr(model, 'turboquant_key_dim', 0) or 0) != int(detected.key_dim or 0)
+            or int(getattr(model, 'turboquant_value_dim', 0) or 0) != int(detected.value_dim or 0)
+            or (getattr(model, 'turboquant_reason', '') or '') != (detected.reason or '')
+        )
+        if not should_update:
+            return False
+        apply_turboquant_info(model, detected)
         return asdict(model) != before
 
     def _normalize_model_ranks(self) -> bool:
@@ -622,8 +717,70 @@ class AppConfig:
             return self.runtime_profile.server_command or self.llama_server
         return runtime
 
+    def engine_capabilities(self, engine_profile: Optional[EngineProfile] = None) -> EngineCapabilities:
+        profile = engine_profile or self.runtime_profile
+        key = f'{profile.engine_id}:{profile.server_bin}'
+        if key not in self._engine_capability_cache:
+            self._engine_capability_cache[key] = detect_engine_capabilities(profile.server_bin, profile.engine_id)
+        return self._engine_capability_cache[key]
+
+    def runtime_profile_from_model(
+        self,
+        model: ModelConfig,
+        ctx_value: int,
+        parallel_value: int,
+        ngl_value: int,
+        runtime_profile: Optional[RuntimeProfile] = None,
+    ) -> RuntimeProfile:
+        if runtime_profile is not None:
+            return runtime_profile
+        args = list(getattr(model, 'extra_args', []) or [])
+        engine_id = self.active_engine_key_for_model(model)
+        if engine_id == 'buun':
+            key_mode, value_mode = self.runtime_profile.buun_kv_pair()
+            kv_preset = f'{key_mode}/{value_mode}'
+        else:
+            key_mode = (
+                extra_arg_value(args, '--cache-type-k')
+                or extra_arg_value(args, '--cache-type')
+                or ''
+            )
+            value_mode = (
+                extra_arg_value(args, '--cache-type-v')
+                or extra_arg_value(args, '--cache-type')
+                or ''
+            )
+            kv_preset = f'{key_mode or value_mode}/{value_mode or key_mode}' if (key_mode or value_mode) else 'default'
+
+        def int_extra(*flags: str) -> int:
+            try:
+                return int(extra_arg_value(args, *flags) or 0)
+            except Exception:
+                return 0
+
+        return RuntimeProfile(
+            engine_id=engine_id,
+            ctx_size=max(1, int(ctx_value or 1)),
+            gpu_layers=int(ngl_value or 0),
+            parallel=max(1, int(parallel_value or 1)),
+            kv_preset=kv_preset,
+            flash_attn='on' if bool(getattr(model, 'flash_attn', True)) else 'off',
+            batch_size=int_extra('--batch-size', '-b'),
+            ubatch_size=int_extra('--ubatch-size', '-ub'),
+            extra_args=(),
+            name='manual',
+        )
+
     def runtime_indicator(self) -> str:
         return self.runtime_profile.header_indicator()
+
+    def turboquant_session_advisory(self, model: ModelConfig) -> str:
+        if self.active_engine_key_for_model(model) != 'buun':
+            return ''
+        status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+        if status in ('native', 'padded'):
+            return ''
+        return f'TurboQuant advisory: {turboquant_detail(model)}'
 
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
@@ -682,7 +839,8 @@ class AppConfig:
             'runtime_config': {
                 'extra_args': list(getattr(model, 'extra_args', []) or []),
                 'engine_key': self.active_engine_key_for_model(model),
-                'kv_mode': self.runtime_profile.kv_mode if self.active_engine_key_for_model(model) == 'buun' else '',
+                'kv_key_mode': self.runtime_profile.kv_key_mode if self.active_engine_key_for_model(model) == 'buun' else '',
+                'kv_value_mode': self.runtime_profile.kv_value_mode if self.active_engine_key_for_model(model) == 'buun' else '',
                 'llama_server': self.runtime_server_command('llama.cpp') if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' else '',
                 'vllm_command': self.vllm_command if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else '',
                 'binary_version': self.runtime_binary_version(model),
@@ -740,6 +898,8 @@ class AppConfig:
             'architecture': getattr(model, 'architecture', ''),
             'classification_source': getattr(model, 'classification_source', ''),
             'classification_confidence': float(getattr(model, 'classification_confidence', 0.0) or 0.0),
+            'turboquant_status': getattr(model, 'turboquant_status', 'unknown'),
+            'turboquant_detail': turboquant_detail(model),
         }
         if not target:
             result.update({'status': 'failed', 'reason': 'model target is empty'})
@@ -1895,11 +2055,19 @@ class AppConfig:
         ctx_override: Optional[int] = None,
         parallel_override: Optional[int] = None,
         ngl_override: Optional[int] = None,
+        runtime_profile: Optional[RuntimeProfile] = None,
     ) -> List[str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
         ctx_value = int(ctx_override if ctx_override is not None else model.ctx)
         parallel_value = int(parallel_override if parallel_override is not None else model.parallel)
         ngl_value = int(ngl_override if ngl_override is not None else model.ngl)
+        if runtime_profile is not None:
+            if ctx_override is None:
+                ctx_value = int(runtime_profile.ctx_size or ctx_value)
+            if parallel_override is None:
+                parallel_value = int(runtime_profile.parallel or parallel_value)
+            if ngl_override is None:
+                ngl_value = int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else ngl_value)
         if runtime == 'vllm':
             cmd = self.command_prefix(self.vllm_command) + [
                 'serve',
@@ -1913,6 +2081,15 @@ class AppConfig:
             cmd += model.extra_args
             return cmd
 
+        engine_profile = self.runtime_profile
+        capabilities = self.engine_capabilities(engine_profile)
+        measured_runtime = self.runtime_profile_from_model(
+            model,
+            ctx_value,
+            parallel_value,
+            ngl_value,
+            runtime_profile=runtime_profile,
+        )
         cmd = self.command_prefix(self.runtime_server_command('llama.cpp')) + [
             '-m', model.path,
             '--alias', model.alias,
@@ -1920,23 +2097,39 @@ class AppConfig:
             '--port', str(model.port),
             '--ctx-size', str(ctx_value),
             '--threads', str(model.threads),
-            '--n-gpu-layers', str(ngl_value),
-            '--parallel', str(parallel_value),
+        ]
+        cmd += list(engine_profile.default_args)
+        cmd += [capabilities.gpu_layers_flag, str(ngl_value)]
+        if capabilities.supports_parallel:
+            cmd += ['--parallel', str(parallel_value)]
+        cmd += [
             '--cache-ram', str(model.cache_ram),
             '--temp', str(model.temp),
         ]
-        if model.flash_attn:
-            cmd += ['--flash-attn', 'on']
         if model.jinja:
             cmd += ['--jinja']
-        cmd += self.runtime_profile.llama_extra_args()
-        cmd += model.extra_args
+        cmd += runtime_profile_extra_args(
+            engine_profile,
+            measured_runtime,
+            capabilities,
+            existing_args=list(getattr(model, 'extra_args', []) or []),
+        )
         return cmd
 
-    def start(self, model: ModelConfig) -> Tuple[bool, str]:
+    def start(self, model: ModelConfig, runtime_profile: Optional[RuntimeProfile] = None) -> Tuple[bool, str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
+        engine_key = (
+            runtime_profile.engine_id
+            if runtime_profile is not None and getattr(runtime_profile, 'engine_id', '')
+            else self.active_engine_key_for_model(model)
+        )
         command = self.runtime_server_command(runtime)
-        label = 'vLLM command' if runtime == 'vllm' else 'llama-server'
+        if runtime == 'vllm':
+            label = 'vLLM command'
+        elif engine_key == 'buun':
+            label = 'buun server'
+        else:
+            label = 'llama-server'
         if not self.command_exists(command):
             return False, f'{label} not found: {command}'
         runtime_ok, runtime_msg = self.runtime_command_ready(runtime, command)
@@ -1946,9 +2139,18 @@ class AppConfig:
         valid, reason = self.validate_model_target(model)
         if not valid:
             return False, reason
-        profile_ok, profile, profile_msg = self.safe_launch_profile(model)
-        if not profile_ok:
-            return False, profile_msg
+        tq_advisory = self.turboquant_session_advisory(model)
+        if runtime_profile is not None:
+            profile = {
+                'ctx': int(runtime_profile.ctx_size or getattr(model, 'ctx', 0) or 0),
+                'parallel': max(1, int(runtime_profile.parallel or getattr(model, 'parallel', 1) or 1)),
+                'ngl': int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else getattr(model, 'ngl', 0) or 0),
+            }
+            profile_msg = f'runtime profile {runtime_profile.name or runtime_profile.engine_id}'
+        else:
+            profile_ok, profile, profile_msg = self.safe_launch_profile(model)
+            if not profile_ok:
+                return False, profile_msg
         if self.get_pid(model):
             return True, f'{model.id} already running'
         log_path = self.logfile(model.id)
@@ -1958,11 +2160,14 @@ class AppConfig:
             ctx_override=profile.get('ctx'),
             parallel_override=profile.get('parallel'),
             ngl_override=profile.get('ngl'),
+            runtime_profile=runtime_profile,
         )
         env = os.environ.copy()
         env['LLAMA_TUI_MODEL_ID'] = model.id
         env['LLAMA_TUI_OWNER_PID'] = str(os.getpid())
         self.append_log(model.id, f'launch profile: {profile_msg}')
+        if tq_advisory:
+            self.append_log(model.id, tq_advisory)
         self.append_log(model.id, f'launch command: {shlex.join(command)}')
         try:
             with open(log_path, 'ab') as log_file:
@@ -1980,7 +2185,32 @@ class AppConfig:
         model.last_good_ctx = profile.get('ctx', model.ctx)
         model.last_good_parallel = profile.get('parallel', model.parallel)
         self.save()
-        return True, f'started PID {proc.pid} ({profile_msg})'
+        detail = f'started PID {proc.pid} ({profile_msg})'
+        if tq_advisory:
+            detail += f' | {tq_advisory}'
+        return True, detail
+
+    def _runtime_log_after_last_launch(self, model: ModelConfig, max_lines: int = 400) -> List[str]:
+        path = self.logfile(model.id)
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(errors='replace').splitlines()
+        except Exception:
+            return []
+        for idx in range(len(lines) - 1, -1, -1):
+            if '] llama-tui:' in lines[idx] and 'launch command:' in lines[idx]:
+                lines = lines[idx + 1:]
+                break
+        return [line for line in lines[-max_lines:] if '] llama-tui:' not in line]
+
+    def _runtime_log_indicates_ready(self, model: ModelConfig) -> bool:
+        text = '\n'.join(self._runtime_log_after_last_launch(model)).lower()
+        if not text:
+            return False
+        loaded = 'model loaded' in text or 'llama model loaded' in text or 'model is loaded' in text
+        listening = 'server is listening' in text or 'listening on' in text or 'http server listening' in text
+        return loaded and listening
 
     def wait_until_ready(
         self,
@@ -1994,11 +2224,17 @@ class AppConfig:
             status, detail = self.health(model)
             if status == 'READY':
                 return True, f'✅ {model.id} is ready on http://{model.host}:{model.port}'
+            if self._runtime_log_indicates_ready(model):
+                return True, f'✅ {model.id} is ready from server log on http://{model.host}:{model.port}'
             if status == 'STOPPED' and not self.get_pid(model):
                 excerpt = '\n'.join(important_log_excerpt(self.logfile(model.id), 24, after_last_launch=True))
                 return False, f'❌ {model.id} crashed during startup (log: {self.logfile(model.id)})\n{excerpt}'
             sleep_with_cancel(0.5, cancel_token)
-        return False, f'⏳ {model.id} is still loading'
+        excerpt = '\n'.join(important_log_excerpt(self.logfile(model.id), 24, after_last_launch=True))
+        detail = f'⏳ {model.id} is still loading'
+        if excerpt:
+            detail += f' (log: {self.logfile(model.id)})\n{excerpt}'
+        return False, detail
 
     def stop(self, model: ModelConfig, managed_only: bool = False) -> Tuple[bool, str]:
         pid = self.get_pid(model, discover=not managed_only, managed_only=managed_only)
@@ -2052,6 +2288,7 @@ class AppConfig:
 
     def add_or_update(self, model: ModelConfig):
         self.enrich_model_architecture(model)
+        self.enrich_model_turboquant(model)
         for idx, existing in enumerate(self.models):
             if existing.id == model.id:
                 if not getattr(model, 'sort_rank', 0):

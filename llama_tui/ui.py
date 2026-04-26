@@ -28,7 +28,7 @@ from .chat import stream_chat_events
 from .constants import LOGO, REFRESH_SECONDS
 from .control import CancelToken, CancelledError
 from .discovery import classify_model_type, display_offload, display_runtime, extract_quant
-from .gguf import architecture_detail
+from .gguf import architecture_detail, turboquant_detail, turboquant_short
 from .hermes_benchmark import benchmark_hermes_workflow
 from .hardware import HardwareProfile
 from .models import ModelConfig
@@ -82,6 +82,7 @@ TRY_TRANSCRIPT_SCROLL_KEYS = {
 BENCHMARK_FEED_LIMIT = 80
 BENCHMARK_RECORD_LIMIT = 120
 BENCHMARK_COMMAND_LIMIT = 12
+BROWSER_HEADER = ' ID              PRT  ST        BN    RLS  RUNTIME    QNT      TQ  ARCH   NAME'
 HEADER_DASHBOARD_MIN_WIDTH = 124
 HEADER_DASHBOARD_MIN_PANEL_WIDTH = 42
 HEADER_DASHBOARD_HEIGHT = 10
@@ -319,8 +320,45 @@ def benchmark_freshness_short(app: AppConfig, model: ModelConfig) -> str:
     return mapping.get(benchmark_freshness_label(app, model), 'MISS')
 
 
+def browser_model_line(
+    app: AppConfig,
+    model: ModelConfig,
+    status: str,
+    machine_pick_id: str,
+    left_w: int,
+) -> str:
+    roles = app.role_badges(model.id)
+    engine = display_runtime(model)[:10]
+    quant = extract_quant(model)[:8]
+    tq = turboquant_short(model)[:3]
+    model_type = classify_model_type(model)[:6]
+    freshness = benchmark_freshness_short(app, model)
+    name_col_width = max(10, left_w - 79)
+    favorite_prefix = '★ ' if getattr(model, 'favorite', False) and name_col_width >= 14 else ''
+    best_badge = ' BEST' if model.id == machine_pick_id and name_col_width >= 15 else ''
+    display_name = favorite_prefix + (model.name or model.id)
+    display_name = display_name[: max(1, name_col_width - len(best_badge))] + best_badge
+    return (
+        f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  '
+        f'{freshness:4}  {roles:3}  {engine:10} {quant:8} {tq:3} {model_type:6} {display_name}'
+    )
+
+
 def benchmark_freshness_display(app: AppConfig, model: ModelConfig) -> str:
     return BENCHMARK_FRESHNESS_LABELS.get(benchmark_freshness_label(app, model), 'Missing')
+
+
+def turboquant_status_kind(model: ModelConfig, buun_session: bool = False) -> str:
+    status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+    if status in ('native', 'padded'):
+        return 'success'
+    if buun_session and status in ('unknown', 'not_applicable'):
+        return 'warning'
+    return 'muted'
+
+
+def turboquant_detail_line(model: ModelConfig) -> str:
+    return f'turboquant: {turboquant_detail(model)}'
 
 
 def filter_option_label(options: List[Tuple[str, str]], value: str) -> str:
@@ -2069,6 +2107,12 @@ def parse_model_form_answers(answers: Dict[str, str], initial: Optional[ModelCon
         verification_fingerprint=str(getattr(initial, 'verification_fingerprint', '') or ''),
         verification_summary=str(getattr(initial, 'verification_summary', '') or ''),
         verification_results=dict(getattr(initial, 'verification_results', {}) or {}),
+        turboquant_status=str(getattr(initial, 'turboquant_status', 'unknown') or 'unknown'),
+        turboquant_head_dim=int(getattr(initial, 'turboquant_head_dim', 0) or 0),
+        turboquant_key_dim=int(getattr(initial, 'turboquant_key_dim', 0) or 0),
+        turboquant_value_dim=int(getattr(initial, 'turboquant_value_dim', 0) or 0),
+        turboquant_source=str(getattr(initial, 'turboquant_source', '') or ''),
+        turboquant_reason=str(getattr(initial, 'turboquant_reason', '') or ''),
         extra_args=cleaned.get('extra_args', '').split() if cleaned.get('extra_args') else [],
     )
     return model, {}
@@ -2497,11 +2541,13 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
     if active_model:
         result = getattr(active_model, 'verification_results', {}) or {}
         cap = result.get('cap', {}) if isinstance(result, dict) else {}
+        active_engine = getattr(app, 'active_engine_key_for_model', lambda _model: '')(active_model)
         items.extend([
             ('', 'normal'),
             (f'active model: {active_model.id}', 'heading'),
             (f'verification: {getattr(active_model, "verification_status", "unknown")} {getattr(active_model, "verification_summary", "")}', 'normal'),
             (f'cap: factor={cap.get("limiting_factor", "-")} configured={cap.get("configured_ctx", "-")} slot={cap.get("ctx_per_slot", "-")} safe={cap.get("estimated_safe_context", "-")} measured={cap.get("measured_max_context", "-")}', 'normal'),
+            (turboquant_detail_line(active_model), turboquant_status_kind(active_model, active_engine == 'buun')),
         ])
     return items
 
@@ -3950,6 +3996,12 @@ def tui(stdscr, app: AppConfig):
             verification_status = getattr(model, 'verification_status', 'unknown') or 'unknown'
             verification_summary = getattr(model, 'verification_summary', '') or 'not verified'
             tags_text = ', '.join(list(getattr(model, 'tags', []) or [])) or '-'
+            tq_kind = turboquant_status_kind(model, app.active_engine_key_for_model(model) == 'buun')
+            tq_attr = (
+                colors['success'] | curses.A_BOLD if tq_kind == 'success'
+                else colors['warning'] if tq_kind == 'warning'
+                else colors['muted']
+            )
             cap = dict((getattr(model, 'verification_results', {}) or {}).get('cap') or {})
             cap_text = (
                 f'cap: {cap.get("limiting_factor", "-")} '
@@ -3963,6 +4015,7 @@ def tui(stdscr, app: AppConfig):
                 (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
                 (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
                 (f'architecture detail: {architecture_detail(model)}', curses.A_NORMAL),
+                (turboquant_detail_line(model), tq_attr),
                 (f'quant/source: {extract_quant(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
                 (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {freshness}', curses.A_NORMAL),
                 (f'tags: {tags_text}', curses.A_NORMAL),
@@ -4062,7 +4115,7 @@ def tui(stdscr, app: AppConfig):
             for i, (line, attr) in enumerate(detail_items[:content_rows]):
                 safe_addstr(stdscr, box_top + 2 + i, 3, line[: left_w - 4], attr)
         elif browser_list:
-            header = ' ID              PRT  ST        BN    RLS  RUNTIME    QNT      ARCH   NAME'
+            header = BROWSER_HEADER
             if content_rows > 0:
                 summary = (
                     f'search={list_search or "-"}  runtime={filter_option_label(FILTER_RUNTIME_OPTIONS, filter_runtime)}  '
@@ -4077,17 +4130,7 @@ def tui(stdscr, app: AppConfig):
             for idx in range(start_idx, end_idx):
                 model = browser_list[idx]
                 status, _ = statuses.get(model.id, ('?', ''))
-                roles = app.role_badges(model.id)
-                engine = display_runtime(model)[:10]
-                quant = extract_quant(model)[:8]
-                model_type = classify_model_type(model)[:6]
-                freshness = benchmark_freshness_short(app, model)
-                name_col_width = max(10, left_w - 75)
-                favorite_prefix = '★ ' if getattr(model, 'favorite', False) and name_col_width >= 14 else ''
-                best_badge = ' BEST' if model.id == machine_pick_id and name_col_width >= 15 else ''
-                display_name = favorite_prefix + (model.name or model.id)
-                display_name = display_name[: max(1, name_col_width - len(best_badge))] + best_badge
-                line = f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  {freshness:4}  {roles:3}  {engine:10} {quant:8} {model_type:6} {display_name}'
+                line = browser_model_line(app, model, status, machine_pick_id, left_w)
                 row_y = box_top + 4 + idx - start_idx
                 if idx == selected:
                     try:

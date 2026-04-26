@@ -63,6 +63,12 @@ class ModelConfig:
     classification_confidence: float = 0.0
     classification_source: str = ''
     classification_reason: str = ''
+    turboquant_status: str = 'unknown'
+    turboquant_head_dim: int = 0
+    turboquant_key_dim: int = 0
+    turboquant_value_dim: int = 0
+    turboquant_source: str = ''
+    turboquant_reason: str = ''
     extra_args: List[str] = field(default_factory=list)
     favorite: bool = False
     last_used_at: str = ''

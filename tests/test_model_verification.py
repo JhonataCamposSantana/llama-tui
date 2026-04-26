@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from llama_tui.app import AppConfig
+from llama_tui.gguf import TurboQuantInfo
 from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
 
@@ -85,6 +86,35 @@ class ModelVerificationTests(unittest.TestCase):
         self.assertIn('not a GGUF', self.app.static_model_diagnostics(bad_suffix)['reason'])
         self.assertIn('bad GGUF magic', self.app.static_model_diagnostics(bad_magic)['reason'])
         self.assertIn('truncated', self.app.static_model_diagnostics(truncated)['reason'])
+
+    def test_turboquant_metadata_is_enriched_and_persisted(self):
+        model_path = self.root / 'model.gguf'
+        model_path.write_bytes(b'GGUF')
+        model = ModelConfig(
+            id='tq',
+            name='TurboQuant',
+            path=str(model_path),
+            alias='tq',
+            port=18080,
+        )
+        detected = TurboQuantInfo(
+            status='native',
+            head_dim=128,
+            key_dim=128,
+            value_dim=128,
+            source='gguf_metadata',
+            reason='key/value head dims are multiples of 128',
+        )
+
+        with patch('llama_tui.app.detect_turboquant_info', return_value=detected):
+            self.app.add_or_update(model)
+            reloaded = AppConfig(self.root / 'models.json').get_model('tq')
+
+        self.assertIsNotNone(reloaded)
+        self.assertEqual(reloaded.turboquant_status, 'native')
+        self.assertEqual(reloaded.turboquant_key_dim, 128)
+        self.assertEqual(reloaded.turboquant_value_dim, 128)
+        self.assertEqual(reloaded.turboquant_source, 'gguf_metadata')
 
     def test_fresh_benchmark_fingerprint_passes_verification(self):
         model = self.model()

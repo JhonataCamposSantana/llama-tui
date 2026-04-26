@@ -33,6 +33,8 @@ from llama_tui.ui import (
     benchmark_row_text,
     benchmark_run_line,
     benchmark_runs_for_model,
+    browser_model_line,
+    BROWSER_HEADER,
     benchmark_wiki_lines,
     benchmark_command_lines,
     build_try_live_stat_lines,
@@ -78,6 +80,8 @@ from llama_tui.ui import (
     try_input_view,
     try_transcript_scroll_action,
     try_input_wrapped_lines,
+    turboquant_detail_line,
+    turboquant_status_kind,
     update_try_live_metrics,
     visible_selection_window,
     wrap_display_item_lines,
@@ -399,6 +403,11 @@ class BrowserAndFormTests(unittest.TestCase):
         pending = ModelConfig(id='pending', name='Pending', path='org/model2', alias='pending', port=18081, runtime='vllm')
         passed.verification_status = 'passed'
         pending.verification_status = 'needs_benchmark'
+        passed.turboquant_status = 'padded'
+        passed.turboquant_key_dim = 96
+        passed.turboquant_value_dim = 96
+        passed.turboquant_source = 'gguf_metadata'
+        passed.turboquant_reason = 'buun zero-padding handles non-128 head dims'
         passed.verification_results = {
             'cap': {
                 'limiting_factor': 'parallel_split',
@@ -432,6 +441,32 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn('model verification: needs_benchmark:1 passed:1', text)
         self.assertIn('benchmark proof needed: 1 model(s)', text)
         self.assertIn('cap: factor=parallel_split', text)
+        self.assertIn('turboquant: padded key=96 value=96', text)
+
+    def test_turboquant_browser_detail_and_buun_warning_labels(self):
+        model = ModelConfig(id='tq', name='TurboQuant Model', path='model.gguf', alias='tq', port=18080)
+        model.turboquant_status = 'unknown'
+        model.turboquant_source = 'gguf_metadata'
+        model.turboquant_reason = 'GGUF metadata missing or unreadable'
+
+        class FakeApp:
+            def role_badges(self, _model_id):
+                return '-'
+
+        line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
+
+        self.assertIn(' TQ ', BROWSER_HEADER)
+        self.assertIn(' UNK ', line)
+        self.assertIn('turboquant: unknown from gguf_metadata', turboquant_detail_line(model))
+        self.assertEqual(turboquant_status_kind(model, buun_session=False), 'muted')
+        self.assertEqual(turboquant_status_kind(model, buun_session=True), 'warning')
+
+        model.turboquant_status = 'native'
+        model.turboquant_key_dim = 128
+        model.turboquant_value_dim = 128
+        line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
+        self.assertIn(' NAT ', line)
+        self.assertEqual(turboquant_status_kind(model, buun_session=True), 'success')
 
     def test_machine_best_summary_includes_explanatory_reason(self):
         model = ModelConfig(id='balanced', name='Balanced', path='balanced.gguf', alias='balanced', port=18080)
@@ -825,6 +860,9 @@ class ProfileUiTests(unittest.TestCase):
             opencode = OpenCode()
             hermes = Hermes()
 
+            def runtime_indicator(self):
+                return 'Engine: llama.cpp | KV: - | Context: model default'
+
             def lm_studio_roots(self):
                 return [Path('/lmstudio/models'), Path('/lmstudio/hub/models')]
 
@@ -833,6 +871,7 @@ class ProfileUiTests(unittest.TestCase):
 
         self.assertIn('config: /tmp/models.json', text)
         self.assertIn('llama-server: /bin/llama-server', text)
+        self.assertIn('Engine: llama.cpp', text)
         self.assertIn('opencode: /tmp/opencode.json', text)
         self.assertIn('hermes: hermes', text)
         self.assertIn('lm-studio=/lmstudio/models, /lmstudio/hub/models', text)

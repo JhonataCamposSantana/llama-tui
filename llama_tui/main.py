@@ -39,6 +39,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument('--engine', choices=('llama.cpp', 'buun'), default='llama.cpp')
     parser.add_argument('--ctx', type=int, default=None)
     parser.add_argument('--kv', default='')
+    parser.add_argument('--kv-key', default='')
+    parser.add_argument('--kv-value', default='')
     return parser
 
 
@@ -46,26 +48,82 @@ def engine_session_lock_path() -> Path:
     return CACHE_DIR / 'runtime_engine_session.lock'
 
 
-def ensure_engine_session_lock(engine: str) -> Path:
-    lock_path = engine_session_lock_path()
-    if lock_path.exists():
-        try:
-            payload = json.loads(lock_path.read_text(encoding='utf-8'))
-        except Exception:
-            payload = {}
+def engine_session_dir() -> Path:
+    return CACHE_DIR / 'runtime_engine_sessions'
+
+
+def engine_session_path(pid: int | None = None) -> Path:
+    return engine_session_dir() / f'{int(pid or os.getpid())}.json'
+
+
+def pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def read_engine_session(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def prune_dead_engine_sessions() -> list[dict]:
+    sessions: list[dict] = []
+    session_dir = engine_session_dir()
+    session_dir.mkdir(parents=True, exist_ok=True)
+    for path in session_dir.glob('*.json'):
+        payload = read_engine_session(path)
         running_pid = int(payload.get('pid', 0) or 0)
         running_engine = str(payload.get('engine', '') or '').strip() or 'llama.cpp'
-        if running_pid > 0:
+        if pid_is_alive(running_pid):
+            sessions.append({'pid': running_pid, 'engine': running_engine, 'path': path})
+        else:
             try:
-                os.kill(running_pid, 0)
+                path.unlink()
             except OSError:
-                running_pid = 0
-        if running_pid > 0 and running_engine != engine:
+                pass
+    return sessions
+
+
+def legacy_engine_session() -> dict:
+    lock_path = engine_session_lock_path()
+    if not lock_path.exists():
+        return {}
+    payload = read_engine_session(lock_path)
+    running_pid = int(payload.get('pid', 0) or 0)
+    running_engine = str(payload.get('engine', '') or '').strip() or 'llama.cpp'
+    if pid_is_alive(running_pid):
+        return {'pid': running_pid, 'engine': running_engine, 'path': lock_path}
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+    return {}
+
+
+def ensure_engine_session_lock(engine: str) -> Path:
+    sessions = prune_dead_engine_sessions()
+    legacy_session = legacy_engine_session()
+    if legacy_session:
+        sessions.append(legacy_session)
+    for session in sessions:
+        running_engine = str(session.get('engine', '') or '').strip() or 'llama.cpp'
+        running_pid = int(session.get('pid', 0) or 0)
+        if running_engine != engine:
             raise SystemExit(
                 f'Engine switch blocked: llama-tui PID {running_pid} is running with engine "{running_engine}". '
                 f'Stop it before launching with "{engine}".'
             )
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = engine_session_path()
     lock_path.write_text(
         json.dumps({'pid': os.getpid(), 'engine': engine}, indent=2) + '\n',
         encoding='utf-8',
@@ -74,10 +132,7 @@ def ensure_engine_session_lock(engine: str) -> Path:
 
 
 def release_engine_session_lock(lock_path: Path):
-    try:
-        payload = json.loads(lock_path.read_text(encoding='utf-8'))
-    except Exception:
-        payload = {}
+    payload = read_engine_session(lock_path)
     if int(payload.get('pid', 0) or 0) == os.getpid():
         try:
             lock_path.unlink()
@@ -85,10 +140,21 @@ def release_engine_session_lock(lock_path: Path):
             pass
 
 
+def validate_buun_kv_args(args):
+    if args.engine != 'buun':
+        return
+    for flag, value in (
+        ('--kv', args.kv),
+        ('--kv-key', args.kv_key),
+        ('--kv-value', args.kv_value),
+    ):
+        if value and value not in BUUN_KV_MODES:
+            raise SystemExit(f'Unsupported {flag} "{value}". Supported buun modes: {", ".join(BUUN_KV_MODES)}')
+
+
 def main():
     args = build_cli_parser().parse_args()
-    if args.engine == 'buun' and args.kv and args.kv not in BUUN_KV_MODES:
-        raise SystemExit(f'Unsupported --kv "{args.kv}". Supported buun modes: {", ".join(BUUN_KV_MODES)}')
+    validate_buun_kv_args(args)
     config_path = Path(args.config_path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_bootstrap_files(config_path)
@@ -100,6 +166,8 @@ def main():
             default_llama_server=DEFAULT_LLAMA_SERVER,
             ctx_override=args.ctx,
             kv_mode=args.kv,
+            kv_key_mode=args.kv_key,
+            kv_value_mode=args.kv_value,
         ),
     )
     cleanup = app.cleanup_managed_processes
