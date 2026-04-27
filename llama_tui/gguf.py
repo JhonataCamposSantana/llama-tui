@@ -61,7 +61,7 @@ class TurboQuantInfo:
     reason: str = ''
 
 
-TURBOQUANT_STATUSES = ('native', 'padded', 'unknown', 'not_applicable')
+TURBOQUANT_STATUSES = ('native', 'padded', 'incompatible', 'unknown', 'not_applicable')
 
 GGUF_EXPERT_SUFFIXES = (
     'expert_count',
@@ -179,17 +179,16 @@ def _gguf_has_kv_fields(metadata: Dict[str, object]) -> bool:
     has_embd = f'{prefix}embedding_length' in metadata or f'{prefix}attention.key_length' in metadata
     return has_layers and has_heads and has_embd
 def read_gguf_metadata(path: str | Path) -> Dict[str, object]:
-    target = str(Path(path).expanduser().resolve(strict=False))
+    source_path = Path(path).expanduser()
+    target = str(source_path.resolve(strict=False))
     cached = GGUF_METADATA_CACHE.get(target)
     if cached is not None:
         return cached
     metadata: Dict[str, object] = {}
-    p = Path(target)
-    if not p.exists() or p.suffix.lower() != '.gguf':
-        GGUF_METADATA_CACHE[target] = metadata
+    if not source_path.exists() or source_path.suffix.lower() != '.gguf':
         return metadata
     try:
-        with open(p, 'rb') as file_obj:
+        with open(source_path, 'rb') as file_obj:
             if _read_exact(file_obj, 4) != b'GGUF':
                 GGUF_METADATA_CACHE[target] = metadata
                 return metadata
@@ -494,7 +493,10 @@ def detect_turboquant_info(model_or_path) -> TurboQuantInfo:
 
     head_dim = key_dim if key_dim == value_dim else max(key_dim, value_dim)
     native = key_dim % 128 == 0 and value_dim % 128 == 0
-    if native:
+    if key_dim < 128 or value_dim < 128:
+        reason = 'TurboKV block size 128 does not fit key/value head dims below 128'
+        status = 'incompatible'
+    elif native:
         reason = 'key/value head dims are multiples of 128'
         status = 'native'
     else:
@@ -569,6 +571,7 @@ def turboquant_short(model: ModelConfig) -> str:
     return {
         'native': 'NAT',
         'padded': 'PAD',
+        'incompatible': 'INC',
         'unknown': 'UNK',
         'not_applicable': 'N/A',
     }.get(status, 'UNK')

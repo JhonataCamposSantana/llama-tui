@@ -427,6 +427,18 @@ class AppConfig:
             return 'buun'
         return 'llama.cpp'
 
+    def active_engine_label_for_model(self, model: ModelConfig) -> str:
+        engine = self.active_engine_key_for_model(model)
+        if engine == 'buun':
+            return self.runtime_profile.display_name
+        if engine == 'vllm':
+            return 'vLLM'
+        return 'llama.cpp'
+
+    def active_runtime_binary_for_model(self, model: ModelConfig) -> str:
+        runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
+        return self.runtime_server_command(runtime)
+
     def _benchmark_payload_for_model(self, model: ModelConfig) -> Dict[str, object]:
         return {
             field: self._copy_benchmark_value(getattr(model, field))
@@ -655,14 +667,39 @@ class AppConfig:
         self.load_warnings = []
         return warnings
 
-    def pidfile(self, model_id: str) -> Path:
+    def _runtime_artifact_engine_for_model_id(self, model_id: str, engine_key: Optional[str] = None) -> str:
+        if engine_key:
+            return str(engine_key)
+        model = self.get_model(model_id)
+        if model is not None:
+            return self.active_engine_key_for_model(model)
+        return (self.runtime_profile.engine or 'llama.cpp').strip() or 'llama.cpp'
+
+    def _runtime_artifact_dir(self, engine_key: str) -> Path:
+        slug = ''.join(ch if ch.isalnum() or ch in ('-', '_', '.') else '_' for ch in str(engine_key or 'llama.cpp'))
+        return CACHE_DIR / 'runtime' / (slug or 'llama.cpp')
+
+    def runtime_artifact_path(self, model_id: str, suffix: str, engine_key: Optional[str] = None) -> Path:
+        engine = self._runtime_artifact_engine_for_model_id(model_id, engine_key)
+        return self._runtime_artifact_dir(engine) / f'{model_id}{suffix}'
+
+    def legacy_pidfile(self, model_id: str) -> Path:
         return CACHE_DIR / f'{model_id}.pid'
 
-    def pid_metadata_file(self, model_id: str) -> Path:
+    def legacy_pid_metadata_file(self, model_id: str) -> Path:
         return CACHE_DIR / f'{model_id}.pid.json'
 
-    def logfile(self, model_id: str) -> Path:
+    def legacy_logfile(self, model_id: str) -> Path:
         return CACHE_DIR / f'{model_id}.log'
+
+    def pidfile(self, model_id: str, engine_key: Optional[str] = None) -> Path:
+        return self.runtime_artifact_path(model_id, '.pid', engine_key)
+
+    def pid_metadata_file(self, model_id: str, engine_key: Optional[str] = None) -> Path:
+        return self.runtime_artifact_path(model_id, '.pid.json', engine_key)
+
+    def logfile(self, model_id: str, engine_key: Optional[str] = None) -> Path:
+        return self.runtime_artifact_path(model_id, '.log', engine_key)
 
     def get_model(self, model_id: str) -> Optional[ModelConfig]:
         return next((m for m in self.models if m.id == model_id), None)
@@ -737,8 +774,12 @@ class AppConfig:
         args = list(getattr(model, 'extra_args', []) or [])
         engine_id = self.active_engine_key_for_model(model)
         if engine_id == 'buun':
-            key_mode, value_mode = self.runtime_profile.buun_kv_pair()
-            kv_preset = f'{key_mode}/{value_mode}'
+            tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+            if tq_status in ('native', 'padded'):
+                key_mode, value_mode = self.runtime_profile.buun_kv_pair()
+                kv_preset = f'{key_mode}/{value_mode}'
+            else:
+                kv_preset = 'default'
         else:
             key_mode = (
                 extra_arg_value(args, '--cache-type-k')
@@ -1799,20 +1840,20 @@ class AppConfig:
             or path in joined
         )
 
-    def _read_pidfile(self, model_id: str) -> Optional[int]:
+    def _read_pidfile(self, model_id: str, engine_key: Optional[str] = None) -> Optional[int]:
         try:
-            return int(self.pidfile(model_id).read_text().strip())
+            return int(self.pidfile(model_id, engine_key).read_text().strip())
         except Exception:
             return None
 
-    def _read_pid_metadata(self, model_id: str) -> Dict:
+    def _read_pid_metadata(self, model_id: str, engine_key: Optional[str] = None) -> Dict:
         try:
-            return json.loads(self.pid_metadata_file(model_id).read_text())
+            return json.loads(self.pid_metadata_file(model_id, engine_key).read_text())
         except Exception:
             return {}
 
-    def _tracked_pgid(self, model_id: str, pid: Optional[int]) -> Optional[int]:
-        metadata = self._read_pid_metadata(model_id)
+    def _tracked_pgid(self, model_id: str, pid: Optional[int], engine_key: Optional[str] = None) -> Optional[int]:
+        metadata = self._read_pid_metadata(model_id, engine_key)
         try:
             pgid = int(metadata.get('pgid') or 0)
             if pgid > 0:
@@ -1826,9 +1867,9 @@ class AppConfig:
                 return None
         return None
 
-    def _clear_pid_tracking(self, model_id: str, pid: Optional[int] = None):
-        self.pidfile(model_id).unlink(missing_ok=True)
-        self.pid_metadata_file(model_id).unlink(missing_ok=True)
+    def _clear_pid_tracking(self, model_id: str, pid: Optional[int] = None, engine_key: Optional[str] = None):
+        self.pidfile(model_id, engine_key).unlink(missing_ok=True)
+        self.pid_metadata_file(model_id, engine_key).unlink(missing_ok=True)
         if pid is not None:
             self._owned_pids.discard(pid)
 
@@ -1838,7 +1879,10 @@ class AppConfig:
         except OSError:
             pgid = pid
         self._owned_pids.add(pid)
-        self.pidfile(model.id).write_text(str(pid))
+        engine_key = self.active_engine_key_for_model(model)
+        pid_path = self.pidfile(model.id)
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(pid))
         metadata = {
             'app': APP_NAME,
             'owner_pid': os.getpid(),
@@ -1846,6 +1890,8 @@ class AppConfig:
             'pid': pid,
             'pgid': pgid,
             'runtime': getattr(model, 'runtime', 'llama.cpp'),
+            'engine': engine_key,
+            'runtime_binary': self.active_runtime_binary_for_model(model),
             'alias': model.alias,
             'port': model.port,
             'path': model.path,
@@ -1853,7 +1899,9 @@ class AppConfig:
             'command': command,
         }
         try:
-            self.pid_metadata_file(model.id).write_text(json.dumps(metadata, indent=2) + '\n')
+            metadata_path = self.pid_metadata_file(model.id)
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path.write_text(json.dumps(metadata, indent=2) + '\n')
         except Exception:
             pass
 
@@ -2066,8 +2114,9 @@ class AppConfig:
                 ctx_value = int(runtime_profile.ctx_size or ctx_value)
             if parallel_override is None:
                 parallel_value = int(runtime_profile.parallel or parallel_value)
-            if ngl_override is None:
+            if ngl_override is None and runtime_profile.gpu_layers is not None:
                 ngl_value = int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else ngl_value)
+        omit_gpu_layers = runtime_profile is not None and runtime_profile.gpu_layers is None
         if runtime == 'vllm':
             cmd = self.command_prefix(self.vllm_command) + [
                 'serve',
@@ -2099,7 +2148,8 @@ class AppConfig:
             '--threads', str(model.threads),
         ]
         cmd += list(engine_profile.default_args)
-        cmd += [capabilities.gpu_layers_flag, str(ngl_value)]
+        if not omit_gpu_layers:
+            cmd += [capabilities.gpu_layers_flag, str(ngl_value)]
         if capabilities.supports_parallel:
             cmd += ['--parallel', str(parallel_value)]
         cmd += [
@@ -2144,9 +2194,17 @@ class AppConfig:
             profile = {
                 'ctx': int(runtime_profile.ctx_size or getattr(model, 'ctx', 0) or 0),
                 'parallel': max(1, int(runtime_profile.parallel or getattr(model, 'parallel', 1) or 1)),
-                'ngl': int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else getattr(model, 'ngl', 0) or 0),
+                'ngl': int(runtime_profile.gpu_layers) if runtime_profile.gpu_layers is not None else None,
             }
-            profile_msg = f'runtime profile {runtime_profile.name or runtime_profile.engine_id}'
+            profile_bits = [f'runtime profile {runtime_profile.name or runtime_profile.engine_id}']
+            if runtime_profile.fit:
+                fit_text = 'fit=on'
+                if runtime_profile.fit_context > 0:
+                    fit_text += f' fit_ctx={runtime_profile.fit_context}'
+                profile_bits.append(fit_text)
+            if runtime_profile.no_warmup:
+                profile_bits.append('no_warmup')
+            profile_msg = ' '.join(profile_bits)
         else:
             profile_ok, profile, profile_msg = self.safe_launch_profile(model)
             if not profile_ok:
@@ -2261,25 +2319,50 @@ class AppConfig:
             return []
         self._shutdown_cleanup_done = True
         msgs = self.stop_all(managed_only=True)
-        known_model_ids = {model.id for model in self.models}
-        for pidfile in CACHE_DIR.glob('*.pid'):
+        runtime_pidfiles = []
+        runtime_root = CACHE_DIR / 'runtime'
+        if runtime_root.exists():
+            runtime_pidfiles = list(runtime_root.glob('*/*.pid'))
+        for pidfile in [*CACHE_DIR.glob('*.pid'), *runtime_pidfiles]:
             model_id = pidfile.stem
-            if model_id in known_model_ids:
-                continue
-            pid = self._read_pidfile(model_id)
-            pgid = self._tracked_pgid(model_id, pid)
+            try:
+                pid = int(pidfile.read_text().strip())
+            except Exception:
+                pid = None
+            metadata_path = Path(f'{pidfile}.json')
+            try:
+                metadata = json.loads(metadata_path.read_text())
+            except Exception:
+                metadata = {}
+            try:
+                pgid = int(metadata.get('pgid') or 0) or None
+            except Exception:
+                pgid = None
+            if pgid is None and pid:
+                try:
+                    pgid = os.getpgid(pid)
+                except OSError:
+                    pgid = None
             group_pids = self._process_group_pids(pgid) if pgid is not None else []
             runtime_pids = [group_pid for group_pid in group_pids if self._pid_looks_like_any_runtime(group_pid)]
             target_pid = pid if pid and self._pid_alive(pid) else None
             if not target_pid:
                 target_pid = runtime_pids[0] if runtime_pids else (group_pids[0] if group_pids else None)
             if not target_pid:
-                self._clear_pid_tracking(model_id, pid)
+                pidfile.unlink(missing_ok=True)
+                metadata_path.unlink(missing_ok=True)
+                if pid is not None:
+                    self._owned_pids.discard(pid)
                 continue
-            if not self._read_pid_metadata(model_id) and not self._pid_looks_like_any_runtime(target_pid):
-                self._clear_pid_tracking(model_id, pid)
+            if not metadata and not self._pid_looks_like_any_runtime(target_pid):
+                pidfile.unlink(missing_ok=True)
+                metadata_path.unlink(missing_ok=True)
+                if pid is not None:
+                    self._owned_pids.discard(pid)
                 continue
             ok, msg = self._stop_pid(model_id, target_pid, use_group=True)
+            pidfile.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
             msgs.append(f'{model_id}: {msg}')
         return msgs
 

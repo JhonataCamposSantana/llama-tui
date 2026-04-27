@@ -1,3 +1,4 @@
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,11 +7,13 @@ from unittest.mock import patch
 from llama_tui.benchmark import adaptive_record_from_candidate, architecture_payload, process_pressure_payload
 from llama_tui.gguf import (
     ArchitectureInfo,
+    GGUF_METADATA_CACHE,
     apply_turboquant_info,
     architecture_label,
     detect_architecture_info,
     detect_turboquant_info,
     estimate_layer_weight_bytes_from_tensor_descriptors,
+    read_gguf_metadata,
     turboquant_detail,
     turboquant_short,
 )
@@ -23,6 +26,26 @@ from llama_tui.hermes_benchmark import hermes_benchmark_record_context
 
 
 class ArchitectureDetectionTests(unittest.TestCase):
+    def write_minimal_gguf(self, path: Path, metadata: dict):
+        def gguf_string(value: str) -> bytes:
+            raw = value.encode('utf-8')
+            return struct.pack('<Q', len(raw)) + raw
+
+        payload = bytearray()
+        payload.extend(b'GGUF')
+        payload.extend(struct.pack('<I', 3))
+        payload.extend(struct.pack('<Q', 0))
+        payload.extend(struct.pack('<Q', len(metadata)))
+        for key, value in metadata.items():
+            payload.extend(gguf_string(str(key)))
+            if isinstance(value, str):
+                payload.extend(struct.pack('<I', 8))
+                payload.extend(gguf_string(value))
+            else:
+                payload.extend(struct.pack('<I', 4))
+                payload.extend(struct.pack('<I', int(value)))
+        path.write_bytes(bytes(payload))
+
     def detect_with_metadata(self, metadata, path='model.gguf', tensors=None):
         with patch('llama_tui.gguf.read_gguf_metadata', return_value=metadata), \
              patch('llama_tui.gguf.read_gguf_tensor_descriptors', return_value=tensors or []):
@@ -57,6 +80,41 @@ class ArchitectureDetectionTests(unittest.TestCase):
         self.assertEqual(info.expert_count, 60)
         self.assertEqual(info.expert_used_count, 4)
         self.assertAlmostEqual(info.active_expert_ratio, 4 / 60)
+
+    def test_symlinked_huggingface_gguf_blob_without_suffix_reads_metadata(self):
+        GGUF_METADATA_CACHE.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blob = root / 'blobs' / 'abc123'
+            blob.parent.mkdir(parents=True)
+            self.write_minimal_gguf(blob, {
+                'general.architecture': 'gemma4',
+                'gemma4.block_count': 30,
+                'gemma4.context_length': 262144,
+                'gemma4.embedding_length': 2816,
+                'gemma4.attention.head_count': 16,
+                'gemma4.attention.key_length': 512,
+                'gemma4.attention.value_length': 512,
+                'gemma4.expert_count': 128,
+                'gemma4.expert_used_count': 8,
+            })
+            snapshot = root / 'models--org--repo' / 'snapshots' / 'rev' / 'model.gguf'
+            snapshot.parent.mkdir(parents=True)
+            snapshot.symlink_to(blob)
+            model = ModelConfig(id='gemma', name='Gemma', path=str(snapshot), alias='gemma', port=18080)
+
+            self.assertEqual(read_gguf_metadata(blob), {})
+            metadata = read_gguf_metadata(snapshot)
+            arch = detect_architecture_info(model)
+            tq = detect_turboquant_info(model)
+
+        self.assertEqual(metadata['general.architecture'], 'gemma4')
+        self.assertEqual(arch.architecture_type, 'moe')
+        self.assertEqual(arch.expert_count, 128)
+        self.assertEqual(arch.expert_used_count, 8)
+        self.assertEqual(tq.status, 'native')
+        self.assertEqual(tq.key_dim, 512)
+        self.assertEqual(tq.value_dim, 512)
 
     def test_qwen36_moe_metadata_and_benchmark_payload(self):
         info = self.detect_with_metadata({
@@ -180,7 +238,7 @@ class ArchitectureDetectionTests(unittest.TestCase):
         self.assertIn('key=128 value=128', turboquant_detail(model))
 
     def test_turboquant_padded_head_dims(self):
-        for dim in (96, 64):
+        for dim in (192, 320):
             with self.subTest(dim=dim):
                 info = self.detect_turboquant_with_metadata({
                     'general.architecture': 'llama',
@@ -191,6 +249,21 @@ class ArchitectureDetectionTests(unittest.TestCase):
                 self.assertEqual(info.status, 'padded')
                 self.assertEqual(info.head_dim, dim)
                 self.assertIn('zero-padding', info.reason)
+
+    def test_turboquant_head_dims_below_block_size_are_incompatible(self):
+        info = self.detect_turboquant_with_metadata({
+            'general.architecture': 'gpt-oss',
+            'gpt-oss.attention.key_length': 64,
+            'gpt-oss.attention.value_length': 64,
+        })
+        model = apply_turboquant_info(
+            ModelConfig(id='m', name='Model', path='model.gguf', alias='m', port=18080),
+            info,
+        )
+
+        self.assertEqual(info.status, 'incompatible')
+        self.assertEqual(turboquant_short(model), 'INC')
+        self.assertIn('below 128', turboquant_detail(model))
 
     def test_turboquant_falls_back_to_embedding_over_head_count(self):
         info = self.detect_turboquant_with_metadata({

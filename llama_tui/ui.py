@@ -82,7 +82,7 @@ TRY_TRANSCRIPT_SCROLL_KEYS = {
 BENCHMARK_FEED_LIMIT = 80
 BENCHMARK_RECORD_LIMIT = 120
 BENCHMARK_COMMAND_LIMIT = 12
-BROWSER_HEADER = ' ID              PRT  ST        BN    RLS  RUNTIME    QNT      TQ  ARCH   NAME'
+BROWSER_HEADER = ' ID              PRT  ST        BN    RLS  ENGINE     QNT      TQ  ARCH   NAME'
 HEADER_DASHBOARD_MIN_WIDTH = 124
 HEADER_DASHBOARD_MIN_PANEL_WIDTH = 42
 HEADER_DASHBOARD_HEIGHT = 10
@@ -328,7 +328,7 @@ def browser_model_line(
     left_w: int,
 ) -> str:
     roles = app.role_badges(model.id)
-    engine = display_runtime(model)[:10]
+    engine = active_engine_short(app, model)[:10]
     quant = extract_quant(model)[:8]
     tq = turboquant_short(model)[:3]
     model_type = classify_model_type(model)[:6]
@@ -344,6 +344,61 @@ def browser_model_line(
     )
 
 
+def active_engine_key(app: AppConfig, model: ModelConfig) -> str:
+    try:
+        return str(app.active_engine_key_for_model(model) or '')
+    except Exception:
+        return str(getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp')
+
+
+def active_engine_short(app: AppConfig, model: ModelConfig) -> str:
+    engine = active_engine_key(app, model)
+    if engine == 'buun':
+        return 'buun'
+    if engine == 'vllm':
+        return 'vLLM'
+    return engine or display_runtime(model)
+
+
+def active_engine_binary(app: AppConfig, model: ModelConfig) -> str:
+    try:
+        return str(app.active_runtime_binary_for_model(model) or '')
+    except Exception:
+        runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
+        if runtime == 'vllm':
+            return str(getattr(app, 'vllm_command', '') or '')
+        try:
+            return str(app.runtime_server_command(runtime) or '')
+        except Exception:
+            return ''
+
+
+def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
+    if active_engine_key(app, model) != 'buun':
+        return '-'
+    tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+    if tq_status not in ('native', 'padded'):
+        return f'default (turboquant {tq_status or "unknown"})'
+    profile = getattr(app, 'runtime_profile', None)
+    try:
+        key_mode, value_mode = profile.buun_kv_pair()
+    except Exception:
+        key_mode, value_mode = '', ''
+    return f'key={key_mode or "-"} value={value_mode or "-"}'
+
+
+def runtime_engine_source_line(app: AppConfig, model: ModelConfig) -> str:
+    return (
+        f'id/model runtime/active engine/source: {model.id} / {display_runtime(model)} / '
+        f'{active_engine_short(app, model)} / {getattr(model, "source", "manual")}'
+    )
+
+
+def active_engine_detail_line(app: AppConfig, model: ModelConfig) -> str:
+    binary = active_engine_binary(app, model) or '-'
+    return f'active engine: {active_engine_short(app, model)}  binary: {binary}  kv: {active_engine_kv(app, model)}'
+
+
 def benchmark_freshness_display(app: AppConfig, model: ModelConfig) -> str:
     return BENCHMARK_FRESHNESS_LABELS.get(benchmark_freshness_label(app, model), 'Missing')
 
@@ -352,6 +407,8 @@ def turboquant_status_kind(model: ModelConfig, buun_session: bool = False) -> st
     status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
     if status in ('native', 'padded'):
         return 'success'
+    if status == 'incompatible':
+        return 'warning'
     if buun_session and status in ('unknown', 'not_applicable'):
         return 'warning'
     return 'muted'
@@ -760,6 +817,7 @@ def build_header_config_items(app: AppConfig, message: str, width: int) -> List[
     lines = [
         (f'config: {app.config_path}', 'muted'),
         (f'llama-server: {app.llama_server}', 'muted'),
+        (f'active engine binary: {getattr(getattr(app, "runtime_profile", None), "server_command", app.llama_server)}', 'muted'),
         (app.runtime_indicator(), 'muted'),
         (f'vllm: {app.vllm_command}', 'muted'),
         (f'opencode: {app.opencode.path or "<unset>"}  continue: {continue_path}  hermes: {getattr(app.hermes, "command", "hermes")}', 'muted'),
@@ -834,6 +892,7 @@ def build_benchmark_progress_items(
     width: int,
     accent_attr: int = 0,
     normal_attr: int = 0,
+    app: Optional[AppConfig] = None,
 ) -> List[Tuple[str, int]]:
     completed = int(state.get('completed', 0) or 0)
     total = int(state.get('total', 0) or 0)
@@ -853,9 +912,12 @@ def build_benchmark_progress_items(
         pid_line = status_detail
     else:
         model_line = f'model: {model.id}'
+        engine_line = ''
+        if app is not None:
+            engine_line = f'  active engine: {active_engine_short(app, model)}'
         runtime_line = (
             f'arch: {classify_model_type(model)}  runtime: {display_runtime(model)}  '
-            f'offload: {display_offload(model)}  ctx/slot={current_slot}  par={getattr(model, "parallel", 1)}'
+            f'offload: {display_offload(model)}{engine_line}  ctx/slot={current_slot}  par={getattr(model, "parallel", 1)}'
         )
         pid_line = f'pid: {pid or "-"}  {detail}'
     items = [
@@ -2516,10 +2578,19 @@ def show_help_overlay(stdscr, colors):
 def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = None) -> List[Tuple[str, str]]:
     items: List[Tuple[str, str]] = [('Config Doctor', 'heading')]
     llama_ok = app.command_exists(app.llama_server)
+    if active_model is not None:
+        active_engine = active_engine_short(app, active_model)
+        active_binary = active_engine_binary(app, active_model) or app.llama_server
+    else:
+        runtime_profile = getattr(app, 'runtime_profile', None)
+        active_engine = getattr(runtime_profile, 'engine', 'llama.cpp') or 'llama.cpp'
+        active_binary = getattr(runtime_profile, 'server_command', app.llama_server) or app.llama_server
+    active_ok = app.command_exists(active_binary)
     vllm_ok = app.command_exists(app.vllm_command)
     hermes_ok = app.command_exists(getattr(app.hermes, 'command', 'hermes') or 'hermes')
     items.extend([
         (f'llama-server: {"ok" if llama_ok else "missing"}  {app.llama_server}', 'success' if llama_ok else 'error'),
+        (f'active engine: {"ok" if active_ok else "missing"}  {active_engine}  {active_binary}', 'success' if active_ok else 'error'),
         (f'vLLM: {"ok" if vllm_ok else "missing"}  {app.vllm_command}', 'success' if vllm_ok else 'warning'),
         (f'Hermes: {"ok" if hermes_ok else "missing"}  {getattr(app.hermes, "command", "hermes") or "hermes"}', 'success' if hermes_ok else 'warning'),
         (f'OpenCode config: {app.opencode.path or "<unset>"}', 'success' if app.opencode.path else 'warning'),
@@ -4012,7 +4083,8 @@ def tui(stdscr, app: AppConfig):
                 ('[Esc] back   [Enter/l] actions   [T] try   [B] deep bench   [F] fast bench   [O] opencode bench   [H] hermes bench   [R] results   [z] auto   [v] detail density', colors['accent'] | curses.A_BOLD),
                 ('', curses.A_NORMAL),
                 (f'name: {model.name}', curses.A_BOLD),
-                (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                (runtime_engine_source_line(app, model), curses.A_NORMAL),
+                (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
                 (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
                 (f'architecture detail: {architecture_detail(model)}', curses.A_NORMAL),
                 (turboquant_detail_line(model), tq_attr),
@@ -4025,6 +4097,7 @@ def tui(stdscr, app: AppConfig):
                 (f'alias/bind: {model.alias} / http://{model.host}:{model.port}', curses.A_NORMAL),
                 (f'status: {status} ({detail})', status_attr(colors, status)),
                 (f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
+                (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
                 (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
                 (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
                 (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
@@ -4217,7 +4290,8 @@ def tui(stdscr, app: AppConfig):
                 if right_active_tab == 'summary':
                     right_items = [
                         (f'name: {model.name}', curses.A_BOLD),
-                        (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                        (runtime_engine_source_line(app, model), curses.A_NORMAL),
+                        (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
                         (f'path: {model.path}', curses.A_NORMAL),
                         (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
                         (f'quant/architecture/offload: {extract_quant(model)} / {classify_model_type(model)} / {display_offload(model)}', curses.A_NORMAL),
@@ -4230,12 +4304,14 @@ def tui(stdscr, app: AppConfig):
                         (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
                     ]
                 elif right_active_tab == 'logs':
-                    right_items = build_log_items(log_lines, curses.A_NORMAL, colors['muted'])
+                    right_items = [(f'log: {app.logfile(model.id)}', colors['accent'] | curses.A_BOLD)]
+                    right_items.extend(build_log_items(log_lines, curses.A_NORMAL, colors['muted']))
                 elif right_active_tab == 'errors':
                     right_items = build_error_items(error_source_lines, colors['error'], colors['muted'])
                 elif right_active_tab == 'command':
                     right_items = [
                         ('command preview:', colors['accent'] | curses.A_BOLD),
+                        (active_engine_detail_line(app, model), curses.A_NORMAL),
                         (command_preview, curses.A_NORMAL),
                     ]
                 elif right_active_tab == 'benchmarks':
@@ -4306,6 +4382,7 @@ def tui(stdscr, app: AppConfig):
                         pid,
                         right_content_w,
                         accent_attr=colors['accent'] | curses.A_BOLD,
+                        app=app,
                     )
                 elif right_active_tab == 'results':
                     run = {
@@ -4328,7 +4405,8 @@ def tui(stdscr, app: AppConfig):
                         for line, kind in benchmark_command_lines(benchmark_state, right_content_w, BENCHMARK_COMMAND_LIMIT + 1)
                     ]
                 elif right_active_tab == 'logs':
-                    right_items = build_log_items(log_lines, curses.A_NORMAL, colors['muted'])
+                    right_items = [(f'log: {app.logfile(model.id)}', colors['accent'] | curses.A_BOLD)]
+                    right_items.extend(build_log_items(log_lines, curses.A_NORMAL, colors['muted']))
                 elif right_active_tab == 'errors':
                     right_items = build_error_items(error_source_lines, colors['error'], colors['muted'])
 
@@ -4336,7 +4414,8 @@ def tui(stdscr, app: AppConfig):
                 if right_active_tab == 'profile':
                     right_items = [
                         (f'model: {model.name}', curses.A_BOLD),
-                        (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                        (runtime_engine_source_line(app, model), curses.A_NORMAL),
+                        (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
                         (f'status: {status} ({detail})', status_attr(colors, status)),
                         (f'pid: {pid or "-"}', curses.A_NORMAL),
                         (f'url: http://{model.host}:{model.port}', curses.A_NORMAL),
@@ -4352,7 +4431,8 @@ def tui(stdscr, app: AppConfig):
                     if try_error:
                         right_items.append((f'error: {try_error}', colors['error'] | curses.A_BOLD))
                 elif right_active_tab == 'logs':
-                    right_items = build_log_items(log_lines, curses.A_NORMAL, colors['muted'])
+                    right_items = [(f'log: {app.logfile(model.id)}', colors['accent'] | curses.A_BOLD)]
+                    right_items.extend(build_log_items(log_lines, curses.A_NORMAL, colors['muted']))
                 elif right_active_tab == 'errors':
                     right_items = build_error_items(error_source_lines, colors['error'], colors['muted'])
                 elif right_active_tab == 'stats':
@@ -4363,6 +4443,7 @@ def tui(stdscr, app: AppConfig):
                 elif right_active_tab == 'command':
                     right_items = [
                         ('command preview:', colors['accent'] | curses.A_BOLD),
+                        (active_engine_detail_line(app, model), curses.A_NORMAL),
                         (command_preview, curses.A_NORMAL),
                     ]
 
@@ -4423,7 +4504,8 @@ def tui(stdscr, app: AppConfig):
             status, detail = statuses.get(model.id, ('?', ''))
             list_right_items: List[Tuple[str, int]] = [
                 (f'name: {model.name}', curses.A_BOLD),
-                (f'id/runtime/source: {model.id} / {display_runtime(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                (runtime_engine_source_line(app, model), curses.A_NORMAL),
+                (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
                 (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {benchmark_freshness_display(app, model)}', curses.A_NORMAL),
                 (f'tags/verification: {", ".join(list(getattr(model, "tags", []) or [])) or "-"} / {getattr(model, "verification_status", "unknown")}', curses.A_NORMAL),
                 (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
@@ -4433,6 +4515,7 @@ def tui(stdscr, app: AppConfig):
                 (f'benchmark: {getattr(model, "last_benchmark_tokens_per_sec", 0.0):.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', curses.A_NORMAL),
                 (f'status: {status} ({detail})', status_attr(colors, status)),
                 (f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
+                (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
                 (f'browser: search={list_search or "-"} runtime={filter_runtime} source={filter_source} status={filter_status} tag={filter_tag} sort={sort_mode}', colors['muted']),
                 ('', curses.A_NORMAL),
                 ('last log lines:', colors['accent'] | curses.A_BOLD),

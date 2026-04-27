@@ -17,6 +17,7 @@ from llama_tui.ui import (
     body_content_rows,
     body_pane_layout,
     body_pane_height,
+    active_engine_detail_line,
     browser_models,
     build_error_source_lines,
     build_benchmark_progress_items,
@@ -82,6 +83,7 @@ from llama_tui.ui import (
     try_input_wrapped_lines,
     turboquant_detail_line,
     turboquant_status_kind,
+    runtime_engine_source_line,
     update_try_live_metrics,
     visible_selection_window,
     wrap_display_item_lines,
@@ -467,6 +469,35 @@ class BrowserAndFormTests(unittest.TestCase):
         line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
         self.assertIn(' NAT ', line)
         self.assertEqual(turboquant_status_kind(model, buun_session=True), 'success')
+
+    def test_active_engine_labels_distinguish_buun_from_model_runtime(self):
+        model = ModelConfig(id='gemma', name='Gemma', path='gemma.gguf', alias='gemma', port=18080)
+        model.turboquant_status = 'native'
+
+        class Profile:
+            def buun_kv_pair(self):
+                return 'turbo4', 'turbo4'
+
+        class FakeApp:
+            runtime_profile = Profile()
+
+            def role_badges(self, _model_id):
+                return '-'
+
+            def active_engine_key_for_model(self, _model):
+                return 'buun'
+
+            def active_runtime_binary_for_model(self, _model):
+                return 'buun-llama-server'
+
+        line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
+
+        self.assertIn(' ENGINE ', BROWSER_HEADER)
+        self.assertIn(' buun ', line)
+        self.assertIn('model runtime/active engine', runtime_engine_source_line(FakeApp(), model))
+        self.assertIn('llama.cpp / buun', runtime_engine_source_line(FakeApp(), model))
+        self.assertIn('binary: buun-llama-server', active_engine_detail_line(FakeApp(), model))
+        self.assertIn('key=turbo4 value=turbo4', active_engine_detail_line(FakeApp(), model))
 
     def test_machine_best_summary_includes_explanatory_reason(self):
         model = ModelConfig(id='balanced', name='Balanced', path='balanced.gguf', alias='balanced', port=18080)

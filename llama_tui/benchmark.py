@@ -123,6 +123,8 @@ FAILURE_CATEGORIES = (
     'CUDA_OOM_WEIGHTS',
     'CUDA_OOM_KV',
     'KV_MODE_INCOMPATIBLE',
+    'BUUN_FIT_FAILED',
+    'BUUN_CPU_WARMUP_ABORT',
     'MODEL_LOAD_FAILED',
     'SERVER_TIMEOUT',
     'API_TIMEOUT',
@@ -137,9 +139,11 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
     category = default_category if default_category in FAILURE_CATEGORIES else 'SERVER_TIMEOUT'
     reason = detail or category
     suggested = ''
+    terminal = False
     if re.search(r'(unknown|invalid|unrecognized).{0,80}(argument|option|value|flag)', low) or 'requires an argument' in low:
         category = 'CLI_INVALID'
         suggested = 'Check the generated command and use syntax supported by this server binary.'
+        terminal = True
         if 'flash-attn' in low or '-fa' in low:
             reason = 'The binary rejected the generated flash-attn syntax.'
             suggested = 'Use "--flash-attn on" or "-fa on" for builds that require a flash-attn value.'
@@ -147,6 +151,7 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         category = 'CLI_INVALID'
         reason = 'The binary requires --flash-attn to receive a valid value.'
         suggested = 'Use "--flash-attn on" or "-fa on"; do not emit bare "-fa".'
+        terminal = True
     if 'chat template' in low or 'jinja' in low and 'template' in low:
         category = 'CHAT_TEMPLATE_ERROR'
         suggested = 'Disable Jinja or adjust the model chat template before benchmarking.'
@@ -154,20 +159,34 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         category = 'KV_MODE_INCOMPATIBLE'
         reason = detail or 'The selected KV mode is incompatible with this model/head dimension.'
         suggested = 'Try a different TurboKV mode or benchmark default/q8 KV cache.'
-    if 'cudamalloc failed' in low or 'cuda error' in low and 'out of memory' in low or 'out of memory' in low:
+        terminal = True
+    if 'failed to fit params to free device memory' in low or 'n_gpu_layers already set by user' in low:
+        category = 'BUUN_FIT_FAILED'
+        reason = detail or 'buun could not fit the model with the generated GPU layer settings.'
+        suggested = 'Use buun -fit without a fixed -ngl, or reduce the explicit GPU layer fallback.'
+        terminal = True
+    if (
+        ('ggml-cpu/ops.cpp' in low or 'ggml_compute_forward_scale' in low)
+        and ('fatal error' in low or 'abort' in low or 'aborted' in low)
+    ):
+        category = 'BUUN_CPU_WARMUP_ABORT'
+        reason = detail or 'buun CPU/default warmup aborted before serving.'
+        suggested = 'Skip the CPU/default probe and try a GPU fit profile with --no-warmup.'
+        terminal = True
+    if not terminal and ('cudamalloc failed' in low or 'cuda error' in low and 'out of memory' in low or 'out of memory' in low):
         if 'kv' in low or 'cache' in low or 'context' in low:
             category = 'CUDA_OOM_KV'
             suggested = 'Reduce context, parallelism, or KV cache size; for OpenCode prefer parallel=1.'
         else:
             category = 'CUDA_OOM_WEIGHTS'
             suggested = 'Reduce GPU layers; for heavy MoE models try partial offload such as -ngl 20 and --parallel 1.'
-    if 'failed to load model' in low or ('llama_model_load' in low and 'failed' in low) or 'model load failed' in low:
+    if not terminal and ('failed to load model' in low or ('llama_model_load' in low and 'failed' in low) or 'model load failed' in low):
         category = 'MODEL_LOAD_FAILED'
         suggested = suggested or 'Verify the GGUF file and model path, then retry with a smaller launch profile.'
-    if 'connection refused' in low or 'failed to establish a new connection' in low or 'port unreachable' in low:
+    if not terminal and ('connection refused' in low or 'failed to establish a new connection' in low or 'port unreachable' in low):
         category = 'PORT_UNREACHABLE'
         suggested = 'The server process did not expose the expected API port.'
-    if 'timed out' in low or 'timeout' in low:
+    if not terminal and ('timed out' in low or 'timeout' in low):
         category = 'API_TIMEOUT' if default_category == 'API_TIMEOUT' else 'SERVER_TIMEOUT'
         suggested = suggested or 'Retry with a smaller context or lower GPU layer count.'
     return {
@@ -2000,7 +2019,7 @@ def annotate_spectrum_records(
     return records
 
 
-def benchmark_run_summary(winners: Dict[str, Dict[str, object]]) -> str:
+def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Optional[List[Dict[str, object]]] = None) -> str:
     if not winners:
         return 'no winners'
     parts = []
@@ -2013,6 +2032,11 @@ def benchmark_run_summary(winners: Dict[str, Dict[str, object]]) -> str:
         parts.append(f'long={int(long.get("ctx_per_slot", 0) or 0)} ctx/slot')
     if auto:
         parts.append(f'auto={int(auto.get("ctx", 0) or 0)} ctx')
+    if any(
+        str(row.get('engine', '') or '') == 'buun' and bool(row.get('runtime_fit', False))
+        for row in list(winners.values()) + list(records or [])
+    ):
+        parts.append('buun fit profile')
     return ', '.join(parts) if parts else 'no winners'
 
 
@@ -2035,7 +2059,7 @@ def build_benchmark_run(
     hardware: str = '',
 ) -> Dict[str, object]:
     successful = [row for row in records if row.get('status') == 'ok']
-    failed = [row for row in records if row.get('status') not in ('ok', 'probe ok')]
+    failed = [row for row in records if row.get('status') not in ('ok', 'probe ok', 'skipped')]
     elapsed = 0.0
     for row in records:
         elapsed += float(row.get('seconds', 0.0) or 0.0)
@@ -2048,7 +2072,7 @@ def build_benchmark_run(
         'elapsed_seconds': round(elapsed, 2),
         'records': [dict(row) for row in records],
         'winners': {key: dict(value) for key, value in winners.items()},
-        'summary': benchmark_run_summary(winners),
+        'summary': benchmark_run_summary(winners, records),
         'successful': len(successful),
         'failed': len(failed),
         'hardware': hardware,
@@ -2082,6 +2106,10 @@ def adaptive_record_from_candidate(
     kv_compression_tier: str = '',
     kv_score_penalty: float = 0.0,
     benchmark_depth: str = '',
+    runtime_fit: bool = False,
+    fit_context: int = 0,
+    runtime_no_warmup: bool = False,
+    gpu_layers_mode: str = '',
     startup_result: str = '',
     failure_category: str = '',
     failure_reason: str = '',
@@ -2133,6 +2161,10 @@ def adaptive_record_from_candidate(
         'kv_compression_tier': kv_compression_tier,
         'kv_score_penalty': round(float(kv_score_penalty or 0.0), 4),
         'benchmark_depth': benchmark_depth,
+        'runtime_fit': bool(runtime_fit),
+        'fit_context': int(fit_context or 0),
+        'runtime_no_warmup': bool(runtime_no_warmup),
+        'gpu_layers_mode': gpu_layers_mode,
         'startup_result': startup_result,
         'failure_category': failure_category,
         'failure_reason': concise_failure(failure_reason, limit=500),
@@ -2216,6 +2248,14 @@ def runtime_record_context(
             turbo_profile.score_penalty if turbo_profile is not None else 0.0
         ),
         'benchmark_depth': getattr(profile, 'benchmark_depth', '') if profile is not None else '',
+        'runtime_fit': bool(getattr(profile, 'fit', False)) if profile is not None else False,
+        'fit_context': int(getattr(profile, 'fit_context', 0) or 0) if profile is not None else 0,
+        'runtime_no_warmup': bool(getattr(profile, 'no_warmup', False)) if profile is not None else False,
+        'gpu_layers_mode': (
+            'fit' if profile is not None and getattr(profile, 'gpu_layers', None) is None and getattr(profile, 'fit', False)
+            else 'fixed' if profile is not None and getattr(profile, 'gpu_layers', None) is not None
+            else ''
+        ),
         'command': command,
     }
 
@@ -2632,13 +2672,18 @@ def active_engine_runtime_profiles(
     heavy_for_gpu = bool(has_gpu and size > 0 and size > int(vram_free * 0.82))
     moe = model_is_moe(model)
     turbo_profiles = supported_turbo_kv_profiles(capabilities, benchmark_depth)
+    turboquant_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+    turboquant_compatible = turboquant_status in ('native', 'padded')
     supports_turbo = bool(
         engine == 'buun'
         and getattr(getattr(app, 'runtime_profile', None), 'supports_turbo_kv', False)
         and capabilities.supports_ctk_ctv
         and has_gpu
         and turbo_profiles
+        and turboquant_compatible
     )
+    supports_buun_fit = bool(engine == 'buun' and has_gpu and capabilities.supports_fit)
+    fit_only_buun = bool(supports_buun_fit and (heavy_for_gpu or (moe and not fits_gpu)))
     supports_cache_kv = bool(capabilities.supports_cache_type_kv and engine != 'buun')
     base_ctx = max(ctx_min, min(ctx_max, 8192 if (moe or heavy_for_gpu or supports_turbo) else 4096))
     profiles: List[RuntimeProfile] = []
@@ -2669,14 +2714,18 @@ def active_engine_runtime_profiles(
     def add(
         name: str,
         ctx: int,
-        ngl: int,
+        ngl: Optional[int],
         kv_preset: str,
         batch: int = 256,
         ubatch: int = 128,
         kv_profile=None,
+        fit: bool = False,
+        fit_context: int = 0,
+        no_warmup: bool = False,
     ):
         ctx = max(ctx_min, min(ctx_max, int(ctx or base_ctx)))
-        key = (name, ctx, int(ngl), kv_preset)
+        ngl_key = 'fit' if ngl is None else int(ngl)
+        key = (name, ctx, ngl_key, kv_preset, bool(fit), int(fit_context or 0), bool(no_warmup))
         if key in seen:
             return
         seen.add(key)
@@ -2685,12 +2734,15 @@ def active_engine_runtime_profiles(
             engine_id=engine,
             name=name,
             ctx_size=ctx,
-            gpu_layers=int(ngl),
+            gpu_layers=None if ngl is None else int(ngl),
             parallel=1,
             kv_preset=kv_preset,
             flash_attn='on',
             batch_size=batch,
             ubatch_size=ubatch,
+            fit=bool(fit),
+            fit_context=max(ctx_min, min(ctx, int(fit_context or ctx_min))) if fit else 0,
+            no_warmup=bool(no_warmup),
             kv_family=family,
             kv_quality_tier=getattr(kv_profile, 'quality_tier', '') if kv_profile is not None else '',
             kv_compression_tier=getattr(kv_profile, 'compression_tier', '') if kv_profile is not None else '',
@@ -2698,13 +2750,114 @@ def active_engine_runtime_profiles(
             benchmark_depth=benchmark_depth,
         ))
 
-    add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, 'default', batch=128, ubatch=64)
+    def fit_context_for(ctx: int) -> int:
+        return min(int(ctx or base_ctx), max(ctx_min, 4096))
+
+    if not (engine == 'buun' and has_gpu):
+        add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, 'default', batch=128, ubatch=64)
     if has_gpu:
+        initial_fit_kv = ''
+        if supports_buun_fit:
+            if supports_turbo:
+                turbo4_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), turbo_profiles[0])
+                initial_fit_kv = turbo4_profile.kv_preset
+                add(
+                    'fit_turbokv_probe',
+                    base_ctx,
+                    None,
+                    turbo4_profile.kv_preset,
+                    batch=128,
+                    ubatch=64,
+                    kv_profile=turbo4_profile,
+                    fit=True,
+                    fit_context=fit_context_for(base_ctx),
+                    no_warmup=capabilities.supports_no_warmup,
+                )
+            else:
+                initial_fit_kv = 'default'
+                add(
+                    'fit_default_probe',
+                    base_ctx,
+                    None,
+                    'default',
+                    batch=128,
+                    ubatch=64,
+                    fit=True,
+                    fit_context=fit_context_for(base_ctx),
+                    no_warmup=capabilities.supports_no_warmup,
+                )
+        context_points = (8192, 16384) if benchmark_depth == 'fast' else (8192, 16384, 24576, 32768)
+        if fit_only_buun:
+            if supports_turbo:
+                for kv_profile in turbo_profiles:
+                    if kv_profile.kv_preset == initial_fit_kv:
+                        continue
+                    add(
+                        f'fit_kv_compression_probe_{kv_profile.name_slug}',
+                        base_ctx,
+                        None,
+                        kv_profile.kv_preset,
+                        batch=128,
+                        ubatch=64,
+                        kv_profile=kv_profile,
+                        fit=True,
+                        fit_context=fit_context_for(base_ctx),
+                        no_warmup=capabilities.supports_no_warmup,
+                    )
+                growth_profiles = [
+                    item for item in turbo_profiles
+                    if not item.scalar and (
+                        benchmark_depth == 'full'
+                        or item.kv_preset in ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq')
+                    )
+                ]
+                if benchmark_depth == 'fast':
+                    next_ctx = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
+                    growth_contexts = (next_ctx,) if next_ctx else ()
+                else:
+                    growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
+                for kv_profile in growth_profiles:
+                    for ctx in growth_contexts:
+                        add(
+                            f'fit_context_growth_sweep_{ctx}_{kv_profile.name_slug}',
+                            ctx,
+                            None,
+                            kv_profile.kv_preset,
+                            batch=128,
+                            ubatch=64,
+                            kv_profile=kv_profile,
+                            fit=True,
+                            fit_context=fit_context_for(ctx),
+                            no_warmup=capabilities.supports_no_warmup,
+                        )
+            else:
+                for ctx in context_points:
+                    if ctx <= base_ctx or ctx > ctx_max:
+                        continue
+                    add(
+                        f'fit_context_growth_sweep_{ctx}',
+                        ctx,
+                        None,
+                        'default',
+                        batch=128,
+                        ubatch=64,
+                        fit=True,
+                        fit_context=fit_context_for(ctx),
+                        no_warmup=capabilities.supports_no_warmup,
+                    )
+            return profiles
         add('partial_gpu_probe', base_ctx, partial_ngl, kv_for_strategy('partial_gpu_probe'))
         if supports_turbo:
             for kv_profile in turbo_profiles:
                 name = 'kv_compression_probe' if kv_profile.kv_preset == 'turbo4/turbo4' else f'kv_compression_probe_{kv_profile.name_slug}'
-                add(name, base_ctx, partial_ngl, kv_profile.kv_preset, kv_profile=kv_profile)
+                add(
+                    name,
+                    base_ctx,
+                    partial_ngl,
+                    kv_profile.kv_preset,
+                    kv_profile=kv_profile,
+                    no_warmup=capabilities.supports_no_warmup,
+                )
         elif supports_cache_kv:
             add('kv_compression_probe', base_ctx, partial_ngl, kv_for_strategy('kv_compression_probe'))
         if benchmark_depth == 'full':
@@ -2797,13 +2950,32 @@ def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: 
         'candidate': benchmark_config_fingerprint(candidate),
         'engine_id': runtime_profile.engine_id,
         'runtime_profile': runtime_profile.name,
+        'gpu_layers': runtime_profile.gpu_layers,
         'kv_preset': runtime_profile.kv_preset,
         'flash_attn': runtime_profile.flash_attn,
         'batch_size': int(runtime_profile.batch_size or 0),
         'ubatch_size': int(runtime_profile.ubatch_size or 0),
+        'fit': bool(runtime_profile.fit),
+        'fit_context': int(runtime_profile.fit_context or 0),
+        'no_warmup': bool(runtime_profile.no_warmup),
         'extra_args': list(runtime_profile.extra_args or ()),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+
+def runtime_profile_is_buun_fit(runtime_profile: RuntimeProfile) -> bool:
+    return (
+        str(getattr(runtime_profile, 'engine_id', '') or '') == 'buun'
+        and bool(getattr(runtime_profile, 'fit', False))
+        and getattr(runtime_profile, 'gpu_layers', None) is None
+    )
+
+
+def runtime_profile_is_fixed_buun(runtime_profile: RuntimeProfile) -> bool:
+    return (
+        str(getattr(runtime_profile, 'engine_id', '') or '') == 'buun'
+        and getattr(runtime_profile, 'gpu_layers', None) is not None
+    )
 
 
 def smart_should_continue_optional(
@@ -3007,9 +3179,10 @@ def benchmark_runtime_profile_with_retry(
 ) -> Tuple[bool, bool, List[Dict[str, object]], List[Dict[str, object]], int]:
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
+    ngl_label = 'fit' if runtime_profile.gpu_layers is None else str(runtime_profile.gpu_layers)
     candidate_label = (
         f'{runtime_profile.name} ctx={runtime_profile.ctx_size} '
-        f'ngl={runtime_profile.gpu_layers} par={runtime_profile.parallel} kv={runtime_profile.kv_preset}'
+        f'ngl={ngl_label} par={runtime_profile.parallel} kv={runtime_profile.kv_preset}'
     )
     attempts = max(1, int(max_attempts or 1))
     for attempt in range(1, attempts + 1):
@@ -3067,6 +3240,16 @@ def benchmark_runtime_profile_with_retry(
         emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label, run_kind=run_kind)
         if ok:
             return True, False, records, measured, completed
+        deterministic_failures = {
+            'CLI_INVALID',
+            'KV_MODE_INCOMPATIBLE',
+            'BUUN_FIT_FAILED',
+            'BUUN_CPU_WARMUP_ABORT',
+        }
+        if str(record.get('failure_category', '') or '') in deterministic_failures:
+            if progress:
+                progress(f'runtime profile candidate {candidate_label} failed with {record.get("failure_category")}; moving to a different profile.')
+            break
         if attempt < attempts and progress:
             progress(f'runtime profile candidate {candidate_label} failed once; retrying to confirm break...')
     return False, True, records, measured, completed
@@ -3415,7 +3598,12 @@ def benchmark_exhaustive_profiles(
                 total=total,
             )
             runtime_deadline = started_monotonic + FULL_RUNTIME_PROFILE_BUDGET_SECONDS
+            buun_fit_succeeded = False
+            fixed_buun_skipped = 0
             for runtime_profile in runtime_profiles:
+                if buun_fit_succeeded and runtime_profile_is_fixed_buun(runtime_profile):
+                    fixed_buun_skipped += 1
+                    continue
                 if time.monotonic() >= runtime_deadline:
                     if progress:
                         progress('smart bounded runtime profile budget reached; selecting from measured candidates')
@@ -3437,6 +3625,12 @@ def benchmark_exhaustive_profiles(
                 measured.extend(new_measured)
                 for item in new_measured:
                     full_by_fingerprint[str(item.get('config_fingerprint', '') or '')] = item
+                if ok and runtime_profile_is_buun_fit(runtime_profile):
+                    buun_fit_succeeded = True
+                    if progress:
+                        progress('smart bounded buun fit profile succeeded; skipping fixed-NGL buun fallback probes')
+            if fixed_buun_skipped and progress:
+                progress(f'smart bounded skipped {fixed_buun_skipped} fixed-NGL buun profile(s) after fit success')
         else:
             default_successes, default_failures, default_break = run_frontier('default')
             if not default_successes:
@@ -3647,8 +3841,13 @@ def benchmark_fast_profiles(
     try:
         if runtime_profiles:
             deadline = time.monotonic() + FAST_RUNTIME_PROFILE_BUDGET_SECONDS
+            buun_fit_succeeded = False
+            fixed_buun_skipped = 0
             for runtime_profile in runtime_profiles:
                 check_cancelled(cancel_token)
+                if buun_fit_succeeded and runtime_profile_is_fixed_buun(runtime_profile):
+                    fixed_buun_skipped += 1
+                    continue
                 if time.monotonic() >= deadline:
                     if progress:
                         progress('fast runtime profile budget reached; selecting from measured candidates')
@@ -3669,6 +3868,12 @@ def benchmark_fast_profiles(
                 )
                 records.extend(new_records)
                 measured.extend(new_measured)
+                if ok and runtime_profile_is_buun_fit(runtime_profile):
+                    buun_fit_succeeded = True
+                    if progress:
+                        progress('fast buun fit profile succeeded; skipping fixed-NGL buun fallback probes')
+            if fixed_buun_skipped and progress:
+                progress(f'fast skipped {fixed_buun_skipped} fixed-NGL buun profile(s) after fit success')
         else:
             chat_floor = chat_min_ctx_per_slot(model)
             for ctx in contexts:

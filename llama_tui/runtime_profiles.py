@@ -34,6 +34,12 @@ RUNTIME_TUNING_FLAGS = (
     '--ubatch-size',
     '-b',
     '-ub',
+    '--fit',
+    '-fit',
+    '--fit-ctx',
+    '-fitc',
+    '--warmup',
+    '--no-warmup',
 )
 
 
@@ -44,6 +50,9 @@ class EngineCapabilities:
     supports_ctk_ctv: bool = False
     supports_cache_type_kv: bool = True
     supports_parallel: bool = True
+    supports_fit: bool = False
+    supports_fit_ctx: bool = False
+    supports_no_warmup: bool = False
     gpu_layers_flag: str = '--n-gpu-layers'
     supported_kv_modes: Tuple[str, ...] = ()
     help_text: str = ''
@@ -158,12 +167,15 @@ class EngineProfile:
 class RuntimeProfile:
     engine_id: str
     ctx_size: int
-    gpu_layers: int
+    gpu_layers: Optional[int]
     parallel: int
     kv_preset: str = 'default'
     flash_attn: str = 'auto'
     batch_size: int = 0
     ubatch_size: int = 0
+    fit: bool = False
+    fit_context: int = 0
+    no_warmup: bool = False
     extra_args: Tuple[str, ...] = field(default_factory=tuple)
     name: str = ''
     kv_family: str = 'default'
@@ -235,6 +247,9 @@ def default_engine_capabilities(engine_id: str = 'llama.cpp') -> EngineCapabilit
             supports_ctk_ctv=True,
             supports_cache_type_kv=False,
             supports_parallel=True,
+            supports_fit=True,
+            supports_fit_ctx=True,
+            supports_no_warmup=True,
             gpu_layers_flag='-ngl',
             supported_kv_modes=BUUN_KV_MODES,
         )
@@ -301,6 +316,9 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         else defaults.supports_cache_type_kv
     )
     supports_parallel = '--parallel' in low if '--parallel' in low else defaults.supports_parallel
+    supports_fit = bool(re.search(r'(^|\s)--?fit(\s|,|$)', low) or defaults.supports_fit)
+    supports_fit_ctx = ('-fitc' in low or '--fit-ctx' in low or defaults.supports_fit_ctx)
+    supports_no_warmup = ('--no-warmup' in low or defaults.supports_no_warmup)
     if '--n-gpu-layers' in low:
         gpu_layers_flag = '--n-gpu-layers'
     elif re.search(r'(^|\s)-ngl(\s|,|$)', low):
@@ -316,6 +334,9 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_ctk_ctv=supports_ctk_ctv,
         supports_cache_type_kv=supports_cache_type_kv,
         supports_parallel=supports_parallel,
+        supports_fit=supports_fit,
+        supports_fit_ctx=supports_fit_ctx,
+        supports_no_warmup=supports_no_warmup,
         gpu_layers_flag=gpu_layers_flag,
         supported_kv_modes=supported_kv_modes,
         help_text=text,
@@ -420,5 +441,11 @@ def runtime_profile_extra_args(
         args += ['--batch-size', str(int(runtime_profile.batch_size))]
     if runtime_profile.ubatch_size > 0:
         args += ['--ubatch-size', str(int(runtime_profile.ubatch_size))]
+    if runtime_profile.fit and capabilities.supports_fit:
+        args += ['-fit', 'on']
+        if runtime_profile.fit_context > 0 and capabilities.supports_fit_ctx:
+            args += ['-fitc', str(int(runtime_profile.fit_context))]
+    if runtime_profile.no_warmup and capabilities.supports_no_warmup:
+        args.append('--no-warmup')
     args.extend(str(item) for item in runtime_profile.extra_args)
     return args
