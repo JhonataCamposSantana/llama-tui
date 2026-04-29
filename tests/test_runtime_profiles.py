@@ -211,6 +211,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 patch.object(app, 'runtime_command_ready', return_value=(True, '')), \
                 patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('buun')), \
                 patch.object(app, 'enrich_model_turboquant', return_value=False), \
+                patch.object(app, 'get_pid', return_value=None), \
                 patch.object(app, 'wait_until_ready', return_value=(True, 'ready')), \
                 patch.object(app, 'logfile', side_effect=lambda model_id: root / f'{model_id}.log'), \
                 patch.object(app, 'pidfile', side_effect=lambda model_id: root / f'{model_id}.pid'), \
@@ -400,6 +401,86 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertIn('--cache-type-k', cmd)
         self.assertIn('--cache-type-v', cmd)
         self.assertNotIn('-ctk', cmd)
+
+    def test_continue_tool_export_forces_jinja_for_llamacpp_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='dense',
+                name='Dense',
+                path='/models/dense.gguf',
+                alias='dense',
+                port=18080,
+                jinja=False,
+            )
+            caps = default_engine_capabilities('llama.cpp')
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model)
+
+        self.assertIn('--jinja', cmd)
+
+    def test_continue_tool_export_forces_jinja_for_buun_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='qwen',
+                name='Qwen',
+                path='/models/qwen.gguf',
+                alias='qwen',
+                port=18080,
+                jinja=False,
+            )
+            caps = default_engine_capabilities('buun')
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model)
+
+        self.assertIn('--jinja', cmd)
+
+    def test_continue_tool_export_does_not_add_jinja_to_vllm_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='vllm',
+                name='vLLM',
+                path='org/model',
+                alias='vllm-model',
+                port=18080,
+                runtime='vllm',
+                jinja=False,
+                extra_args=['--trust-remote-code'],
+            )
+
+            cmd = app.build_command(model)
+
+        self.assertNotIn('--jinja', cmd)
+        self.assertIn('--trust-remote-code', cmd)
+
+    def test_continue_tool_export_preserves_template_override_without_chatml_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='dense',
+                name='Dense',
+                path='/models/dense.gguf',
+                alias='dense',
+                port=18080,
+                jinja=False,
+                extra_args=['--chat-template-file', '/models/tool-template.jinja'],
+            )
+            caps = default_engine_capabilities('llama.cpp')
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model)
+
+        self.assertIn('--jinja', cmd)
+        self.assertIn('--chat-template-file', cmd)
+        self.assertIn('/models/tool-template.jinja', cmd)
+        self.assertNotIn('chatml', cmd)
 
     def test_runtime_profile_command_accepts_known_working_buun_shape(self):
         with tempfile.TemporaryDirectory() as tmp:

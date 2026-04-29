@@ -1205,6 +1205,13 @@ class AppConfig:
     def continue_base_url(self, model: ModelConfig) -> str:
         return f'http://{model.host}:{model.port}/v1'
 
+    def continue_tool_use_launch_required(self, model: ModelConfig) -> bool:
+        if not bool(getattr(model, 'enabled', True)):
+            return False
+        if not getattr(self.continue_settings, 'path', ''):
+            return False
+        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun')
+
     def hermes_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
 
@@ -2159,7 +2166,7 @@ class AppConfig:
             '--cache-ram', str(model.cache_ram),
             '--temp', str(model.temp),
         ]
-        if model.jinja:
+        if model.jinja or self.continue_tool_use_launch_required(model):
             cmd += ['--jinja']
         cmd += runtime_profile_extra_args(
             engine_profile,
@@ -2696,10 +2703,14 @@ class AppConfig:
                 '    provider: "openai"',
                 f'    model: {yaml_quote(self.continue_model_ref(model))}',
                 f'    apiBase: {yaml_quote(self.continue_base_url(model))}',
-                '    apiKey: "no-key-required"',
+                '    apiKey: "sk-no-key-required"',
                 '    roles:',
             ])
             lines.extend(f'      - {role}' for role in ('chat', 'edit', 'apply', 'autocomplete'))
+            lines.extend([
+                '    capabilities:',
+                '      - tool_use',
+            ])
             lines.extend([
                 '    defaultCompletionOptions:',
                 f'      contextLength: {max(1, context_per_slot(model))}',

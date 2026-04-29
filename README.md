@@ -131,7 +131,7 @@ Useful per-model fields:
 - `ngl`: `llama.cpp` GPU layer offload count.
 - `parallel`: llama.cpp parallel slots.
 - `cache_ram`: llama.cpp prompt cache RAM value.
-- `flash_attn`, `jinja`, `extra_args`: runtime flags.
+- `flash_attn`, `jinja`, `extra_args`: runtime flags. Continue tool-capable llama.cpp and buun exports force `--jinja` at launch; add `--chat-template-file ...` in `extra_args` when a GGUF needs a tool-use template override.
 - `optimize_mode`: `max_context_safe` or `manual`.
 - `optimize_tier`: `safe`, `moderate`, or `extreme`.
 - `ctx_min`, `ctx_max`, `memory_reserve_percent`: guardrails for auto tuning.
@@ -213,6 +213,8 @@ llama-server \
   --flash-attn on \
   --jinja
 ```
+
+For Continue Agent Mode tool use, llama-tui forces `--jinja` for enabled Continue-exported llama.cpp and buun models even when the saved model setting has `jinja` off. It does not add a fallback chat template; use model `extra_args` such as `--chat-template-file /path/to/tool-template.jinja` for GGUFs whose embedded template is not tool-use compatible.
 
 For vLLM, llama-tui builds:
 
@@ -423,7 +425,9 @@ If VS Code is unavailable, it still launches the model + OpenCode path and repor
 
 Press `c` to generate the config. By default `continue.path` is `~/.continue/config.yaml`; you can override it in settings if your Continue install uses a different YAML path.
 
-llama-tui writes a local Continue `config.yaml` using the OpenAI-compatible provider format. Every enabled llama-tui-managed model is exported with `chat`, `edit`, `apply`, and `autocomplete` roles plus autocomplete options, so Continue can use any exported model for the interactive coding roles.
+llama-tui writes a local Continue `config.yaml` using the OpenAI-compatible provider format. Every enabled llama-tui-managed model is exported with `chat`, `edit`, `apply`, and `autocomplete` roles, autocomplete options, and the `tool_use` capability so Continue can use any exported model for interactive coding roles and Agent Mode tool calls.
+
+Continue MCP tools only execute in Agent Mode. In plain Chat mode, Continue may still read rules and context, but it will not run MCP tools.
 
 `continue.default_model_id`, `continue.edit_model_id`, and `continue.autocomplete_model_id` still influence the order of the generated model list. If a Continue role is blank, llama-tui falls back to the matching OpenCode role; if those are also blank, it uses the first enabled model for chat/edit and the second enabled model for autocomplete when available.
 

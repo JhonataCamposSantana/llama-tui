@@ -2588,15 +2588,36 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
     active_ok = app.command_exists(active_binary)
     vllm_ok = app.command_exists(app.vllm_command)
     hermes_ok = app.command_exists(getattr(app.hermes, 'command', 'hermes') or 'hermes')
+    continue_path = getattr(app.continue_settings, 'path', '') or ''
     items.extend([
         (f'llama-server: {"ok" if llama_ok else "missing"}  {app.llama_server}', 'success' if llama_ok else 'error'),
         (f'active engine: {"ok" if active_ok else "missing"}  {active_engine}  {active_binary}', 'success' if active_ok else 'error'),
         (f'vLLM: {"ok" if vllm_ok else "missing"}  {app.vllm_command}', 'success' if vllm_ok else 'warning'),
         (f'Hermes: {"ok" if hermes_ok else "missing"}  {getattr(app.hermes, "command", "hermes") or "hermes"}', 'success' if hermes_ok else 'warning'),
         (f'OpenCode config: {app.opencode.path or "<unset>"}', 'success' if app.opencode.path else 'warning'),
-        (f'Continue config: {getattr(app.continue_settings, "path", "") or "<unset>"} mode={getattr(app.continue_settings, "merge_mode", "preserve_sections")}', 'success' if getattr(app.continue_settings, 'path', '') else 'warning'),
+        (f'Continue config: {continue_path or "<unset>"} mode={getattr(app.continue_settings, "merge_mode", "preserve_sections")}', 'success' if continue_path else 'warning'),
         (f'Hermes home: {getattr(app.hermes, "home_root", "") or "<unset>"}', 'success' if getattr(app.hermes, 'home_root', '') else 'warning'),
     ])
+    enabled_continue_models = [
+        model
+        for model in list(getattr(app, 'models', []) or [])
+        if bool(getattr(model, 'enabled', True)) and continue_path
+    ]
+    items.append((
+        f'Continue Agent tools: tool_use exported for {len(enabled_continue_models)} model(s); MCP requires Agent Mode',
+        'success' if enabled_continue_models else 'muted',
+    ))
+    if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'buun'):
+        try:
+            tool_jinja_ready = bool(app.continue_tool_use_launch_required(active_model)) or bool(getattr(active_model, 'jinja', True))
+        except Exception:
+            tool_jinja_ready = bool(getattr(active_model, 'jinja', True))
+        items.append((
+            'Continue llama.cpp tools: --jinja ready; use extra_args --chat-template-file when needed'
+            if tool_jinja_ready
+            else 'Continue llama.cpp tools: --jinja disabled; Agent tools may fail',
+            'success' if tool_jinja_ready else 'warning',
+        ))
     terminal = app.detect_terminal_launcher()
     items.append((f'terminal launcher: {terminal or "<not detected>"}', 'success' if terminal else 'warning'))
     code_ok = app.command_exists('code')

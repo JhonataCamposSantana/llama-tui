@@ -19,6 +19,9 @@ def assert_all_interactive_roles(testcase: unittest.TestCase, block: str):
     for role in ('chat', 'edit', 'apply', 'autocomplete'):
         testcase.assertIn(f'      - {role}', block)
     testcase.assertIn('autocompleteOptions:', block)
+    testcase.assertIn('apiKey: "sk-no-key-required"', block)
+    testcase.assertIn('capabilities:', block)
+    testcase.assertIn('      - tool_use', block)
 
 
 class ContinueIntegrationTests(unittest.TestCase):
@@ -331,4 +334,5 @@ class ContinueIntegrationTests(unittest.TestCase):
         self.assertEqual(text.count('  # BEGIN llama-tui managed models'), 1)
         self.assertEqual(text.count('  # END llama-tui managed models'), 1)
         self.assertNotIn('Stale Model', text)
+        self.assertNotIn('tool_use', text)
         self.assertIn('  - name: "User Model"', text)
