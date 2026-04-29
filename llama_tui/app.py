@@ -2372,7 +2372,7 @@ class AppConfig:
     def leave_managed_processes_running(self):
         self._shutdown_cleanup_done = True
 
-    def add_or_update(self, model: ModelConfig):
+    def add_or_update(self, model: ModelConfig, sync_exports: bool = False):
         self.enrich_model_architecture(model)
         self.enrich_model_turboquant(model)
         for idx, existing in enumerate(self.models):
@@ -2386,14 +2386,18 @@ class AppConfig:
                 self.models[idx] = model
                 self._normalize_model_ranks()
                 self.save()
+                if sync_exports:
+                    self.sync_generated_configs('model update')
                 return
         if not getattr(model, 'sort_rank', 0):
             model.sort_rank = self.next_sort_rank()
         self.models.append(model)
         self._normalize_model_ranks()
         self.save()
+        if sync_exports:
+            self.sync_generated_configs('model add')
 
-    def delete(self, model_id: str) -> Tuple[bool, str]:
+    def delete(self, model_id: str, sync_exports: bool = False) -> Tuple[bool, str]:
         for i, model in enumerate(self.models):
             if model.id == model_id:
                 self.stop(model)
@@ -2401,12 +2405,16 @@ class AppConfig:
                 self._clear_pid_tracking(model_id)
                 self._clear_roles(model_id)
                 self.save()
-                return True, 'deleted'
+                msg = 'deleted'
+                if sync_exports:
+                    msg += f' | {self.sync_generated_configs("model delete", removed_models=[model])}'
+                return True, msg
         return False, 'not found'
 
-    def prune_missing_models(self) -> Tuple[int, List[str]]:
+    def prune_missing_models(self, sync_exports: bool = False) -> Tuple[int, List[str]]:
         discovered, _ = self.discover_source_files()
-        removed = []
+        removed: List[str] = []
+        removed_models: List[ModelConfig] = []
         changed = False
         for model in list(self.models):
             source = self.infer_model_source(model)
@@ -2427,15 +2435,20 @@ class AppConfig:
                 should_remove = normalized not in discovered
 
             if should_remove:
-                self.delete(model.id)
+                ok, _msg = self.delete(model.id, sync_exports=False)
+                if not ok:
+                    continue
                 removed.append(model.id)
+                removed_models.append(model)
                 changed = True
 
         if changed:
             self.save()
+            if sync_exports:
+                self.sync_generated_configs('model prune', removed_models=removed_models)
         return len(removed), removed
 
-    def detect_models(self) -> Tuple[int, List[str]]:
+    def detect_models(self, sync_exports: bool = False) -> Tuple[int, List[str]]:
         discovered, notes = self.discover_source_files()
         existing_paths = {self.normalize_model_ref(m.path): m for m in self.models}
         added = []
@@ -2450,14 +2463,16 @@ class AppConfig:
                 continue
 
             model = detected_model_from_path(gguf, self.models, source=source)
-            self.add_or_update(model)
+            self.add_or_update(model, sync_exports=False)
             existing_paths[resolved] = model
             added.append(model.id)
             changed = True
 
-        removed_count, removed = self.prune_missing_models()
+        removed_count, removed = self.prune_missing_models(sync_exports=sync_exports)
         if changed:
             self.save()
+        if sync_exports and changed and not removed:
+            self.sync_generated_configs('model detect')
 
         parts = []
         if added:
@@ -2494,11 +2509,14 @@ class AppConfig:
         for attr in ('default_model_id', 'small_model_id', 'build_model_id', 'plan_model_id'):
             if getattr(self.opencode, attr) == model_id:
                 setattr(self.opencode, attr, '')
+        for attr in ('default_model_id', 'edit_model_id', 'autocomplete_model_id'):
+            if getattr(self.continue_settings, attr) == model_id:
+                setattr(self.continue_settings, attr, '')
         for attr in ('default_model_id', 'code_model_id'):
             if getattr(self.hermes, attr) == model_id:
                 setattr(self.hermes, attr, '')
 
-    def set_role(self, role: str, model_id: str):
+    def set_role(self, role: str, model_id: str, sync_exports: bool = False):
         mapping = {
             'main': 'default_model_id',
             'small': 'small_model_id',
@@ -2508,6 +2526,8 @@ class AppConfig:
         attr = mapping[role]
         setattr(self.opencode, attr, model_id)
         self.save()
+        if sync_exports:
+            self.sync_generated_configs(f'{role} role update')
 
     def role_badges(self, model_id: str) -> str:
         badges = []
@@ -2541,13 +2561,13 @@ class AppConfig:
                 return measured_ctx
         return max(1, context_per_slot(model))
 
-    def generate_opencode(self) -> Tuple[bool, str]:
+    def generate_opencode(self, allow_empty: bool = True) -> Tuple[bool, str]:
         path = Path(self.opencode.path).expanduser() if self.opencode.path else None
         if not path:
             return False, 'Set opencode.path first in settings.'
 
         enabled_models = [m for m in self.models if m.enabled]
-        if not enabled_models:
+        if not enabled_models and not allow_empty:
             return False, 'No enabled models to export.'
 
         default_model = self.get_model(self.opencode.default_model_id) or (enabled_models[0] if enabled_models else None)
@@ -2590,8 +2610,8 @@ class AppConfig:
                 }
             }
 
-        def ref(model: ModelConfig) -> str:
-            return self.opencode_model_ref(model)
+        def ref(model: Optional[ModelConfig]) -> str:
+            return self.opencode_model_ref(model) if model else ''
 
         config = {
             '$schema': existing.get('$schema', 'https://opencode.ai/config.json'),
@@ -2636,6 +2656,12 @@ class AppConfig:
         return default_model, edit_model, autocomplete_model
 
     def _continue_managed_model_lines(self, enabled_models: List[ModelConfig]) -> List[str]:
+        if not enabled_models:
+            return [
+                CONTINUE_MANAGED_BEGIN,
+                '  # Generated by llama-tui. Edit models in llama-tui, then regenerate.',
+                CONTINUE_MANAGED_END,
+            ]
         default_model, edit_model, autocomplete_model = self.continue_role_models(enabled_models)
         ordered_models: List[ModelConfig] = []
         seen_ids = set()
@@ -2657,22 +2683,6 @@ class AppConfig:
             used_names.add(candidate)
             return candidate
 
-        def model_roles(model: ModelConfig) -> List[str]:
-            roles: List[str] = []
-            if model.id == default_model.id:
-                roles.append('chat')
-            if model.id == edit_model.id:
-                roles.extend(['edit', 'apply'])
-            if model.id == autocomplete_model.id:
-                roles.append('autocomplete')
-            if not roles:
-                roles.append('chat')
-            deduped: List[str] = []
-            for role in roles:
-                if role not in deduped:
-                    deduped.append(role)
-            return deduped
-
         def autocomplete_prompt_tokens(model: ModelConfig) -> int:
             return min(2048, max(256, context_per_slot(model)))
 
@@ -2681,7 +2691,6 @@ class AppConfig:
             '  # Generated by llama-tui. Edit models in llama-tui, then regenerate.',
         ]
         for model in ordered_models:
-            roles = model_roles(model)
             lines.extend([
                 f'  - name: {yaml_quote(model_display_name(model))}',
                 '    provider: "openai"',
@@ -2690,20 +2699,19 @@ class AppConfig:
                 '    apiKey: "no-key-required"',
                 '    roles:',
             ])
-            lines.extend(f'      - {role}' for role in roles)
+            lines.extend(f'      - {role}' for role in ('chat', 'edit', 'apply', 'autocomplete'))
             lines.extend([
                 '    defaultCompletionOptions:',
                 f'      contextLength: {max(1, context_per_slot(model))}',
                 f'      maxTokens: {max(1, int(getattr(model, "output", 0) or 0))}',
                 f'      temperature: {float(getattr(model, "temp", 0.7) or 0.7)}',
             ])
-            if 'autocomplete' in roles:
-                lines.extend([
-                    '    autocompleteOptions:',
-                    '      debounceDelay: 250',
-                    f'      maxPromptTokens: {autocomplete_prompt_tokens(model)}',
-                    '      onlyMyCode: true',
-                ])
+            lines.extend([
+                '    autocompleteOptions:',
+                '      debounceDelay: 250',
+                f'      maxPromptTokens: {autocomplete_prompt_tokens(model)}',
+                '      onlyMyCode: true',
+            ])
         lines.append(CONTINUE_MANAGED_END)
         return lines
 
@@ -2718,19 +2726,32 @@ class AppConfig:
         ]
         return '\n'.join(lines) + '\n'
 
+    def _strip_continue_managed_blocks(self, lines: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        idx = 0
+        while idx < len(lines):
+            line = lines[idx]
+            if line == CONTINUE_MANAGED_BEGIN:
+                idx += 1
+                while idx < len(lines):
+                    if lines[idx] == CONTINUE_MANAGED_END:
+                        idx += 1
+                        break
+                    if lines[idx].strip() and not lines[idx].startswith(' '):
+                        break
+                    idx += 1
+                continue
+            if line == CONTINUE_MANAGED_END:
+                idx += 1
+                continue
+            cleaned.append(line)
+            idx += 1
+        return cleaned
+
     def _merge_continue_config_text(self, existing_text: str, managed_model_lines: List[str]) -> str:
         if not existing_text.strip():
             return self._render_continue_full_config(managed_model_lines)
-        lines = existing_text.splitlines()
-        try:
-            begin = lines.index(CONTINUE_MANAGED_BEGIN)
-            end = lines.index(CONTINUE_MANAGED_END, begin + 1)
-        except ValueError:
-            begin = -1
-            end = -1
-        if begin >= 0 and end >= begin:
-            merged = lines[:begin] + managed_model_lines + lines[end + 1:]
-            return '\n'.join(merged).rstrip() + '\n'
+        lines = self._strip_continue_managed_blocks(existing_text.splitlines())
 
         models_index = next((idx for idx, line in enumerate(lines) if line.strip() == 'models:' and not line.startswith(' ')), -1)
         if models_index >= 0:
@@ -2743,13 +2764,13 @@ class AppConfig:
         merged.extend(['models:', *managed_model_lines])
         return '\n'.join(merged).rstrip() + '\n'
 
-    def generate_continue_config(self) -> Tuple[bool, str]:
+    def generate_continue_config(self, allow_empty: bool = True) -> Tuple[bool, str]:
         if not self.continue_settings.path:
             self.continue_settings.path = '~/.continue/config.yaml'
         path = Path(self.continue_settings.path).expanduser()
 
         enabled_models = [m for m in self.models if m.enabled]
-        if not enabled_models:
+        if not enabled_models and not allow_empty:
             return False, 'No enabled models to export.'
 
         managed_lines = self._continue_managed_model_lines(enabled_models)
@@ -2768,3 +2789,59 @@ class AppConfig:
         path.write_text(output, encoding='utf-8')
         self.save()
         return True, f'Generated {path}'
+
+    def _hermes_config_is_generated(self, path: Path) -> bool:
+        try:
+            first_line = path.read_text(encoding='utf-8').splitlines()[0]
+        except Exception:
+            return False
+        return first_line.startswith('# Generated by llama-tui.')
+
+    def _remove_generated_hermes_home(self, model: ModelConfig) -> Tuple[bool, str]:
+        home = self.hermes_home_for_model(model)
+        config_path = home / 'config.yaml'
+        if not config_path.exists():
+            return False, f'Hermes config absent for {model.id}'
+        if not self._hermes_config_is_generated(config_path):
+            return False, f'Hermes config not llama-tui generated for {model.id}'
+        root = Path(getattr(self.hermes, 'home_root', '') or str(CACHE_DIR / 'hermes')).expanduser()
+        backup_dir = root / 'backups' / model.id
+        self._backup_export_file(config_path, str(backup_dir))
+        try:
+            shutil.rmtree(home)
+        except OSError as exc:
+            return False, f'Hermes cleanup failed for {model.id}: {compact_message(str(exc))}'
+        return True, f'Removed Hermes config {home}'
+
+    def sync_generated_configs(
+        self,
+        reason: str,
+        removed_models: Optional[List[ModelConfig]] = None,
+        allow_empty: bool = True,
+    ) -> str:
+        messages: List[str] = []
+        removed_models = list(removed_models or [])
+        if self.opencode.path:
+            ok, msg = self.generate_opencode(allow_empty=allow_empty)
+            messages.append(msg if ok else f'opencode sync failed: {msg}')
+
+        if getattr(self, 'continue_settings', None) and getattr(self.continue_settings, 'path', ''):
+            ok, msg = self.generate_continue_config(allow_empty=allow_empty)
+            messages.append(msg if ok else f'continue sync failed: {msg}')
+
+        hermes_messages: List[str] = []
+        for model in removed_models:
+            ok, msg = self._remove_generated_hermes_home(model)
+            if ok:
+                hermes_messages.append(msg)
+        for model in self.models:
+            config_path = self.hermes_config_path(model)
+            if config_path.exists() and self._hermes_config_is_generated(config_path):
+                ok, msg = self.generate_hermes_config(model)
+                hermes_messages.append(msg if ok else f'Hermes sync failed: {msg}')
+        if hermes_messages:
+            messages.append('Hermes: ' + '; '.join(hermes_messages[:3]))
+
+        if messages:
+            return f'{reason}: ' + ' | '.join(messages)
+        return f'{reason}: no generated config paths enabled'

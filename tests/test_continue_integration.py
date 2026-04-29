@@ -15,6 +15,12 @@ def block_for_model(text: str, name: str) -> str:
     return text[start:] if next_start == -1 else text[start:next_start]
 
 
+def assert_all_interactive_roles(testcase: unittest.TestCase, block: str):
+    for role in ('chat', 'edit', 'apply', 'autocomplete'):
+        testcase.assertIn(f'      - {role}', block)
+    testcase.assertIn('autocompleteOptions:', block)
+
+
 class ContinueIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -130,21 +136,17 @@ class ContinueIntegrationTests(unittest.TestCase):
         main_block = block_for_model(text, 'Main Model')
         self.assertIn('model: "main-local"', main_block)
         self.assertIn('apiBase: "http://127.0.0.1:18080/v1"', main_block)
-        self.assertIn('roles:\n      - chat', main_block)
-        self.assertNotIn('      - autocomplete', main_block)
+        assert_all_interactive_roles(self, main_block)
 
         build_block = block_for_model(text, 'Build Model')
-        self.assertIn('      - edit', build_block)
-        self.assertIn('      - apply', build_block)
-        self.assertNotIn('      - autocomplete', build_block)
+        assert_all_interactive_roles(self, build_block)
 
         small_block = block_for_model(text, 'Small Model')
-        self.assertIn('      - autocomplete', small_block)
-        self.assertIn('autocompleteOptions:', small_block)
+        assert_all_interactive_roles(self, small_block)
         self.assertIn('maxPromptTokens: 2048', small_block)
 
         extra_block = block_for_model(text, 'Extra Model')
-        self.assertIn('roles:\n      - chat', extra_block)
+        assert_all_interactive_roles(self, extra_block)
 
     def test_generate_continue_config_falls_back_to_first_and_second_enabled_models(self):
         ok, msg = self.app.generate_continue_config()
@@ -154,10 +156,8 @@ class ContinueIntegrationTests(unittest.TestCase):
         main_block = block_for_model(text, 'Main Model')
         second_block = block_for_model(text, 'Build Model')
 
-        self.assertIn('      - chat', main_block)
-        self.assertIn('      - edit', main_block)
-        self.assertIn('      - apply', main_block)
-        self.assertIn('      - autocomplete', second_block)
+        assert_all_interactive_roles(self, main_block)
+        assert_all_interactive_roles(self, second_block)
 
     def test_preserves_existing_sections_and_unmarked_models(self):
         target = Path(self.app.continue_settings.path)
@@ -236,6 +236,40 @@ class ContinueIntegrationTests(unittest.TestCase):
         self.assertIn('  - name: "User Model"', text)
         self.assertIn('  - name: "Main Model"', text)
 
+    def test_duplicate_and_unterminated_managed_blocks_are_sanitized(self):
+        target = Path(self.app.continue_settings.path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            '\n'.join([
+                'name: "Existing Continue"',
+                'version: "1.0.0"',
+                'schema: "v1"',
+                'models:',
+                '  # BEGIN llama-tui managed models',
+                '  - name: "Old Complete"',
+                '    provider: "openai"',
+                '    model: "old-complete"',
+                '  # END llama-tui managed models',
+                '  # BEGIN llama-tui managed models',
+                '  - name: "Old Unterminated"',
+                '    provider: "openai"',
+                '    model: "old-unterminated"',
+                'allowAnonymousTelemetry: false',
+            ]) + '\n',
+            encoding='utf-8',
+        )
+
+        ok, msg = self.app.generate_continue_config()
+
+        self.assertTrue(ok, msg)
+        text = target.read_text(encoding='utf-8')
+        self.assertEqual(text.count('  # BEGIN llama-tui managed models'), 1)
+        self.assertEqual(text.count('  # END llama-tui managed models'), 1)
+        self.assertNotIn('Old Complete', text)
+        self.assertNotIn('Old Unterminated', text)
+        self.assertIn('allowAnonymousTelemetry: false', text)
+        self.assertIn('  - name: "Main Model"', text)
+
     def test_continue_roles_override_opencode_fallback_roles(self):
         self.app.opencode.default_model_id = 'main'
         self.app.opencode.build_model_id = 'build'
@@ -253,13 +287,10 @@ class ContinueIntegrationTests(unittest.TestCase):
         small_block = block_for_model(text, 'Small Model')
         main_block = block_for_model(text, 'Main Model')
 
-        self.assertIn('      - chat', extra_block)
-        self.assertIn('      - edit', build_block)
-        self.assertIn('      - apply', build_block)
-        self.assertIn('      - autocomplete', small_block)
-        self.assertNotIn('      - edit', main_block)
-        self.assertNotIn('      - apply', main_block)
-        self.assertNotIn('      - autocomplete', main_block)
+        assert_all_interactive_roles(self, extra_block)
+        assert_all_interactive_roles(self, build_block)
+        assert_all_interactive_roles(self, small_block)
+        assert_all_interactive_roles(self, main_block)
         self.assertLess(text.index('  - name: "Extra Model"'), text.index('  - name: "Main Model"'))
 
     def test_context_length_uses_per_slot_context(self):
@@ -272,3 +303,32 @@ class ContinueIntegrationTests(unittest.TestCase):
         text = Path(self.app.continue_settings.path).read_text(encoding='utf-8')
         build_block = block_for_model(text, 'Build Model')
         self.assertIn('contextLength: 8192', build_block)
+
+    def test_empty_continue_export_removes_stale_managed_models(self):
+        target = Path(self.app.continue_settings.path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            '\n'.join([
+                'name: "Existing Continue"',
+                'models:',
+                '  # BEGIN llama-tui managed models',
+                '  - name: "Stale Model"',
+                '    provider: "openai"',
+                '    model: "stale"',
+                '  # END llama-tui managed models',
+                '  - name: "User Model"',
+                '    provider: "openai"',
+                '    model: "user-model"',
+            ]) + '\n',
+            encoding='utf-8',
+        )
+        self.app.models = []
+
+        ok, msg = self.app.generate_continue_config()
+
+        self.assertTrue(ok, msg)
+        text = target.read_text(encoding='utf-8')
+        self.assertEqual(text.count('  # BEGIN llama-tui managed models'), 1)
+        self.assertEqual(text.count('  # END llama-tui managed models'), 1)
+        self.assertNotIn('Stale Model', text)
+        self.assertIn('  - name: "User Model"', text)

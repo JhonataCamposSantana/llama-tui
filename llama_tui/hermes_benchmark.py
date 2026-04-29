@@ -696,11 +696,11 @@ def benchmark_hermes_workflow(
     run['summary'] = f'Hermes {float(best["score"]):.2f} score ctx={best_model.ctx} par={best_model.parallel}'
     upsert_benchmark_run(best_model, run)
     app.add_or_update(best_model)
-    sync_ok, sync_msg = app.generate_hermes_config(best_model)
+    sync_msg = app.sync_generated_configs('Hermes profile sync') if hasattr(app, 'sync_generated_configs') else app.generate_hermes_config(best_model)[1]
     msg = (
         f'✅ Hermes workflow winner: {best_model.id} {best["preset"]}/{best["tier"]} '
         f'score={float(best["score"]):.2f} ctx={best_model.ctx} parallel={best_model.parallel} '
-        f'threads={best_model.threads} ngl={best_model.ngl} | {sync_msg if sync_ok else sync_msg}'
+        f'threads={best_model.threads} ngl={best_model.ngl} | {sync_msg}'
     )
     emit_benchmark_event(
         progress,

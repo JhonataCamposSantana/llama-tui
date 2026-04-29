@@ -103,6 +103,8 @@ SPECTRUM_LABELS = {
 
 
 def sync_opencode_after_tuning(app: AppConfig) -> str:
+    if hasattr(app, 'sync_generated_configs'):
+        return app.sync_generated_configs('profile sync')
     messages: List[str] = []
     if app.opencode.path:
         ok, msg = app.generate_opencode()

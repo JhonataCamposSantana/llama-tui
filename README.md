@@ -162,7 +162,7 @@ Useful per-model fields:
 - `X`: prune missing models.
 - `a`: add a model.
 - `e`: edit a model.
-- `d`: delete a model from the registry.
+- `d`: delete a model from the registry and refresh generated tool configs.
 - `m`, `s`, `b`, `p`: assign OpenCode main, small, build, or plan role.
 - `g`: generate `opencode.json`.
 - `c`: generate Continue `config.yaml`.
@@ -392,7 +392,7 @@ Files containing `mmproj` are ignored. New models get generated ids, aliases, th
 
 Dense vs MoE detection is metadata-first. llama-tui reads GGUF `general.architecture` and expert metadata such as `{arch}.expert_count` and `{arch}.expert_used_count`; if metadata is incomplete, it can inspect tensor descriptors by name without reading tensor data; filename patterns such as `30B-A3B` are only a weak fallback. MoE benchmark mode keeps memory estimates based on the full loaded GGUF, keeps KV-cache estimates attention/layer-driven, and scores OpenCode-style profiles by stable context before raw tokens/sec.
 
-Press `X` to prune registry entries whose model files disappeared.
+Press `X` to prune registry entries whose model files disappeared. Model add, edit, delete, detect, prune, role, settings, and benchmark tuning actions refresh generated tool configs so removed models do not linger in OpenCode, Continue, or llama-tui-generated Hermes homes.
 
 ## OpenCode Export
 
@@ -423,18 +423,13 @@ If VS Code is unavailable, it still launches the model + OpenCode path and repor
 
 Press `c` to generate the config. By default `continue.path` is `~/.continue/config.yaml`; you can override it in settings if your Continue install uses a different YAML path.
 
-llama-tui writes a local Continue `config.yaml` using the OpenAI-compatible provider format:
+llama-tui writes a local Continue `config.yaml` using the OpenAI-compatible provider format. Every enabled llama-tui-managed model is exported with `chat`, `edit`, `apply`, and `autocomplete` roles plus autocomplete options, so Continue can use any exported model for the interactive coding roles.
 
-- `continue.default_model_id` becomes the chat model,
-- `continue.edit_model_id` becomes the edit/apply model,
-- `continue.autocomplete_model_id` becomes the autocomplete model,
-- any other enabled models are still exported as additional chat choices.
-
-If a Continue role is blank, llama-tui falls back to the matching OpenCode role. If those are also blank, it uses the first enabled model for chat/edit and the second enabled model for autocomplete when available.
+`continue.default_model_id`, `continue.edit_model_id`, and `continue.autocomplete_model_id` still influence the order of the generated model list. If a Continue role is blank, llama-tui falls back to the matching OpenCode role; if those are also blank, it uses the first enabled model for chat/edit and the second enabled model for autocomplete when available.
 
 Existing Continue config files are backed up under `continue.backup_dir` before writing.
 
-The default `continue.merge_mode` is `preserve_sections`. In that mode llama-tui keeps top-level user sections such as `rules`, `context`, `prompts`, `mcpServers`, `docs`, and `data`, preserves unmarked user models, and replaces only the block between:
+The default `continue.merge_mode` is `preserve_sections`. In that mode llama-tui keeps top-level user sections such as `rules`, `context`, `prompts`, `mcpServers`, `docs`, and `data`, preserves unmarked user models, sanitizes older duplicate or unterminated managed blocks, and replaces the managed block between:
 
 ```yaml
   # BEGIN llama-tui managed models
@@ -445,7 +440,7 @@ Set `continue.merge_mode` to `managed_file` if you want llama-tui to rewrite the
 
 Continue `contextLength` is exported as per-slot context, `ctx // parallel`, so autocomplete and chat tools see the same effective window the server exposes for each simultaneous request.
 
-llama-tui also refreshes the Continue export after benchmark-driven tuning and Auto-profile updates so the exported context and token limits stay aligned with the latest saved model settings.
+llama-tui also refreshes the Continue export after registry changes, settings/role changes, benchmark-driven tuning, and Auto-profile updates so the exported model list, context, and token limits stay aligned with the latest saved model settings. If no enabled models remain, the managed block is written empty instead of leaving stale entries behind.
 
 ## Safety Notes
 

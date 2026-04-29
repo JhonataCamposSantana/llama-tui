@@ -4822,7 +4822,7 @@ def tui(stdscr, app: AppConfig):
         elif key in (curses.KEY_DOWN, ord('j')) and browser_list and view_mode == 'list':
             selected = min(len(browser_list) - 1, selected + 1)
         elif key == ord('r'):
-            count, items = app.detect_models()
+            count, items = app.detect_models(sync_exports=True)
             statuses = {m.id: app.health(m) for m in app.models}
             invalidate_machine_summary()
             message = items[0] if items else (f'Synced {count} model(s)' if count else 'Synced.')
@@ -4907,7 +4907,7 @@ def tui(stdscr, app: AppConfig):
                 profile = app.hardware_profile(refresh=True)
                 tier = select_best_tier(model, profile)
                 tune_msg = f'Auto profile applied from estimate: {apply_best_optimization(model, tier=tier, profile=profile)}'
-            app.add_or_update(model)
+            app.add_or_update(model, sync_exports=False)
             sync_msg = sync_opencode_after_tuning(app)
             invalidate_machine_summary()
             message = f'{tune_msg} | {sync_msg}'
@@ -4980,7 +4980,7 @@ def tui(stdscr, app: AppConfig):
             if model:
                 if not getattr(model, 'default_benchmark_status', ''):
                     model.default_benchmark_status = 'pending'
-                app.add_or_update(model)
+                app.add_or_update(model, sync_exports=True)
                 select_model_in_browser(model.id)
                 invalidate_machine_summary()
                 message = f'Added {model.id} with safe defaults. Open details to start now; press B for measured settings.'
@@ -4988,21 +4988,24 @@ def tui(stdscr, app: AppConfig):
             current = active_detail_model() or selected_model()
             updated = prompt_model(stdscr, colors, f'Edit {current.id}', current) if current else None
             if updated:
+                removed_models = []
                 if updated.id != current.id:
-                    app.delete(current.id)
+                    removed_models.append(current)
+                    app.delete(current.id, sync_exports=False)
                 if not getattr(updated, 'default_benchmark_status', ''):
                     updated.default_benchmark_status = 'pending'
-                app.add_or_update(updated)
+                app.add_or_update(updated, sync_exports=False)
+                sync_msg = app.sync_generated_configs('model edit', removed_models=removed_models)
                 select_model_in_browser(updated.id)
                 if view_mode == 'detail':
                     detail_model_id = updated.id
                 invalidate_machine_summary()
-                message = f'Updated {updated.id}.'
+                message = f'Updated {updated.id}. {sync_msg}'
         elif key == ord('d') and app.models:
             delete_model = active_detail_model() or selected_model()
             if delete_model and prompt_yes_no(stdscr, colors, 'Delete Model', f'remove {delete_model.id} from llama-tui config'):
                 target_id = delete_model.id
-                ok, msg = app.delete(target_id)
+                ok, msg = app.delete(target_id, sync_exports=True)
                 clamp_selected()
                 if view_mode == 'detail':
                     view_mode = 'list'
@@ -5012,14 +5015,14 @@ def tui(stdscr, app: AppConfig):
             else:
                 message = 'Delete cancelled.'
         elif key == ord('x'):
-            count, items = app.detect_models()
+            count, items = app.detect_models(sync_exports=True)
             message = items[0] if items else (f'Detected {count} new model(s)' if count else 'No new GGUFs found.')
             if count:
                 message = f'{message} | safe defaults set; start now or press B for measured settings.'
             clamp_selected()
             invalidate_machine_summary()
         elif key == ord('X'):
-            count, removed = app.prune_missing_models()
+            count, removed = app.prune_missing_models(sync_exports=True)
             message = f'Pruned {count}: {", ".join(removed[:5])}' if count else 'No missing models to prune.'
             clamp_selected()
             invalidate_machine_summary()
@@ -5035,22 +5038,22 @@ def tui(stdscr, app: AppConfig):
             message = msg
         elif key == ord('o'):
             if prompt_settings(stdscr, colors, app):
-                message = 'Settings saved.'
+                message = f'Settings saved. {app.sync_generated_configs("settings update")}'
             else:
                 message = 'Settings unchanged.'
         elif key == ord('m') and app.models:
             model = active_detail_model() or selected_model()
-            app.set_role('main', model.id)
+            app.set_role('main', model.id, sync_exports=True)
             message = f'{model.id} set as main model.'
         elif key == ord('s') and app.models:
             model = active_detail_model() or selected_model()
-            app.set_role('small', model.id)
+            app.set_role('small', model.id, sync_exports=True)
             message = f'{model.id} set as small model.'
         elif key == ord('b') and app.models:
             model = active_detail_model() or selected_model()
-            app.set_role('build', model.id)
+            app.set_role('build', model.id, sync_exports=True)
             message = f'{model.id} set as build model.'
         elif key == ord('p') and app.models:
             model = active_detail_model() or selected_model()
-            app.set_role('plan', model.id)
+            app.set_role('plan', model.id, sync_exports=True)
             message = f'{model.id} set as plan model.'
