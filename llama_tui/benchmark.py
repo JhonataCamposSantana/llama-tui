@@ -11,6 +11,12 @@ from urllib import request
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .gguf import architecture_label, extra_arg_value, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
+from .memory_guardrail import (
+    MemoryGuardrailDecision,
+    MemoryGuardrailState,
+    memory_guardrail_record_fields,
+    start_memory_guardrail_watchdog,
+)
 from .models import ModelConfig
 from .optimize import (
     apply_hardware_baseline,
@@ -124,6 +130,9 @@ def benchmark_command_preview(
 
 FAILURE_CATEGORIES = (
     'CLI_INVALID',
+    'MEMORY_GUARDRAIL',
+    'MEMORY_FIT_FAILED',
+    'FIXED_GPU_LAYERS_FIT_FAILED',
     'CUDA_OOM_WEIGHTS',
     'CUDA_OOM_KV',
     'KV_MODE_INCOMPATIBLE',
@@ -169,10 +178,26 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         reason = detail or 'The selected KV mode is incompatible with this model/head dimension.'
         suggested = 'Try a different TurboKV mode or benchmark default/q8 KV cache.'
         terminal = True
-    if 'failed to fit params to free device memory' in low or 'n_gpu_layers already set by user' in low:
-        category = 'BUUN_FIT_FAILED'
-        reason = detail or 'buun could not fit the model with the generated GPU layer settings.'
-        suggested = 'Use buun -fit without a fixed -ngl, or reduce the explicit GPU layer fallback.'
+    fit_memory_failure = (
+        'failed to fit params to free device memory' in low
+        or 'cannot meet free memory target' in low
+        or ('projected to use' in low and 'device memory' in low and 'free device memory' in low)
+        or ('llama_params_fit_impl' in low and 'free device memory' in low)
+    )
+    fixed_gpu_layer_failure = fit_memory_failure and (
+        'n_gpu_layers already set by user' in low
+        or 'gpu layers already set by user' in low
+        or re.search(r'n_gpu_layers.{0,80}set by user', low) is not None
+    )
+    if fixed_gpu_layer_failure:
+        category = 'FIXED_GPU_LAYERS_FIT_FAILED'
+        reason = detail or 'The fixed GPU-layer candidate could not fit current free device memory.'
+        suggested = 'Stop retrying fixed GPU-layer probes for this run; use fit/default/q8 fallbacks instead.'
+        terminal = True
+    elif fit_memory_failure:
+        category = 'MEMORY_FIT_FAILED'
+        reason = detail or 'The runtime fit planner could not meet the current free memory target.'
+        suggested = 'Reduce context/offload for this run or retry after freeing RAM/VRAM.'
         terminal = True
     if (
         ('ggml-cpu/ops.cpp' in low or 'ggml_compute_forward_scale' in low)
@@ -182,7 +207,14 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         reason = detail or 'buun CPU/default warmup aborted before serving.'
         suggested = 'Skip the CPU/default probe and try a GPU fit profile with --no-warmup.'
         terminal = True
-    if not terminal and ('cudamalloc failed' in low or 'cuda error' in low and 'out of memory' in low or 'out of memory' in low):
+    memory_allocation_failure = (
+        'cudamalloc failed' in low
+        or ('cuda error' in low and 'out of memory' in low)
+        or 'out of memory' in low
+        or 'failed to allocate buffer for kv cache' in low
+        or ('failed to create context' in low and ('memory' in low or 'kv' in low or 'cache' in low))
+    )
+    if not terminal and memory_allocation_failure:
         if 'kv' in low or 'cache' in low or 'context' in low:
             category = 'CUDA_OOM_KV'
             suggested = 'Reduce context, parallelism, or KV cache size; for OpenCode prefer parallel=1.'
@@ -391,6 +423,54 @@ def runtime_profile_skip_reason(runtime_profile: RuntimeProfile, disabled: set[T
     return ''
 
 
+def _runtime_profile_memory_shape(runtime_profile: RuntimeProfile) -> Tuple[str, str, str, str, str]:
+    engine = str(getattr(runtime_profile, 'engine_id', '') or '')
+    kv_preset = str(getattr(runtime_profile, 'kv_preset', '') or '')
+    if getattr(runtime_profile, 'gpu_layers', None) is None and bool(getattr(runtime_profile, 'fit', False)):
+        mode = 'fit'
+        layers = 'fit'
+    elif getattr(runtime_profile, 'gpu_layers', None) is not None:
+        mode = 'fixed'
+        layers = str(int(getattr(runtime_profile, 'gpu_layers') or 0))
+    else:
+        mode = 'default'
+        layers = ''
+    parallel = str(max(1, int(getattr(runtime_profile, 'parallel', 1) or 1)))
+    return engine, kv_preset, mode, layers, parallel
+
+
+def runtime_profile_memory_disable_key(record: Dict[str, object], runtime_profile: RuntimeProfile) -> Tuple[str, ...]:
+    category = str(record.get('failure_category', '') or '')
+    if category in ('FIXED_GPU_LAYERS_FIT_FAILED',) or (
+        category == 'CUDA_OOM_WEIGHTS' and getattr(runtime_profile, 'gpu_layers', None) is not None
+    ):
+        return ('fixed_ngl', str(getattr(runtime_profile, 'engine_id', '') or ''))
+    if category in ('CUDA_OOM_KV', 'MEMORY_GUARDRAIL'):
+        return ('context_shape', *_runtime_profile_memory_shape(runtime_profile), str(int(getattr(runtime_profile, 'ctx_size', 0) or 0)))
+    return ()
+
+
+def runtime_profile_memory_skip_reason(runtime_profile: RuntimeProfile, disabled: set[Tuple[str, ...]]) -> str:
+    engine = str(getattr(runtime_profile, 'engine_id', '') or '')
+    shape = _runtime_profile_memory_shape(runtime_profile)
+    ctx = int(getattr(runtime_profile, 'ctx_size', 0) or 0)
+    for key in disabled:
+        if not key:
+            continue
+        if key[0] == 'fixed_ngl' and len(key) >= 2:
+            if key[1] == engine and getattr(runtime_profile, 'gpu_layers', None) is not None:
+                return 'fixed GPU-layer profiles were already rejected by memory fit/OOM for this run'
+        if key[0] == 'context_shape' and len(key) >= 7:
+            bad_shape = tuple(key[1:6])
+            try:
+                bad_ctx = int(key[6] or 0)
+            except Exception:
+                bad_ctx = 0
+            if shape == bad_shape and bad_ctx > 0 and ctx >= bad_ctx:
+                return f'same runtime/KV shape already hit memory guardrail/OOM at ctx={bad_ctx}'
+    return ''
+
+
 def emit_benchmark_event(
     progress: Optional[Callable[[object], None]],
     event: str,
@@ -502,6 +582,88 @@ def current_process_pressure_payload() -> Dict[str, object]:
         return process_pressure_payload(benchmark_current_process_pressure())
     except Exception:
         return {}
+
+
+def _pressure_score_from_payload(payload: Optional[Dict[str, object]]) -> float:
+    try:
+        return max(0.0, min(1.0, float((payload or {}).get('process_pressure_score', 0.0) or 0.0)))
+    except Exception:
+        return 0.0
+
+
+def _guardrail_profile(app: AppConfig) -> HardwareProfile:
+    try:
+        return app.hardware_profile(refresh=True)
+    except Exception:
+        return HardwareProfile()
+
+
+def _candidate_required_for_opencode_floor(candidate: ModelConfig, observed_floor: int) -> bool:
+    return int(observed_floor or 0) > 0 and ctx_per_slot(candidate) >= int(observed_floor or 0)
+
+
+def memory_guardrail_admission(
+    profile: HardwareProfile,
+    candidate: ModelConfig,
+    estimated_safe_ctx: int,
+    pressure_payload: Optional[Dict[str, object]] = None,
+    observed_floor: int = 0,
+    state: Optional[MemoryGuardrailState] = None,
+) -> MemoryGuardrailDecision:
+    guardrail_state = state or MemoryGuardrailState()
+    return guardrail_state.observe(
+        profile,
+        phase='admission',
+        candidate_ctx=int(getattr(candidate, 'ctx', 0) or 0),
+        safe_ctx=int(estimated_safe_ctx or 0),
+        observed_floor=int(observed_floor or 0),
+        required_for_floor=_candidate_required_for_opencode_floor(candidate, observed_floor),
+        pressure_score=_pressure_score_from_payload(pressure_payload),
+    )
+
+
+def apply_memory_guardrail_record(
+    record: Dict[str, object],
+    decision: Optional[MemoryGuardrailDecision] = None,
+    state: Optional[MemoryGuardrailState] = None,
+) -> Dict[str, object]:
+    if decision is not None:
+        record.update(memory_guardrail_record_fields(decision))
+    if state is not None:
+        record.update(state.record_fields())
+        decision = state.stop_decision or state.skip_decision or decision
+    if decision is not None and decision.action in ('skip', 'stop'):
+        record['failure_category'] = 'MEMORY_GUARDRAIL'
+        record['failure_reason'] = concise_failure(decision.reason, limit=500)
+        record['suggested_fix'] = 'Candidate was stopped or skipped to protect system memory; try safer fit/default fallbacks or free RAM/VRAM.'
+        record['detail'] = concise_failure(
+            f'candidate {"skipped" if decision.action == "skip" else "stopped"} by memory guardrail: {decision.reason}',
+            limit=500,
+        )
+        record['startup_result'] = 'FAILED'
+    return record
+
+
+def memory_guardrail_skip_record(
+    candidate: ModelConfig,
+    objective: str,
+    decision: MemoryGuardrailDecision,
+    runtime_context: Dict[str, object],
+    process_snapshots: Dict[str, Dict[str, object]],
+) -> Dict[str, object]:
+    snapshot = dict(decision.snapshot or {})
+    record = adaptive_record_from_candidate(
+        candidate,
+        objective,
+        'skipped',
+        detail=f'candidate skipped by memory guardrail: {decision.reason}',
+        ram_available=int(snapshot.get('ram_available', 0) or 0),
+        gpu_memory_free=int(snapshot.get('gpu_memory_free', 0) or 0),
+        gpu_memory_total=int(snapshot.get('gpu_memory_total', 0) or 0),
+        process_snapshots=process_snapshots,
+        **runtime_context,
+    )
+    return apply_memory_guardrail_record(record, decision)
 
 
 def _record_headroom_score(record: Dict[str, object]) -> float:
@@ -2744,6 +2906,24 @@ def benchmark_adaptive_candidate(
     process_snapshots: Dict[str, Dict[str, object]] = {'before': current_process_pressure_payload()}
     before_hw = app.hardware_profile(refresh=True)
     runtime_context = runtime_record_context(app, candidate, runtime_profile)
+    estimated_safe_ctx = candidate_safe_context_estimate(candidate, before_hw)
+    observed_floor = observed_opencode_context_floor(candidate)
+    guardrail_state = MemoryGuardrailState()
+    admission = memory_guardrail_admission(
+        before_hw,
+        candidate,
+        estimated_safe_ctx,
+        pressure_payload=process_snapshots.get('before'),
+        observed_floor=observed_floor,
+        state=guardrail_state,
+    )
+    if admission.should_skip:
+        if progress:
+            progress(
+                f'adaptive {objective} skipped by memory guardrail: '
+                f'ctx={candidate.ctx} safe_ctx={estimated_safe_ctx} {admission.reason}'
+            )
+        return memory_guardrail_skip_record(candidate, objective, admission, runtime_context, process_snapshots), None
     start_at = time.monotonic()
     if runtime_profile is not None:
         ok, msg = app.start(candidate, runtime_profile=runtime_profile)
@@ -2763,24 +2943,54 @@ def benchmark_adaptive_candidate(
         )
         apply_failure_context(record, msg, default_category='SERVER_TIMEOUT')
         return record, None
+    watchdog_stop = None
+    watchdog_thread = None
+    watchdog_stop, watchdog_thread = start_memory_guardrail_watchdog(
+        lambda: _guardrail_profile(app),
+        lambda: app.stop(candidate, managed_only=True),
+        guardrail_state,
+        candidate_ctx=int(getattr(candidate, 'ctx', 0) or 0),
+        safe_ctx=estimated_safe_ctx,
+        observed_floor=observed_floor,
+        required_for_floor=_candidate_required_for_opencode_floor(candidate, observed_floor),
+        pressure_score=_pressure_score_from_payload(process_snapshots.get('before')),
+        phase='runtime',
+    )
     try:
         ready_start = time.monotonic()
         ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
         ready_seconds = time.monotonic() - ready_start
         process_snapshots['after_ready'] = current_process_pressure_payload()
         if not ready_ok:
+            if guardrail_state.stop_decision is not None:
+                ready_msg = guardrail_state.stop_decision.reason
             record = adaptive_record_from_candidate(
                 candidate,
                 objective,
-                'not ready',
+                'memory guardrail stopped' if guardrail_state.stop_decision is not None else 'not ready',
                 detail=ready_msg,
                 startup_seconds=startup_seconds,
                 ready_seconds=ready_seconds,
                 process_snapshots=process_snapshots,
                 **runtime_context,
             )
-            apply_failure_context(record, ready_msg, default_category='SERVER_TIMEOUT')
+            if guardrail_state.stop_decision is not None:
+                apply_memory_guardrail_record(record, guardrail_state.stop_decision, guardrail_state)
+            else:
+                apply_failure_context(record, ready_msg, default_category='SERVER_TIMEOUT')
             return record, None
+        if guardrail_state.stop_decision is not None:
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'memory guardrail stopped',
+                detail=guardrail_state.stop_decision.reason,
+                startup_seconds=startup_seconds,
+                ready_seconds=ready_seconds,
+                process_snapshots=process_snapshots,
+                **runtime_context,
+            )
+            return apply_memory_guardrail_record(record, guardrail_state.stop_decision, guardrail_state), None
         if int(getattr(candidate, 'last_good_ctx', 0) or 0) > 0:
             candidate.ctx = int(candidate.last_good_ctx)
         if int(getattr(candidate, 'last_good_parallel', 0) or 0) > 0:
@@ -2799,6 +3009,19 @@ def benchmark_adaptive_candidate(
             cancel_token=cancel_token,
         )
         warmup_seconds = time.monotonic() - warmup_start
+        if guardrail_state.stop_decision is not None:
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'memory guardrail stopped',
+                detail=guardrail_state.stop_decision.reason,
+                startup_seconds=startup_seconds,
+                ready_seconds=ready_seconds,
+                warmup_seconds=warmup_seconds,
+                process_snapshots=process_snapshots,
+                **runtime_context,
+            )
+            return apply_memory_guardrail_record(record, guardrail_state.stop_decision, guardrail_state), None
         bench_ok, bench = benchmark_completion_suite(
             candidate,
             max_tokens=BENCHMARK_SAMPLE_TOKENS,
@@ -2807,18 +3030,22 @@ def benchmark_adaptive_candidate(
         )
         if not bench_ok:
             process_snapshots['after_generation'] = current_process_pressure_payload()
+            detail = guardrail_state.stop_decision.reason if guardrail_state.stop_decision is not None else str(bench.get('error', 'unknown error'))
             record = adaptive_record_from_candidate(
                 candidate,
                 objective,
-                'benchmark failed',
-                detail=str(bench.get('error', 'unknown error')),
+                'memory guardrail stopped' if guardrail_state.stop_decision is not None else 'benchmark failed',
+                detail=detail,
                 startup_seconds=startup_seconds,
                 ready_seconds=ready_seconds,
                 warmup_seconds=warmup_seconds,
                 process_snapshots=process_snapshots,
                 **runtime_context,
             )
-            apply_failure_context(record, str(bench.get('error', 'unknown error')), default_category='API_TIMEOUT')
+            if guardrail_state.stop_decision is not None:
+                apply_memory_guardrail_record(record, guardrail_state.stop_decision, guardrail_state)
+            else:
+                apply_failure_context(record, str(bench.get('error', 'unknown error')), default_category='API_TIMEOUT')
             return record, None
         snap = app.hardware_profile(refresh=True)
         process_snapshots['after_generation'] = current_process_pressure_payload()
@@ -2854,10 +3081,15 @@ def benchmark_adaptive_candidate(
             process_snapshots=process_snapshots,
             **runtime_context,
         )
+        apply_memory_guardrail_record(record, state=guardrail_state)
         measured = dict(record)
         measured['model'] = ModelConfig(**asdict(candidate))
         return record, measured
     finally:
+        if watchdog_stop is not None:
+            watchdog_stop.set()
+        if watchdog_thread is not None:
+            watchdog_thread.join(timeout=1.0)
         app.stop(candidate, managed_only=True)
         sleep_with_cancel(0.5, cancel_token)
 
@@ -3772,6 +4004,19 @@ def benchmark_exhaustive_candidate_with_retry(
         emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label, run_kind=run_kind)
         if ok:
             return True, False, records, measured, completed
+        deterministic_failures = {
+            'CLI_INVALID',
+            'MEMORY_GUARDRAIL',
+            'MEMORY_FIT_FAILED',
+            'FIXED_GPU_LAYERS_FIT_FAILED',
+            'CUDA_OOM_WEIGHTS',
+            'CUDA_OOM_KV',
+            'KV_MODE_INCOMPATIBLE',
+            'BUUN_FIT_FAILED',
+            'BUUN_CPU_WARMUP_ABORT',
+        }
+        if str(record.get('failure_category', '') or '') in deterministic_failures:
+            return False, True, records, measured, completed
         if attempt == 1 and progress:
             progress(f'{benchmark_label} candidate {candidate_label} failed once; retrying to confirm break...')
     return False, True, records, measured, completed
@@ -3855,6 +4100,11 @@ def benchmark_runtime_profile_with_retry(
             return True, False, records, measured, completed
         deterministic_failures = {
             'CLI_INVALID',
+            'MEMORY_GUARDRAIL',
+            'MEMORY_FIT_FAILED',
+            'FIXED_GPU_LAYERS_FIT_FAILED',
+            'CUDA_OOM_WEIGHTS',
+            'CUDA_OOM_KV',
             'KV_MODE_INCOMPATIBLE',
             'BUUN_FIT_FAILED',
             'BUUN_CPU_WARMUP_ABORT',
@@ -4019,6 +4269,7 @@ def benchmark_exhaustive_profiles(
     started_monotonic = time.monotonic()
     full_by_fingerprint: Dict[str, Dict[str, object]] = {}
     disabled_runtime_kv: set[Tuple[str, str]] = set()
+    disabled_runtime_memory: set[Tuple[str, ...]] = set()
 
     running_model = ModelConfig(**asdict(model))
     running_model.default_benchmark_status = 'running'
@@ -4216,6 +4467,8 @@ def benchmark_exhaustive_profiles(
             fixed_buun_skipped = 0
             for runtime_profile in runtime_profiles:
                 skip_reason = runtime_profile_skip_reason(runtime_profile, disabled_runtime_kv)
+                if not skip_reason:
+                    skip_reason = runtime_profile_memory_skip_reason(runtime_profile, disabled_runtime_memory)
                 if skip_reason:
                     if progress:
                         progress(f'smart bounded skipped {runtime_profile.name}: {skip_reason}')
@@ -4249,6 +4502,11 @@ def benchmark_exhaustive_profiles(
                     if progress:
                         progress('smart bounded buun fit profile succeeded; skipping fixed-NGL buun fallback probes')
                 elif not ok and new_records:
+                    memory_key = runtime_profile_memory_disable_key(new_records[-1], runtime_profile)
+                    if memory_key and memory_key not in disabled_runtime_memory:
+                        disabled_runtime_memory.add(memory_key)
+                        if progress:
+                            progress(f'smart bounded pruned memory-risky runtime shape after {new_records[-1].get("failure_category")}')
                     disable_key = runtime_profile_kv_disable_key(new_records[-1], runtime_profile)
                     if disable_key[0] and disable_key not in disabled_runtime_kv:
                         disabled_runtime_kv.add(disable_key)
@@ -4434,6 +4692,7 @@ def benchmark_fast_profiles(
     current: Optional[ModelConfig] = None
     completed = 0
     disabled_runtime_kv: set[Tuple[str, str]] = set()
+    disabled_runtime_memory: set[Tuple[str, ...]] = set()
 
     running_model = ModelConfig(**asdict(model))
     running_model.default_benchmark_status = 'running'
@@ -4477,6 +4736,8 @@ def benchmark_fast_profiles(
             for runtime_profile in runtime_profiles:
                 check_cancelled(cancel_token)
                 skip_reason = runtime_profile_skip_reason(runtime_profile, disabled_runtime_kv)
+                if not skip_reason:
+                    skip_reason = runtime_profile_memory_skip_reason(runtime_profile, disabled_runtime_memory)
                 if skip_reason:
                     if progress:
                         progress(f'fast skipped {runtime_profile.name}: {skip_reason}')
@@ -4509,6 +4770,11 @@ def benchmark_fast_profiles(
                     if progress:
                         progress('fast buun fit profile succeeded; skipping fixed-NGL buun fallback probes')
                 elif not ok and new_records:
+                    memory_key = runtime_profile_memory_disable_key(new_records[-1], runtime_profile)
+                    if memory_key and memory_key not in disabled_runtime_memory:
+                        disabled_runtime_memory.add(memory_key)
+                        if progress:
+                            progress(f'fast pruned memory-risky runtime shape after {new_records[-1].get("failure_category")}')
                     disable_key = runtime_profile_kv_disable_key(new_records[-1], runtime_profile)
                     if disable_key[0] and disable_key not in disabled_runtime_kv:
                         disabled_runtime_kv.add(disable_key)

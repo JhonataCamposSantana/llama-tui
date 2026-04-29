@@ -17,6 +17,7 @@ from .benchmark import (
     adaptive_context_upper_bound,
     architecture_payload,
     benchmark_preflight_cleanup,
+    candidate_safe_context_estimate,
     configure_adaptive_candidate,
     clone_model_config,
     concise_failure,
@@ -30,7 +31,12 @@ from .benchmark import (
     sync_opencode_after_tuning,
 )
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
-from .hardware import read_meminfo_bytes
+from .hardware import HardwareProfile, read_meminfo_bytes
+from .memory_guardrail import (
+    MemoryGuardrailState,
+    memory_guardrail_record_fields,
+    start_memory_guardrail_watchdog,
+)
 from .models import ModelConfig
 from .textutil import compact_message
 
@@ -390,7 +396,9 @@ def sample_memory(app) -> Dict[str, int]:
     mem_available = profile.memory_available or read_meminfo_bytes().get('MemAvailable', 0)
     return {
         'ram_available': int(mem_available or 0),
+        'ram_total': int(profile.memory_total or 0),
         'gpu_memory_free': int(profile.gpu_memory_free or 0),
+        'gpu_memory_total': int(profile.gpu_memory_total or 0),
     }
 
 
@@ -423,8 +431,10 @@ def run_process_with_metrics(
     no_output_timed_out = False
     idle_timed_out = False
     aborted = False
+    memory_guardrail_stopped = False
     context_overflow = False
     context_required = 0
+    guardrail_state = MemoryGuardrailState()
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -442,13 +452,25 @@ def run_process_with_metrics(
         selector.register(proc.stderr, selectors.EVENT_READ, 'stderr')
 
     def remember_memory():
-        nonlocal min_ram, min_vram
+        nonlocal min_ram, min_vram, memory_guardrail_stopped
         snap = sample_memory(app)
         ram = int(snap.get('ram_available', 0) or 0)
         vram = int(snap.get('gpu_memory_free', 0) or 0)
         min_ram = ram if min_ram <= 0 else min(min_ram, ram)
         if vram > 0:
             min_vram = vram if min_vram <= 0 else min(min_vram, vram)
+        decision = guardrail_state.observe(
+            HardwareProfile(
+                memory_total=int(snap.get('ram_total', 0) or 0),
+                memory_available=ram,
+                gpu_memory_total=int(snap.get('gpu_memory_total', 0) or 0),
+                gpu_memory_free=vram,
+            ),
+            phase='runtime',
+        )
+        if decision.should_stop and proc.poll() is None:
+            memory_guardrail_stopped = True
+            app.terminate_process_group(proc.pid)
 
     remember_memory()
     try:
@@ -501,6 +523,8 @@ def run_process_with_metrics(
                         app.terminate_process_group(proc.pid)
                         break
             remember_memory()
+            if memory_guardrail_stopped:
+                break
             if context_overflow:
                 break
             if proc.poll() is not None:
@@ -541,6 +565,7 @@ def run_process_with_metrics(
         'aborted': aborted,
         'context_overflow': context_overflow,
         'context_required': context_required,
+        'memory_guardrail_stopped': memory_guardrail_stopped,
         'elapsed': elapsed,
         'first_output': first_output if first_output is not None else elapsed,
         'stdout': stdout_lines[-40:],
@@ -549,6 +574,7 @@ def run_process_with_metrics(
         'raw_event_tail': raw_event_tail(stdout_lines + stderr_lines),
         'min_ram_available': min_ram,
         'min_gpu_memory_free': min_vram,
+        **guardrail_state.record_fields(),
     }
 
 
@@ -633,6 +659,19 @@ def run_opencode_task(
             run = run_process_with_metrics(command, workspace, env, timeout, app, cancel_token=cancel_token)
             all_output = list(run.get('stdout', []) or []) + list(run.get('stderr', []) or [])
             unittest_seen = detected_unittest_command(all_output)
+            guardrail_fields = {
+                key: run.get(key)
+                for key in (
+                    'memory_guardrail_status',
+                    'memory_guardrail_reason',
+                    'memory_guardrail_action',
+                    'memory_guardrail_snapshot',
+                    'memory_guardrail_min_ram_available',
+                    'memory_guardrail_min_gpu_memory_free',
+                    'memory_guardrail_observations',
+                )
+                if key in run
+            }
             if run.get('aborted'):
                 return {
                     'task': task.name,
@@ -655,6 +694,7 @@ def run_opencode_task(
                     'raw_event_tail': list(run.get('raw_event_tail', []) or [])[-12:],
                     'unittest_command_seen': unittest_seen,
                     'detail': 'user requested abort',
+                    **guardrail_fields,
                 }
             check_cancelled(cancel_token)
             tests_ok, test_detail = verify_fixture(workspace)
@@ -668,6 +708,9 @@ def run_opencode_task(
             if context_required:
                 status = 'context too small'
                 detail = f'OpenCode requested about {context_required} tokens; {detail}'
+            elif run.get('memory_guardrail_stopped') or run.get('memory_guardrail_status') == 'memory_guardrail_stopped':
+                status = 'memory guardrail stopped'
+                detail = f'candidate stopped to protect system memory: {run.get("memory_guardrail_reason", "")}'
             elif run.get('no_output_timeout'):
                 status = 'opencode no output timeout'
                 detail = f'no OpenCode output for {OPENCODE_NO_OUTPUT_TIMEOUT}s'
@@ -705,6 +748,7 @@ def run_opencode_task(
                 'unittest_command_seen': unittest_seen,
                 'context_required': context_required,
                 'detail': concise_failure(detail, limit=500),
+                **guardrail_fields,
             }
 
 
@@ -742,6 +786,7 @@ def summarize_sample_status(samples: List[Dict[str, object]]) -> str:
     statuses = [str(sample.get('status', '') or '') for sample in samples]
     for candidate in (
         'aborted',
+        'memory guardrail stopped',
         'context too small',
         'opencode no output timeout',
         'opencode idle timeout',
@@ -757,6 +802,16 @@ def summarize_sample_status(samples: List[Dict[str, object]]) -> str:
 def opencode_failure_summary(records: List[Dict[str, object]]) -> str:
     if not records:
         return 'no candidate completed a task'
+    guardrail = next((
+        row for row in records
+        if isinstance(row, dict)
+        and row.get('memory_guardrail_status') in ('memory_guardrail_stopped', 'memory_guardrail_skipped')
+    ), None)
+    if guardrail:
+        return concise_failure(
+            f'memory guardrail stopped candidate: {guardrail.get("memory_guardrail_reason", guardrail.get("detail", ""))}',
+            limit=500,
+        )
     required = max([int(row.get('context_required', 0) or 0) for row in records if isinstance(row, dict)] or [0])
     largest = max([int(row.get('ctx_per_slot', 0) or 0) for row in records if isinstance(row, dict)] or [0])
     if required:
@@ -796,6 +851,8 @@ def compact_sample_details(samples: List[Dict[str, object]]) -> List[Dict[str, o
             'context_overflow': bool(sample.get('context_overflow')),
             'unittest_command_seen': bool(sample.get('unittest_command_seen')),
             'context_required': int(sample.get('context_required', 0) or 0),
+            'memory_guardrail_status': sample.get('memory_guardrail_status', ''),
+            'memory_guardrail_reason': sample.get('memory_guardrail_reason', ''),
             'detail': concise_failure(str(sample.get('detail', '')), limit=320),
             'stdout_tail': list(sample.get('stdout_tail', []) or [])[-8:],
             'stderr_tail': list(sample.get('stderr_tail', []) or [])[-8:],
@@ -945,6 +1002,61 @@ def benchmark_opencode_workflow(
                     record=record,
                 )
                 continue
+            guardrail_state = MemoryGuardrailState()
+            guardrail_profile = app.hardware_profile(refresh=True)
+            estimated_safe_ctx = candidate_safe_context_estimate(candidate, guardrail_profile)
+            try:
+                pressure_score = float(current_process_pressure_payload().get('process_pressure_score', 0.0) or 0.0)
+            except Exception:
+                pressure_score = 0.0
+            admission = guardrail_state.observe(
+                guardrail_profile,
+                phase='admission',
+                candidate_ctx=int(getattr(candidate, 'ctx', 0) or 0),
+                safe_ctx=estimated_safe_ctx,
+                observed_floor=observed_context_floor,
+                required_for_floor=observed_context_floor > 0 and ctx_per_slot(candidate) >= observed_context_floor,
+                pressure_score=pressure_score,
+            )
+            if admission.should_skip:
+                record = {
+                    'preset': preset,
+                    'tier': tier,
+                    'status': 'memory guardrail skipped',
+                    'score': 0.0,
+                    'seconds': 0.0,
+                    'passed': 0,
+                    'tasks': len(OPENCODE_WORKFLOW_TASKS),
+                    'detail': f'candidate skipped by memory guardrail: {admission.reason}',
+                    'ctx': int(getattr(candidate, 'ctx', 0) or 0),
+                    'ctx_per_slot': ctx_per_slot(candidate),
+                    'parallel': int(getattr(candidate, 'parallel', 0) or 0),
+                    'threads': int(getattr(candidate, 'threads', 0) or 0),
+                    'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+                    'estimated_safe_ctx': estimated_safe_ctx,
+                    'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+                    'failure_category': 'MEMORY_GUARDRAIL',
+                    'failure_reason': admission.reason,
+                }
+                record.update(memory_guardrail_record_fields(admission))
+                record.update(benchmark_record_context(candidate))
+                records.append(record)
+                completed_steps += len(OPENCODE_WORKFLOW_TASKS)
+                if progress:
+                    progress(f'opencode candidate {attempt}/{len(candidates)} skipped by memory guardrail: {admission.reason}')
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_result',
+                    model,
+                    'opencode',
+                    message=f'opencode candidate {attempt}/{len(candidates)} skipped by memory guardrail',
+                    phase='OpenCode benchmark (headless)',
+                    completed=completed_steps,
+                    total=total_steps,
+                    candidate=f'{preset}/{tier}',
+                    record=record,
+                )
+                continue
             current = (preset, tier, candidate)
             if progress:
                 progress(
@@ -1006,13 +1118,28 @@ def benchmark_opencode_workflow(
                 continue
 
             samples: List[Dict[str, object]] = []
+            watchdog_stop = None
+            watchdog_thread = None
             try:
+                watchdog_stop, watchdog_thread = start_memory_guardrail_watchdog(
+                    lambda: app.hardware_profile(refresh=True),
+                    lambda: app.stop(candidate, managed_only=True),
+                    guardrail_state,
+                    candidate_ctx=int(getattr(candidate, 'ctx', 0) or 0),
+                    safe_ctx=estimated_safe_ctx,
+                    observed_floor=observed_context_floor,
+                    required_for_floor=observed_context_floor > 0 and ctx_per_slot(candidate) >= observed_context_floor,
+                    pressure_score=pressure_score,
+                    phase='runtime',
+                )
                 ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=180, cancel_token=cancel_token)
                 if not ready_ok:
+                    if guardrail_state.stop_decision is not None:
+                        ready_msg = guardrail_state.stop_decision.reason
                     record = {
                         'preset': preset,
                         'tier': tier,
-                        'status': 'not ready',
+                        'status': 'memory guardrail stopped' if guardrail_state.stop_decision is not None else 'not ready',
                         'score': 0.0,
                         'seconds': 0.0,
                         'passed': 0,
@@ -1025,6 +1152,10 @@ def benchmark_opencode_workflow(
                         'ngl': int(getattr(candidate, 'ngl', 0) or 0),
                         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                     }
+                    if guardrail_state.stop_decision is not None:
+                        record['failure_category'] = 'MEMORY_GUARDRAIL'
+                        record['failure_reason'] = guardrail_state.stop_decision.reason
+                        record.update(guardrail_state.record_fields())
                     record.update(benchmark_record_context(candidate))
                     records.append(record)
                     if progress:
@@ -1125,6 +1256,14 @@ def benchmark_opencode_workflow(
                             )
                         completed_steps += max(0, len(OPENCODE_WORKFLOW_TASKS) - task_idx)
                         break
+                    if sample.get('memory_guardrail_status') == 'memory_guardrail_stopped':
+                        if progress:
+                            progress(
+                                f'opencode candidate {attempt}/{len(candidates)} stopped early by memory guardrail: '
+                                f'{sample.get("memory_guardrail_reason", "")}'
+                            )
+                        completed_steps += max(0, len(OPENCODE_WORKFLOW_TASKS) - task_idx)
+                        break
 
                 score = score_opencode_samples(samples)
                 passed = sum(1 for sample in samples if sample.get('ok'))
@@ -1162,6 +1301,12 @@ def benchmark_opencode_workflow(
                     'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
                 }
                 record.update(benchmark_record_context(candidate))
+                record.update(guardrail_state.record_fields())
+                sample_guardrail = next((sample for sample in samples if sample.get('memory_guardrail_status')), None)
+                if sample_guardrail:
+                    for key, value in sample_guardrail.items():
+                        if key.startswith('memory_guardrail_'):
+                            record[key] = value
                 records.append(record)
                 if score > 0:
                     results.append({
@@ -1188,6 +1333,10 @@ def benchmark_opencode_workflow(
                     record=record,
                 )
             finally:
+                if watchdog_stop is not None:
+                    watchdog_stop.set()
+                if watchdog_thread is not None:
+                    watchdog_thread.join(timeout=1.0)
                 app.stop(candidate, managed_only=True)
                 if progress:
                     progress(f'opencode candidate {attempt}/{len(candidates)} stopped.')

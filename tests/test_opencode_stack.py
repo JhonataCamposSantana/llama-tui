@@ -1544,12 +1544,27 @@ class DiscoveryDefaultsTests(unittest.TestCase):
         self.assertEqual(model.ctx, 2048)
         self.assertEqual(model.ctx_min, 2048)
         self.assertEqual(model.ctx_max, 131072)
+        self.assertEqual(model.host, '127.0.0.1')
+        self.assertEqual(model.port, 18080)
         self.assertEqual(model.ngl, 0)
         self.assertEqual(model.temp, 0.7)
         self.assertEqual(model.output, 2048)
         self.assertEqual(model.optimize_tier, 'safe')
         self.assertEqual(model.memory_reserve_percent, 40)
         self.assertEqual(model.default_benchmark_status, 'pending')
+
+    def test_detected_models_reuse_stable_single_server_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_path = root / 'Alpha.gguf'
+            second_path = root / 'Beta.gguf'
+            first_path.write_bytes(b'not real gguf metadata')
+            second_path.write_bytes(b'not real gguf metadata')
+            first = detected_model_from_path(first_path, [])
+            second = detected_model_from_path(second_path, [first])
+
+        self.assertEqual(first.port, 18080)
+        self.assertEqual(second.port, 18080)
 
     def test_personal_paths_are_not_embedded_in_constants(self):
         text = Path('llama_tui/constants.py').read_text()
@@ -1613,6 +1628,48 @@ class ProcessLifecycleTests(unittest.TestCase):
         self.assertTrue(result['no_output_timeout'])
         self.assertEqual(result['stdout'], [])
         self.assertEqual(result['stderr'], [])
+
+    def test_memory_guardrail_kills_opencode_process(self):
+        class FakeApp:
+            def __init__(self):
+                self.samples = 0
+
+            def hardware_profile(self, refresh=False):
+                self.samples += 1
+                if self.samples == 1:
+                    return HardwareProfile(
+                        memory_total=16 * 1024**3,
+                        memory_available=12 * 1024**3,
+                        gpu_memory_total=8 * 1024**3,
+                        gpu_memory_free=7 * 1024**3,
+                    )
+                return HardwareProfile(
+                    memory_total=16 * 1024**3,
+                    memory_available=512 * 1024**2,
+                    gpu_memory_total=8 * 1024**3,
+                    gpu_memory_free=7 * 1024**3,
+                )
+
+            def terminate_process_group(self, pid):
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                return True, 'terminated'
+
+        result = run_process_with_metrics(
+            [sys.executable, '-c', 'import time; time.sleep(60)'],
+            Path(self.tmp.name),
+            os.environ.copy(),
+            timeout=10,
+            app=FakeApp(),
+            no_output_timeout=0,
+            idle_output_timeout=0,
+        )
+
+        self.assertTrue(result['memory_guardrail_stopped'])
+        self.assertEqual(result['memory_guardrail_status'], 'memory_guardrail_stopped')
+        self.assertIn('RAM available', result['memory_guardrail_reason'])
 
     def test_stdout_stderr_tails_are_persisted(self):
         code = 'import sys; print("{\\"event\\":\\"ok\\"}"); print("python -m unittest -q", file=sys.stderr)'

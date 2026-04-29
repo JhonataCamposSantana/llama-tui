@@ -43,6 +43,7 @@ DATA_DIR = Path.home() / '.local' / 'share' / APP_NAME
 CACHE_DIR = Path.home() / '.cache' / APP_NAME
 DEFAULT_CONFIG_PATH = Path(os.environ['LLAMA_TUI_CONFIG']).expanduser() if os.environ.get('LLAMA_TUI_CONFIG') else (CONFIG_DIR / 'models.json')
 DEFAULT_HOST = '127.0.0.1'
+DEFAULT_MODEL_PORT = 18080
 DEFAULT_HF_CACHE = _env_path(
     'HF_CACHE_ROOT',
     Path(os.environ['HF_HOME']).expanduser() / 'hub'

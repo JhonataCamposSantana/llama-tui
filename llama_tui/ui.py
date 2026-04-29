@@ -25,7 +25,7 @@ from .benchmark import (
     sync_opencode_after_tuning,
 )
 from .chat import stream_chat_events
-from .constants import LOGO, REFRESH_SECONDS
+from .constants import DEFAULT_HOST, DEFAULT_MODEL_PORT, LOGO, REFRESH_SECONDS
 from .control import CancelToken, CancelledError
 from .discovery import classify_model_type, display_offload, display_runtime, extract_quant
 from .gguf import architecture_detail, turboquant_detail, turboquant_short
@@ -2074,7 +2074,7 @@ def model_form_fields(initial: ModelConfig) -> List[Dict[str, str]]:
 
 
 def parse_model_form_answers(answers: Dict[str, str], initial: Optional[ModelConfig] = None) -> Tuple[Optional[ModelConfig], Dict[str, str]]:
-    initial = initial or ModelConfig(id='', name='', path='', alias='', port=8080)
+    initial = initial or ModelConfig(id='', name='', path='', alias='', port=DEFAULT_MODEL_PORT)
     cleaned = {key: str(value or '').strip() for key, value in answers.items()}
     errors: Dict[str, str] = {}
     if not cleaned.get('id'):
@@ -2358,7 +2358,7 @@ def parse_workspace_form_answers(app: AppConfig, answers: Dict[str, str]) -> Tup
 
 
 def prompt_model(stdscr, colors, title: str, initial: Optional[ModelConfig] = None) -> Optional[ModelConfig]:
-    initial = initial or ModelConfig(id='', name='', path='', alias='', port=8080)
+    initial = initial or ModelConfig(id='', name='', path='', alias='', port=DEFAULT_MODEL_PORT)
     return prompt_form(
         stdscr,
         colors,
@@ -2607,6 +2607,33 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
         statuses[status] = statuses.get(status, 0) + 1
     status_line = ' '.join(f'{key}:{value}' for key, value in sorted(statuses.items())) or 'none'
     items.append((f'model verification: {status_line}', 'success' if statuses.get('passed') else 'muted'))
+
+    def model_endpoint(model: ModelConfig) -> str:
+        host = str(getattr(model, 'host', DEFAULT_HOST) or DEFAULT_HOST).strip() or DEFAULT_HOST
+        try:
+            port = int(getattr(model, 'port', DEFAULT_MODEL_PORT) or DEFAULT_MODEL_PORT)
+        except (TypeError, ValueError):
+            port = DEFAULT_MODEL_PORT
+        return f'{host}:{port}'
+
+    enabled_endpoints = sorted({
+        model_endpoint(model)
+        for model in list(getattr(app, 'models', []) or [])
+        if bool(getattr(model, 'enabled', True))
+    })
+    if not enabled_endpoints:
+        items.append((f'server endpoint: default {DEFAULT_HOST}:{DEFAULT_MODEL_PORT}', 'muted'))
+    elif len(enabled_endpoints) == 1:
+        kind = 'success' if enabled_endpoints[0] == f'{DEFAULT_HOST}:{DEFAULT_MODEL_PORT}' else 'warning'
+        items.append((f'server endpoint: {enabled_endpoints[0]}', kind))
+    else:
+        preview = ', '.join(enabled_endpoints[:3])
+        if len(enabled_endpoints) > 3:
+            preview += ' ...'
+        items.append((
+            f'server endpoints split: {len(enabled_endpoints)} endpoints ({preview}); single-server workflow prefers {DEFAULT_HOST}:{DEFAULT_MODEL_PORT}',
+            'warning',
+        ))
     pending = app.benchmark_proof_model_ids(force=False)
     items.append((f'benchmark proof needed: {len(pending)} model(s)', 'warning' if pending else 'success'))
     if active_model:

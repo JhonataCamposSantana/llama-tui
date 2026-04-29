@@ -441,6 +441,8 @@ class BrowserAndFormTests(unittest.TestCase):
         text = '\n'.join(row for row, _kind in rows)
 
         self.assertIn('model verification: needs_benchmark:1 passed:1', text)
+        self.assertIn('server endpoints split: 2 endpoints', text)
+        self.assertIn('single-server workflow prefers 127.0.0.1:18080', text)
         self.assertIn('benchmark proof needed: 1 model(s)', text)
         self.assertIn('cap: factor=parallel_split', text)
         self.assertIn('turboquant: padded key=96 value=96', text)

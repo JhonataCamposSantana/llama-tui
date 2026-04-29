@@ -2,6 +2,7 @@ import inspect
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from llama_tui.app import AppConfig
 from llama_tui.benchmark import (
     active_engine_runtime_profiles,
     adaptive_record_from_candidate,
+    benchmark_adaptive_candidate,
     benchmark_all_models_runner,
     benchmark_exhaustive_profiles,
     benchmark_fast_profiles,
@@ -17,7 +19,10 @@ from llama_tui.benchmark import (
     classify_benchmark_failure,
     launch_with_failsafe,
     measured_profile_runtime_profile,
+    memory_guardrail_admission,
     model_and_runtime_profile_from_measured_profile,
+    runtime_profile_memory_disable_key,
+    runtime_profile_memory_skip_reason,
     select_measured_profiles,
 )
 from llama_tui.hardware import HardwareProfile
@@ -473,7 +478,9 @@ class RuntimeProfileTests(unittest.TestCase):
             'cudaMalloc failed: out of memory while loading tensors': 'CUDA_OOM_WEIGHTS',
             'cudaMalloc failed: out of memory allocating KV cache': 'CUDA_OOM_KV',
             'K cache type turbo4 with block size 128 does not divide': 'KV_MODE_INCOMPATIBLE',
-            'failed to fit params to free device memory, n_gpu_layers already set by user to 21': 'BUUN_FIT_FAILED',
+            'failed to fit params to free device memory, n_gpu_layers already set by user to 21': 'FIXED_GPU_LAYERS_FIT_FAILED',
+            'llama_params_fit_impl: projected to use 9879 MiB of device memory vs. 7665 MiB of free device memory; cannot meet free memory target of 1024 MiB': 'MEMORY_FIT_FAILED',
+            'failed to allocate buffer for kv cache; failed to create context': 'CUDA_OOM_KV',
             'ggml-cpu/ops.cpp:4443: fatal error in ggml_compute_forward_scale': 'BUUN_CPU_WARMUP_ABORT',
             'failed to load model': 'MODEL_LOAD_FAILED',
             'server timed out': 'SERVER_TIMEOUT',
@@ -487,11 +494,103 @@ class RuntimeProfileTests(unittest.TestCase):
             'ggml_backend_cuda_buffer_type_alloc_buffer: cudaMalloc failed: out of memory\n'
             'llama_model_load: failed to load model'
         )
-        cases[mixed_buun_fit_oom] = 'BUUN_FIT_FAILED'
+        cases[mixed_buun_fit_oom] = 'FIXED_GPU_LAYERS_FIT_FAILED'
         for text, expected in cases.items():
             with self.subTest(text=text):
                 default = 'API_TIMEOUT' if text == 'request timed out' else 'SERVER_TIMEOUT'
                 self.assertEqual(classify_benchmark_failure(text, default)['failure_category'], expected)
+
+    def test_memory_guardrail_admission_skips_critical_memory(self):
+        model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200, ctx=65536)
+        profile = HardwareProfile(
+            memory_total=16 * 1024**3,
+            memory_available=512 * 1024**2,
+            gpu_memory_total=8 * 1024**3,
+            gpu_memory_free=7 * 1024**3,
+        )
+
+        decision = memory_guardrail_admission(profile, model, estimated_safe_ctx=32768)
+
+        self.assertTrue(decision.should_skip)
+        self.assertEqual(decision.status, 'memory_guardrail_skipped')
+        self.assertIn('RAM available', decision.reason)
+
+    def test_runtime_memory_pruning_skips_same_or_larger_risky_shapes(self):
+        failed_profile = RuntimeProfile(
+            engine_id='llama.cpp',
+            name='context_growth_sweep_32768',
+            ctx_size=32768,
+            gpu_layers=30,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+        )
+        failed = {'failure_category': 'CUDA_OOM_KV'}
+        key = runtime_profile_memory_disable_key(failed, failed_profile)
+        larger_same_shape = RuntimeProfile(
+            engine_id='llama.cpp',
+            name='context_growth_sweep_65536',
+            ctx_size=65536,
+            gpu_layers=30,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+        )
+        safer_default = RuntimeProfile(
+            engine_id='llama.cpp',
+            name='context_growth_sweep_65536_default',
+            ctx_size=65536,
+            gpu_layers=30,
+            parallel=1,
+            kv_preset='default',
+        )
+
+        self.assertTrue(runtime_profile_memory_skip_reason(larger_same_shape, {key}))
+        self.assertEqual(runtime_profile_memory_skip_reason(safer_default, {key}), '')
+
+    def test_adaptive_candidate_watchdog_stops_managed_candidate_on_critical_memory(self):
+        model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=8192, ctx_min=2048, ctx_max=8192)
+
+        class FakeApp:
+            def __init__(self):
+                self.samples = 0
+                self.stops = 0
+
+            def hardware_profile(self, refresh=False):
+                self.samples += 1
+                if self.samples == 1:
+                    return HardwareProfile(
+                        memory_total=16 * 1024**3,
+                        memory_available=12 * 1024**3,
+                        gpu_memory_total=8 * 1024**3,
+                        gpu_memory_free=7 * 1024**3,
+                    )
+                return HardwareProfile(
+                    memory_total=16 * 1024**3,
+                    memory_available=512 * 1024**2,
+                    gpu_memory_total=8 * 1024**3,
+                    gpu_memory_free=7 * 1024**3,
+                )
+
+            def build_command(self, _model, runtime_profile=None):
+                return ['llama-server']
+
+            def start(self, _model, runtime_profile=None):
+                return True, 'started'
+
+            def wait_until_ready(self, _model, timeout=180, cancel_token=None):
+                time.sleep(1.2)
+                return False, 'not ready'
+
+            def stop(self, _model, managed_only=True):
+                self.stops += 1
+                return True, 'stopped'
+
+        app = FakeApp()
+        record, measured = benchmark_adaptive_candidate(app, model, 'long_context', None, None)
+
+        self.assertIsNone(measured)
+        self.assertEqual(record['failure_category'], 'MEMORY_GUARDRAIL')
+        self.assertEqual(record['memory_guardrail_status'], 'memory_guardrail_stopped')
+        self.assertGreaterEqual(app.stops, 1)
 
     def test_buun_heavy_moe_profiles_use_fit_only_turbokv_from_traits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1429,6 +1528,114 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(any('skipping fixed-NGL buun fallback probes' in str(item) for item in events))
         self.assertTrue(any('skipped 1 fixed-NGL buun profile' in str(item) for item in events))
         self.assertIn('buun fit profile', app.saved[-1].benchmark_runs[0]['summary'])
+
+    def test_fast_runner_prunes_fixed_gpu_layer_profiles_after_fit_oom(self):
+        model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)
+        hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+        fixed_a = RuntimeProfile(
+            engine_id='buun',
+            name='gpu_layer_sweep_ngl26',
+            ctx_size=8192,
+            gpu_layers=26,
+            parallel=1,
+            kv_preset='turbo4/turbo4',
+            benchmark_depth='fast',
+        )
+        fixed_b = RuntimeProfile(
+            engine_id='buun',
+            name='gpu_layer_sweep_ngl30',
+            ctx_size=8192,
+            gpu_layers=30,
+            parallel=1,
+            kv_preset='turbo4/turbo4',
+            benchmark_depth='fast',
+        )
+        fit_fallback = RuntimeProfile(
+            engine_id='buun',
+            name='fit_default_probe',
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='default',
+            fit=True,
+            fit_context=4096,
+            no_warmup=True,
+            benchmark_depth='fast',
+        )
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return hardware
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, model):
+                self.saved.append(model)
+
+        calls = []
+
+        def fake_runtime_benchmark(_app, base_model, profile, objective, _progress, _cancel_token, completed, total, **kwargs):
+            calls.append(profile.name)
+            candidate = ModelConfig(
+                id=base_model.id,
+                name=base_model.name,
+                path=base_model.path,
+                alias=base_model.alias,
+                port=base_model.port,
+                ctx=profile.ctx_size,
+                parallel=profile.parallel,
+                ngl=profile.gpu_layers if profile.gpu_layers is not None else base_model.ngl,
+            )
+            if profile.gpu_layers is not None:
+                failed = adaptive_record_from_candidate(
+                    candidate,
+                    objective,
+                    'not ready',
+                    detail='failed to fit params to free device memory: n_gpu_layers already set by user to 26',
+                    failure_category='FIXED_GPU_LAYERS_FIT_FAILED',
+                    failure_reason='fixed GPU layers cannot fit',
+                    runtime_profile=profile.name,
+                    gpu_layers_mode='fixed',
+                )
+                return False, True, [failed], [], completed + 1
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=20.0,
+                seconds=1.0,
+                engine=profile.engine_id,
+                runtime_profile=profile.name,
+                kv_preset=profile.kv_preset,
+                runtime_fit=profile.fit,
+                fit_context=profile.fit_context,
+                gpu_layers_mode='fit',
+            )
+            measured = dict(record)
+            measured['model'] = candidate
+            return True, False, [record], [measured], completed + 1
+
+        events = []
+        app = FakeApp()
+        with patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=[fixed_a, fixed_b, fit_fallback]), \
+             patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model, progress=events.append)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, ['gpu_layer_sweep_ngl26', 'fit_default_probe'])
+        self.assertTrue(any('fixed GPU-layer profiles were already rejected' in str(item) for item in events))
 
     def test_deep_benchmark_all_continues_using_adaptive_runner(self):
         self.assertEqual(benchmark_all_models_runner.__name__, 'benchmark_all_models_runner')

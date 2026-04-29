@@ -22,6 +22,7 @@ from .constants import (
     DEFAULT_LLMFIT_CACHE,
     DEFAULT_LLM_MODELS_CACHE,
     DEFAULT_LLAMA_SERVER,
+    DEFAULT_MODEL_PORT,
     DEFAULT_VLLM_COMMAND,
 )
 from .discovery import (
@@ -2472,7 +2473,7 @@ class AppConfig:
             return 0, notes
         return 0, ['No new GGUFs found.']
 
-    def next_port(self, start: int = 8080) -> int:
+    def next_port(self, start: int = DEFAULT_MODEL_PORT) -> int:
         used = {m.port for m in self.models}
         port = start
         while port in used:

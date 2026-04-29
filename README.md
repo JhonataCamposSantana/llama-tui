@@ -125,7 +125,7 @@ Useful per-model fields:
 - `runtime`: `llama.cpp` or `vllm`.
 - `path`: GGUF path for `llama.cpp`, local path or repo id for vLLM.
 - `alias`: served model name used by OpenAI-compatible requests.
-- `host` and `port`: bind address.
+- `host` and `port`: bind address. New local models default to `127.0.0.1:18080` so generated tool configs stay on one stable local endpoint.
 - `ctx`: requested context size.
 - `threads`: CPU generation threads.
 - `ngl`: `llama.cpp` GPU layer offload count.
@@ -203,7 +203,7 @@ llama-server \
   -m /path/to/model.gguf \
   --alias my-model \
   --host 127.0.0.1 \
-  --port 8080 \
+  --port 18080 \
   --ctx-size 8192 \
   --threads 6 \
   --n-gpu-layers 12 \
@@ -219,7 +219,7 @@ For vLLM, llama-tui builds:
 ```bash
 vllm serve MODEL_REF \
   --host 127.0.0.1 \
-  --port 8080 \
+  --port 18080 \
   --served-model-name my-model \
   --max-model-len 8192
 ```
@@ -388,7 +388,7 @@ lm_studio_model_roots
 
 LM Studio defaults are read from `LM_STUDIO_HOME`, then `~/.lmstudio-home-pointer`, then `~/.lmstudio`. llama-tui scans only the user model folders, `models` and `hub/models`, by default; internal bundled models are skipped unless you add that path manually.
 
-Files containing `mmproj` are ignored. New models get generated ids, aliases, ports, architecture labels, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. That pending marker means “unbenchmarked,” not blocked: you can start the server immediately, and nothing benchmarks automatically in the background. Open the model details and press `B` when you want measured settings.
+Files containing `mmproj` are ignored. New models get generated ids, aliases, the stable local endpoint `127.0.0.1:18080`, architecture labels, and a generic safe profile: small context, CPU-first launch, safe memory reserve, and `default_benchmark_status=pending`. That pending marker means “unbenchmarked,” not blocked: you can start the server immediately, and nothing benchmarks automatically in the background. Open the model details and press `B` when you want measured settings.
 
 Dense vs MoE detection is metadata-first. llama-tui reads GGUF `general.architecture` and expert metadata such as `{arch}.expert_count` and `{arch}.expert_used_count`; if metadata is incomplete, it can inspect tensor descriptors by name without reading tensor data; filename patterns such as `30B-A3B` are only a weak fallback. MoE benchmark mode keeps memory estimates based on the full loaded GGUF, keeps KV-cache estimates attention/layer-driven, and scores OpenCode-style profiles by stable context before raw tokens/sec.
 

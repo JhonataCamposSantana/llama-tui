@@ -3,6 +3,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import List
 
+from .constants import DEFAULT_MODEL_PORT
 from .gguf import (
     apply_architecture_info,
     apply_turboquant_info,
@@ -113,17 +114,13 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
     while model_id in ids:
         model_id = f'{base_id}_{i}'
         i += 1
-    ports = {m.port for m in existing_models}
-    port = 8080
-    while port in ports:
-        port += 1
     ctx_max = gguf_context_max(path)
     model = ModelConfig(
         id=model_id,
         name=name,
         path=str(path),
         alias=slugify(stem),
-        port=port,
+        port=DEFAULT_MODEL_PORT,
         ctx=GENERIC_DISCOVERY_CTX,
         ctx_min=GENERIC_DISCOVERY_CTX,
         ctx_max=ctx_max,

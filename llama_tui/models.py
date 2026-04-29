@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from .constants import DEFAULT_HOST
+from .constants import DEFAULT_HOST, DEFAULT_MODEL_PORT
 
 
 @dataclass
@@ -10,7 +10,7 @@ class ModelConfig:
     name: str
     path: str
     alias: str
-    port: int
+    port: int = DEFAULT_MODEL_PORT
     host: str = DEFAULT_HOST
     ctx: int = 8192
     threads: int = 6
