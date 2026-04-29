@@ -421,7 +421,7 @@ If VS Code is unavailable, it still launches the model + OpenCode path and repor
 
 ## Continue Export
 
-Set `continue.path` in settings, then press `c` to generate the config.
+Press `c` to generate the config. By default `continue.path` is `~/.continue/config.yaml`; you can override it in settings if your Continue install uses a different YAML path.
 
 llama-tui writes a local Continue `config.yaml` using the OpenAI-compatible provider format:
 
@@ -445,7 +445,7 @@ Set `continue.merge_mode` to `managed_file` if you want llama-tui to rewrite the
 
 Continue `contextLength` is exported as per-slot context, `ctx // parallel`, so autocomplete and chat tools see the same effective window the server exposes for each simultaneous request.
 
-When `continue.path` is set, llama-tui also refreshes the Continue export after benchmark-driven tuning and Auto-profile updates so the exported context and token limits stay aligned with the latest saved model settings.
+llama-tui also refreshes the Continue export after benchmark-driven tuning and Auto-profile updates so the exported context and token limits stay aligned with the latest saved model settings.
 
 ## Safety Notes
 

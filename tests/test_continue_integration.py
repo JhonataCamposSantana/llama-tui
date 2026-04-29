@@ -1,6 +1,8 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from llama_tui.app import AppConfig
 from llama_tui.models import ModelConfig
@@ -79,6 +81,31 @@ class ContinueIntegrationTests(unittest.TestCase):
         self.assertEqual(loaded.continue_settings.edit_model_id, 'build')
         self.assertEqual(loaded.continue_settings.autocomplete_model_id, 'small')
         self.assertEqual(loaded.continue_settings.merge_mode, 'managed_file')
+
+    def test_generate_continue_config_uses_standard_default_path_when_unset(self):
+        with tempfile.TemporaryDirectory() as home_raw:
+            home = Path(home_raw)
+            with patch.dict(os.environ, {'HOME': str(home)}):
+                app = AppConfig(home / 'models.json')
+                app.continue_settings.path = ''
+                app.continue_settings.backup_dir = str(home / 'backups')
+                app.add_or_update(ModelConfig(
+                    id='main',
+                    name='Main Model',
+                    path=__file__,
+                    alias='main-local',
+                    port=18080,
+                    ctx=8192,
+                    output=1024,
+                ))
+
+                ok, msg = app.generate_continue_config()
+
+            target = home / '.continue' / 'config.yaml'
+            self.assertTrue(ok, msg)
+            self.assertEqual(app.continue_settings.path, '~/.continue/config.yaml')
+            self.assertTrue(target.exists())
+            self.assertIn(str(target), msg)
 
     def test_generate_continue_config_uses_existing_role_assignments_and_backup(self):
         self.app.opencode.default_model_id = 'main'

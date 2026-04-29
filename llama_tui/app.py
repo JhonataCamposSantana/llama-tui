@@ -272,7 +272,7 @@ class AppConfig:
             backup_dir=str(CONFIG_DIR / 'backups'),
         )
         self.continue_settings = ContinueSettings(
-            path='',
+            path='~/.continue/config.yaml',
             backup_dir=str(CONFIG_DIR / 'backups'),
         )
         self.hermes = HermesSettings(
@@ -339,6 +339,8 @@ class AppConfig:
         self.lm_studio_model_roots = data.get('lm_studio_model_roots', self.lm_studio_model_roots)
         self.opencode = self._load_settings(OpencodeSettings, data.get('opencode', {}), self.opencode, 'opencode')
         self.continue_settings = self._load_settings(ContinueSettings, data.get('continue', {}), self.continue_settings, 'continue')
+        if not self.continue_settings.path:
+            self.continue_settings.path = '~/.continue/config.yaml'
         if not self.continue_settings.backup_dir:
             self.continue_settings.backup_dir = str(CONFIG_DIR / 'backups')
         if getattr(self.continue_settings, 'merge_mode', '') not in CONTINUE_MERGE_MODES:
@@ -2522,6 +2524,22 @@ class AppConfig:
             badges.append('C')
         return ''.join(badges) or '-'
 
+    def opencode_context_limit_for_model(self, model: ModelConfig) -> int:
+        profile = (getattr(model, 'measured_profiles', {}) or {}).get('opencode_ready') or {}
+        if isinstance(profile, dict) and str(profile.get('status', 'ok') or 'ok') == 'ok':
+            try:
+                measured_ctx = int(profile.get('ctx_per_slot', 0) or 0)
+            except Exception:
+                measured_ctx = 0
+            if measured_ctx <= 0:
+                try:
+                    measured_ctx = int(profile.get('ctx', 0) or 0) // max(1, int(profile.get('parallel', 1) or 1))
+                except Exception:
+                    measured_ctx = 0
+            if measured_ctx > 0:
+                return measured_ctx
+        return max(1, context_per_slot(model))
+
     def generate_opencode(self) -> Tuple[bool, str]:
         path = Path(self.opencode.path).expanduser() if self.opencode.path else None
         if not path:
@@ -2551,7 +2569,7 @@ class AppConfig:
         provider = {}
         for model in enabled_models:
             provider_key = self.opencode_provider_key(model)
-            runtime_label = 'vLLM' if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else 'llama.cpp'
+            runtime_label = self.active_engine_label_for_model(model)
             provider[provider_key] = {
                 'npm': '@ai-sdk/openai-compatible',
                 'name': f'{runtime_label} {model.name}',
@@ -2564,7 +2582,7 @@ class AppConfig:
                     model.alias: {
                         'name': model.name,
                         'limit': {
-                            'context': model.ctx,
+                            'context': self.opencode_context_limit_for_model(model),
                             'output': model.output,
                         }
                     }
@@ -2725,9 +2743,9 @@ class AppConfig:
         return '\n'.join(merged).rstrip() + '\n'
 
     def generate_continue_config(self) -> Tuple[bool, str]:
-        path = Path(self.continue_settings.path).expanduser() if self.continue_settings.path else None
-        if not path:
-            return False, 'Set continue.path first in settings.'
+        if not self.continue_settings.path:
+            self.continue_settings.path = '~/.continue/config.yaml'
+        path = Path(self.continue_settings.path).expanduser()
 
         enabled_models = [m for m in self.models if m.enabled]
         if not enabled_models:

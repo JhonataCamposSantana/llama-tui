@@ -99,7 +99,7 @@ class OpencodeSettings:
 
 @dataclass
 class ContinueSettings:
-    path: str = ''
+    path: str = '~/.continue/config.yaml'
     backup_dir: str = ''
     default_model_id: str = ''
     edit_model_id: str = ''

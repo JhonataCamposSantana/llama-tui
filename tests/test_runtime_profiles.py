@@ -1,4 +1,5 @@
 import inspect
+import json
 import os
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ from llama_tui.benchmark import (
     benchmark_runtime_profile_with_retry,
     classify_benchmark_failure,
     launch_with_failsafe,
+    measured_profile_runtime_profile,
+    model_and_runtime_profile_from_measured_profile,
     select_measured_profiles,
 )
 from llama_tui.hardware import HardwareProfile
@@ -22,6 +25,7 @@ from llama_tui.main import (
     build_cli_parser,
     ensure_engine_session_lock,
     engine_session_path,
+    last_engine_session_stop_count,
     release_engine_session_lock,
     validate_buun_kv_args,
 )
@@ -219,6 +223,124 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('-ctk') + 1], 'turbo4')
         self.assertEqual(cmd[cmd.index('-ctv') + 1], 'turbo4')
 
+    def test_measured_buun_profile_replays_fit_runtime_metadata(self):
+        fingerprint = {
+            'engine_id': 'buun',
+            'runtime_profile': 'fit_context_growth_sweep_32768_turbo4_turbo4',
+            'gpu_layers': None,
+            'kv_preset': 'turbo4/turbo4',
+            'flash_attn': 'on',
+            'batch_size': 128,
+            'ubatch_size': 64,
+            'fit': True,
+            'fit_context': 4096,
+            'no_warmup': True,
+        }
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path='/models/m.gguf',
+            alias='m',
+            port=18200,
+            measured_profiles={
+                'opencode_ready': {
+                    'status': 'ok',
+                    'ctx': 32768,
+                    'ctx_per_slot': 32768,
+                    'parallel': 1,
+                    'ngl': 999,
+                    'tokens_per_sec': 20.0,
+                    'engine': 'buun',
+                    'runtime_profile': 'fit_context_growth_sweep_32768_turbo4_turbo4',
+                    'kv_preset': 'turbo4/turbo4',
+                    'runtime_fit': True,
+                    'fit_context': 4096,
+                    'runtime_no_warmup': True,
+                    'gpu_layers_mode': 'fit',
+                    'batch_size': 128,
+                    'ubatch_size': 64,
+                    'config_fingerprint': json.dumps(fingerprint),
+                }
+            },
+        )
+
+        candidate, runtime_profile = model_and_runtime_profile_from_measured_profile(model, 'opencode_ready')
+        direct_runtime = measured_profile_runtime_profile(model, 'opencode_ready')
+
+        self.assertIsNotNone(candidate)
+        self.assertIsNotNone(runtime_profile)
+        self.assertIsNotNone(direct_runtime)
+        self.assertEqual(candidate.ctx, 32768)
+        self.assertTrue(runtime_profile.fit)
+        self.assertIsNone(runtime_profile.gpu_layers)
+        self.assertEqual(runtime_profile.fit_context, 4096)
+        self.assertTrue(runtime_profile.no_warmup)
+        self.assertEqual(runtime_profile.kv_preset, 'turbo4/turbo4')
+        self.assertEqual(runtime_profile.batch_size, 128)
+        self.assertEqual(runtime_profile.ubatch_size, 64)
+
+    def test_launch_with_failsafe_starts_measured_profile_with_runtime_replay(self):
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path='/models/m.gguf',
+            alias='m',
+            port=18200,
+            measured_profiles={
+                'auto': {
+                    'status': 'ok',
+                    'ctx': 32768,
+                    'ctx_per_slot': 32768,
+                    'parallel': 1,
+                    'ngl': 999,
+                    'tokens_per_sec': 20.0,
+                    'engine': 'buun',
+                    'runtime_profile': 'fit_context_growth_sweep_32768_turbo4_turbo4',
+                    'kv_preset': 'turbo4/turbo4',
+                    'runtime_fit': True,
+                    'fit_context': 4096,
+                    'runtime_no_warmup': True,
+                    'gpu_layers_mode': 'fit',
+                    'batch_size': 128,
+                    'ubatch_size': 64,
+                }
+            },
+        )
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self):
+                self.started_runtime_profiles = []
+                self.saved = []
+
+            def hardware_profile(self, refresh=False):
+                return HardwareProfile(memory_available=32 * 1024**3)
+
+            def add_or_update(self, saved):
+                self.saved.append(saved)
+
+            def start(self, _model, runtime_profile=None):
+                self.started_runtime_profiles.append(runtime_profile)
+                return True, 'started'
+
+            def wait_until_ready(self, _model, timeout=120, cancel_token=None):
+                return True, 'ready'
+
+            def stop(self, _model, managed_only=True):
+                return True, 'stopped'
+
+        app = FakeApp()
+        ok, msg = launch_with_failsafe(app, model, 'best', 'auto')
+
+        self.assertTrue(ok, msg)
+        self.assertTrue(app.started_runtime_profiles)
+        runtime_profile = app.started_runtime_profiles[0]
+        self.assertIsNotNone(runtime_profile)
+        self.assertTrue(runtime_profile.fit)
+        self.assertIsNone(runtime_profile.gpu_layers)
+        self.assertEqual(runtime_profile.fit_context, 4096)
+
     def test_runtime_artifacts_are_scoped_by_active_engine(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -413,6 +535,128 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertIsNone(turbo_probe.gpu_layers)
         self.assertIn(32768, {item.ctx_size for item in profiles})
 
+    def test_buun_dense_profiles_include_fit_context_growth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='dense',
+                name='Dense',
+                path='/models/dense.gguf',
+                alias='dense',
+                port=18080,
+                architecture='llama',
+                architecture_type='dense',
+                turboquant_status='native',
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('buun')):
+                with patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
+                    profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        growth = [item for item in profiles if item.name.startswith('fit_context_growth_sweep_')]
+        self.assertTrue(any(item.ctx_size >= 16384 for item in growth))
+        self.assertTrue(all(item.fit and item.gpu_layers is None for item in growth))
+        self.assertTrue(any(item.name == 'partial_gpu_probe' for item in profiles))
+
+    def test_buun_dense_health_based_growth_can_exceed_32k(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='dense',
+                name='Dense',
+                path='/models/dense.gguf',
+                alias='dense',
+                port=18080,
+                architecture='llama',
+                architecture_type='dense',
+                turboquant_status='native',
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+                ctx_max=131072,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('buun')), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3), \
+                patch('llama_tui.benchmark.current_process_pressure_payload', return_value={'process_pressure_score': 0.1}):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        growth_contexts = {item.ctx_size for item in profiles if item.name.startswith('fit_context_growth_sweep_')}
+        self.assertGreater(max(growth_contexts), 32768)
+        self.assertIn(131072, growth_contexts)
+
+    def test_buun_moe_health_based_growth_can_exceed_32k(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='moe',
+                name='MoE',
+                path='/models/moe.gguf',
+                alias='moe',
+                port=18080,
+                architecture_type='moe',
+                expert_count=64,
+                expert_used_count=8,
+                turboquant_status='native',
+                turboquant_key_dim=256,
+                turboquant_value_dim=256,
+                ctx_max=131072,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('buun')), \
+                patch('llama_tui.benchmark.model_file_size', return_value=12 * 1024**3), \
+                patch('llama_tui.benchmark.current_process_pressure_payload', return_value={'process_pressure_score': 0.1}):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        growth_contexts = {item.ctx_size for item in profiles if item.name.startswith('fit_context_growth_sweep_')}
+        self.assertGreater(max(growth_contexts), 32768)
+        self.assertIn(131072, growth_contexts)
+
+    def test_buun_context_growth_caps_at_safe_estimate_under_pressure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='dense',
+                name='Dense',
+                path='/models/dense.gguf',
+                alias='dense',
+                port=18080,
+                architecture='llama',
+                architecture_type='dense',
+                turboquant_status='native',
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+                ctx_max=131072,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('buun')), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3), \
+                patch('llama_tui.benchmark.current_process_pressure_payload', return_value={'process_pressure_score': 0.7}), \
+                patch('llama_tui.benchmark.candidate_safe_context_estimate', return_value=65536):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        growth_contexts = {item.ctx_size for item in profiles if item.name.startswith('fit_context_growth_sweep_')}
+        self.assertIn(65536, growth_contexts)
+        self.assertLessEqual(max(growth_contexts), 65536)
+
     def test_buun_fast_profiles_use_curated_turbokv_ladder(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
@@ -450,6 +694,39 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(all(item.fit for item in profiles))
         self.assertTrue(all(item.gpu_layers is None for item in profiles))
         self.assertTrue(any(item.name.startswith('fit_context_growth_sweep_16384') for item in profiles))
+        names = [item.name for item in profiles]
+        self.assertLess(names.index('fit_turbokv_probe'), names.index('fit_default_probe'))
+
+    def test_buun_fit_profiles_include_default_fallback_after_turbokv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='moe',
+                name='MoE',
+                path='/models/model.gguf',
+                alias='moe',
+                port=18080,
+                architecture_type='moe',
+                expert_count=64,
+                expert_used_count=8,
+                turboquant_status='native',
+                turboquant_key_dim=192,
+                turboquant_value_dim=192,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('buun')):
+                with patch('llama_tui.benchmark.model_file_size', return_value=12 * 1024**3):
+                    profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        names = [item.name for item in profiles]
+        self.assertIn('fit_turbokv_probe', names)
+        self.assertIn('fit_default_probe', names)
+        self.assertTrue(any(item.name.startswith('fit_context_growth_sweep_') and item.kv_preset == 'default' for item in profiles))
 
     def test_buun_fit_context_growth_command_omits_fixed_ngl(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -848,6 +1125,191 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(measured, [])
         self.assertEqual(runner.call_count, 1)
 
+    def test_failed_fast_runtime_profile_run_preserves_previous_working_winners(self):
+        profile = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+        old_auto = {
+            'status': 'ok',
+            'tokens_per_sec': 22.0,
+            'seconds': 1.0,
+            'ctx': 8192,
+            'ctx_per_slot': 8192,
+            'parallel': 1,
+        }
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path='/models/model.gguf',
+            alias='m',
+            port=18200,
+            measured_profiles={
+                'auto': dict(old_auto),
+                'fast_chat': dict(old_auto),
+                'long_context': dict(old_auto),
+                'opencode_ready': dict(old_auto),
+            },
+            default_benchmark_status='done',
+            last_benchmark_tokens_per_sec=22.0,
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='buun',
+            name='fit_turbokv_probe',
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='turbo4/turbo4',
+            kv_family='turbo',
+            fit=True,
+            fit_context=4096,
+        )
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self, stored):
+                self.models = [stored]
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model, discover=True, managed_only=False):
+                return None
+
+            def get_model(self, model_id):
+                return next((item for item in self.models if item.id == model_id), None)
+
+            def hardware_profile(self, refresh=False):
+                return profile
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, saved):
+                self.models[0] = saved
+                self.saved.append(saved)
+
+        failed = adaptive_record_from_candidate(
+            model,
+            'long_context',
+            'not ready',
+            detail='K cache type turbo4 with block size 128 does not divide n_embd_head_k=192',
+            failure_category='KV_MODE_INCOMPATIBLE',
+            failure_reason='K cache type turbo4 with block size 128 does not divide n_embd_head_k=192',
+        )
+
+        def fake_runtime_benchmark(_app, _base_model, _profile, _objective, _progress, _cancel_token, completed, _total, **_kwargs):
+            return False, True, [dict(failed)], [], completed + 1
+
+        app = FakeApp(model)
+        with patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=[runtime_profile]), \
+             patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model)
+
+        self.assertFalse(ok)
+        self.assertIn('kept previous working measured profiles', msg)
+        self.assertEqual(app.saved[-1].default_benchmark_status, 'done')
+        self.assertEqual(app.saved[-1].measured_profiles['auto']['tokens_per_sec'], 22.0)
+        self.assertEqual(app.saved[-1].last_benchmark_tokens_per_sec, 22.0)
+
+    def test_fast_runner_skips_remaining_turbokv_after_shape_incompatibility(self):
+        model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)
+        hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+        turbo4 = RuntimeProfile(
+            engine_id='buun',
+            name='fit_turbokv_probe',
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='turbo4/turbo4',
+            kv_family='turbo',
+            fit=True,
+            fit_context=4096,
+        )
+        turbo3 = RuntimeProfile(
+            engine_id='buun',
+            name='fit_kv_compression_probe_turbo3',
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='turbo3_tcq/turbo3_tcq',
+            kv_family='turbo',
+            fit=True,
+            fit_context=4096,
+        )
+        default = RuntimeProfile(
+            engine_id='buun',
+            name='fit_default_probe',
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='default',
+            kv_family='default',
+            fit=True,
+            fit_context=4096,
+        )
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model, discover=True, managed_only=False):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return hardware
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, saved):
+                self.saved.append(saved)
+
+        calls = []
+
+        def fake_runtime_benchmark(_app, base_model, profile, objective, _progress, _cancel_token, completed, _total, **kwargs):
+            calls.append(profile.name)
+            candidate = ModelConfig(id=base_model.id, name=base_model.name, path=base_model.path, alias=base_model.alias, port=base_model.port, ctx=profile.ctx_size, parallel=profile.parallel)
+            if profile.kv_family == 'turbo':
+                failed = adaptive_record_from_candidate(
+                    candidate,
+                    objective,
+                    'not ready',
+                    detail='K cache type turbo4 with block size 128 does not divide n_embd_head_k=192',
+                    failure_category='KV_MODE_INCOMPATIBLE',
+                    failure_reason='K cache type turbo4 with block size 128 does not divide n_embd_head_k=192',
+                )
+                return False, True, [failed], [], completed + 1
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=18.0,
+                seconds=1.0,
+                engine=profile.engine_id,
+                runtime_profile=profile.name,
+                kv_preset=profile.kv_preset,
+                runtime_fit=profile.fit,
+                fit_context=profile.fit_context,
+            )
+            measured = dict(record)
+            measured['model'] = candidate
+            return True, False, [record], [measured], completed + 1
+
+        events = []
+        app = FakeApp()
+        with patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=[turbo4, turbo3, default]), \
+             patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model, progress=events.append)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, ['fit_turbokv_probe', 'fit_default_probe'])
+        self.assertTrue(any('disabled family turbo' in str(event) for event in events))
+
     def test_fast_runner_skips_fixed_buun_profiles_after_fit_success(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)
         hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
@@ -876,6 +1338,18 @@ class RuntimeProfileTests(unittest.TestCase):
             engine_id='buun',
             name='fit_context_growth_sweep_16384_turbo4_turbo4',
             ctx_size=16384,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='turbo4/turbo4',
+            fit=True,
+            fit_context=4096,
+            no_warmup=True,
+            benchmark_depth='fast',
+        )
+        fit_growth_high = RuntimeProfile(
+            engine_id='buun',
+            name='fit_context_growth_sweep_49152_turbo4_turbo4',
+            ctx_size=49152,
             gpu_layers=None,
             parallel=1,
             kv_preset='turbo4/turbo4',
@@ -941,13 +1415,17 @@ class RuntimeProfileTests(unittest.TestCase):
 
         app = FakeApp()
         events = []
-        profiles = [fit_probe, fixed_probe, fit_growth]
+        profiles = [fit_probe, fixed_probe, fit_growth, fit_growth_high]
         with patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=profiles):
             with patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
                 ok, msg = benchmark_fast_profiles(app, model, progress=events.append)
 
         self.assertTrue(ok, msg)
-        self.assertEqual(calls, ['fit_turbokv_probe', 'fit_context_growth_sweep_16384_turbo4_turbo4'])
+        self.assertEqual(calls, [
+            'fit_turbokv_probe',
+            'fit_context_growth_sweep_16384_turbo4_turbo4',
+            'fit_context_growth_sweep_49152_turbo4_turbo4',
+        ])
         self.assertTrue(any('skipping fixed-NGL buun fallback probes' in str(item) for item in events))
         self.assertTrue(any('skipped 1 fixed-NGL buun profile' in str(item) for item in events))
         self.assertIn('buun fit profile', app.saved[-1].benchmark_runs[0]['summary'])
@@ -1068,6 +1546,11 @@ class RuntimeProfileTests(unittest.TestCase):
 
                 self.assertIn(f'Unsupported {flag} "bad-mode"', str(ctx.exception))
 
+    def test_cli_parser_accepts_kill_existing(self):
+        args = build_cli_parser().parse_args(['--kill-existing'])
+
+        self.assertTrue(args.kill_existing)
+
 
 class EngineSessionTests(unittest.TestCase):
     def setUp(self):
@@ -1119,16 +1602,111 @@ class EngineSessionTests(unittest.TestCase):
         self.assertFalse(path.exists())
 
     def test_different_live_engine_blocks_startup(self):
-        self.write_session(11111, 'buun')
+        session_path = self.write_session(11111, 'buun')
 
         def alive(pid):
             return pid == 11111
 
-        with patch('llama_tui.main.CACHE_DIR', self.cache_dir), patch('llama_tui.main.pid_is_alive', side_effect=alive):
+        process = {
+            'pid': 11111,
+            'command': 'python3 /home/jcampos/.local/bin/llama-tui',
+            'cwd': '/home/jcampos/.cache/llmfit/models',
+            'status': 'S (sleeping)',
+            'state': 'S',
+        }
+        with patch('llama_tui.main.CACHE_DIR', self.cache_dir), \
+             patch('llama_tui.main.pid_is_alive', side_effect=alive), \
+             patch('llama_tui.main.describe_pid', return_value=process):
             with self.assertRaises(SystemExit) as ctx:
                 ensure_engine_session_lock('llama.cpp')
 
-        self.assertIn('Engine switch blocked', str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn('Engine switch blocked', message)
+        self.assertIn('PID 11111', message)
+        self.assertIn('engine "buun"', message)
+        self.assertIn('command: python3 /home/jcampos/.local/bin/llama-tui', message)
+        self.assertIn('cwd: /home/jcampos/.cache/llmfit/models', message)
+        self.assertIn(f'session: {session_path}', message)
+        self.assertIn('--kill-existing', message)
+
+    def test_interactive_prompt_accepts_kill_and_acquires_lock(self):
+        blocker = self.write_session(11111, 'buun')
+        terminated = []
+        prompts = []
+
+        def alive(pid):
+            if pid == 11111:
+                return pid not in terminated
+            return pid == os.getpid()
+
+        def terminate(pid):
+            terminated.append(pid)
+            return True, f'terminated PID {pid}'
+
+        def prompt(engine, sessions):
+            prompts.append((engine, sessions))
+            return True
+
+        with patch('llama_tui.main.CACHE_DIR', self.cache_dir), \
+             patch('llama_tui.main.pid_is_alive', side_effect=alive), \
+             patch('llama_tui.main.terminate_pid_group', side_effect=terminate):
+            path = ensure_engine_session_lock('llama.cpp', interactive=True, prompt_fn=prompt)
+
+        self.assertEqual(terminated, [11111])
+        self.assertEqual(prompts[0][0], 'llama.cpp')
+        self.assertEqual(prompts[0][1][0]['pid'], 11111)
+        self.assertFalse(blocker.exists())
+        self.assertTrue(path.exists())
+
+    def test_interactive_prompt_declines_kill_and_exits_cleanly(self):
+        blocker = self.write_session(11111, 'buun')
+
+        def alive(pid):
+            return pid == 11111
+
+        with patch('llama_tui.main.CACHE_DIR', self.cache_dir), \
+             patch('llama_tui.main.pid_is_alive', side_effect=alive), \
+             patch('llama_tui.main.terminate_pid_group') as terminate:
+            with self.assertRaises(SystemExit) as ctx:
+                ensure_engine_session_lock('llama.cpp', interactive=True, prompt_fn=lambda _engine, _sessions: False)
+
+        self.assertIn('Startup canceled', str(ctx.exception))
+        self.assertFalse(terminate.called)
+        self.assertTrue(blocker.exists())
+
+    def test_kill_existing_terminates_blockers_removes_sessions_and_acquires_lock(self):
+        blocker = self.write_session(11111, 'buun')
+        terminated = []
+
+        def alive(pid):
+            if pid == 11111:
+                return pid not in terminated
+            return pid == os.getpid()
+
+        def terminate(pid):
+            terminated.append(pid)
+            return True, f'terminated PID {pid}'
+
+        with patch('llama_tui.main.CACHE_DIR', self.cache_dir), \
+             patch('llama_tui.main.pid_is_alive', side_effect=alive), \
+             patch('llama_tui.main.terminate_pid_group', side_effect=terminate):
+            path = ensure_engine_session_lock('llama.cpp', kill_existing=True)
+
+        self.assertEqual(terminated, [11111])
+        self.assertFalse(blocker.exists())
+        self.assertTrue(path.exists())
+        self.assertEqual(last_engine_session_stop_count(), 1)
+
+    def test_zombie_engine_session_is_pruned(self):
+        stale = self.write_session(11111, 'buun')
+
+        with patch('llama_tui.main.CACHE_DIR', self.cache_dir), \
+             patch('llama_tui.main.os.kill', return_value=None), \
+             patch('llama_tui.main.pid_state', return_value='Z'):
+            path = ensure_engine_session_lock('llama.cpp')
+
+        self.assertFalse(stale.exists())
+        self.assertTrue(path.exists())
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import sys
@@ -18,6 +19,7 @@ from llama_tui.benchmark import (
     apply_measured_profile,
     benchmark_all_models_runner,
     benchmark_all_models_deep,
+    benchmark_preflight_cleanup,
     benchmark_config_fingerprint,
     benchmark_profile_is_fresh,
     benchmark_exhaustive_candidate_with_retry,
@@ -50,6 +52,7 @@ from llama_tui.discovery import detected_model_from_path
 from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
 from llama_tui.opencode_benchmark import (
+    benchmark_opencode_workflow,
     build_opencode_run_command,
     compact_sample_details,
     ctx_per_slot,
@@ -59,6 +62,7 @@ from llama_tui.opencode_benchmark import (
     run_process_with_metrics,
     sample_timeout_type,
     score_opencode_samples,
+    write_temp_opencode_config,
 )
 from llama_tui.runtime_profiles import make_runtime_profile
 
@@ -293,6 +297,26 @@ class DeepBenchmarkAllTests(unittest.TestCase):
         self.assertEqual(restore_calls, ['managed'])
         self.assertEqual(app.stop_calls, [('managed', True)])
         self.assertIn('1 restored', msg)
+
+    def test_shared_benchmark_preflight_stops_managed_and_reports_unmanaged_blocker(self):
+        primary = benchmarked_model('primary', status='pending')
+        other = benchmarked_model('other', status='pending')
+        app = FakeBenchmarkApp([primary, other])
+        app.managed_running.add('other')
+        events = []
+
+        ok, msg = benchmark_preflight_cleanup(app, primary, 'server_fast', events.append)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(app.stop_calls, [('other', True)])
+        self.assertTrue(any('stopped 1 managed' in str(event) for event in events))
+
+        app = FakeBenchmarkApp([primary])
+        app.unmanaged_running.add('primary')
+        ok, msg = benchmark_preflight_cleanup(app, primary, 'server_fast')
+
+        self.assertFalse(ok)
+        self.assertIn('unmanaged server/process', msg)
 
     def test_batch_runner_uses_adaptive_benchmark_with_safer_budget(self):
         app = FakeBenchmarkApp([])
@@ -743,6 +767,98 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertEqual(candidates[0][0], 'opencode_ready')
         self.assertEqual(ctx_per_slot(candidates[0][2]), 20000)
 
+    def test_opencode_benchmark_replays_measured_runtime_profile(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='bigctx',
+            name='Big Context',
+            path=__file__,
+            alias='bigctx',
+            port=18180,
+            ctx_max=32768,
+            measured_profiles={
+                'opencode_ready': {
+                    'status': 'ok',
+                    'ctx': 32768,
+                    'ctx_per_slot': 32768,
+                    'parallel': 1,
+                    'ngl': 999,
+                    'output': 2048,
+                    'tokens_per_sec': 12.0,
+                    'engine': 'buun',
+                    'runtime_profile': 'fit_context_growth_sweep_32768_turbo4_turbo4',
+                    'kv_preset': 'turbo4/turbo4',
+                    'runtime_fit': True,
+                    'fit_context': 4096,
+                    'runtime_no_warmup': True,
+                    'gpu_layers_mode': 'fit',
+                }
+            },
+        )
+
+        class FakeApp:
+            opencode = SimpleNamespace(path='', timeout=600000, chunk_timeout=60000)
+
+            def __init__(self):
+                self.models = [model]
+                self.started_runtime_profiles = []
+                self.saved = []
+
+            def command_exists(self, _command):
+                return True
+
+            def hardware_profile(self, refresh=False):
+                return profile
+
+            def start(self, _candidate, runtime_profile=None):
+                self.started_runtime_profiles.append(runtime_profile)
+                return True, 'started'
+
+            def wait_until_ready(self, _candidate, timeout=180, cancel_token=None):
+                return True, 'ready'
+
+            def stop(self, _candidate, managed_only=True):
+                return True, 'stopped'
+
+            def add_or_update(self, saved):
+                self.saved.append(saved)
+
+            def opencode_provider_key(self, _model):
+                return 'local-bigctx'
+
+            def opencode_model_ref(self, _model):
+                return 'local-bigctx/bigctx'
+
+            def append_log(self, _model_id, _text):
+                pass
+
+        sample = {
+            'ok': True,
+            'tests_ok': True,
+            'status': 'passed',
+            'elapsed': 1.0,
+            'first_output': 0.1,
+            'exit_code': 0,
+            'unittest_command_seen': True,
+            'min_ram_available': 8 * 1024**3,
+            'stdout_tail': [],
+            'stderr_tail': [],
+        }
+        app = FakeApp()
+        with patch('llama_tui.opencode_benchmark.opencode_cli_preflight', return_value=(True, 'cli ok')), \
+            patch('llama_tui.opencode_benchmark.benchmark_preflight_cleanup', return_value=(True, 'preflight ok')), \
+            patch('llama_tui.opencode_benchmark.opencode_provider_preflight', return_value=(True, 'provider ok')), \
+            patch('llama_tui.opencode_benchmark.run_opencode_task', return_value=sample), \
+            patch('llama_tui.opencode_benchmark.detect_vscode_pressure', return_value={'processes': 0, 'rss_mib': 0}), \
+            patch('llama_tui.opencode_benchmark.sleep_with_cancel', return_value=None):
+            ok, msg = benchmark_opencode_workflow(app, model)
+
+        self.assertTrue(ok, msg)
+        runtime_profile = next(item for item in app.started_runtime_profiles if item is not None)
+        self.assertTrue(runtime_profile.fit)
+        self.assertIsNone(runtime_profile.gpu_layers)
+        self.assertEqual(runtime_profile.fit_context, 4096)
+
     def test_opencode_candidates_are_dynamic_for_tiny_context(self):
         profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
         model = ModelConfig(id='smallctx', name='Small Context', path=__file__, alias='smallctx', port=18181, ctx_max=4096, parallel=1)
@@ -750,6 +866,114 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         candidates = opencode_candidate_models(model, profile)
         self.assertTrue(candidates)
         self.assertTrue(all(ctx_per_slot(candidate) <= 4096 for _preset, _tier, candidate, _msg in candidates))
+
+    def test_opencode_config_exports_candidate_ctx_per_slot_limit(self):
+        model = ModelConfig(id='slotctx', name='Slot Context', path=__file__, alias='slotctx', port=18182, ctx=8192, parallel=4, output=512)
+        app = SimpleNamespace(
+            opencode=SimpleNamespace(timeout=600000, chunk_timeout=60000),
+            opencode_provider_key=lambda _model: 'local-slotctx',
+            opencode_model_ref=lambda _model: 'local-slotctx/slotctx',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_temp_opencode_config(app, model, Path(tmp))
+            config = json.loads(path.read_text(encoding='utf-8'))
+
+        limit = config['provider']['local-slotctx']['models']['slotctx']['limit']
+        self.assertEqual(limit['context'], 2048)
+        self.assertEqual(limit['output'], 512)
+
+    def test_persistent_opencode_export_uses_measured_context_and_active_engine_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = AppConfig(
+                root / 'models.json',
+                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            )
+            app.opencode.path = str(root / 'opencode.json')
+            model = ModelConfig(
+                id='dense',
+                name='Dense',
+                path=__file__,
+                alias='dense',
+                port=18182,
+                ctx=8192,
+                parallel=1,
+                output=512,
+                measured_profiles={
+                    'opencode_ready': {
+                        'status': 'ok',
+                        'ctx': 32768,
+                        'ctx_per_slot': 32768,
+                        'parallel': 1,
+                        'tokens_per_sec': 20.0,
+                    }
+                },
+            )
+            app.models = [model]
+
+            ok, msg = app.generate_opencode()
+            config = json.loads(Path(app.opencode.path).read_text(encoding='utf-8'))
+
+        self.assertTrue(ok, msg)
+        provider = config['provider']['local-dense']
+        self.assertIn('buun', provider['name'].lower())
+        self.assertNotIn('llama.cpp Dense', provider['name'])
+        self.assertEqual(provider['models']['dense']['limit']['context'], 32768)
+
+    def test_opencode_candidates_skip_below_observed_context_floor(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='floor', name='Floor', path=__file__, alias='floor', port=18183, ctx_max=8192)
+        model.last_opencode_benchmark_results = [
+            {'status': 'context too small', 'context_required': 9000, 'detail': 'OpenCode requested about 9000 tokens'}
+        ]
+
+        candidates = opencode_candidate_models(model, profile)
+
+        self.assertEqual(candidates, [])
+
+    def test_opencode_candidates_include_observed_floor_above_32k_when_healthy(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(id='floor', name='Floor', path=__file__, alias='floor', port=18184, ctx_max=131072)
+        model.last_opencode_benchmark_results = [
+            {'status': 'context too small', 'context_required': 70000, 'detail': 'OpenCode requested about 70000 tokens'}
+        ]
+
+        with patch('llama_tui.opencode_benchmark.adaptive_context_upper_bound', return_value=131072), \
+            patch('llama_tui.benchmark.current_process_pressure_payload', return_value={'process_pressure_score': 0.1}):
+            candidates = opencode_candidate_models(model, profile)
+
+        self.assertTrue(candidates)
+        self.assertTrue(all(ctx_per_slot(candidate) >= 70000 for _preset, _tier, candidate, _msg in candidates))
+        self.assertTrue(any(ctx_per_slot(candidate) > 32768 for _preset, _tier, candidate, _msg in candidates))
+
+    def test_opencode_process_stops_immediately_on_context_overflow(self):
+        class FakeApp:
+            def hardware_profile(self, refresh=False):
+                return HardwareProfile(memory_available=8 * 1024**3)
+
+            def terminate_process_group(self, pid):
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                return True, 'terminated'
+
+        command = [
+            sys.executable,
+            '-c',
+            (
+                'import time\n'
+                'print("srv send_error: request (8051 tokens) exceeds the available context size (2048 tokens)", flush=True)\n'
+                'time.sleep(10)\n'
+            ),
+        ]
+        started = time.monotonic()
+        result = run_process_with_metrics(command, Path.cwd(), os.environ.copy(), 30, FakeApp())
+
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertTrue(result['context_overflow'])
+        self.assertEqual(result['context_required'], 8051)
+        self.assertTrue(result['timed_out'] is False)
 
     def test_detects_visible_unittest_command(self):
         self.assertTrue(detected_unittest_command(['running python -m unittest -q now']))
@@ -1186,6 +1410,59 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertEqual(winners['opencode_ready']['ctx_per_slot'], 16000)
         self.assertIn('OpenCode floor 12000', winners['opencode_ready']['selection_reason'])
 
+    def test_select_measured_profiles_does_not_mark_opencode_ready_below_floor(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path=__file__,
+            alias='m',
+            port=18200,
+            output=256,
+            last_opencode_benchmark_results=[{'detail': 'request (12000 tokens) exceeds context'}],
+        )
+        small_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=8192, parallel=1)
+        measured = [
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'long_context', 'model': small_model, 'tokens_per_sec': 50.0, 'ctx_per_slot': 8192, 'parallel': 1},
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertEqual(winners['opencode_ready']['status'], 'not_ready')
+        self.assertEqual(winners['opencode_ready']['context_required'], 12000)
+        self.assertEqual(winners['opencode_ready']['ctx_per_slot'], 8192)
+        self.assertIn('not OpenCode-ready', winners['opencode_ready']['selection_reason'])
+
+    def test_select_measured_profiles_preserves_previous_valid_opencode_profile(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        previous = {
+            'status': 'ok',
+            'ctx': 32768,
+            'ctx_per_slot': 32768,
+            'parallel': 1,
+            'tokens_per_sec': 20.0,
+        }
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path=__file__,
+            alias='m',
+            port=18200,
+            output=256,
+            measured_profiles={'opencode_ready': dict(previous)},
+            last_opencode_benchmark_results=[{'detail': 'request (12000 tokens) exceeds context'}],
+        )
+        small_model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, ctx=8192, parallel=1)
+        measured = [
+            {'status': 'ok', 'measurement_type': 'full', 'objective': 'long_context', 'model': small_model, 'tokens_per_sec': 50.0, 'ctx_per_slot': 8192, 'parallel': 1},
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertEqual(winners['opencode_ready']['status'], 'ok')
+        self.assertEqual(winners['opencode_ready']['ctx_per_slot'], 32768)
+        self.assertTrue(winners['opencode_ready']['preserved_from_previous'])
+
     def test_select_measured_profiles_auto_uses_quality_score(self):
         profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
         model = ModelConfig(id='m', name='M', path=__file__, alias='m', port=18200, output=256)
@@ -1282,8 +1559,9 @@ class DiscoveryDefaultsTests(unittest.TestCase):
         profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=16 * 1024**3, memory_available=8 * 1024**3)
         first = ModelConfig(id='a', name='Qwen Opus Coder Gemma', path=__file__, alias='a', port=18100)
         second = ModelConfig(id='b', name='Plain Local Model', path=__file__, alias='b', port=18101)
-        first_candidates = safe_bootstrap_candidate_models(first, profile)
-        second_candidates = safe_bootstrap_candidate_models(second, profile)
+        with patch('llama_tui.optimize.process_pressure_score', return_value=0.0):
+            first_candidates = safe_bootstrap_candidate_models(first, profile)
+            second_candidates = safe_bootstrap_candidate_models(second, profile)
 
         first_shape = [(preset, tier, c.ctx, c.ngl, c.parallel, c.memory_reserve_percent, c.extra_args) for preset, tier, c, _ in first_candidates]
         second_shape = [(preset, tier, c.ctx, c.ngl, c.parallel, c.memory_reserve_percent, c.extra_args) for preset, tier, c, _ in second_candidates]

@@ -60,6 +60,10 @@ FAST_BENCHMARK_PARALLEL_TARGETS = (1, 2, 4)
 FAST_RUNTIME_PROFILE_BUDGET_SECONDS = 30 * 60
 SMART_BENCHMARK_SOFT_BUDGET_SECONDS = 45 * 60
 FULL_RUNTIME_PROFILE_BUDGET_SECONDS = 120 * 60
+CONTEXT_HEALTH_PRESSURE_CAP = 0.45
+CONTEXT_HEALTH_HIGH_PRESSURE = 0.80
+RUNTIME_CONTEXT_MILESTONES = (8_192, 16_384, 24_576, 32_768, 49_152, 65_536, 98_304, 131_072)
+FAST_RUNTIME_CONTEXT_TARGET_LIMIT = 4
 SMART_FRONTIER_MAX_PROBES = 10
 SMART_PARALLEL_IMPROVEMENT_THRESHOLD = 0.08
 SMART_PARALLEL_NON_IMPROVING_LIMIT = 2
@@ -152,6 +156,11 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         reason = 'The binary requires --flash-attn to receive a valid value.'
         suggested = 'Use "--flash-attn on" or "-fa on"; do not emit bare "-fa".'
         terminal = True
+    if 'unsupported cache type' in low and ('cache' in low or 'turbo' in low):
+        category = 'KV_MODE_INCOMPATIBLE'
+        reason = detail or 'The selected KV mode is not supported by this server/model combination.'
+        suggested = 'Try a different TurboKV mode or benchmark default/q8 KV cache.'
+        terminal = True
     if 'chat template' in low or 'jinja' in low and 'template' in low:
         category = 'CHAT_TEMPLATE_ERROR'
         suggested = 'Disable Jinja or adjust the model chat template before benchmarking.'
@@ -209,6 +218,177 @@ def benchmark_failure_summary(records: List[Dict[str, object]], fallback: str) -
             summary += f' Suggested fix: {fix}'
         return summary
     return fallback
+
+
+def _good_measured_profiles(profiles: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    if not isinstance(profiles, dict):
+        return {}
+    good = {}
+    for key, value in profiles.items():
+        if isinstance(value, dict) and str(value.get('status', 'ok') or 'ok') == 'ok':
+            good[str(key)] = dict(value)
+    return good
+
+
+def previous_usable_measured_profiles(app, model: ModelConfig) -> Dict[str, Dict[str, object]]:
+    sources = []
+    if hasattr(app, 'get_model'):
+        try:
+            current = app.get_model(model.id)
+        except Exception:
+            current = None
+        if current is not None:
+            sources.append(current)
+    sources.append(model)
+    for source in sources:
+        profiles = _good_measured_profiles(getattr(source, 'measured_profiles', {}) or {})
+        if profiles:
+            return dict(getattr(source, 'measured_profiles', {}) or profiles)
+    return {}
+
+
+def failed_benchmark_model_state(
+    app,
+    model: ModelConfig,
+    records: List[Dict[str, object]],
+    ended_at: str,
+) -> Tuple[ModelConfig, bool]:
+    source = model
+    if hasattr(app, 'get_model'):
+        try:
+            source = app.get_model(model.id) or model
+        except Exception:
+            source = model
+    saved = ModelConfig(**asdict(source))
+    previous = previous_usable_measured_profiles(app, model)
+    saved.last_benchmark_results = records
+    saved.default_benchmark_at = ended_at
+    if previous:
+        saved.measured_profiles = previous
+        saved.default_benchmark_status = 'done'
+        return saved, True
+    saved.measured_profiles = {}
+    saved.default_benchmark_status = 'failed'
+    return saved, False
+
+
+def preserved_profiles_message(prefix: str, records: List[Dict[str, object]]) -> str:
+    summary = benchmark_failure_summary(records, 'no new measured candidates completed')
+    return f'⚠ {prefix}: {summary}; kept previous working measured profiles'
+
+
+def _call_model_health(app, model: ModelConfig) -> Tuple[str, str]:
+    try:
+        return app.health(model)
+    except Exception as exc:
+        return 'UNKNOWN', str(exc)
+
+
+def _stop_managed_model(app, model: ModelConfig) -> Tuple[bool, str]:
+    if not hasattr(app, 'stop'):
+        return False, 'app cannot stop managed model processes'
+    try:
+        return app.stop(model, managed_only=True)
+    except TypeError:
+        return app.stop(model)
+
+
+def _known_llama_pressure(payload: Dict[str, object]) -> str:
+    known = payload.get('process_known', {}) if isinstance(payload, dict) else {}
+    count = 0
+    if isinstance(known, dict):
+        try:
+            count = int(known.get('llama', 0) or 0)
+        except Exception:
+            count = 0
+    if count <= 0:
+        return ''
+    detail = str(payload.get('process_pressure_detail', '') or '')
+    return f'unmanaged llama-family process(es) still visible: {count}' + (f' | {detail}' if detail else '')
+
+
+def benchmark_preflight_cleanup(
+    app,
+    model: ModelConfig,
+    run_kind: str,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    check_cancelled(cancel_token)
+    stopped: List[str] = []
+    models = list(getattr(app, 'models', []) or [])
+    if model.id not in {getattr(item, 'id', '') for item in models}:
+        models.insert(0, model)
+    for item in models:
+        try:
+            managed_pid = _get_model_pid(app, item, discover=False, managed_only=True)
+        except Exception:
+            managed_pid = None
+        if not managed_pid:
+            continue
+        ok, msg = _stop_managed_model(app, item)
+        if not ok:
+            return False, f'❌ benchmark preflight could not stop managed {item.id}: {msg}'
+        stopped.append(f'{item.id}:{managed_pid}')
+    if stopped:
+        sleep_with_cancel(0.3, cancel_token)
+
+    status, detail = _call_model_health(app, model)
+    try:
+        managed_pid = _get_model_pid(app, model, discover=False, managed_only=True)
+    except Exception:
+        managed_pid = None
+    try:
+        any_pid = managed_pid or _get_model_pid(app, model)
+    except Exception:
+        any_pid = managed_pid
+    running = status in ('READY', 'LOADING', 'STARTING') or bool(any_pid)
+    if running and not managed_pid:
+        return False, (
+            f'❌ benchmark preflight blocked: unmanaged server/process is already running for {model.id}. '
+            f'Stop the manual llama-cli/llama-server process first; status={status} detail={compact_message(detail)}'
+        )
+
+    pressure = current_process_pressure_payload()
+    pieces = [f'benchmark preflight ({run_kind}): stopped {len(stopped)} managed process(es)']
+    pressure_detail = str(pressure.get('process_pressure_detail', '') or '')
+    if pressure_detail:
+        pieces.append(pressure_detail)
+    llama_note = _known_llama_pressure(pressure)
+    if llama_note:
+        pieces.append(llama_note)
+    msg = '; '.join(pieces)
+    if progress:
+        progress(msg)
+    return True, msg
+
+
+def runtime_profile_kv_disable_key(record: Dict[str, object], runtime_profile: RuntimeProfile) -> Tuple[str, str]:
+    category = str(record.get('failure_category', '') or '')
+    if category != 'KV_MODE_INCOMPATIBLE':
+        return '', ''
+    kv_preset = str(getattr(runtime_profile, 'kv_preset', '') or '')
+    text = ' '.join([
+        str(record.get('failure_reason', '') or ''),
+        str(record.get('detail', '') or ''),
+        kv_preset,
+    ]).lower()
+    kv_family = str(getattr(runtime_profile, 'kv_family', '') or '')
+    if 'does not divide' in text or 'block size' in text:
+        return 'family', kv_family or ('turbo' if 'turbo' in kv_preset else 'cache')
+    return 'preset', kv_preset
+
+
+def runtime_profile_skip_reason(runtime_profile: RuntimeProfile, disabled: set[Tuple[str, str]]) -> str:
+    kv_preset = str(getattr(runtime_profile, 'kv_preset', '') or '')
+    kv_family = str(getattr(runtime_profile, 'kv_family', '') or '')
+    if ('preset', kv_preset) in disabled:
+        return f'KV preset {kv_preset} was already rejected for this run'
+    if kv_family and ('family', kv_family) in disabled:
+        return f'KV family {kv_family} was already rejected for this run'
+    if not kv_family and 'turbo' in kv_preset and ('family', 'turbo') in disabled:
+        return 'TurboKV was already rejected for this run'
+    return ''
 
 
 def emit_benchmark_event(
@@ -447,6 +627,12 @@ def round_context_down(value: int, step: int = ADAPTIVE_CONTEXT_ROUNDING) -> int
     return max(step, int(value // step) * step)
 
 
+def round_context_up(value: int, step: int = ADAPTIVE_CONTEXT_ROUNDING) -> int:
+    value = max(1, int(value or 1))
+    step = max(1, int(step or 1))
+    return max(step, int(((value + step - 1) // step) * step))
+
+
 def ctx_per_slot(model: ModelConfig) -> int:
     return int(getattr(model, 'ctx', 0) or 0) // max(1, int(getattr(model, 'parallel', 1) or 1))
 
@@ -469,6 +655,173 @@ def get_measured_profile(model: ModelConfig, key: str) -> Dict[str, object]:
     profiles = getattr(model, 'measured_profiles', {}) or {}
     profile = profiles.get(key) or {}
     return profile if isinstance(profile, dict) and profile.get('status', 'ok') == 'ok' else {}
+
+
+def _profile_int(profile: Dict[str, object], key: str, default: int = 0) -> int:
+    try:
+        return int(profile.get(key, default) or default)
+    except Exception:
+        return int(default or 0)
+
+
+def _profile_bool(profile: Dict[str, object], key: str, default: bool = False) -> bool:
+    value = profile.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def _measured_profile_config(profile: Dict[str, object]) -> Dict[str, object]:
+    raw = profile.get('config_fingerprint')
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _command_tokens_from_profile(profile: Dict[str, object]) -> List[str]:
+    command = profile.get('command')
+    if isinstance(command, list):
+        return [str(item) for item in command]
+    if not isinstance(command, str) or not command.strip():
+        return []
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _command_flag_value(tokens: List[str], *flags: str) -> str:
+    flag_set = {flag for flag in flags if flag}
+    for idx, token in enumerate(tokens):
+        if token in flag_set and idx + 1 < len(tokens):
+            return str(tokens[idx + 1])
+        for flag in flag_set:
+            prefix = f'{flag}='
+            if token.startswith(prefix):
+                return token[len(prefix):]
+    return ''
+
+
+def _command_has_flag(tokens: List[str], *flags: str) -> bool:
+    flag_set = {flag for flag in flags if flag}
+    return any(token in flag_set for token in tokens)
+
+
+def measured_profile_runtime_profile(
+    model: ModelConfig,
+    key: str,
+) -> Optional[RuntimeProfile]:
+    profile = get_measured_profile(model, key)
+    if not profile:
+        return None
+
+    fingerprint = _measured_profile_config(profile)
+    command_tokens = _command_tokens_from_profile(profile)
+    replay_fields = (
+        'runtime_fit',
+        'fit_context',
+        'runtime_no_warmup',
+        'gpu_layers_mode',
+        'batch_size',
+        'ubatch_size',
+        'runtime_profile',
+    )
+    has_replay_data = (
+        any(bool(profile.get(field)) for field in replay_fields)
+        or any(field in fingerprint for field in ('engine_id', 'runtime_profile', 'fit', 'gpu_layers', 'kv_preset'))
+        or any(token in command_tokens for token in ('-fit', '--fit', '-fitc', '--fit-ctx', '-ctk', '-ctv', '--cache-type-k', '--cache-type-v'))
+    )
+    if not has_replay_data:
+        return None
+
+    engine = str(profile.get('engine') or fingerprint.get('engine_id') or getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp')
+    if 'buun' in engine.lower():
+        engine = 'buun'
+    elif engine.strip().lower() == 'vllm':
+        return None
+    else:
+        engine = 'llama.cpp'
+
+    runtime_name = str(profile.get('runtime_profile') or fingerprint.get('runtime_profile') or '')
+    ctx = _profile_int(profile, 'ctx', int(getattr(model, 'ctx', 0) or 0))
+    parallel = max(1, _profile_int(profile, 'parallel', int(getattr(model, 'parallel', 1) or 1)))
+
+    kv_preset = str(profile.get('kv_preset') or fingerprint.get('kv_preset') or '').strip()
+    if not kv_preset:
+        key_mode = _command_flag_value(command_tokens, '-ctk', '--cache-type-k')
+        value_mode = _command_flag_value(command_tokens, '-ctv', '--cache-type-v')
+        kv_preset = f'{key_mode}/{value_mode}' if key_mode and value_mode else 'default'
+
+    flash_attn = str(profile.get('flash_attn_mode') or fingerprint.get('flash_attn') or '').strip()
+    if not flash_attn and 'flash_attn' in profile:
+        flash_attn = 'on' if bool(profile.get('flash_attn')) else 'off'
+    if not flash_attn:
+        flash_attn = _command_flag_value(command_tokens, '--flash-attn', '-fa') or 'on'
+
+    fit = (
+        _profile_bool(profile, 'runtime_fit')
+        or bool(fingerprint.get('fit'))
+        or (_command_flag_value(command_tokens, '-fit', '--fit').strip().lower() in ('on', 'true', '1', 'yes'))
+    )
+    fit_context = _profile_int(profile, 'fit_context', int(fingerprint.get('fit_context', 0) or 0))
+    if fit_context <= 0:
+        fit_context = int(_command_flag_value(command_tokens, '-fitc', '--fit-ctx') or 0)
+
+    no_warmup = (
+        _profile_bool(profile, 'runtime_no_warmup')
+        or bool(fingerprint.get('no_warmup'))
+        or _command_has_flag(command_tokens, '--no-warmup')
+    )
+
+    batch_size = _profile_int(profile, 'batch_size', int(fingerprint.get('batch_size', 0) or 0))
+    if batch_size <= 0:
+        batch_size = int(_command_flag_value(command_tokens, '--batch-size', '-b') or 0)
+    ubatch_size = _profile_int(profile, 'ubatch_size', int(fingerprint.get('ubatch_size', 0) or 0))
+    if ubatch_size <= 0:
+        ubatch_size = int(_command_flag_value(command_tokens, '--ubatch-size', '-ub') or 0)
+
+    gpu_layers_mode = str(profile.get('gpu_layers_mode') or '').strip().lower()
+    fingerprint_gpu_layers = fingerprint.get('gpu_layers')
+    if fit and (gpu_layers_mode == 'fit' or fingerprint_gpu_layers is None):
+        gpu_layers = None
+    else:
+        command_ngl = _command_flag_value(command_tokens, '-ngl', '--n-gpu-layers')
+        if command_ngl:
+            gpu_layers = int(command_ngl)
+        elif fingerprint_gpu_layers is not None:
+            gpu_layers = int(fingerprint_gpu_layers)
+        else:
+            gpu_layers = _profile_int(profile, 'ngl', int(getattr(model, 'ngl', 0) or 0))
+
+    turbo_profile = turbo_kv_profile_for_preset(kv_preset)
+    family = str(profile.get('kv_family') or '').strip()
+    if not family:
+        family = 'turbo' if turbo_profile is not None else 'cache' if kv_preset and kv_preset != 'default' else 'default'
+    extra_args = fingerprint.get('extra_args') if isinstance(fingerprint.get('extra_args'), list) else ()
+    return RuntimeProfile(
+        engine_id=engine,
+        name=runtime_name or f'measured_{key}',
+        ctx_size=max(1, int(ctx or getattr(model, 'ctx', 1) or 1)),
+        gpu_layers=gpu_layers,
+        parallel=parallel,
+        kv_preset=kv_preset or 'default',
+        flash_attn=flash_attn or 'on',
+        batch_size=max(0, int(batch_size or 0)),
+        ubatch_size=max(0, int(ubatch_size or 0)),
+        fit=bool(fit),
+        fit_context=max(0, int(fit_context or 0)),
+        no_warmup=bool(no_warmup),
+        extra_args=tuple(str(item) for item in extra_args),
+        kv_family=family,
+        kv_quality_tier=str(profile.get('kv_quality_tier') or getattr(turbo_profile, 'quality_tier', '') or ''),
+        kv_compression_tier=str(profile.get('kv_compression_tier') or getattr(turbo_profile, 'compression_tier', '') or ''),
+        kv_score_penalty=float(profile.get('kv_score_penalty', getattr(turbo_profile, 'score_penalty', 0.0) or 0.0) or 0.0),
+        benchmark_depth=str(profile.get('benchmark_depth') or ''),
+    )
 
 
 def apply_measured_profile(model: ModelConfig, key: str) -> Tuple[bool, str]:
@@ -506,6 +859,22 @@ def model_from_measured_profile(model: ModelConfig, key: str) -> Optional[ModelC
     candidate = ModelConfig(**asdict(model))
     ok, _msg = apply_measured_profile(candidate, key)
     return candidate if ok else None
+
+
+def model_and_runtime_profile_from_measured_profile(
+    model: ModelConfig,
+    key: str,
+) -> Tuple[Optional[ModelConfig], Optional[RuntimeProfile]]:
+    candidate = model_from_measured_profile(model, key)
+    if candidate is None:
+        return None, None
+    runtime_profile = measured_profile_runtime_profile(model, key)
+    if runtime_profile is not None:
+        candidate.ctx = int(runtime_profile.ctx_size or candidate.ctx)
+        candidate.parallel = max(1, int(runtime_profile.parallel or candidate.parallel or 1))
+        if runtime_profile.gpu_layers is not None:
+            candidate.ngl = int(runtime_profile.gpu_layers)
+    return candidate, runtime_profile
 
 
 def measured_profile_ctx_per_slot(model: ModelConfig, key: str) -> int:
@@ -900,13 +1269,32 @@ def launch_with_failsafe(
     profile = app.hardware_profile(refresh=True)
     measured_key = measured_profile_key_for_launch(mode, tier)
     if measured_key:
-        ok, measured_msg = apply_measured_profile(model, measured_key)
-        if ok:
+        measured_model, runtime_profile = model_and_runtime_profile_from_measured_profile(model, measured_key)
+        if measured_model is not None:
+            model.ctx = measured_model.ctx
+            model.parallel = measured_model.parallel
+            model.threads = measured_model.threads
+            model.ngl = measured_model.ngl
+            model.output = measured_model.output
+            model.cache_ram = measured_model.cache_ram
+            model.temp = measured_model.temp
+            model.flash_attn = measured_model.flash_attn
+            model.jinja = measured_model.jinja
+            model.memory_reserve_percent = measured_model.memory_reserve_percent
+            model.extra_args = list(getattr(measured_model, 'extra_args', []) or [])
+            model.optimize_mode = measured_model.optimize_mode
+            model.optimize_tier = measured_model.optimize_tier
+            _ok, measured_msg = apply_measured_profile(measured_model, measured_key)
+            runtime_note = ''
+            if runtime_profile is not None:
+                runtime_note = f' runtime={runtime_profile.name or runtime_profile.engine_id}'
+                if runtime_profile.fit:
+                    runtime_note += f' fit=on fitc={runtime_profile.fit_context or "-"}'
             if progress:
-                progress(f'trying measured {measured_key} profile: {measured_msg}')
+                progress(f'trying measured {measured_key} profile: {measured_msg}{runtime_note}')
             app.add_or_update(model)
             sync_msg = sync_opencode_after_tuning(app)
-            ok, msg = app.start(model)
+            ok, msg = app.start(model, runtime_profile=runtime_profile)
             if ok:
                 try:
                     ready_ok, ready_msg = app.wait_until_ready(model, timeout=120, cancel_token=cancel_token)
@@ -926,7 +1314,7 @@ def launch_with_failsafe(
                 if progress:
                     progress(f'measured {measured_key} failed to start: {concise_failure(msg)}')
         elif progress:
-            progress(f'{model.id}: {measured_msg}; using estimated launch profile.')
+            progress(f'{model.id}: no measured {measured_key} profile; using estimated launch profile.')
     if mode == 'opencode_ready':
         mode = 'best'
     if tier == 'auto':
@@ -1517,14 +1905,19 @@ def _run_server_benchmark_candidates(
 
     if not results:
         details = '; '.join(failures[:3]) if failures else 'no candidates completed'
-        msg = f'❌ {label} failed: {benchmark_failure_summary(benchmark_records, details)}'
-        recorded_model = clone_model_config(model)
-        recorded_model.last_benchmark_results = benchmark_records
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        recorded_model, preserved = failed_benchmark_model_state(app, model, benchmark_records, ended_at)
         if update_default_status:
             recorded_model.benchmark_fingerprint = app.model_fingerprint(recorded_model)
-            recorded_model.default_benchmark_status = 'failed'
-            recorded_model.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
+            if not preserved:
+                recorded_model.default_benchmark_status = 'failed'
+            recorded_model.default_benchmark_at = ended_at
         app.add_or_update(recorded_model)
+        msg = (
+            preserved_profiles_message(f'{label} found no better working candidate', benchmark_records)
+            if preserved
+            else f'❌ {label} failed: {benchmark_failure_summary(benchmark_records, details)}'
+        )
         if progress:
             progress(msg)
         return False, msg
@@ -1607,6 +2000,13 @@ def adaptive_profile_dict(
         'kv_compression_tier',
         'kv_score_penalty',
         'benchmark_depth',
+        'runtime_fit',
+        'fit_context',
+        'runtime_no_warmup',
+        'gpu_layers_mode',
+        'batch_size',
+        'ubatch_size',
+        'config_fingerprint',
         'command',
     ):
         if key in record:
@@ -1639,13 +2039,30 @@ def parse_context_requirement(text: str) -> int:
 def observed_opencode_context_floor(model: ModelConfig) -> int:
     floor = 0
     for row in getattr(model, 'last_opencode_benchmark_results', []) or []:
+        try:
+            floor = max(floor, int(row.get('context_required', 0) or 0))
+        except Exception:
+            pass
         floor = max(floor, parse_context_requirement(str(row.get('detail', ''))))
         for task in row.get('task_details', []) or []:
             if isinstance(task, dict):
+                try:
+                    floor = max(floor, int(task.get('context_required', 0) or 0))
+                except Exception:
+                    pass
                 floor = max(floor, parse_context_requirement(str(task.get('detail', ''))))
                 floor = max(floor, parse_context_requirement(' '.join(str(x) for x in task.get('stderr_tail', []) or [])))
                 floor = max(floor, parse_context_requirement(' '.join(str(x) for x in task.get('stdout_tail', []) or [])))
     return floor
+
+
+def measured_profile_meets_opencode_floor(profile: Dict[str, object], floor: int) -> bool:
+    if not profile or profile.get('status', 'ok') != 'ok':
+        return False
+    floor = int(floor or 0)
+    if floor <= 0:
+        return True
+    return int(profile.get('ctx_per_slot', profile.get('ctx', 0)) or 0) >= floor
 
 
 def select_measured_profiles(
@@ -1666,15 +2083,15 @@ def select_measured_profiles(
 
     fast_pool = [item for item in successful if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or successful
     long_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
-    opencode_pool = [
-        item for item in successful
-        if int(item.get('parallel', 1) or 1) == 1 and int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor
-    ] or [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
+    opencode_single_slot_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
+    opencode_pool = (
+        [item for item in opencode_single_slot_pool if int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor]
+        if opencode_floor
+        else opencode_single_slot_pool
+    )
 
     fast = max(fast_pool, key=lambda item: (score_fast_chat(item, model), float(item.get('tokens_per_sec', 0.0) or 0.0)))
     long = max(long_pool, key=lambda item: (score_long_context(item, model), int(item.get('ctx_per_slot', 0) or 0)))
-    opencode = max(opencode_pool, key=lambda item: (score_opencode_ready(item, model), int(item.get('ctx_per_slot', 0) or 0)))
-
     auto = max(successful, key=lambda item: score_auto(item, model))
     winner_specs = {
         'fast_chat': (
@@ -1687,17 +2104,6 @@ def select_measured_profiles(
             float(long.get('ctx_per_slot', 0) or 0),
             'largest full single-slot context, tok/s as tie-breaker',
         ),
-        'opencode_ready': (
-            opencode,
-            float(opencode.get('ctx_per_slot', 0) or 0),
-            (
-                f'largest full single-slot context meeting OpenCode floor {opencode_floor}'
-                if opencode_floor and int(opencode.get('ctx_per_slot', 0) or 0) >= opencode_floor
-                else f'best full single-slot fallback; no row met OpenCode floor {opencode_floor}'
-                if opencode_floor
-                else 'best full single-slot fallback; no OpenCode context floor was observed'
-            ),
-        ),
         'auto': (
             auto,
             score_auto(auto, model),
@@ -1706,6 +2112,17 @@ def select_measured_profiles(
             ),
         ),
     }
+    if opencode_pool:
+        opencode = max(opencode_pool, key=lambda item: (score_opencode_ready(item, model), int(item.get('ctx_per_slot', 0) or 0)))
+        winner_specs['opencode_ready'] = (
+            opencode,
+            float(opencode.get('ctx_per_slot', 0) or 0),
+            (
+                f'largest full single-slot context meeting OpenCode floor {opencode_floor}'
+                if opencode_floor
+                else 'best full single-slot fallback; no OpenCode context floor was observed'
+            ),
+        )
     profiles = {}
     for key, (item, selection_score, selection_reason) in winner_specs.items():
         selected = dict(item)
@@ -1716,6 +2133,29 @@ def select_measured_profiles(
         if source_objective and source_objective != key:
             profile_dict['reused_from'] = source_objective
         profiles[key] = profile_dict
+    if 'opencode_ready' not in profiles:
+        previous_opencode = get_measured_profile(model, 'opencode_ready')
+        if measured_profile_meets_opencode_floor(previous_opencode, opencode_floor):
+            preserved = dict(previous_opencode)
+            preserved['selection_reason'] = f'preserved previous OpenCode-ready profile meeting OpenCode floor {opencode_floor}'
+            preserved['preserved_from_previous'] = True
+            profiles['opencode_ready'] = preserved
+        else:
+            fallback = max(
+                opencode_single_slot_pool or successful,
+                key=lambda item: (score_opencode_ready(item, model), int(item.get('ctx_per_slot', 0) or 0)),
+            )
+            selected = dict(fallback)
+            selected['selection_score'] = round(float(selected.get('ctx_per_slot', 0) or 0), 4)
+            selected['selection_reason'] = f'not OpenCode-ready: no measured row met observed OpenCode floor {opencode_floor}'
+            profile_dict = adaptive_profile_dict('opencode_ready', fallback['model'], selected, profile)
+            source_objective = str(fallback.get('objective', '') or '')
+            if source_objective and source_objective != 'opencode_ready':
+                profile_dict['reused_from'] = source_objective
+            profile_dict['status'] = 'not_ready'
+            profile_dict['context_required'] = int(opencode_floor or 0)
+            profile_dict['opencode_floor'] = int(opencode_floor or 0)
+            profiles['opencode_ready'] = profile_dict
     return profiles
 
 
@@ -1975,6 +2415,8 @@ def annotate_spectrum_records(
     }
     for key, label in winner_labels.items():
         profile = winners.get(key) or {}
+        if str(profile.get('status', 'ok') or 'ok') != 'ok':
+            continue
         for record in successful:
             if record_matches_profile(record, profile):
                 add_spectrum_label(record, 'winner')
@@ -2019,6 +2461,19 @@ def annotate_spectrum_records(
     return records
 
 
+def opencode_profile_status_text(winners: Dict[str, Dict[str, object]]) -> str:
+    profile = winners.get('opencode_ready') or {}
+    if not profile:
+        return 'opencode not ready'
+    ctx = int(profile.get('ctx_per_slot', profile.get('ctx', 0)) or 0)
+    if str(profile.get('status', 'ok') or 'ok') == 'ok':
+        return f'opencode ctx/slot={ctx}'
+    floor = int(profile.get('context_required', profile.get('opencode_floor', 0)) or 0)
+    if floor:
+        return f'opencode not ready (best ctx/slot={ctx}, floor={floor})'
+    return f'opencode not ready (best ctx/slot={ctx})'
+
+
 def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Optional[List[Dict[str, object]]] = None) -> str:
     if not winners:
         return 'no winners'
@@ -2032,6 +2487,8 @@ def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Option
         parts.append(f'long={int(long.get("ctx_per_slot", 0) or 0)} ctx/slot')
     if auto:
         parts.append(f'auto={int(auto.get("ctx", 0) or 0)} ctx')
+    if winners.get('opencode_ready'):
+        parts.append(opencode_profile_status_text(winners))
     if any(
         str(row.get('engine', '') or '') == 'buun' and bool(row.get('runtime_fit', False))
         for row in list(winners.values()) + list(records or [])
@@ -2110,6 +2567,8 @@ def adaptive_record_from_candidate(
     fit_context: int = 0,
     runtime_no_warmup: bool = False,
     gpu_layers_mode: str = '',
+    batch_size: int = 0,
+    ubatch_size: int = 0,
     startup_result: str = '',
     failure_category: str = '',
     failure_reason: str = '',
@@ -2164,6 +2623,8 @@ def adaptive_record_from_candidate(
         'runtime_fit': bool(runtime_fit),
         'fit_context': int(fit_context or 0),
         'runtime_no_warmup': bool(runtime_no_warmup),
+        'batch_size': int(batch_size or 0),
+        'ubatch_size': int(ubatch_size or 0),
         'gpu_layers_mode': gpu_layers_mode,
         'startup_result': startup_result,
         'failure_category': failure_category,
@@ -2251,6 +2712,8 @@ def runtime_record_context(
         'runtime_fit': bool(getattr(profile, 'fit', False)) if profile is not None else False,
         'fit_context': int(getattr(profile, 'fit_context', 0) or 0) if profile is not None else 0,
         'runtime_no_warmup': bool(getattr(profile, 'no_warmup', False)) if profile is not None else False,
+        'batch_size': int(getattr(profile, 'batch_size', 0) or 0) if profile is not None else 0,
+        'ubatch_size': int(getattr(profile, 'ubatch_size', 0) or 0) if profile is not None else 0,
         'gpu_layers_mode': (
             'fit' if profile is not None and getattr(profile, 'gpu_layers', None) is None and getattr(profile, 'fit', False)
             else 'fixed' if profile is not None and getattr(profile, 'gpu_layers', None) is not None
@@ -2639,6 +3102,109 @@ def candidate_safe_context_estimate(candidate: ModelConfig, profile: HardwarePro
     )
 
 
+def context_pressure_score(pressure_payload: Optional[Dict[str, object]] = None) -> float:
+    payload = pressure_payload if pressure_payload is not None else current_process_pressure_payload()
+    try:
+        return max(0.0, min(1.0, float(payload.get('process_pressure_score', 0.0) or 0.0)))
+    except Exception:
+        return 0.0
+
+
+def health_context_ceiling(
+    model: ModelConfig,
+    profile: HardwareProfile,
+    ctx_min: int,
+    absolute_ctx_max: int,
+    pressure_payload: Optional[Dict[str, object]] = None,
+    objective: str = 'long_context',
+    variant: str = 'default',
+) -> int:
+    ctx_min = max(256, int(ctx_min or 2048))
+    absolute_ctx_max = max(ctx_min, int(absolute_ctx_max or ctx_min))
+    pressure = context_pressure_score(pressure_payload)
+    if pressure < CONTEXT_HEALTH_PRESSURE_CAP:
+        return absolute_ctx_max
+    seed = configure_adaptive_candidate(model, profile, objective, ctx_min, 1, variant)
+    seed.ctx_max = absolute_ctx_max
+    safe_ctx = candidate_safe_context_estimate(seed, profile)
+    if safe_ctx <= 0:
+        return ctx_min
+    return max(ctx_min, min(absolute_ctx_max, round_context_down(safe_ctx, CONTEXT_REFINE_STEP)))
+
+
+def _context_milestones_to(ceiling: int) -> List[int]:
+    ceiling = max(1, int(ceiling or 1))
+    values = [ctx for ctx in RUNTIME_CONTEXT_MILESTONES if ctx <= ceiling]
+    if ceiling not in values:
+        values.append(ceiling)
+    current = RUNTIME_CONTEXT_MILESTONES[-1]
+    while current < ceiling:
+        current = min(ceiling, current * 2)
+        if current not in values:
+            values.append(current)
+        if current >= ceiling:
+            break
+    return sorted(set(values))
+
+
+def dynamic_context_growth_targets(
+    model: ModelConfig,
+    profile: HardwareProfile,
+    ctx_min: int,
+    absolute_ctx_max: int,
+    depth: str = 'full',
+    pressure_payload: Optional[Dict[str, object]] = None,
+    observed_floor: int = 0,
+    objective: str = 'long_context',
+    variant: str = 'default',
+) -> List[int]:
+    benchmark_depth = 'fast' if str(depth or '').strip().lower() == 'fast' else 'full'
+    ctx_min = max(256, int(ctx_min or 2048))
+    absolute_ctx_max = max(ctx_min, int(absolute_ctx_max or ctx_min))
+    health_ceiling = health_context_ceiling(
+        model,
+        profile,
+        ctx_min,
+        absolute_ctx_max,
+        pressure_payload=pressure_payload,
+        objective=objective,
+        variant=variant,
+    )
+    health_ceiling = max(ctx_min, min(absolute_ctx_max, health_ceiling))
+    floor_target = round_context_up(observed_floor, CONTEXT_REFINE_STEP) if int(observed_floor or 0) > 0 else 0
+    milestones = _context_milestones_to(health_ceiling)
+    values = {ctx_min}
+
+    if benchmark_depth == 'fast':
+        values.update(ctx for ctx in (8_192, 16_384) if ctx_min <= ctx <= health_ceiling)
+        if floor_target > 32_768 and floor_target <= health_ceiling:
+            values.add(floor_target)
+        elif health_ceiling > 32_768:
+            above = [ctx for ctx in milestones if ctx > 32_768]
+            if above:
+                values.add(min(above))
+        ordered = sorted(ctx for ctx in values if ctx_min <= ctx <= health_ceiling)
+        if len(ordered) <= FAST_RUNTIME_CONTEXT_TARGET_LIMIT:
+            return ordered
+        required = {ctx_min}
+        if floor_target > 32_768 and floor_target <= health_ceiling:
+            required.add(floor_target)
+        required.add(max(ordered))
+        selected = sorted(required)
+        for ctx in ordered:
+            if len(selected) >= FAST_RUNTIME_CONTEXT_TARGET_LIMIT:
+                break
+            if ctx not in selected:
+                selected.append(ctx)
+        return sorted(set(selected))
+
+    values.update(ctx for ctx in milestones if ctx_min <= ctx <= health_ceiling)
+    if floor_target > 0 and floor_target <= health_ceiling:
+        values.add(floor_target)
+    values.add(health_ceiling)
+    return sorted(ctx for ctx in values if ctx_min <= ctx <= health_ceiling)
+
+
 def active_engine_runtime_profiles(
     app: AppConfig,
     model: ModelConfig,
@@ -2686,6 +3252,17 @@ def active_engine_runtime_profiles(
     fit_only_buun = bool(supports_buun_fit and (heavy_for_gpu or (moe and not fits_gpu)))
     supports_cache_kv = bool(capabilities.supports_cache_type_kv and engine != 'buun')
     base_ctx = max(ctx_min, min(ctx_max, 8192 if (moe or heavy_for_gpu or supports_turbo) else 4096))
+    pressure_payload = current_process_pressure_payload()
+    opencode_floor = observed_opencode_context_floor(model)
+    context_points = dynamic_context_growth_targets(
+        model,
+        profile,
+        ctx_min,
+        ctx_max,
+        depth=benchmark_depth,
+        pressure_payload=pressure_payload,
+        observed_floor=opencode_floor,
+    )
     profiles: List[RuntimeProfile] = []
     seen = set()
 
@@ -2753,6 +3330,77 @@ def active_engine_runtime_profiles(
     def fit_context_for(ctx: int) -> int:
         return min(int(ctx or base_ctx), max(ctx_min, 4096))
 
+    def fit_growth_contexts() -> Tuple[int, ...]:
+        available = [ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max]
+        floor = int(observed_opencode_context_floor(model) or 0)
+        if floor > base_ctx:
+            eligible = [ctx for ctx in context_points if ctx <= ctx_max]
+            floor_ctx = _nearest_context_at_or_above(eligible, floor)
+            if floor_ctx > base_ctx:
+                available.append(floor_ctx)
+        if benchmark_depth == 'fast':
+            selected = []
+            next_ctx = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
+            if next_ctx:
+                selected.append(next_ctx)
+            high_ctx = next((ctx for ctx in context_points if ctx > 32_768 and ctx <= ctx_max), 0)
+            if high_ctx:
+                selected.append(high_ctx)
+            if floor > base_ctx:
+                eligible = [ctx for ctx in context_points if ctx <= ctx_max]
+                floor_ctx = _nearest_context_at_or_above(eligible, floor)
+                if floor_ctx > base_ctx:
+                    selected.append(floor_ctx)
+            available = selected
+        return tuple(sorted(set(ctx for ctx in available if ctx > base_ctx and ctx <= ctx_max)))
+
+    def add_buun_fit_growth_profiles(include_turbo_ladder: bool):
+        growth_contexts = fit_growth_contexts()
+        if not growth_contexts:
+            return
+        if supports_turbo:
+            if include_turbo_ladder:
+                ladder_profiles = [
+                    item for item in turbo_profiles
+                    if not item.scalar and (
+                        benchmark_depth == 'full'
+                        or item.kv_preset in ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq')
+                    )
+                ]
+                preferred = next((item for item in ladder_profiles if item.kv_preset == 'turbo4/turbo4'), None)
+                preferred_profiles = [preferred or ladder_profiles[0]] if ladder_profiles else []
+            else:
+                preferred = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), None)
+                preferred_profiles = [preferred or turbo_profiles[0]] if turbo_profiles else []
+                ladder_profiles = preferred_profiles
+            for ctx in growth_contexts:
+                ctx_profiles = ladder_profiles if ctx <= 32_768 else preferred_profiles
+                for kv_profile in ctx_profiles:
+                    add(
+                        f'fit_context_growth_sweep_{ctx}_{kv_profile.name_slug}',
+                        ctx,
+                        None,
+                        kv_profile.kv_preset,
+                        batch=128,
+                        ubatch=64,
+                        kv_profile=kv_profile,
+                        fit=True,
+                        fit_context=fit_context_for(ctx),
+                        no_warmup=capabilities.supports_no_warmup,
+                    )
+        for ctx in growth_contexts:
+            add(
+                f'fit_context_growth_sweep_{ctx}',
+                ctx,
+                None,
+                'default',
+                batch=128,
+                ubatch=64,
+                fit=True,
+                fit_context=fit_context_for(ctx),
+                no_warmup=capabilities.supports_no_warmup,
+            )
+
     if not (engine == 'buun' and has_gpu):
         add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, 'default', batch=128, ubatch=64)
     if has_gpu:
@@ -2773,6 +3421,17 @@ def active_engine_runtime_profiles(
                     fit_context=fit_context_for(base_ctx),
                     no_warmup=capabilities.supports_no_warmup,
                 )
+                add(
+                    'fit_default_probe',
+                    base_ctx,
+                    None,
+                    'default',
+                    batch=128,
+                    ubatch=64,
+                    fit=True,
+                    fit_context=fit_context_for(base_ctx),
+                    no_warmup=capabilities.supports_no_warmup,
+                )
             else:
                 initial_fit_kv = 'default'
                 add(
@@ -2786,7 +3445,8 @@ def active_engine_runtime_profiles(
                     fit_context=fit_context_for(base_ctx),
                     no_warmup=capabilities.supports_no_warmup,
                 )
-        context_points = (8192, 16384) if benchmark_depth == 'fast' else (8192, 16384, 24576, 32768)
+            if not fit_only_buun:
+                add_buun_fit_growth_profiles(include_turbo_ladder=False)
         if fit_only_buun:
             if supports_turbo:
                 for kv_profile in turbo_profiles:
@@ -2804,47 +3464,9 @@ def active_engine_runtime_profiles(
                         fit_context=fit_context_for(base_ctx),
                         no_warmup=capabilities.supports_no_warmup,
                     )
-                growth_profiles = [
-                    item for item in turbo_profiles
-                    if not item.scalar and (
-                        benchmark_depth == 'full'
-                        or item.kv_preset in ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq')
-                    )
-                ]
-                if benchmark_depth == 'fast':
-                    next_ctx = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
-                    growth_contexts = (next_ctx,) if next_ctx else ()
-                else:
-                    growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
-                for kv_profile in growth_profiles:
-                    for ctx in growth_contexts:
-                        add(
-                            f'fit_context_growth_sweep_{ctx}_{kv_profile.name_slug}',
-                            ctx,
-                            None,
-                            kv_profile.kv_preset,
-                            batch=128,
-                            ubatch=64,
-                            kv_profile=kv_profile,
-                            fit=True,
-                            fit_context=fit_context_for(ctx),
-                            no_warmup=capabilities.supports_no_warmup,
-                        )
+                add_buun_fit_growth_profiles(include_turbo_ladder=True)
             else:
-                for ctx in context_points:
-                    if ctx <= base_ctx or ctx > ctx_max:
-                        continue
-                    add(
-                        f'fit_context_growth_sweep_{ctx}',
-                        ctx,
-                        None,
-                        'default',
-                        batch=128,
-                        ubatch=64,
-                        fit=True,
-                        fit_context=fit_context_for(ctx),
-                        no_warmup=capabilities.supports_no_warmup,
-                    )
+                add_buun_fit_growth_profiles(include_turbo_ladder=False)
             return profiles
         add('partial_gpu_probe', base_ctx, partial_ngl, kv_for_strategy('partial_gpu_probe'))
         if supports_turbo:
@@ -2875,27 +3497,18 @@ def active_engine_runtime_profiles(
             add('kv_compression_probe', base_ctx, 0, kv_for_strategy('kv_compression_probe'))
 
     context_seed_ngl = partial_ngl if has_gpu else 0
-    context_points = (8192, 16384) if benchmark_depth == 'fast' else (8192, 16384, 24576, 32768)
     if supports_turbo:
-        growth_profiles = [
-            item for item in turbo_profiles
-            if not item.scalar and (
-                benchmark_depth == 'full'
-                or item.kv_preset in ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq')
-            )
-        ]
-        if benchmark_depth == 'fast':
-            next_ctx = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
-            growth_contexts = (next_ctx,) if next_ctx else ()
-        else:
-            growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
-        for kv_profile in growth_profiles:
+        sweep_kv_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), turbo_profiles[0] if turbo_profiles else None)
+        growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
+        if sweep_kv_profile is not None:
             for ctx in growth_contexts:
-                add(f'context_growth_sweep_{ctx}_{kv_profile.name_slug}', ctx, context_seed_ngl, kv_profile.kv_preset, kv_profile=kv_profile)
+                add(f'context_growth_sweep_{ctx}_{sweep_kv_profile.name_slug}', ctx, context_seed_ngl, sweep_kv_profile.kv_preset, kv_profile=sweep_kv_profile)
+        for ctx in growth_contexts:
+            add(f'context_growth_sweep_{ctx}', ctx, context_seed_ngl, 'default')
     else:
         context_kv = kv_for_strategy('context_growth_sweep')
         for ctx in context_points:
-            if ctx <= ctx_max:
+            if ctx > base_ctx and ctx <= ctx_max:
                 add(f'context_growth_sweep_{ctx}', ctx, context_seed_ngl, context_kv)
     return profiles
 
@@ -3382,9 +3995,9 @@ def benchmark_exhaustive_profiles(
     progress: Optional[Callable[[object], None]] = None,
     cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
-    status, _detail = app.health(model)
-    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
-        return False, '❌ Stop the model before running smart bounded benchmark profiles.'
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'server', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
 
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
@@ -3405,6 +4018,7 @@ def benchmark_exhaustive_profiles(
     completed = 0
     started_monotonic = time.monotonic()
     full_by_fingerprint: Dict[str, Dict[str, object]] = {}
+    disabled_runtime_kv: set[Tuple[str, str]] = set()
 
     running_model = ModelConfig(**asdict(model))
     running_model.default_benchmark_status = 'running'
@@ -3601,6 +4215,11 @@ def benchmark_exhaustive_profiles(
             buun_fit_succeeded = False
             fixed_buun_skipped = 0
             for runtime_profile in runtime_profiles:
+                skip_reason = runtime_profile_skip_reason(runtime_profile, disabled_runtime_kv)
+                if skip_reason:
+                    if progress:
+                        progress(f'smart bounded skipped {runtime_profile.name}: {skip_reason}')
+                    continue
                 if buun_fit_succeeded and runtime_profile_is_fixed_buun(runtime_profile):
                     fixed_buun_skipped += 1
                     continue
@@ -3629,6 +4248,12 @@ def benchmark_exhaustive_profiles(
                     buun_fit_succeeded = True
                     if progress:
                         progress('smart bounded buun fit profile succeeded; skipping fixed-NGL buun fallback probes')
+                elif not ok and new_records:
+                    disable_key = runtime_profile_kv_disable_key(new_records[-1], runtime_profile)
+                    if disable_key[0] and disable_key not in disabled_runtime_kv:
+                        disabled_runtime_kv.add(disable_key)
+                        if progress:
+                            progress(f'smart bounded disabled {disable_key[0]} {disable_key[1]} after incompatible KV startup')
             if fixed_buun_skipped and progress:
                 progress(f'smart bounded skipped {fixed_buun_skipped} fixed-NGL buun profile(s) after fit success')
         else:
@@ -3719,20 +4344,17 @@ def benchmark_exhaustive_profiles(
     winners = select_measured_profiles(model, measured, profile)
     annotate_spectrum_records(records, winners)
     ended_at = datetime.now().isoformat(timespec='seconds')
-    saved = ModelConfig(**asdict(model))
-    saved.last_benchmark_results = records
-    saved.measured_profiles = winners
-    saved.benchmark_fingerprint = app.model_fingerprint(saved)
-    saved.default_benchmark_at = ended_at
-    status_text = 'done' if winners else 'failed'
-    run = build_benchmark_run(run_id, 'server', status_text, records, winners, started_at, ended_at, profile.short_summary())
-    upsert_benchmark_run(saved, run)
-
     if not winners:
-        saved.default_benchmark_status = 'failed'
+        saved, preserved = failed_benchmark_model_state(app, model, records, ended_at)
+        saved.benchmark_fingerprint = app.model_fingerprint(saved)
+        run = build_benchmark_run(run_id, 'server', 'failed', records, {}, started_at, ended_at, profile.short_summary())
+        upsert_benchmark_run(saved, run)
         app.add_or_update(saved)
-        summary = benchmark_failure_summary(records, 'no measured candidates completed')
-        msg = f'❌ smart bounded benchmark failed: {summary}'
+        if preserved:
+            msg = preserved_profiles_message('smart bounded benchmark found no better working candidate', records)
+        else:
+            summary = benchmark_failure_summary(records, 'no measured candidates completed')
+            msg = f'❌ smart bounded benchmark failed: {summary}'
         if progress:
             progress(msg)
         emit_benchmark_event(
@@ -3747,6 +4369,14 @@ def benchmark_exhaustive_profiles(
             records=records,
         )
         return False, msg
+
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    saved.measured_profiles = winners
+    saved.benchmark_fingerprint = app.model_fingerprint(saved)
+    saved.default_benchmark_at = ended_at
+    run = build_benchmark_run(run_id, 'server', 'done', records, winners, started_at, ended_at, profile.short_summary())
+    upsert_benchmark_run(saved, run)
 
     auto_profile = winners['auto']
     apply_measured_profile(saved, 'auto')
@@ -3763,7 +4393,7 @@ def benchmark_exhaustive_profiles(
     msg = (
         f'✅ smart bounded profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
         f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
-        f'opencode ctx/slot={winners["opencode_ready"]["ctx_per_slot"]}, '
+        f'{opencode_profile_status_text(winners)}, '
         f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
     )
     if progress:
@@ -3788,9 +4418,9 @@ def benchmark_fast_profiles(
     progress: Optional[Callable[[object], None]] = None,
     cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
-    status, _detail = app.health(model)
-    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
-        return False, '❌ Stop the model before running fast benchmark profiles.'
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'server_fast', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
 
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
@@ -3803,6 +4433,7 @@ def benchmark_fast_profiles(
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
     completed = 0
+    disabled_runtime_kv: set[Tuple[str, str]] = set()
 
     running_model = ModelConfig(**asdict(model))
     running_model.default_benchmark_status = 'running'
@@ -3845,6 +4476,11 @@ def benchmark_fast_profiles(
             fixed_buun_skipped = 0
             for runtime_profile in runtime_profiles:
                 check_cancelled(cancel_token)
+                skip_reason = runtime_profile_skip_reason(runtime_profile, disabled_runtime_kv)
+                if skip_reason:
+                    if progress:
+                        progress(f'fast skipped {runtime_profile.name}: {skip_reason}')
+                    continue
                 if buun_fit_succeeded and runtime_profile_is_fixed_buun(runtime_profile):
                     fixed_buun_skipped += 1
                     continue
@@ -3872,6 +4508,12 @@ def benchmark_fast_profiles(
                     buun_fit_succeeded = True
                     if progress:
                         progress('fast buun fit profile succeeded; skipping fixed-NGL buun fallback probes')
+                elif not ok and new_records:
+                    disable_key = runtime_profile_kv_disable_key(new_records[-1], runtime_profile)
+                    if disable_key[0] and disable_key not in disabled_runtime_kv:
+                        disabled_runtime_kv.add(disable_key)
+                        if progress:
+                            progress(f'fast disabled {disable_key[0]} {disable_key[1]} after incompatible KV startup')
             if fixed_buun_skipped and progress:
                 progress(f'fast skipped {fixed_buun_skipped} fixed-NGL buun profile(s) after fit success')
         else:
@@ -3984,19 +4626,17 @@ def benchmark_fast_profiles(
     winners = select_measured_profiles(model, measured, profile)
     annotate_spectrum_records(records, winners)
     ended_at = datetime.now().isoformat(timespec='seconds')
-    saved = ModelConfig(**asdict(model))
-    saved.last_benchmark_results = records
-    saved.measured_profiles = winners
-    saved.benchmark_fingerprint = app.model_fingerprint(saved)
-    saved.default_benchmark_at = ended_at
-    status_text = 'done' if winners else 'failed'
-    run = build_benchmark_run(run_id, 'server_fast', status_text, records, winners, started_at, ended_at, profile.short_summary())
-    upsert_benchmark_run(saved, run)
-
     if not winners:
-        saved.default_benchmark_status = 'failed'
+        saved, preserved = failed_benchmark_model_state(app, model, records, ended_at)
+        saved.benchmark_fingerprint = app.model_fingerprint(saved)
+        run = build_benchmark_run(run_id, 'server_fast', 'failed', records, {}, started_at, ended_at, profile.short_summary())
+        upsert_benchmark_run(saved, run)
         app.add_or_update(saved)
-        msg = f'❌ fast benchmark failed: {benchmark_failure_summary(records, "no measured candidates completed")}'
+        msg = (
+            preserved_profiles_message('fast benchmark found no better working candidate', records)
+            if preserved
+            else f'❌ fast benchmark failed: {benchmark_failure_summary(records, "no measured candidates completed")}'
+        )
         if progress:
             progress(msg)
         emit_benchmark_event(
@@ -4011,6 +4651,14 @@ def benchmark_fast_profiles(
             records=records,
         )
         return False, msg
+
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    saved.measured_profiles = winners
+    saved.benchmark_fingerprint = app.model_fingerprint(saved)
+    saved.default_benchmark_at = ended_at
+    run = build_benchmark_run(run_id, 'server_fast', 'done', records, winners, started_at, ended_at, profile.short_summary())
+    upsert_benchmark_run(saved, run)
 
     auto_profile = winners['auto']
     apply_measured_profile(saved, 'auto')
@@ -4027,7 +4675,7 @@ def benchmark_fast_profiles(
     msg = (
         f'✅ fast profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
         f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
-        f'opencode ctx/slot={winners["opencode_ready"]["ctx_per_slot"]}, '
+        f'{opencode_profile_status_text(winners)}, '
         f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
     )
     if progress:
@@ -4053,9 +4701,9 @@ def benchmark_adaptive_profiles(
     cancel_token: Optional[CancelToken] = None,
     time_budget_seconds: int = ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS,
 ) -> Tuple[bool, str]:
-    status, _detail = app.health(model)
-    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
-        return False, '❌ Stop the model before running adaptive benchmark profiles.'
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'server', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
     profile = app.hardware_profile(refresh=True)
     deadline = time.monotonic() + max(60, int(time_budget_seconds or ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS))
     records: List[Dict[str, object]] = []
@@ -4190,15 +4838,16 @@ def benchmark_adaptive_profiles(
 
     winners = select_measured_profiles(model, measured, profile)
     annotate_spectrum_records(records, winners)
-    saved = ModelConfig(**asdict(model))
-    saved.last_benchmark_results = records
-    saved.measured_profiles = winners
-    saved.benchmark_fingerprint = app.model_fingerprint(saved)
-    saved.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
     if not winners:
-        saved.default_benchmark_status = 'failed'
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        saved, preserved = failed_benchmark_model_state(app, model, records, ended_at)
+        saved.benchmark_fingerprint = app.model_fingerprint(saved)
         app.add_or_update(saved)
-        msg = f'❌ adaptive benchmark failed: {benchmark_failure_summary(records, "no measured candidates completed")}'
+        msg = (
+            preserved_profiles_message('adaptive benchmark found no better working candidate', records)
+            if preserved
+            else f'❌ adaptive benchmark failed: {benchmark_failure_summary(records, "no measured candidates completed")}'
+        )
         if progress:
             progress(msg)
         emit_benchmark_event(
@@ -4211,6 +4860,12 @@ def benchmark_adaptive_profiles(
             records=records,
         )
         return False, msg
+
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    saved.measured_profiles = winners
+    saved.benchmark_fingerprint = app.model_fingerprint(saved)
+    saved.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
 
     auto_profile = winners['auto']
     apply_measured_profile(saved, 'auto')
@@ -4276,6 +4931,9 @@ def safe_bootstrap_benchmark(
     progress: Optional[Callable[[str], None]] = None,
     cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'safe_bootstrap', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
     profile = app.hardware_profile(refresh=True)
     return _run_server_benchmark_candidates(
         app,

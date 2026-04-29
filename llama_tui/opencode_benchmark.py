@@ -16,13 +16,16 @@ from typing import Callable, Dict, List, Optional, Tuple
 from .benchmark import (
     adaptive_context_upper_bound,
     architecture_payload,
+    benchmark_preflight_cleanup,
     configure_adaptive_candidate,
     clone_model_config,
     concise_failure,
     ctx_per_slot,
     current_process_pressure_payload,
+    dynamic_context_growth_targets,
     emit_benchmark_event,
-    model_from_measured_profile,
+    model_and_runtime_profile_from_measured_profile,
+    observed_opencode_context_floor,
     parse_context_requirement,
     sync_opencode_after_tuning,
 )
@@ -185,7 +188,7 @@ def write_temp_opencode_config(app, model: ModelConfig, home: Path) -> Path:
                     model.alias: {
                         'name': model.name,
                         'limit': {
-                            'context': model.ctx,
+                            'context': max(1, ctx_per_slot(model)),
                             'output': model.output,
                         },
                     },
@@ -325,8 +328,12 @@ def build_opencode_run_command(app, model: ModelConfig, workspace: Path, prompt:
 def opencode_candidate_models(model: ModelConfig, profile) -> List[Tuple[str, str, ModelConfig, str]]:
     candidates: List[Tuple[str, str, ModelConfig, str]] = []
     seen = set()
+    observed_floor = max(0, int(observed_opencode_context_floor(model) or 0))
 
     def add(label: str, tier: str, candidate: ModelConfig, detail: str):
+        slot = ctx_per_slot(candidate)
+        if observed_floor and slot < observed_floor:
+            return
         key = (int(getattr(candidate, 'ctx', 0) or 0), int(getattr(candidate, 'parallel', 1) or 1), tuple(getattr(candidate, 'extra_args', []) or []))
         if key in seen:
             return
@@ -334,7 +341,7 @@ def opencode_candidate_models(model: ModelConfig, profile) -> List[Tuple[str, st
         candidates.append((label, tier, candidate, detail))
 
     for key in ('opencode_ready', 'long_context', 'auto', 'fast_chat'):
-        measured = model_from_measured_profile(model, key)
+        measured, _runtime_profile = model_and_runtime_profile_from_measured_profile(model, key)
         if measured is not None:
             add(key, 'measured', measured, f'measured {key} ctx_per_slot={ctx_per_slot(measured)}')
             if len(candidates) >= OPENCODE_BENCHMARK_CANDIDATES:
@@ -346,16 +353,29 @@ def opencode_candidate_models(model: ModelConfig, profile) -> List[Tuple[str, st
     for variant in variants:
         upper = adaptive_context_upper_bound(model, profile, OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE, parallel=1, variant=variant)
         ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+        ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', upper or ctx_min) or (upper or ctx_min)))
+        dynamic_points = dynamic_context_growth_targets(
+            model,
+            profile,
+            ctx_min,
+            ctx_max,
+            depth='fast',
+            observed_floor=observed_floor,
+            objective=OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE,
+            variant=variant,
+        )
         points = sorted(set([
             ctx_min,
             max(ctx_min, upper // 2),
             upper,
+            *dynamic_points,
         ]))
         if (getattr(model, 'architecture_type', '') or '').strip().lower() == 'moe':
             points = sorted(set(points + [
                 max(ctx_min, min(upper, 16384)),
                 max(ctx_min, min(upper, 32768)),
             ]))
+        points = sorted(set(points))
         for ctx in points:
             candidate = configure_adaptive_candidate(model, profile, OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE, ctx, 1, variant)
             label = OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE if variant == 'default' else f'{OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE}_{variant}'
@@ -389,6 +409,7 @@ def run_process_with_metrics(
     cancel_token: Optional[CancelToken] = None,
     no_output_timeout: int = OPENCODE_NO_OUTPUT_TIMEOUT,
     idle_output_timeout: int = OPENCODE_IDLE_OUTPUT_TIMEOUT,
+    stop_on_context_overflow: bool = True,
 ) -> Dict[str, object]:
     check_cancelled(cancel_token)
     started = time.monotonic()
@@ -402,6 +423,8 @@ def run_process_with_metrics(
     no_output_timed_out = False
     idle_timed_out = False
     aborted = False
+    context_overflow = False
+    context_required = 0
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -470,7 +493,16 @@ def run_process_with_metrics(
                     stdout_lines.append(line.rstrip())
                 else:
                     stderr_lines.append(line.rstrip())
+                if stop_on_context_overflow:
+                    required = parse_context_requirement(line)
+                    if required:
+                        context_required = max(context_required, int(required))
+                        context_overflow = True
+                        app.terminate_process_group(proc.pid)
+                        break
             remember_memory()
+            if context_overflow:
+                break
             if proc.poll() is not None:
                 break
     finally:
@@ -507,6 +539,8 @@ def run_process_with_metrics(
         'no_output_timeout': no_output_timed_out,
         'idle_output_timeout': idle_timed_out,
         'aborted': aborted,
+        'context_overflow': context_overflow,
+        'context_required': context_required,
         'elapsed': elapsed,
         'first_output': first_output if first_output is not None else elapsed,
         'stdout': stdout_lines[-40:],
@@ -627,7 +661,10 @@ def run_opencode_task(
             stderr = ' | '.join(str(line) for line in run.get('stderr', [])[-8:])
             stdout = ' | '.join(str(line) for line in run.get('stdout', [])[-8:])
             detail = test_detail or stderr or stdout
-            context_required = parse_context_requirement(' | '.join([detail, stderr, stdout]))
+            context_required = max(
+                int(run.get('context_required', 0) or 0),
+                int(parse_context_requirement(' | '.join([detail, stderr, stdout])) or 0),
+            )
             if context_required:
                 status = 'context too small'
                 detail = f'OpenCode requested about {context_required} tokens; {detail}'
@@ -656,6 +693,7 @@ def run_opencode_task(
                 'no_output_timeout': bool(run.get('no_output_timeout')),
                 'idle_output_timeout': bool(run.get('idle_output_timeout')),
                 'aborted': bool(run.get('aborted')),
+                'context_overflow': bool(run.get('context_overflow')),
                 'elapsed': float(run.get('elapsed', 0.0) or 0.0),
                 'first_output': float(run.get('first_output', 0.0) or 0.0),
                 'min_ram_available': int(run.get('min_ram_available', 0) or 0),
@@ -716,6 +754,18 @@ def summarize_sample_status(samples: List[Dict[str, object]]) -> str:
     return 'tests failed' if samples else 'failed'
 
 
+def opencode_failure_summary(records: List[Dict[str, object]]) -> str:
+    if not records:
+        return 'no candidate completed a task'
+    required = max([int(row.get('context_required', 0) or 0) for row in records if isinstance(row, dict)] or [0])
+    largest = max([int(row.get('ctx_per_slot', 0) or 0) for row in records if isinstance(row, dict)] or [0])
+    if required:
+        return f'no candidate completed; OpenCode requested about {required} tokens, largest tested ctx/slot was {largest}'
+    first_detail = next((str(row.get('detail', '') or '') for row in records if isinstance(row, dict) and row.get('detail')), '')
+    first_status = next((str(row.get('status', '') or '') for row in records if isinstance(row, dict) and row.get('status')), 'failed')
+    return concise_failure(f'{first_status}: {first_detail}' if first_detail else first_status, limit=500)
+
+
 def sample_timeout_type(sample: Dict[str, object]) -> str:
     if sample.get('aborted'):
         return 'aborted'
@@ -743,6 +793,7 @@ def compact_sample_details(samples: List[Dict[str, object]]) -> List[Dict[str, o
             'timed_out': bool(sample.get('timed_out')),
             'no_output_timeout': bool(sample.get('no_output_timeout')),
             'idle_output_timeout': bool(sample.get('idle_output_timeout')),
+            'context_overflow': bool(sample.get('context_overflow')),
             'unittest_command_seen': bool(sample.get('unittest_command_seen')),
             'context_required': int(sample.get('context_required', 0) or 0),
             'detail': concise_failure(str(sample.get('detail', '')), limit=320),
@@ -768,9 +819,9 @@ def benchmark_opencode_workflow(
         return False, f'❌ opencode preflight failed: {cli_msg}'
     if progress:
         progress(cli_msg)
-    status, _detail = app.health(model)
-    if status in ('READY', 'LOADING', 'STARTING') or app.get_pid(model):
-        return False, '❌ Stop the model before running opencode workflow benchmark.'
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'opencode', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
 
     profile = app.hardware_profile(refresh=True)
     candidates = opencode_candidate_models(model, profile)
@@ -851,9 +902,49 @@ def benchmark_opencode_workflow(
 
     current: Optional[Tuple[str, str, ModelConfig]] = None
     completed_steps = 0
+    observed_context_floor = max(0, int(observed_opencode_context_floor(model) or 0))
     try:
         for attempt, (preset, tier, candidate, tune_msg) in enumerate(candidates, start=1):
             check_cancelled(cancel_token)
+            runtime_profile = None
+            if tier == 'measured':
+                _measured_candidate, runtime_profile = model_and_runtime_profile_from_measured_profile(model, preset)
+            if observed_context_floor and ctx_per_slot(candidate) < observed_context_floor:
+                record = {
+                    'preset': preset,
+                    'tier': tier,
+                    'status': 'context too small',
+                    'score': 0.0,
+                    'seconds': 0.0,
+                    'passed': 0,
+                    'tasks': len(OPENCODE_WORKFLOW_TASKS),
+                    'detail': f'skipped ctx/slot={ctx_per_slot(candidate)} below observed OpenCode floor {observed_context_floor}',
+                    'ctx': int(getattr(candidate, 'ctx', 0) or 0),
+                    'ctx_per_slot': ctx_per_slot(candidate),
+                    'parallel': int(getattr(candidate, 'parallel', 0) or 0),
+                    'threads': int(getattr(candidate, 'threads', 0) or 0),
+                    'ngl': int(getattr(candidate, 'ngl', 0) or 0),
+                    'context_required': observed_context_floor,
+                    'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+                }
+                record.update(benchmark_record_context(candidate))
+                records.append(record)
+                completed_steps += len(OPENCODE_WORKFLOW_TASKS)
+                if progress:
+                    progress(f'opencode candidate {attempt}/{len(candidates)} skipped: {record["detail"]}')
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_result',
+                    model,
+                    'opencode',
+                    message=f'opencode candidate {attempt}/{len(candidates)} skipped below observed context floor',
+                    phase='OpenCode benchmark (headless)',
+                    completed=completed_steps,
+                    total=total_steps,
+                    candidate=f'{preset}/{tier}',
+                    record=record,
+                )
+                continue
             current = (preset, tier, candidate)
             if progress:
                 progress(
@@ -874,7 +965,10 @@ def benchmark_opencode_workflow(
                 total=total_steps,
                 candidate=f'{preset}/{tier}',
             )
-            ok, msg = app.start(candidate)
+            try:
+                ok, msg = app.start(candidate, runtime_profile=runtime_profile)
+            except TypeError:
+                ok, msg = app.start(candidate)
             if not ok:
                 record = {
                     'preset': preset,
@@ -1010,6 +1104,9 @@ def benchmark_opencode_workflow(
                     sample = run_opencode_task(app, candidate, task, cancel_token=cancel_token, progress=progress)
                     samples.append(sample)
                     completed_steps += 1
+                    required = int(sample.get('context_required', 0) or 0)
+                    if required:
+                        observed_context_floor = max(observed_context_floor, required)
                     check_cancelled(cancel_token)
                     if progress:
                         state = str(sample.get('status', 'passed' if sample.get('ok') else 'failed'))
@@ -1020,6 +1117,14 @@ def benchmark_opencode_workflow(
                         )
                         if not sample.get('ok') and sample.get('detail'):
                             progress(f'opencode task {task.name} detail: {concise_failure(str(sample.get("detail")), limit=500)}')
+                    if required and not sample.get('ok'):
+                        if progress:
+                            progress(
+                                f'opencode candidate {attempt}/{len(candidates)} stopped early: '
+                                f'ctx/slot={ctx_per_slot(candidate)} below observed request {required}'
+                            )
+                        completed_steps += max(0, len(OPENCODE_WORKFLOW_TASKS) - task_idx)
+                        break
 
                 score = score_opencode_samples(samples)
                 passed = sum(1 for sample in samples if sample.get('ok'))
@@ -1130,7 +1235,7 @@ def benchmark_opencode_workflow(
     recorded_model.last_opencode_benchmark_results = records
     if not results:
         app.add_or_update(recorded_model)
-        msg = '❌ opencode workflow benchmark failed: no candidate completed a task'
+        msg = f'❌ opencode workflow benchmark failed: {opencode_failure_summary(records)}'
         if progress:
             progress(msg)
         emit_benchmark_event(
