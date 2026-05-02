@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,12 +16,14 @@ from llama_tui.benchmark import (
     benchmark_all_models_runner,
     benchmark_exhaustive_profiles,
     benchmark_fast_profiles,
+    benchmark_run_summary,
     benchmark_runtime_profile_with_retry,
     classify_benchmark_failure,
     launch_with_failsafe,
     measured_profile_runtime_profile,
     memory_guardrail_admission,
     model_and_runtime_profile_from_measured_profile,
+    runtime_record_context,
     runtime_profile_memory_disable_key,
     runtime_profile_memory_skip_reason,
     select_measured_profiles,
@@ -33,6 +36,7 @@ from llama_tui.main import (
     last_engine_session_stop_count,
     release_engine_session_lock,
     validate_buun_kv_args,
+    validate_turboquant_kv_args,
 )
 from llama_tui.models import ModelConfig
 from llama_tui.runtime_profiles import (
@@ -42,6 +46,14 @@ from llama_tui.runtime_profiles import (
     make_runtime_profile,
     parse_engine_capabilities,
 )
+
+
+def turboquant_no_fit_capabilities() -> EngineCapabilities:
+    return replace(
+        default_engine_capabilities('turboquant'),
+        supports_fit=False,
+        supports_fit_ctx=False,
+    )
 
 
 class RuntimeProfileTests(unittest.TestCase):
@@ -78,6 +90,30 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.llama_extra_args(), ['--flash-attn', 'on', '-ctk', 'turbo3_tcq', '-ctv', 'turbo2_tcq'])
         self.assertIn('key=turbo3_tcq value=turbo2_tcq', profile.header_indicator())
 
+    def test_turboquant_profile_defaults_to_q8_baseline(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('TURBOQUANT_LLAMA_SERVER_BIN', None)
+            profile = make_runtime_profile('turboquant', 'llama-server')
+
+        self.assertEqual(profile.engine_id, 'turboquant')
+        self.assertTrue(profile.supports_turbo_kv)
+        self.assertEqual(profile.turboquant_kv_pair(), ('q8_0', 'q8_0'))
+        self.assertEqual(profile.llama_extra_args(), ['--flash-attn', 'on', '-ctk', 'q8_0', '-ctv', 'q8_0'])
+        self.assertIn('TurboQuant+', profile.header_indicator())
+
+    def test_turboquant_profile_respects_env_override_and_manual_kv(self):
+        with patch.dict(os.environ, {'TURBOQUANT_LLAMA_SERVER_BIN': '/opt/tqp/bin/llama-server'}):
+            profile = make_runtime_profile(
+                'turboquant',
+                'llama-server',
+                kv_key_mode='q8_0',
+                kv_value_mode='turbo4',
+            )
+
+        self.assertEqual(profile.server_command, '/opt/tqp/bin/llama-server')
+        self.assertEqual(profile.turboquant_kv_pair(), ('q8_0', 'turbo4'))
+        self.assertIn('key=q8_0 value=turbo4', profile.header_indicator())
+
     def test_capability_parser_detects_buun_flash_value_and_ngl(self):
         caps = parse_engine_capabilities(
             'usage: llama-server --flash-attn on|off|auto -ctk MODE -ctv MODE --parallel N -ngl N -fit on -fitc N --no-warmup',
@@ -90,6 +126,18 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(caps.supports_fit)
         self.assertTrue(caps.supports_fit_ctx)
         self.assertTrue(caps.supports_no_warmup)
+        self.assertEqual(caps.gpu_layers_flag, '-ngl')
+
+    def test_capability_parser_detects_turboquant_cache_types(self):
+        caps = parse_engine_capabilities(
+            'KV cache data type for K\nallowed values: f16 q8_0 q4_0 turbo2 turbo3 turbo4\n'
+            'KV cache data type for V\nallowed values: f16 q8_0 q4_0 turbo2 turbo3 turbo4\n'
+            '--flash-attn on|off|auto -ctk TYPE -ctv TYPE -ngl N --parallel N',
+            engine_id='turboquant',
+        )
+
+        self.assertTrue(caps.supports_ctk_ctv)
+        self.assertIn('turbo4', caps.supported_kv_modes)
         self.assertEqual(caps.gpu_layers_flag, '-ngl')
 
     def test_capability_parser_detects_llama_cache_type_flags(self):
@@ -140,6 +188,85 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('--cache-type-k', cmd)
         self.assertNotIn('--cache-type-v', cmd)
         self.assertEqual(cmd[cmd.index('--flash-attn') + 1], 'on')
+
+    def test_turboquant_command_uses_short_cache_flags_for_manual_safe_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile(
+                    'turboquant',
+                    'llama-server',
+                    kv_key_mode='q8_0',
+                    kv_value_mode='turbo4',
+                ),
+            )
+            model = ModelConfig(
+                id='qwen',
+                name='Qwen Q8_0',
+                path='/models/qwen.Q8_0.gguf',
+                alias='qwen-tq',
+                port=18080,
+                turboquant_status='native',
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('turboquant')):
+                cmd = app.build_command(model)
+
+        self.assertEqual(cmd[0], app.runtime_profile.server_command)
+        self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('-ctv') + 1], 'turbo4')
+        self.assertNotIn('--cache-type-k', cmd)
+
+    def test_turboquant_head_dim_64_forces_q8_baseline_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile(
+                    'turboquant',
+                    'llama-server',
+                    kv_key_mode='q8_0',
+                    kv_value_mode='turbo4',
+                ),
+            )
+            model = ModelConfig(
+                id='oss',
+                name='GPT OSS',
+                path='/models/gpt-oss.gguf',
+                alias='oss-tq',
+                port=18080,
+                turboquant_status='incompatible',
+                turboquant_head_dim=64,
+                turboquant_key_dim=64,
+                turboquant_value_dim=64,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('turboquant')):
+                cmd = app.build_command(model)
+
+        self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('-ctv') + 1], 'q8_0')
+        self.assertIn('head_dim=64', app.turboquant_session_advisory(model))
+
+    def test_turboquant_binary_warning_for_vanilla_help(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(id='m', name='M', path='/models/m.gguf', alias='m', port=18080)
+            caps = EngineCapabilities(
+                supports_ctk_ctv=True,
+                supports_cache_type_kv=True,
+                supported_kv_modes=('f16', 'q8_0', 'q4_0'),
+                help_text='allowed values: f16 q8_0 q4_0',
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                warning = app.turboquant_binary_warning(model)
+
+        self.assertIn('does not advertise turbo cache types', warning)
 
     def test_buun_command_omits_turbokv_for_incompatible_model_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,19 +486,30 @@ class RuntimeProfileTests(unittest.TestCase):
                     runtime_profile=make_runtime_profile('buun', 'llama-server'),
                 )
                 buun_app.models = [model]
+                turboquant_app = AppConfig(
+                    root / 'turboquant.json',
+                    runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+                )
+                turboquant_app.models = [model]
 
                 llama_log = llama_app.logfile(model.id)
                 buun_log = buun_app.logfile(model.id)
+                turboquant_log = turboquant_app.logfile(model.id)
                 llama_pid = llama_app.pidfile(model.id)
                 buun_pid = buun_app.pidfile(model.id)
+                turboquant_pid = turboquant_app.pidfile(model.id)
                 legacy_log = buun_app.legacy_logfile(model.id)
 
         self.assertNotEqual(llama_log, buun_log)
+        self.assertNotEqual(llama_log, turboquant_log)
         self.assertNotEqual(llama_pid, buun_pid)
+        self.assertNotEqual(llama_pid, turboquant_pid)
         self.assertEqual(llama_log, root / 'runtime' / 'llama.cpp' / 'm.log')
         self.assertEqual(buun_log, root / 'runtime' / 'buun' / 'm.log')
+        self.assertEqual(turboquant_log, root / 'runtime' / 'turboquant' / 'm.log')
         self.assertEqual(llama_pid, root / 'runtime' / 'llama.cpp' / 'm.pid')
         self.assertEqual(buun_pid, root / 'runtime' / 'buun' / 'm.pid')
+        self.assertEqual(turboquant_pid, root / 'runtime' / 'turboquant' / 'm.pid')
         self.assertEqual(legacy_log, root / 'm.log')
 
     def test_llama_command_can_use_supported_q8_cache_flags(self):
@@ -553,6 +691,39 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertIn('-ctk', cmd)
         self.assertIn('-ctv', cmd)
 
+    def test_turboquant_fit_runtime_profile_omits_fixed_ngl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(id='dense', name='Dense', path='$MODEL', alias='dense-tq', port=18080)
+            profile = RuntimeProfile(
+                engine_id='turboquant',
+                name='fit_weight_discovery_q8_0_turbo4',
+                ctx_size=8192,
+                gpu_layers=None,
+                parallel=1,
+                kv_preset='q8_0/turbo4',
+                flash_attn='on',
+                fit=True,
+                fit_context=4096,
+                fit_discovery_phase='weight_fit',
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('turboquant')):
+                cmd = app.build_command(model, runtime_profile=profile)
+
+        self.assertEqual(cmd[0], app.runtime_profile.server_command)
+        self.assertNotIn('-ngl', cmd)
+        self.assertNotIn('--n-gpu-layers', cmd)
+        self.assertIn('-fit', cmd)
+        self.assertEqual(cmd[cmd.index('-fit') + 1], 'on')
+        self.assertIn('-fitc', cmd)
+        self.assertEqual(cmd[cmd.index('-fitc') + 1], '4096')
+        self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('-ctv') + 1], 'turbo4')
+
     def test_failure_classification_names_actionable_startup_errors(self):
         cases = {
             'unknown value for --flash-attn: -ctk': 'CLI_INVALID',
@@ -576,10 +747,29 @@ class RuntimeProfileTests(unittest.TestCase):
             'llama_model_load: failed to load model'
         )
         cases[mixed_buun_fit_oom] = 'FIXED_GPU_LAYERS_FIT_FAILED'
+        observed_fixed_fit_failure = (
+            'llama_params_fit: failed to fit params to free device memory: '
+            'n_gpu_layers already set by user to 18, abort\n'
+            'ggml_backend_cuda_buffer_type_alloc_buffer: cudaMalloc failed: out of memory\n'
+            'llama_model_load_from_file_impl: failed to load model'
+        )
+        cases[observed_fixed_fit_failure] = 'FIXED_GPU_LAYERS_FIT_FAILED'
+        observed_weight_oom = (
+            'ggml_backend_cuda_buffer_type_alloc_buffer: allocating 512.00 MiB on device 0: '
+            'cudaMalloc failed: out of memory\n'
+            'alloc_tensor_range: failed to allocate CUDA0 buffer\n'
+            'llama_model_load: error loading model: unable to allocate CUDA0 buffer\n'
+            'llama_model_load_from_file_impl: failed to load model'
+        )
+        cases[observed_weight_oom] = 'CUDA_OOM_WEIGHTS'
         for text, expected in cases.items():
             with self.subTest(text=text):
                 default = 'API_TIMEOUT' if text == 'request timed out' else 'SERVER_TIMEOUT'
                 self.assertEqual(classify_benchmark_failure(text, default)['failure_category'], expected)
+
+        classified = classify_benchmark_failure(observed_weight_oom)
+        self.assertIn('cudaMalloc failed', classified['failure_excerpt'])
+        self.assertEqual(classified['failure_category'], 'CUDA_OOM_WEIGHTS')
 
     def test_memory_guardrail_admission_skips_critical_memory(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200, ctx=65536)
@@ -1013,6 +1203,284 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(all(item.fit for item in profiles))
         self.assertTrue(all(item.gpu_layers is None for item in profiles))
         self.assertFalse(any('turbo' in item.kv_preset for item in profiles))
+
+    def test_turboquant_head_dim_64_profiles_use_baseline_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='oss',
+                name='GPT OSS Q4_K_M',
+                path='/models/gpt-oss-Q4_K_M.gguf',
+                alias='oss',
+                port=18080,
+                turboquant_status='incompatible',
+                turboquant_head_dim=64,
+                turboquant_key_dim=64,
+                turboquant_value_dim=64,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=turboquant_no_fit_capabilities()), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        self.assertTrue(profiles)
+        self.assertTrue(all(item.engine_id == 'turboquant' for item in profiles))
+        self.assertEqual({item.kv_preset for item in profiles}, {'q8_0/q8_0'})
+
+    def test_turboquant_unknown_head_dim_avoids_auto_turbo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='unknown',
+                name='Unknown Q4_K_M',
+                path='/models/unknown-Q4_K_M.gguf',
+                alias='unknown',
+                port=18080,
+                turboquant_status='unknown',
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=turboquant_no_fit_capabilities()), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        self.assertEqual({item.kv_preset for item in profiles}, {'q8_0/q8_0'})
+
+    def test_turboquant_fit_profiles_discover_weight_fit_before_context_growth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='dense',
+                name='Dense Q8_0',
+                path='/models/dense-Q8_0.gguf',
+                alias='dense',
+                port=18080,
+                architecture='llama',
+                architecture_type='dense',
+                turboquant_status='native',
+                turboquant_head_dim=128,
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+                ctx_max=262144,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('turboquant')), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3), \
+                patch('llama_tui.benchmark.current_process_pressure_payload', return_value={}):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        self.assertTrue(profiles)
+        self.assertEqual(profiles[0].fit_discovery_phase, 'weight_fit')
+        self.assertTrue(profiles[0].fit)
+        self.assertIsNone(profiles[0].gpu_layers)
+        self.assertEqual(profiles[0].ctx_size, 8192)
+        self.assertEqual(profiles[0].kv_preset, 'q8_0/turbo4')
+        growth = profiles[1:]
+        self.assertTrue(growth)
+        self.assertTrue(all(item.fit_discovery_phase == 'context_growth' for item in growth))
+        self.assertTrue(all(item.fit and item.gpu_layers is None for item in growth))
+        self.assertFalse(any(item.ctx_size == 262144 for item in growth))
+        growth_presets = [item.kv_preset for item in growth]
+        self.assertIn('q8_0/turbo4', growth_presets)
+        self.assertIn('q8_0/turbo3', growth_presets)
+        self.assertLess(
+            max(index for index, preset in enumerate(growth_presets) if preset == 'q8_0/turbo4'),
+            min(index for index, preset in enumerate(growth_presets) if preset == 'q8_0/turbo3'),
+        )
+
+    def test_turboquant_q8_profiles_include_safe_balanced_and_symmetric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='dense',
+                name='Dense Q8_0',
+                path='/models/dense-Q8_0.gguf',
+                alias='dense',
+                port=18080,
+                architecture='llama',
+                architecture_type='dense',
+                turboquant_status='native',
+                turboquant_head_dim=128,
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=turboquant_no_fit_capabilities()), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        presets = {item.kv_preset for item in profiles}
+        self.assertIn('q8_0/q8_0', presets)
+        self.assertIn('q8_0/turbo4', presets)
+        self.assertIn('q8_0/turbo3', presets)
+        self.assertIn('q8_0/turbo2', presets)
+        self.assertIn('turbo4/turbo4', presets)
+        self.assertIn('turbo3/turbo3', presets)
+
+    def test_turboquant_low_bit_profiles_keep_symmetric_manual_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='sensitive',
+                name='Sensitive Q4_K_M',
+                path='/models/sensitive-Q4_K_M.gguf',
+                alias='sensitive',
+                port=18080,
+                architecture='unknown',
+                architecture_type='dense',
+                turboquant_status='native',
+                turboquant_head_dim=128,
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=turboquant_no_fit_capabilities()), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        presets = {item.kv_preset for item in profiles}
+        self.assertIn('q8_0/turbo4', presets)
+        self.assertIn('q8_0/turbo3', presets)
+        self.assertNotIn('turbo4/turbo4', presets)
+        self.assertNotIn('turbo3/turbo3', presets)
+
+    def test_turboquant_validated_low_bit_family_allows_symmetric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mistral',
+                name='Mistral Q4_K_M',
+                path='/models/mistral-Q4_K_M.gguf',
+                alias='mistral',
+                port=18080,
+                architecture='mistral',
+                model_family='mistral',
+                architecture_type='dense',
+                turboquant_status='native',
+                turboquant_head_dim=128,
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=turboquant_no_fit_capabilities()), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        self.assertIn('turbo3/turbo3', {item.kv_preset for item in profiles})
+
+    def test_turboquant_runtime_record_context_includes_cache_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile(
+                    'turboquant',
+                    'llama-server',
+                    kv_key_mode='q8_0',
+                    kv_value_mode='turbo4',
+                ),
+            )
+            model = ModelConfig(
+                id='dense',
+                name='Dense Q8_0',
+                path='/models/dense-Q8_0.gguf',
+                alias='dense',
+                port=18080,
+                architecture='llama',
+                model_family='llama',
+                turboquant_status='native',
+                turboquant_head_dim=128,
+                turboquant_key_dim=128,
+                turboquant_value_dim=128,
+            )
+            caps = default_engine_capabilities('turboquant')
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                context = runtime_record_context(app, model)
+
+        self.assertEqual(context['engine'], 'turboquant')
+        self.assertEqual(context['ctk'], 'q8_0')
+        self.assertEqual(context['ctv'], 'turbo4')
+        self.assertEqual(context['detected_head_dim'], 128)
+        self.assertEqual(context['model_quant'], 'Q8_0')
+        self.assertEqual(context['model_family'], 'llama')
+        self.assertEqual(context['binary_path'], app.runtime_profile.server_command)
+        self.assertIn('turbo4', context['help_supported_cache_types'])
+
+    def test_fit_discovery_metadata_persists_on_measured_profiles(self):
+        candidate = ModelConfig(id='dense', name='Dense', path='/models/dense.gguf', alias='dense', port=18080, ctx=8192)
+        record = adaptive_record_from_candidate(
+            candidate,
+            'long_context',
+            'ok',
+            engine='turboquant',
+            runtime_profile='fit_weight_discovery_q8_0_turbo4',
+            kv_preset='q8_0/turbo4',
+            runtime_fit=True,
+            fit_context=4096,
+            fit_discovery_phase='weight_fit',
+            viable_ngl=28,
+            viable_ngl_source='offloaded_layers',
+            fit_selected_ngl=28,
+            fit_selected_ngl_source='offloaded_layers',
+            fit_log_excerpt='offloaded 28/33 layers to GPU',
+            runtime_log_path='/tmp/runtime/turboquant/dense.log',
+        )
+        model = ModelConfig(
+            id='dense',
+            name='Dense',
+            path='/models/dense.gguf',
+            alias='dense',
+            port=18080,
+            measured_profiles={'opencode_ready': record},
+        )
+
+        profile = measured_profile_runtime_profile(model, 'opencode_ready')
+
+        self.assertEqual(record['fit_discovery_phase'], 'weight_fit')
+        self.assertEqual(record['viable_ngl'], 28)
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.fit_discovery_phase, 'weight_fit')
+        self.assertEqual(profile.viable_ngl, 28)
+        self.assertEqual(profile.viable_ngl_source, 'offloaded_layers')
+        self.assertEqual(profile.fit_selected_ngl, 28)
+        self.assertEqual(profile.fit_log_excerpt, 'offloaded 28/33 layers to GPU')
+
+    def test_benchmark_run_summary_mentions_saved_winners_despite_failures(self):
+        ok = {'status': 'ok', 'tokens_per_sec': 24.0, 'ctx': 8192, 'ctx_per_slot': 8192}
+        failed = {'status': 'not ready', 'failure_category': 'CUDA_OOM_WEIGHTS'}
+
+        summary = benchmark_run_summary({'auto': ok}, [failed, ok])
+
+        self.assertIn('auto=8192 ctx', summary)
+        self.assertIn('1 candidate failure(s), winners saved', summary)
 
     def test_buun_profiles_filter_unsupported_help_kv_modes(self):
         caps = EngineCapabilities(
@@ -1606,9 +2074,105 @@ class RuntimeProfileTests(unittest.TestCase):
             'fit_context_growth_sweep_16384_turbo4_turbo4',
             'fit_context_growth_sweep_49152_turbo4_turbo4',
         ])
-        self.assertTrue(any('skipping fixed-NGL buun fallback probes' in str(item) for item in events))
-        self.assertTrue(any('skipped 1 fixed-NGL buun profile' in str(item) for item in events))
+        self.assertTrue(any('skipping fixed-NGL fallback probes' in str(item) for item in events))
+        self.assertTrue(any('skipped 1 fixed-NGL profile' in str(item) for item in events))
         self.assertIn('buun fit profile', app.saved[-1].benchmark_runs[0]['summary'])
+
+    def test_fast_runner_carries_weight_fit_ceiling_into_turboquant_context_growth(self):
+        model = ModelConfig(id='m', name='M', path='/models/model-Q8_0.gguf', alias='m', port=18200)
+        hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+        weight_fit = RuntimeProfile(
+            engine_id='turboquant',
+            name='fit_weight_discovery_q8_0_turbo4',
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='q8_0/turbo4',
+            fit=True,
+            fit_context=4096,
+            benchmark_depth='fast',
+            fit_discovery_phase='weight_fit',
+        )
+        context_growth = RuntimeProfile(
+            engine_id='turboquant',
+            name='fit_context_growth_sweep_16384_q8_0_turbo4',
+            ctx_size=16384,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='q8_0/turbo4',
+            fit=True,
+            fit_context=4096,
+            benchmark_depth='fast',
+            fit_discovery_phase='context_growth',
+        )
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return hardware
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, model):
+                self.saved.append(model)
+
+        seen_viable = []
+
+        def fake_runtime_benchmark(_app, base_model, profile, objective, _progress, _cancel_token, completed, total, **kwargs):
+            seen_viable.append((profile.name, profile.viable_ngl, profile.viable_ngl_source))
+            candidate = ModelConfig(
+                id=base_model.id,
+                name=base_model.name,
+                path=base_model.path,
+                alias=base_model.alias,
+                port=base_model.port,
+                ctx=profile.ctx_size,
+                parallel=profile.parallel,
+            )
+            viable_ngl = 28 if profile.fit_discovery_phase == 'weight_fit' else profile.viable_ngl
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=20.0,
+                seconds=1.0,
+                engine=profile.engine_id,
+                runtime_profile=profile.name,
+                kv_preset=profile.kv_preset,
+                benchmark_depth=kwargs.get('benchmark_depth', ''),
+                runtime_fit=profile.fit,
+                fit_context=profile.fit_context,
+                gpu_layers_mode='fit',
+                fit_discovery_phase=profile.fit_discovery_phase,
+                viable_ngl=viable_ngl,
+                viable_ngl_source='offloaded_layers',
+                fit_selected_ngl=viable_ngl,
+                fit_selected_ngl_source='offloaded_layers',
+                fit_log_excerpt='offloaded 28/33 layers to GPU',
+            )
+            measured = dict(record)
+            measured['model'] = candidate
+            return True, False, [record], [measured], completed + 1
+
+        app = FakeApp()
+        with patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=[weight_fit, context_growth]), \
+             patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model, progress=lambda _msg: None)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(seen_viable[0], ('fit_weight_discovery_q8_0_turbo4', 0, ''))
+        self.assertEqual(seen_viable[1], ('fit_context_growth_sweep_16384_q8_0_turbo4', 28, 'offloaded_layers'))
 
     def test_fast_runner_prunes_fixed_gpu_layer_profiles_after_fit_oom(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)
@@ -1716,6 +2280,117 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(ok, msg)
         self.assertEqual(calls, ['gpu_layer_sweep_ngl26', 'fit_default_probe'])
+        self.assertTrue(any('fixed GPU-layer profiles were already rejected' in str(item) for item in events))
+
+    def test_fast_runner_prunes_turboquant_fixed_profiles_after_cuda_weight_oom(self):
+        model = ModelConfig(id='m', name='M', path='/models/model-Q8_0.gguf', alias='m', port=18200)
+        hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+        fixed_a = RuntimeProfile(
+            engine_id='turboquant',
+            name='gpu_layer_sweep_ngl26',
+            ctx_size=8192,
+            gpu_layers=26,
+            parallel=1,
+            kv_preset='q8_0/turbo4',
+            benchmark_depth='fast',
+        )
+        fixed_b = RuntimeProfile(
+            engine_id='turboquant',
+            name='gpu_layer_sweep_ngl30',
+            ctx_size=8192,
+            gpu_layers=30,
+            parallel=1,
+            kv_preset='q8_0/turbo4',
+            benchmark_depth='fast',
+        )
+        fit_fallback = RuntimeProfile(
+            engine_id='turboquant',
+            name='fit_weight_discovery_q8_0_turbo4',
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='q8_0/turbo4',
+            fit=True,
+            fit_context=4096,
+            benchmark_depth='fast',
+            fit_discovery_phase='weight_fit',
+        )
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return hardware
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, model):
+                self.saved.append(model)
+
+        calls = []
+
+        def fake_runtime_benchmark(_app, base_model, profile, objective, _progress, _cancel_token, completed, total, **kwargs):
+            calls.append(profile.name)
+            candidate = ModelConfig(
+                id=base_model.id,
+                name=base_model.name,
+                path=base_model.path,
+                alias=base_model.alias,
+                port=base_model.port,
+                ctx=profile.ctx_size,
+                parallel=profile.parallel,
+                ngl=profile.gpu_layers if profile.gpu_layers is not None else base_model.ngl,
+            )
+            if profile.gpu_layers is not None:
+                failed = adaptive_record_from_candidate(
+                    candidate,
+                    objective,
+                    'not ready',
+                    detail='alloc_tensor_range: failed to allocate CUDA0 buffer',
+                    failure_category='CUDA_OOM_WEIGHTS',
+                    failure_reason='failed to allocate CUDA0 buffer',
+                    runtime_profile=profile.name,
+                    gpu_layers_mode='fixed',
+                )
+                return False, True, [failed], [], completed + 1
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=20.0,
+                seconds=1.0,
+                engine=profile.engine_id,
+                runtime_profile=profile.name,
+                kv_preset=profile.kv_preset,
+                runtime_fit=profile.fit,
+                fit_context=profile.fit_context,
+                gpu_layers_mode='fit',
+                fit_discovery_phase=profile.fit_discovery_phase,
+                viable_ngl=24,
+                viable_ngl_source='offloaded_layers',
+            )
+            measured = dict(record)
+            measured['model'] = candidate
+            return True, False, [record], [measured], completed + 1
+
+        events = []
+        app = FakeApp()
+        with patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=[fixed_a, fixed_b, fit_fallback]), \
+             patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model, progress=events.append)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, ['gpu_layer_sweep_ngl26', 'fit_weight_discovery_q8_0_turbo4'])
         self.assertTrue(any('fixed GPU-layer profiles were already rejected' in str(item) for item in events))
 
     def test_deep_benchmark_all_continues_using_adaptive_runner(self):
@@ -1833,6 +2508,16 @@ class RuntimeProfileTests(unittest.TestCase):
                     validate_buun_kv_args(args)
 
                 self.assertIn(f'Unsupported {flag} "bad-mode"', str(ctx.exception))
+
+    def test_invalid_turboquant_kv_modes_fail_clearly(self):
+        for flag in ('--kv', '--kv-key', '--kv-value'):
+            with self.subTest(flag=flag):
+                args = build_cli_parser().parse_args(['--engine', 'turboquant', flag, 'turbo3_tcq'])
+
+                with self.assertRaises(SystemExit) as ctx:
+                    validate_turboquant_kv_args(args)
+
+                self.assertIn(f'Unsupported {flag} "turbo3_tcq"', str(ctx.exception))
 
     def test_cli_parser_accepts_kill_existing(self):
         args = build_cli_parser().parse_args(['--kill-existing'])

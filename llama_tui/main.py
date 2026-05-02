@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .app import AppConfig
 from .constants import CONFIG_DIR, DATA_DIR, CACHE_DIR, DEFAULT_CONFIG_PATH, SCRIPT_DIR, DEFAULT_LLAMA_SERVER
-from .runtime_profiles import BUUN_KV_MODES, make_runtime_profile
+from .runtime_profiles import BUUN_KV_MODES, TURBOQUANT_KV_MODES, make_runtime_profile
 from .ui import tui
 
 
@@ -38,7 +38,7 @@ def ensure_bootstrap_files(config_path: Path) -> Path:
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='llama-tui')
     parser.add_argument('config_path', nargs='?', default=str(DEFAULT_CONFIG_PATH))
-    parser.add_argument('--engine', choices=('llama.cpp', 'buun'), default='llama.cpp')
+    parser.add_argument('--engine', choices=('llama.cpp', 'buun', 'turboquant'), default='llama.cpp')
     parser.add_argument('--ctx', type=int, default=None)
     parser.add_argument('--kv', default='')
     parser.add_argument('--kv-key', default='')
@@ -420,9 +420,24 @@ def validate_buun_kv_args(args):
             raise SystemExit(f'Unsupported {flag} "{value}". Supported buun modes: {", ".join(BUUN_KV_MODES)}')
 
 
+def validate_turboquant_kv_args(args):
+    if args.engine != 'turboquant':
+        return
+    for flag, value in (
+        ('--kv', args.kv),
+        ('--kv-key', args.kv_key),
+        ('--kv-value', args.kv_value),
+    ):
+        if value and value not in TURBOQUANT_KV_MODES:
+            raise SystemExit(
+                f'Unsupported {flag} "{value}". Supported TurboQuant+ modes: {", ".join(TURBOQUANT_KV_MODES)}'
+            )
+
+
 def main():
     args = build_cli_parser().parse_args()
     validate_buun_kv_args(args)
+    validate_turboquant_kv_args(args)
     config_path = Path(args.config_path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_bootstrap_files(config_path)

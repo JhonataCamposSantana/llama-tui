@@ -4,10 +4,17 @@ import shlex
 import subprocess
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 DEFAULT_BUUN_LLAMA_SERVER = 'buun-llama-server'
+DEFAULT_TURBOQUANT_LLAMA_SERVER = (
+    str(Path.home() / 'llama-cpp-turboquant' / 'build' / 'bin' / 'llama-server')
+    if (Path.home() / 'llama-cpp-turboquant' / 'build' / 'bin' / 'llama-server').exists()
+    else 'turboquant-llama-server'
+)
 BUUN_KV_MODES = ('turbo4', 'turbo3_tcq', 'turbo2_tcq', 'turbo3', 'turbo2')
+TURBOQUANT_KV_MODES = ('q8_0', 'turbo4', 'turbo3', 'turbo2')
 COMMON_KV_MODES = (
     'f32',
     'f16',
@@ -67,6 +74,7 @@ class TurboKvProfile:
     benchmark_depth: str
     score_penalty: float = 0.0
     scalar: bool = False
+    profile_class: str = ''
 
     @property
     def name_slug(self) -> str:
@@ -74,36 +82,52 @@ class TurboKvProfile:
 
 
 TURBO_KV_PROFILES: Tuple[TurboKvProfile, ...] = (
-    TurboKvProfile('turbo4/turbo4', 'turbo4 safe', 'safe', '4.25bpv', 'fast', 0.0),
-    TurboKvProfile('turbo3_tcq/turbo3_tcq', 'turbo3 TCQ', 'balanced', '3.25bpv', 'fast', 0.025),
-    TurboKvProfile('turbo3_tcq/turbo2_tcq', 'turbo3/turbo2 TCQ', 'aggressive', '2.75bpv', 'fast', 0.06),
-    TurboKvProfile('turbo2_tcq/turbo2_tcq', 'turbo2 TCQ', 'max_context', '2.25bpv', 'full', 0.10),
-    TurboKvProfile('turbo3/turbo3', 'turbo3 scalar', 'diagnostic', '3.25bpv_scalar', 'full', 0.08, True),
-    TurboKvProfile('turbo2/turbo2', 'turbo2 scalar', 'diagnostic', '2.25bpv_scalar', 'full', 0.15, True),
+    TurboKvProfile('turbo4/turbo4', 'turbo4 safe', 'safe', '4.25bpv', 'fast', 0.0, False, 'safe'),
+    TurboKvProfile('turbo3_tcq/turbo3_tcq', 'turbo3 TCQ', 'balanced', '3.25bpv', 'fast', 0.025, False, 'balanced'),
+    TurboKvProfile('turbo3_tcq/turbo2_tcq', 'turbo3/turbo2 TCQ', 'aggressive', '2.75bpv', 'fast', 0.06, False, 'aggressive'),
+    TurboKvProfile('turbo2_tcq/turbo2_tcq', 'turbo2 TCQ', 'max_context', '2.25bpv', 'full', 0.10, False, 'extreme'),
+    TurboKvProfile('turbo3/turbo3', 'turbo3 scalar', 'diagnostic', '3.25bpv_scalar', 'full', 0.08, True, 'diagnostic'),
+    TurboKvProfile('turbo2/turbo2', 'turbo2 scalar', 'diagnostic', '2.25bpv_scalar', 'full', 0.15, True, 'diagnostic'),
+)
+
+TURBOQUANT_KV_PROFILES: Tuple[TurboKvProfile, ...] = (
+    TurboKvProfile('q8_0/q8_0', 'q8 baseline', 'baseline', '8.5bpv', 'fast', 0.0, False, 'baseline'),
+    TurboKvProfile('q8_0/turbo4', 'safe V turbo4', 'safe', '6.375bpv', 'fast', 0.0, False, 'safe'),
+    TurboKvProfile('q8_0/turbo3', 'balanced V turbo3', 'balanced', '5.8125bpv', 'fast', 0.025, False, 'balanced'),
+    TurboKvProfile('q8_0/turbo2', 'extreme V turbo2', 'extreme_v', '5.3125bpv', 'full', 0.08, False, 'extreme V'),
+    TurboKvProfile('turbo4/turbo4', 'symmetric turbo4', 'symmetric', '4.25bpv', 'full', 0.06, False, 'symmetric'),
+    TurboKvProfile('turbo3/turbo3', 'symmetric turbo3', 'symmetric', '3.125bpv', 'full', 0.10, False, 'symmetric'),
+    TurboKvProfile('turbo2/turbo2', 'symmetric turbo2', 'symmetric', '2.125bpv', 'full', 0.18, False, 'symmetric'),
 )
 
 
 def turbo_kv_profile_for_preset(kv_preset: str) -> Optional[TurboKvProfile]:
     normalized = (kv_preset or '').strip().lower()
-    for profile in TURBO_KV_PROFILES:
-        if profile.kv_preset == normalized:
-            return profile
+    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES):
+        for profile in profile_set:
+            if profile.kv_preset == normalized:
+                return profile
     key_mode, value_mode = kv_modes_from_preset(normalized)
     symmetric = f'{key_mode}/{value_mode}' if key_mode and value_mode else ''
-    for profile in TURBO_KV_PROFILES:
-        if profile.kv_preset == symmetric:
-            return profile
+    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES):
+        for profile in profile_set:
+            if profile.kv_preset == symmetric:
+                return profile
     return None
 
 
 def supported_turbo_kv_profiles(
     capabilities: EngineCapabilities,
     depth: str = 'full',
+    engine_id: str = 'buun',
 ) -> List[TurboKvProfile]:
     normalized_depth = (depth or 'full').strip().lower()
-    allowed = {mode.strip().lower() for mode in capabilities.supported_kv_modes or BUUN_KV_MODES}
+    engine = (engine_id or 'buun').strip().lower()
+    defaults = TURBOQUANT_KV_MODES if engine == 'turboquant' else BUUN_KV_MODES
+    profile_set = TURBOQUANT_KV_PROFILES if engine == 'turboquant' else TURBO_KV_PROFILES
+    allowed = {mode.strip().lower() for mode in capabilities.supported_kv_modes or defaults}
     profiles: List[TurboKvProfile] = []
-    for profile in TURBO_KV_PROFILES:
+    for profile in profile_set:
         if normalized_depth == 'fast' and profile.benchmark_depth != 'fast':
             continue
         key_mode, value_mode = kv_modes_from_preset(profile.kv_preset)
@@ -143,15 +167,19 @@ class EngineProfile:
     def is_buun(self) -> bool:
         return self.engine_id == 'buun'
 
+    @property
+    def is_turboquant(self) -> bool:
+        return self.engine_id == 'turboquant'
+
     def llama_extra_args(self) -> List[str]:
-        if not self.is_buun:
+        if not (self.is_buun or self.is_turboquant):
             return []
-        key_mode, value_mode = self.buun_kv_pair()
+        key_mode, value_mode = self.engine_kv_pair()
         return ['--flash-attn', 'on', '-ctk', key_mode, '-ctv', value_mode]
 
     def header_indicator(self) -> str:
-        if self.is_buun:
-            key_mode, value_mode = self.buun_kv_pair()
+        if self.is_buun or self.is_turboquant:
+            key_mode, value_mode = self.engine_kv_pair()
             kv = f'key={key_mode} value={value_mode}'
         else:
             kv = (self.kv_mode or '-').strip() or '-'
@@ -161,6 +189,14 @@ class EngineProfile:
 
     def buun_kv_pair(self) -> Tuple[str, str]:
         return resolve_buun_kv_modes(self.kv_mode, self.kv_key_mode, self.kv_value_mode)
+
+    def turboquant_kv_pair(self) -> Tuple[str, str]:
+        return resolve_turboquant_kv_modes(self.kv_mode, self.kv_key_mode, self.kv_value_mode)
+
+    def engine_kv_pair(self) -> Tuple[str, str]:
+        if self.is_turboquant:
+            return self.turboquant_kv_pair()
+        return self.buun_kv_pair()
 
 
 @dataclass(frozen=True)
@@ -183,6 +219,12 @@ class RuntimeProfile:
     kv_compression_tier: str = ''
     kv_score_penalty: float = 0.0
     benchmark_depth: str = ''
+    fit_discovery_phase: str = ''
+    viable_ngl: int = 0
+    viable_ngl_source: str = ''
+    fit_selected_ngl: int = 0
+    fit_selected_ngl_source: str = ''
+    fit_log_excerpt: str = ''
 
 
 def resolve_buun_kv_modes(
@@ -191,6 +233,17 @@ def resolve_buun_kv_modes(
     kv_value_mode: str = '',
 ) -> Tuple[str, str]:
     base = (kv_mode or 'turbo4').strip() or 'turbo4'
+    key_mode = (kv_key_mode or base).strip() or base
+    value_mode = (kv_value_mode or base).strip() or base
+    return key_mode, value_mode
+
+
+def resolve_turboquant_kv_modes(
+    kv_mode: str = '',
+    kv_key_mode: str = '',
+    kv_value_mode: str = '',
+) -> Tuple[str, str]:
+    base = (kv_mode or 'q8_0').strip() or 'q8_0'
     key_mode = (kv_key_mode or base).strip() or base
     value_mode = (kv_value_mode or base).strip() or base
     return key_mode, value_mode
@@ -219,6 +272,23 @@ def make_runtime_profile(
             experimental=True,
             context_override=ctx_override,
             kv_mode=(kv_mode or 'turbo4').strip() or 'turbo4',
+            kv_key_mode=key_mode,
+            kv_value_mode=value_mode,
+        )
+    if normalized == 'turboquant':
+        command = os.environ.get('TURBOQUANT_LLAMA_SERVER_BIN') or DEFAULT_TURBOQUANT_LLAMA_SERVER
+        key_mode, value_mode = resolve_turboquant_kv_modes(kv_mode, kv_key_mode, kv_value_mode)
+        return EngineProfile(
+            engine_id='turboquant',
+            label='TurboQuant+',
+            server_bin=command,
+            default_args=(),
+            supported_kv_modes=TURBOQUANT_KV_MODES,
+            flash_attn_syntax='value',
+            supports_turbo_kv=True,
+            experimental=True,
+            context_override=ctx_override,
+            kv_mode=(kv_mode or 'q8_0').strip() or 'q8_0',
             kv_key_mode=key_mode,
             kv_value_mode=value_mode,
         )
@@ -253,6 +323,19 @@ def default_engine_capabilities(engine_id: str = 'llama.cpp') -> EngineCapabilit
             gpu_layers_flag='-ngl',
             supported_kv_modes=BUUN_KV_MODES,
         )
+    if normalized == 'turboquant':
+        return EngineCapabilities(
+            flash_attn_syntax='value',
+            flash_attn_flag='--flash-attn',
+            supports_ctk_ctv=True,
+            supports_cache_type_kv=True,
+            supports_parallel=True,
+            supports_fit=True,
+            supports_fit_ctx=True,
+            supports_no_warmup=False,
+            gpu_layers_flag='-ngl',
+            supported_kv_modes=TURBOQUANT_KV_MODES,
+        )
     return EngineCapabilities(supported_kv_modes=('f16', 'q8_0', 'q4_0'))
 
 
@@ -285,8 +368,11 @@ def parse_supported_kv_modes(help_text: str, engine_id: str, defaults: EngineCap
                 found.append(cleaned)
     if found:
         return tuple(found)
-    if (engine_id or '').strip().lower() == 'buun' and defaults.supports_ctk_ctv:
+    normalized_engine = (engine_id or '').strip().lower()
+    if normalized_engine == 'buun' and defaults.supports_ctk_ctv:
         return BUUN_KV_MODES
+    if normalized_engine == 'turboquant' and defaults.supports_ctk_ctv:
+        return TURBOQUANT_KV_MODES
     return defaults.supported_kv_modes
 
 
@@ -432,7 +518,9 @@ def runtime_profile_extra_args(
     args = strip_runtime_tuning_args(existing_args)
     args.extend(build_flash_attn_args(runtime_profile.flash_attn, capabilities))
     kv_key, kv_value = kv_modes_from_preset(runtime_profile.kv_preset)
-    if engine.supports_turbo_kv and is_turbo_kv_preset(runtime_profile.kv_preset):
+    if engine.is_turboquant and kv_key and kv_value and capabilities.supports_ctk_ctv:
+        args += ['-ctk', kv_key, '-ctv', kv_value]
+    elif engine.supports_turbo_kv and is_turbo_kv_preset(runtime_profile.kv_preset):
         if capabilities.supports_ctk_ctv:
             args += ['-ctk', kv_key or 'turbo4', '-ctv', kv_value or 'turbo4']
     elif kv_key and kv_value and capabilities.supports_cache_type_kv:

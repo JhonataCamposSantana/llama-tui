@@ -689,6 +689,75 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(reloaded_llama.benchmark_runs[0]['id'], 'llama-run')
         self.assertEqual(reloaded_llama.measured_profiles['auto']['ctx'], 8192)
 
+    def test_turboquant_benchmarks_persist_separately_from_llama_cpp(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny Model',
+            path='example/tiny-model-Q8_0.gguf',
+            alias='tiny-local',
+            port=18080,
+            runtime='llama.cpp',
+            last_benchmark_tokens_per_sec=50.0,
+            last_benchmark_seconds=1.0,
+            last_benchmark_profile='llama.cpp auto 50 tok/s',
+            last_benchmark_results=[{'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 8192, 'parallel': 1}],
+            measured_profiles={'auto': {'status': 'ok', 'tokens_per_sec': 50.0, 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1}},
+            benchmark_runs=[{'id': 'llama-run', 'kind': 'server', 'status': 'done'}],
+            benchmark_fingerprint='llama-fingerprint',
+            default_benchmark_status='done',
+            default_benchmark_at='2026-04-14T12:00:00',
+        )
+        self.app.add_or_update(model)
+
+        tq_app = AppConfig(
+            self.config_path,
+            runtime_profile=make_runtime_profile('turboquant', 'llama-server', kv_key_mode='q8_0', kv_value_mode='turbo4'),
+        )
+        tq_model = tq_app.get_model('tiny')
+        tq_model.last_benchmark_tokens_per_sec = 38.0
+        tq_model.last_benchmark_seconds = 2.0
+        tq_model.last_benchmark_profile = 'turboquant auto 38 tok/s'
+        tq_model.last_benchmark_results = [{
+            'status': 'ok',
+            'tokens_per_sec': 38.0,
+            'ctx': 16384,
+            'parallel': 1,
+            'engine': 'turboquant',
+            'ctk': 'q8_0',
+            'ctv': 'turbo4',
+            'detected_head_dim': 128,
+        }]
+        tq_model.measured_profiles = {
+            'auto': {
+                'status': 'ok',
+                'tokens_per_sec': 38.0,
+                'ctx': 16384,
+                'ctx_per_slot': 16384,
+                'parallel': 1,
+                'engine': 'turboquant',
+                'ctk': 'q8_0',
+                'ctv': 'turbo4',
+            }
+        }
+        tq_model.benchmark_runs = [{'id': 'turboquant-run', 'kind': 'server', 'status': 'done'}]
+        tq_model.benchmark_fingerprint = tq_app.model_fingerprint(tq_model)
+        tq_model.default_benchmark_status = 'done'
+        tq_model.default_benchmark_at = '2026-04-14T12:30:00'
+        tq_app.add_or_update(tq_model)
+
+        reloaded_tq = AppConfig(
+            self.config_path,
+            runtime_profile=make_runtime_profile('turboquant', 'llama-server', kv_key_mode='q8_0', kv_value_mode='turbo4'),
+        ).get_model('tiny')
+        reloaded_llama = AppConfig(self.config_path).get_model('tiny')
+
+        self.assertEqual(reloaded_tq.last_benchmark_tokens_per_sec, 38.0)
+        self.assertEqual(reloaded_tq.benchmark_runs[0]['id'], 'turboquant-run')
+        self.assertEqual(reloaded_tq.measured_profiles['auto']['ctv'], 'turbo4')
+        self.assertIn('turboquant', reloaded_tq.engine_benchmark_store)
+        self.assertEqual(reloaded_llama.last_benchmark_tokens_per_sec, 50.0)
+        self.assertEqual(reloaded_llama.benchmark_runs[0]['id'], 'llama-run')
+
     def test_measured_mode_launch_profile_uses_saved_values(self):
         model = ModelConfig(
             id='tiny',

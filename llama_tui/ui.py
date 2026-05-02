@@ -355,6 +355,8 @@ def active_engine_short(app: AppConfig, model: ModelConfig) -> str:
     engine = active_engine_key(app, model)
     if engine == 'buun':
         return 'buun'
+    if engine == 'turboquant':
+        return 'turboquant'
     if engine == 'vllm':
         return 'vLLM'
     return engine or display_runtime(model)
@@ -374,16 +376,29 @@ def active_engine_binary(app: AppConfig, model: ModelConfig) -> str:
 
 
 def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
-    if active_engine_key(app, model) != 'buun':
+    engine = active_engine_key(app, model)
+    if engine not in ('buun', 'turboquant'):
         return '-'
     tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
-    if tq_status not in ('native', 'padded'):
+    if engine == 'buun' and tq_status not in ('native', 'padded'):
         return f'default (turboquant {tq_status or "unknown"})'
-    profile = getattr(app, 'runtime_profile', None)
     try:
-        key_mode, value_mode = profile.buun_kv_pair()
+        runtime_profile = app.runtime_profile_from_model(
+            model,
+            int(getattr(model, 'ctx', 0) or 0),
+            int(getattr(model, 'parallel', 1) or 1),
+            int(getattr(model, 'ngl', 0) or 0),
+        )
+        key_mode, value_mode = str(getattr(runtime_profile, 'kv_preset', '') or '').split('/', 1)
     except Exception:
-        key_mode, value_mode = '', ''
+        profile = getattr(app, 'runtime_profile', None)
+        try:
+            key_mode, value_mode = profile.engine_kv_pair()
+        except Exception:
+            try:
+                key_mode, value_mode = profile.buun_kv_pair()
+            except Exception:
+                key_mode, value_mode = '', ''
     return f'key={key_mode or "-"} value={value_mode or "-"}'
 
 
@@ -399,17 +414,43 @@ def active_engine_detail_line(app: AppConfig, model: ModelConfig) -> str:
     return f'active engine: {active_engine_short(app, model)}  binary: {binary}  kv: {active_engine_kv(app, model)}'
 
 
+def active_engine_warning_line(app: AppConfig, model: ModelConfig) -> str:
+    messages = []
+    for name in ('turboquant_session_advisory', 'turboquant_binary_warning'):
+        try:
+            value = str(getattr(app, name)(model) or '')
+        except Exception:
+            value = ''
+        if value:
+            messages.append(value)
+    return ' | '.join(messages)
+
+
+def active_engine_warning_attr(message: str, colors: Dict[str, int]) -> int:
+    low = (message or '').lower()
+    if 'high advisory' in low or 'binary warning' in low:
+        return colors['error'] | curses.A_BOLD
+    return colors['warning']
+
+
 def benchmark_freshness_display(app: AppConfig, model: ModelConfig) -> str:
     return BENCHMARK_FRESHNESS_LABELS.get(benchmark_freshness_label(app, model), 'Missing')
 
 
-def turboquant_status_kind(model: ModelConfig, buun_session: bool = False) -> str:
+def turboquant_status_kind(model: ModelConfig, buun_session: bool = False, turboquant_session: bool = False) -> str:
     status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+    head_dim = max(
+        int(getattr(model, 'turboquant_head_dim', 0) or 0),
+        int(getattr(model, 'turboquant_key_dim', 0) or 0),
+        int(getattr(model, 'turboquant_value_dim', 0) or 0),
+    )
+    if turboquant_session and head_dim == 64:
+        return 'error'
     if status in ('native', 'padded'):
         return 'success'
     if status == 'incompatible':
         return 'warning'
-    if buun_session and status in ('unknown', 'not_applicable'):
+    if (buun_session or turboquant_session) and status in ('unknown', 'not_applicable'):
         return 'warning'
     return 'muted'
 
@@ -1276,6 +1317,9 @@ def benchmark_row_text(record: Dict[str, object]) -> str:
     pressure = str(record.get('process_pressure_level', '') or '')
     if pressure:
         suffix_parts.append(f'pressure={pressure}')
+    failure_category = str(record.get('failure_category', '') or '')
+    if failure_category and status.lower() not in ('ok', 'probe ok', 'tests passed'):
+        suffix_parts.append(f'fail={failure_category}')
     suffix = (' ' + ' '.join(suffix_parts)) if suffix_parts else ''
     return (
         f'{label[:18]:18} {score:7.2f} {score_label:5} {seconds:6.1f}s '
@@ -1288,6 +1332,19 @@ def benchmark_record_display_items(record: Dict[str, object], attr: int = 0) -> 
     detail = compact_message(str(record.get('detail', '') or ''))
     if detail:
         items.append((f'  detail: {detail}', attr))
+    failure_excerpt = compact_message(str(record.get('failure_excerpt', '') or ''))
+    if failure_excerpt:
+        items.append((f'  failure: {failure_excerpt}', attr))
+    runtime_log_path = str(record.get('runtime_log_path', '') or '')
+    if runtime_log_path:
+        items.append((f'  log: {runtime_log_path}', attr))
+    viable_ngl = int(record.get('viable_ngl', 0) or 0)
+    fit_phase = str(record.get('fit_discovery_phase', '') or '')
+    if viable_ngl or fit_phase:
+        source = str(record.get('viable_ngl_source', '') or record.get('fit_selected_ngl_source', '') or 'unknown')
+        ngl_text = str(viable_ngl) if viable_ngl else '-'
+        phase_text = fit_phase or '-'
+        items.append((f'  fit discovery: phase={phase_text} viable_ngl={ngl_text} source={source}', attr))
     pressure_detail = compact_message(str(record.get('process_pressure_detail', '') or ''))
     if pressure_detail:
         items.append((f'  process pressure: {pressure_detail}', attr))
@@ -2607,7 +2664,7 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
         f'Continue Agent tools: tool_use exported for {len(enabled_continue_models)} model(s); MCP requires Agent Mode',
         'success' if enabled_continue_models else 'muted',
     ))
-    if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'buun'):
+    if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'buun', 'turboquant'):
         try:
             tool_jinja_ready = bool(app.continue_tool_use_launch_required(active_model)) or bool(getattr(active_model, 'jinja', True))
         except Exception:
@@ -2666,7 +2723,10 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
             (f'active model: {active_model.id}', 'heading'),
             (f'verification: {getattr(active_model, "verification_status", "unknown")} {getattr(active_model, "verification_summary", "")}', 'normal'),
             (f'cap: factor={cap.get("limiting_factor", "-")} configured={cap.get("configured_ctx", "-")} slot={cap.get("ctx_per_slot", "-")} safe={cap.get("estimated_safe_context", "-")} measured={cap.get("measured_max_context", "-")}', 'normal'),
-            (turboquant_detail_line(active_model), turboquant_status_kind(active_model, active_engine == 'buun')),
+            (
+                turboquant_detail_line(active_model),
+                turboquant_status_kind(active_model, active_engine == 'buun', active_engine == 'turboquant'),
+            ),
         ])
     return items
 
@@ -4115,7 +4175,12 @@ def tui(stdscr, app: AppConfig):
             verification_status = getattr(model, 'verification_status', 'unknown') or 'unknown'
             verification_summary = getattr(model, 'verification_summary', '') or 'not verified'
             tags_text = ', '.join(list(getattr(model, 'tags', []) or [])) or '-'
-            tq_kind = turboquant_status_kind(model, app.active_engine_key_for_model(model) == 'buun')
+            active_engine = app.active_engine_key_for_model(model)
+            tq_kind = turboquant_status_kind(
+                model,
+                active_engine == 'buun',
+                active_engine == 'turboquant',
+            )
             tq_attr = (
                 colors['success'] | curses.A_BOLD if tq_kind == 'success'
                 else colors['warning'] if tq_kind == 'warning'
@@ -4161,6 +4226,9 @@ def tui(stdscr, app: AppConfig):
                 (' '.join(app.build_command(model)), curses.A_NORMAL),
                 ('', curses.A_NORMAL),
             ]
+            engine_warning = active_engine_warning_line(app, model)
+            if engine_warning:
+                detail_rows.insert(5, (engine_warning, active_engine_warning_attr(engine_warning, colors)))
             if detail_density == 'advanced':
                 benchmark_rows = list(getattr(model, 'last_benchmark_results', []) or [])
                 if not benchmark_rows and benchmark_score > 0:
@@ -4362,6 +4430,9 @@ def tui(stdscr, app: AppConfig):
                         (active_engine_detail_line(app, model), curses.A_NORMAL),
                         (command_preview, curses.A_NORMAL),
                     ]
+                    engine_warning = active_engine_warning_line(app, model)
+                    if engine_warning:
+                        right_items.insert(2, (engine_warning, active_engine_warning_attr(engine_warning, colors)))
                 elif right_active_tab == 'benchmarks':
                     right_items = [
                         (f'benchmark: {benchmark_score:.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', colors['success'] | curses.A_BOLD if benchmark_score > 0 else colors['warning']),
@@ -4494,6 +4565,9 @@ def tui(stdscr, app: AppConfig):
                         (active_engine_detail_line(app, model), curses.A_NORMAL),
                         (command_preview, curses.A_NORMAL),
                     ]
+                    engine_warning = active_engine_warning_line(app, model)
+                    if engine_warning:
+                        right_items.insert(2, (engine_warning, active_engine_warning_attr(engine_warning, colors)))
 
             elif view_mode == 'results':
                 runs = benchmark_runs_for_model(model)

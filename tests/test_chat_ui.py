@@ -18,6 +18,7 @@ from llama_tui.ui import (
     body_pane_layout,
     body_pane_height,
     active_engine_detail_line,
+    active_engine_warning_line,
     browser_models,
     build_error_source_lines,
     build_benchmark_progress_items,
@@ -501,6 +502,51 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn('llama.cpp / buun', runtime_engine_source_line(FakeApp(), model))
         self.assertIn('binary: buun-llama-server', active_engine_detail_line(FakeApp(), model))
         self.assertIn('key=turbo4 value=turbo4', active_engine_detail_line(FakeApp(), model))
+
+    def test_turboquant_active_engine_label_kv_and_warning(self):
+        model = ModelConfig(id='oss', name='GPT OSS', path='oss.gguf', alias='oss', port=18080)
+        model.turboquant_status = 'incompatible'
+        model.turboquant_head_dim = 64
+        model.turboquant_key_dim = 64
+        model.turboquant_value_dim = 64
+
+        class RuntimeProfile:
+            kv_preset = 'q8_0/q8_0'
+
+        class Profile:
+            def engine_kv_pair(self):
+                return 'q8_0', 'turbo4'
+
+        class FakeApp:
+            runtime_profile = Profile()
+
+            def role_badges(self, _model_id):
+                return '-'
+
+            def active_engine_key_for_model(self, _model):
+                return 'turboquant'
+
+            def active_runtime_binary_for_model(self, _model):
+                return '/work/llama.cpp/build/bin/llama-server'
+
+            def runtime_profile_from_model(self, *_args):
+                return RuntimeProfile()
+
+            def turboquant_session_advisory(self, _model):
+                return 'TurboQuant+ high advisory: head_dim=64; turbo V compression is disabled, using q8_0/q8_0.'
+
+            def turboquant_binary_warning(self, _model):
+                return 'TurboQuant+ binary warning: binary does not advertise turbo cache types in --help.'
+
+        line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
+        warning = active_engine_warning_line(FakeApp(), model)
+
+        self.assertIn('turboquant', line)
+        self.assertEqual(turboquant_status_kind(model, turboquant_session=True), 'error')
+        self.assertIn('active engine: turboquant', active_engine_detail_line(FakeApp(), model))
+        self.assertIn('key=q8_0 value=q8_0', active_engine_detail_line(FakeApp(), model))
+        self.assertIn('head_dim=64', warning)
+        self.assertIn('binary warning', warning)
 
     def test_machine_best_summary_includes_explanatory_reason(self):
         model = ModelConfig(id='balanced', name='Balanced', path='balanced.gguf', alias='balanced', port=18080)
@@ -1247,6 +1293,14 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('knee_refine', row)
         self.assertIn('needs~9616tok', row)
         self.assertIn('pressure=medium', row)
+        failed = benchmark_row_text({
+            'objective': 'long_context',
+            'status': 'not ready',
+            'ctx': 8192,
+            'parallel': 1,
+            'failure_category': 'CUDA_OOM_WEIGHTS',
+        })
+        self.assertIn('fail=CUDA_OOM_WEIGHTS', failed)
 
     def test_benchmark_record_display_items_include_sample_details(self):
         items = benchmark_record_display_items({
@@ -1265,6 +1319,11 @@ class BenchmarkDashboardTests(unittest.TestCase):
             'architecture_label': 'MoE 8x2',
             'classification_source': 'gguf_metadata',
             'process_pressure_detail': 'pressure=medium apps=ide:1',
+            'failure_excerpt': 'alloc_tensor_range: failed to allocate CUDA0 buffer',
+            'runtime_log_path': '/tmp/runtime/turboquant/m.log',
+            'fit_discovery_phase': 'weight_fit',
+            'viable_ngl': 28,
+            'viable_ngl_source': 'offloaded_layers',
             'samples': [{
                 'task': 'fix_calc',
                 'status': 'hermes command failed',
@@ -1280,6 +1339,9 @@ class BenchmarkDashboardTests(unittest.TestCase):
         text = '\n'.join(line for line, _attr in items)
 
         self.assertIn('detail: bad flag', text)
+        self.assertIn('failure: alloc_tensor_range: failed to allocate CUDA0 buffer', text)
+        self.assertIn('log: /tmp/runtime/turboquant/m.log', text)
+        self.assertIn('fit discovery: phase=weight_fit viable_ngl=28 source=offloaded_layers', text)
         self.assertIn('architecture: MoE 8x2 from gguf_metadata', text)
         self.assertIn('process pressure: pressure=medium apps=ide:1', text)
         self.assertIn('context: required=64000 configured=70000 actual_slot=2048 experimental override', text)

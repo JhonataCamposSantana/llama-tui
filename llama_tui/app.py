@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -426,13 +427,13 @@ class AppConfig:
         runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
         if runtime == 'vllm':
             return 'vllm'
-        if self.runtime_profile.engine == 'buun':
-            return 'buun'
+        if self.runtime_profile.engine in ('buun', 'turboquant'):
+            return self.runtime_profile.engine
         return 'llama.cpp'
 
     def active_engine_label_for_model(self, model: ModelConfig) -> str:
         engine = self.active_engine_key_for_model(model)
-        if engine == 'buun':
+        if engine in ('buun', 'turboquant'):
             return self.runtime_profile.display_name
         if engine == 'vllm':
             return 'vLLM'
@@ -783,6 +784,14 @@ class AppConfig:
                 kv_preset = f'{key_mode}/{value_mode}'
             else:
                 kv_preset = 'default'
+        elif engine_id == 'turboquant':
+            key_mode, value_mode = self.runtime_profile.turboquant_kv_pair()
+            head_dim = self.turboquant_head_dim(model)
+            tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+            if head_dim == 64 or (0 < head_dim < 128) or tq_status == 'incompatible':
+                kv_preset = 'q8_0/q8_0'
+            else:
+                kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
         else:
             key_mode = (
                 extra_arg_value(args, '--cache-type-k')
@@ -818,13 +827,64 @@ class AppConfig:
     def runtime_indicator(self) -> str:
         return self.runtime_profile.header_indicator()
 
+    def turboquant_head_dim(self, model: ModelConfig) -> int:
+        values = (
+            getattr(model, 'turboquant_head_dim', 0),
+            getattr(model, 'turboquant_key_dim', 0),
+            getattr(model, 'turboquant_value_dim', 0),
+        )
+        parsed = []
+        for value in values:
+            try:
+                parsed.append(int(value or 0))
+            except Exception:
+                parsed.append(0)
+        return max(parsed or [0])
+
     def turboquant_session_advisory(self, model: ModelConfig) -> str:
-        if self.active_engine_key_for_model(model) != 'buun':
+        engine = self.active_engine_key_for_model(model)
+        if engine not in ('buun', 'turboquant'):
             return ''
         status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+        if engine == 'turboquant':
+            head_dim = self.turboquant_head_dim(model)
+            if head_dim == 64:
+                return 'TurboQuant+ high advisory: head_dim=64; turbo V compression is disabled, using q8_0/q8_0.'
+            if 0 < head_dim < 128:
+                return f'TurboQuant+ high advisory: head_dim={head_dim}; turbo cache compression is disabled, using q8_0/q8_0.'
+            if head_dim <= 0 or status == 'unknown':
+                return 'TurboQuant+ advisory: head_dim unknown; automatic turbo recommendations are limited. Use q8_0/turbo4 manually after validation.'
+            if status not in ('native', 'padded'):
+                return f'TurboQuant+ advisory: {turboquant_detail(model)}'
+            return ''
         if status in ('native', 'padded'):
             return ''
         return f'TurboQuant advisory: {turboquant_detail(model)}'
+
+    def turboquant_binary_warning(self, model: ModelConfig) -> str:
+        if self.active_engine_key_for_model(model) != 'turboquant':
+            return ''
+        command = self.runtime_server_command('llama.cpp')
+        try:
+            capabilities = self.engine_capabilities()
+        except Exception:
+            return ''
+        help_text = str(getattr(capabilities, 'help_text', '') or '')
+        if not help_text:
+            return ''
+        if re.search(r'\bturbo(?:2|3|4)(?:_tcq)?\b', help_text.lower()):
+            return ''
+        path_hint = ''
+        parts = self.command_prefix(command)
+        if parts:
+            binary = parts[0]
+            low = binary.lower()
+            if 'llama.cpp' in low and 'llama-cpp-turboquant' not in low:
+                path_hint = ' The path looks like a vanilla llama.cpp checkout.'
+        return (
+            f'TurboQuant+ binary warning: {command} does not advertise turbo cache types in --help.'
+            f'{path_hint}'
+        )
 
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
@@ -883,8 +943,8 @@ class AppConfig:
             'runtime_config': {
                 'extra_args': list(getattr(model, 'extra_args', []) or []),
                 'engine_key': self.active_engine_key_for_model(model),
-                'kv_key_mode': self.runtime_profile.kv_key_mode if self.active_engine_key_for_model(model) == 'buun' else '',
-                'kv_value_mode': self.runtime_profile.kv_value_mode if self.active_engine_key_for_model(model) == 'buun' else '',
+                'kv_key_mode': self.runtime_profile.kv_key_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant') else '',
+                'kv_value_mode': self.runtime_profile.kv_value_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant') else '',
                 'llama_server': self.runtime_server_command('llama.cpp') if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' else '',
                 'vllm_command': self.vllm_command if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else '',
                 'binary_version': self.runtime_binary_version(model),
@@ -1210,7 +1270,7 @@ class AppConfig:
             return False
         if not getattr(self.continue_settings, 'path', ''):
             return False
-        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun')
+        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant')
 
     def hermes_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
@@ -2188,6 +2248,8 @@ class AppConfig:
             label = 'vLLM command'
         elif engine_key == 'buun':
             label = 'buun server'
+        elif engine_key == 'turboquant':
+            label = 'TurboQuant+ server'
         else:
             label = 'llama-server'
         if not self.command_exists(command):
@@ -2200,6 +2262,7 @@ class AppConfig:
         if not valid:
             return False, reason
         tq_advisory = self.turboquant_session_advisory(model)
+        tq_binary_warning = self.turboquant_binary_warning(model)
         if runtime_profile is not None:
             profile = {
                 'ctx': int(runtime_profile.ctx_size or getattr(model, 'ctx', 0) or 0),
@@ -2236,6 +2299,8 @@ class AppConfig:
         self.append_log(model.id, f'launch profile: {profile_msg}')
         if tq_advisory:
             self.append_log(model.id, tq_advisory)
+        if tq_binary_warning:
+            self.append_log(model.id, tq_binary_warning)
         self.append_log(model.id, f'launch command: {shlex.join(command)}')
         try:
             with open(log_path, 'ab') as log_file:
@@ -2256,6 +2321,8 @@ class AppConfig:
         detail = f'started PID {proc.pid} ({profile_msg})'
         if tq_advisory:
             detail += f' | {tq_advisory}'
+        if tq_binary_warning:
+            detail += f' | {tq_binary_warning}'
         return True, detail
 
     def _runtime_log_after_last_launch(self, model: ModelConfig, max_lines: int = 400) -> List[str]:
