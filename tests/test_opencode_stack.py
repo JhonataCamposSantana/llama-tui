@@ -879,7 +879,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             def hardware_profile(self, refresh=False):
                 return profile
 
-            def start(self, _candidate, runtime_profile=None):
+            def start(self, _candidate, runtime_profile=None, benchmark_profile=None):
                 self.started_runtime_profiles.append(runtime_profile)
                 return True, 'started'
 
@@ -1180,7 +1180,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             def __init__(self):
                 self.starts = 0
 
-            def start(self, _candidate):
+            def start(self, _candidate, runtime_profile=None, benchmark_profile=None):
                 self.starts += 1
                 return False, 'boom'
 
@@ -1259,7 +1259,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             )
             return record, True
 
-        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token):
+        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token, **_kwargs):
             calls.append((objective, candidate.ctx, candidate.parallel))
             record = adaptive_record_from_candidate(
                 candidate,
@@ -1324,7 +1324,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             def add_or_update(self, model):
                 self.saved.append(model)
 
-        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token):
+        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token, **_kwargs):
             record = adaptive_record_from_candidate(
                 candidate,
                 objective,
@@ -1384,7 +1384,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             def add_or_update(self, model):
                 self.saved.append(model)
 
-        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token):
+        def fake_benchmark(_app, candidate, objective, _progress, _cancel_token, **_kwargs):
             calls.append((objective, candidate.ctx, candidate.parallel))
             if objective == 'long_context' and candidate.ctx > 2048:
                 return adaptive_record_from_candidate(candidate, objective, 'start failed', detail='oom'), None

@@ -36,13 +36,35 @@ def ensure_bootstrap_files(config_path: Path) -> Path:
     return config_path
 
 def build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='llama-tui')
-    parser.add_argument('config_path', nargs='?', default=str(DEFAULT_CONFIG_PATH))
-    parser.add_argument('--engine', choices=('llama.cpp', 'buun', 'turboquant'), default='llama.cpp')
-    parser.add_argument('--ctx', type=int, default=None)
-    parser.add_argument('--kv', default='')
-    parser.add_argument('--kv-key', default='')
-    parser.add_argument('--kv-value', default='')
+    parser = argparse.ArgumentParser(
+        description='llama-tui: local LLM control plane for llama.cpp, TurboQuant+, Buun, and vLLM models.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f'''examples:
+  llama-tui
+  llama-tui {DEFAULT_CONFIG_PATH}
+  llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4
+  llama-tui --engine buun --kill-existing
+
+defaults:
+  supported runtimes: llama.cpp, turboquant, buun, vLLM saved model entries
+  config path: {DEFAULT_CONFIG_PATH}
+  llama.cpp binary: LLAMA_SERVER or config llama_server
+  TurboQuant+ binary: TURBOQUANT_LLAMA_SERVER_BIN
+  Buun binary: BUUN_LLAMA_SERVER_BIN
+  vLLM command: VLLM_COMMAND or config vllm_command
+
+notes:
+  --help exits before curses starts.
+  --engine switches the active GGUF engine for this TUI session.
+  vLLM model entries still use their saved runtime and vllm_command.
+''',
+    )
+    parser.add_argument('config_path', nargs='?', default=str(DEFAULT_CONFIG_PATH), help='models.json config path (default: %(default)s)')
+    parser.add_argument('--engine', choices=('llama.cpp', 'buun', 'turboquant'), default='llama.cpp', help='active GGUF engine for this session (default: %(default)s)')
+    parser.add_argument('--ctx', type=int, default=None, help='optional session context override for the active GGUF engine')
+    parser.add_argument('--kv', default='', help='KV cache mode shorthand for Buun/TurboQuant+ sessions')
+    parser.add_argument('--kv-key', default='', help='key-cache mode for Buun/TurboQuant+ sessions')
+    parser.add_argument('--kv-value', default='', help='value-cache mode for Buun/TurboQuant+ sessions')
     parser.add_argument(
         '--kill-existing',
         action='store_true',

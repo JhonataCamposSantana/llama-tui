@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import re
 import shlex
 import shutil
 import signal
@@ -32,6 +31,12 @@ from .discovery import (
     is_real_model_file,
     looks_like_model_reference,
 )
+from .engines import (
+    ENGINE_TURBOQUANT,
+    ENGINE_VLLM,
+    resolve_engine_install,
+    turboquant_binary_warning as engine_turboquant_binary_warning,
+)
 from .control import CancelToken, check_cancelled, sleep_with_cancel
 from .gguf import estimate_kv_bytes_per_token, extra_arg_value, read_gguf_metadata
 from .gguf import (
@@ -43,6 +48,11 @@ from .gguf import (
     turboquant_detail,
 )
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
+from .launch_profiles import (
+    BenchmarkLaunchProfile,
+    benchmark_profile_server_args,
+    build_benchmark_launch_profile,
+)
 from .models import ContinueSettings, HermesSettings, ModelConfig, OpencodeSettings, UiSettings
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
 from .runtime_profiles import (
@@ -425,8 +435,8 @@ class AppConfig:
 
     def active_engine_key_for_model(self, model: ModelConfig) -> str:
         runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
-        if runtime == 'vllm':
-            return 'vllm'
+        if runtime == ENGINE_VLLM:
+            return ENGINE_VLLM
         if self.runtime_profile.engine in ('buun', 'turboquant'):
             return self.runtime_profile.engine
         return 'llama.cpp'
@@ -440,8 +450,8 @@ class AppConfig:
         return 'llama.cpp'
 
     def active_runtime_binary_for_model(self, model: ModelConfig) -> str:
-        runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
-        return self.runtime_server_command(runtime)
+        install = resolve_engine_install(self, self.active_engine_key_for_model(model))
+        return str(install.resolved_command or '')
 
     def _benchmark_payload_for_model(self, model: ModelConfig) -> Dict[str, object]:
         return {
@@ -555,6 +565,13 @@ class AppConfig:
         payload['cache_ram'] = int(payload.get('cache_ram', 0) or 0)
         payload['output'] = int(payload.get('output', 4096) or 4096)
         payload['temp'] = float(payload.get('temp', 0.7) or 0.7)
+        payload['top_p'] = float(payload.get('top_p', 0.95) if payload.get('top_p', 0.95) is not None else 0.95)
+        payload['top_k'] = int(payload.get('top_k', 40) or 0)
+        payload['repeat_penalty'] = float(payload.get('repeat_penalty', 1.0) if payload.get('repeat_penalty', 1.0) is not None else 1.0)
+        payload['presence_penalty'] = float(payload.get('presence_penalty', 0.0) if payload.get('presence_penalty', 0.0) is not None else 0.0)
+        payload['no_context_shift'] = bool(payload.get('no_context_shift', False))
+        preserve_thinking = str(payload.get('preserve_thinking', 'auto') or 'auto').strip().lower()
+        payload['preserve_thinking'] = preserve_thinking if preserve_thinking in ('auto', 'on', 'off') else 'auto'
         payload['architecture'] = str(payload.get('architecture', '') or '')
         payload['architecture_type'] = str(payload.get('architecture_type', 'unknown') or 'unknown').strip().lower()
         if payload['architecture_type'] not in ('dense', 'moe', 'unknown'):
@@ -586,6 +603,8 @@ class AppConfig:
         payload['sort_rank'] = int(payload.get('sort_rank', index + 1) or (index + 1))
         extra_args = payload.get('extra_args', [])
         payload['extra_args'] = [str(item) for item in extra_args] if isinstance(extra_args, list) else []
+        launch_overrides = payload.get('launch_overrides', {})
+        payload['launch_overrides'] = dict(launch_overrides) if isinstance(launch_overrides, dict) else {}
         tags = payload.get('tags', [])
         payload['tags'] = [str(item).strip() for item in tags if str(item).strip()] if isinstance(tags, list) else []
         payload['verification_status'] = str(payload.get('verification_status', 'unknown') or 'unknown')
@@ -752,10 +771,11 @@ class AppConfig:
         return line
 
     def runtime_server_command(self, runtime: str) -> str:
-        if runtime == 'vllm':
-            return self.vllm_command
-        if runtime == 'llama.cpp':
-            return self.runtime_profile.server_command or self.llama_server
+        runtime_key = (runtime or 'llama.cpp').strip().lower()
+        if runtime_key == ENGINE_VLLM:
+            return str(resolve_engine_install(self, ENGINE_VLLM).resolved_command or self.vllm_command)
+        if runtime_key == 'llama.cpp':
+            return str(resolve_engine_install(self, self.runtime_profile.engine).resolved_command or self.runtime_profile.server_command or self.llama_server)
         return runtime
 
     def engine_capabilities(self, engine_profile: Optional[EngineProfile] = None) -> EngineCapabilities:
@@ -862,29 +882,14 @@ class AppConfig:
         return f'TurboQuant advisory: {turboquant_detail(model)}'
 
     def turboquant_binary_warning(self, model: ModelConfig) -> str:
-        if self.active_engine_key_for_model(model) != 'turboquant':
+        if self.active_engine_key_for_model(model) != ENGINE_TURBOQUANT:
             return ''
         command = self.runtime_server_command('llama.cpp')
         try:
             capabilities = self.engine_capabilities()
         except Exception:
             return ''
-        help_text = str(getattr(capabilities, 'help_text', '') or '')
-        if not help_text:
-            return ''
-        if re.search(r'\bturbo(?:2|3|4)(?:_tcq)?\b', help_text.lower()):
-            return ''
-        path_hint = ''
-        parts = self.command_prefix(command)
-        if parts:
-            binary = parts[0]
-            low = binary.lower()
-            if 'llama.cpp' in low and 'llama-cpp-turboquant' not in low:
-                path_hint = ' The path looks like a vanilla llama.cpp checkout.'
-        return (
-            f'TurboQuant+ binary warning: {command} does not advertise turbo cache types in --help.'
-            f'{path_hint}'
-        )
+        return engine_turboquant_binary_warning(command, capabilities)
 
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
@@ -2174,6 +2179,7 @@ class AppConfig:
         parallel_override: Optional[int] = None,
         ngl_override: Optional[int] = None,
         runtime_profile: Optional[RuntimeProfile] = None,
+        benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
     ) -> List[str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
         ctx_value = int(ctx_override if ctx_override is not None else model.ctx)
@@ -2209,6 +2215,13 @@ class AppConfig:
             ngl_value,
             runtime_profile=runtime_profile,
         )
+        launch_profile = benchmark_profile or build_benchmark_launch_profile(
+            model,
+            measured_runtime,
+            capabilities,
+            purpose='serve_default',
+            depth='full',
+        )
         cmd = self.command_prefix(self.runtime_server_command('llama.cpp')) + [
             '-m', model.path,
             '--alias', model.alias,
@@ -2224,7 +2237,7 @@ class AppConfig:
             cmd += ['--parallel', str(parallel_value)]
         cmd += [
             '--cache-ram', str(model.cache_ram),
-            '--temp', str(model.temp),
+            '--temp', str(launch_profile.temp),
         ]
         if model.jinja or self.continue_tool_use_launch_required(model):
             cmd += ['--jinja']
@@ -2234,9 +2247,16 @@ class AppConfig:
             capabilities,
             existing_args=list(getattr(model, 'extra_args', []) or []),
         )
+        profile_args, _unsupported_flags = benchmark_profile_server_args(launch_profile, capabilities)
+        cmd += profile_args
         return cmd
 
-    def start(self, model: ModelConfig, runtime_profile: Optional[RuntimeProfile] = None) -> Tuple[bool, str]:
+    def start(
+        self,
+        model: ModelConfig,
+        runtime_profile: Optional[RuntimeProfile] = None,
+        benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
+    ) -> Tuple[bool, str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
         engine_key = (
             runtime_profile.engine_id
@@ -2277,11 +2297,20 @@ class AppConfig:
                 profile_bits.append(fit_text)
             if runtime_profile.no_warmup:
                 profile_bits.append('no_warmup')
+            if benchmark_profile is not None:
+                profile_bits.append(
+                    f'benchmark_profile={benchmark_profile.name} output={benchmark_profile.measurement_output}'
+                )
             profile_msg = ' '.join(profile_bits)
         else:
             profile_ok, profile, profile_msg = self.safe_launch_profile(model)
             if not profile_ok:
                 return False, profile_msg
+            if benchmark_profile is not None:
+                profile_msg = (
+                    f'{profile_msg} benchmark_profile={benchmark_profile.name} '
+                    f'output={benchmark_profile.measurement_output}'
+                )
         if self.get_pid(model):
             return True, f'{model.id} already running'
         log_path = self.logfile(model.id)
@@ -2292,6 +2321,7 @@ class AppConfig:
             parallel_override=profile.get('parallel'),
             ngl_override=profile.get('ngl'),
             runtime_profile=runtime_profile,
+            benchmark_profile=benchmark_profile,
         )
         env = os.environ.copy()
         env['LLAMA_TUI_MODEL_ID'] = model.id

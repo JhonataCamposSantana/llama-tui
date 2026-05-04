@@ -14,8 +14,10 @@ from .benchmark import (
     benchmark_best_optimization,
     benchmark_fast_profiles,
     benchmark_profile_is_fresh,
+    benchmark_raw_speed_profile,
     deep_benchmark_model_decision,
     estimate_text_tokens,
+    get_measured_profile,
     launch_hermes_stack,
     launch_opencode_stack,
     launch_with_failsafe,
@@ -83,6 +85,7 @@ BENCHMARK_FEED_LIMIT = 80
 BENCHMARK_RECORD_LIMIT = 120
 BENCHMARK_COMMAND_LIMIT = 12
 BROWSER_HEADER = ' ID              PRT  ST        BN    RLS  ENGINE     QNT      TQ  ARCH   NAME'
+FLEET_BROWSER_HEADER = ' MODEL                         STATE    PICK         CTX     TOK/S   ENGINE      HEALTH'
 HEADER_DASHBOARD_MIN_WIDTH = 124
 HEADER_DASHBOARD_MIN_PANEL_WIDTH = 42
 HEADER_DASHBOARD_HEIGHT = 10
@@ -97,7 +100,7 @@ RIGHT_PANE_SCROLL_KEYS = {
     curses.KEY_END: 'newest',
 }
 RIGHT_TABS = {
-    'detail': ['summary', 'logs', 'errors', 'command', 'benchmarks'],
+    'detail': ['overview', 'launch', 'tuning', 'benchmarks', 'logs', 'command', 'exports'],
     'benchmark': ['progress', 'results', 'commands', 'logs', 'errors'],
     'try': ['profile', 'logs', 'errors', 'stats', 'command'],
     'results': ['run_summary', 'rankings', 'failures'],
@@ -118,6 +121,9 @@ RIGHT_TAB_LABELS = {
     'rankings': 'Rankings',
     'failures': 'Failures',
     'overview': 'Overview',
+    'launch': 'Launch',
+    'tuning': 'Tuning',
+    'exports': 'Exports',
 }
 SERVER_WINNER_LABELS = {
     'fast_chat': ('Winner', 'Fastest'),
@@ -142,7 +148,7 @@ RANK_ROLE_PRIORITY = {
     'Break Point': 31,
 }
 RIGHT_DEFAULT_TAB = {
-    'detail': 'summary',
+    'detail': 'overview',
     'benchmark': 'progress',
     'try': 'profile',
     'results': 'run_summary',
@@ -207,6 +213,7 @@ SORT_OPTIONS = [
     ('port', 'Port'),
 ]
 DETAIL_DENSITY_OPTIONS = [('simple', 'Simple'), ('advanced', 'Advanced')]
+BROWSER_VIEW_OPTIONS = [('compact', 'Compact'), ('advanced', 'Advanced')]
 FILTER_RUNTIME_OPTIONS = [
     ('all', 'All runtimes'),
     ('llama.cpp', 'llama.cpp'),
@@ -295,6 +302,11 @@ def detail_density_label(value: str) -> str:
     return dict(DETAIL_DENSITY_OPTIONS).get(normalized, 'Simple')
 
 
+def browser_view_label(value: str) -> str:
+    normalized = normalize_choice(value, tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact')
+    return dict(BROWSER_VIEW_OPTIONS).get(normalized, 'Compact')
+
+
 def benchmark_freshness_label(app: AppConfig, model: ModelConfig) -> str:
     if benchmark_profile_is_fresh(app, model):
         return 'fresh'
@@ -318,6 +330,192 @@ def benchmark_freshness_short(app: AppConfig, model: ModelConfig) -> str:
         'running': 'RUN',
     }
     return mapping.get(benchmark_freshness_label(app, model), 'MISS')
+
+
+def format_model_state(status: str) -> str:
+    normalized = str(status or '').strip().upper()
+    if normalized == 'READY':
+        return 'running'
+    if normalized in ('LOADING', 'STARTING'):
+        return 'starting'
+    if normalized == 'ERROR':
+        return 'error'
+    return 'stopped'
+
+
+def format_engine_badge(engine_id: str, narrow: bool = False) -> str:
+    normalized = str(engine_id or '').strip().lower()
+    if normalized == 'turboquant':
+        return 'TQ' if narrow else 'TurboQuant+'
+    if normalized == 'buun':
+        return 'Buun'
+    if normalized == 'vllm':
+        return 'vLLM'
+    if normalized == 'llama.cpp':
+        return 'llama' if narrow else 'llama.cpp'
+    return '?' if narrow else 'Unknown'
+
+
+def _measured_profile_for_recommendation(model: ModelConfig) -> Tuple[str, Dict[str, object]]:
+    for key in ('opencode_ready', 'fast_chat', 'long_context', 'auto'):
+        profile = get_measured_profile(model, key)
+        if profile:
+            return key, profile
+    return '', {}
+
+
+def format_model_recommendation(app: AppConfig, model: ModelConfig) -> str:
+    if benchmark_profile_is_fresh(app, model):
+        key, _profile = _measured_profile_for_recommendation(model)
+        labels = {
+            'opencode_ready': 'OpenCode',
+            'fast_chat': 'Fast Chat',
+            'long_context': 'Long Ctx',
+            'auto': 'Auto',
+        }
+        if key:
+            return labels.get(key, profile_label(key))
+    if (getattr(model, 'optimize_mode', '') or '').strip().lower() == 'manual':
+        return 'Manual'
+    return 'Needs Bench'
+
+
+def _profile_context(profile: Dict[str, object]) -> int:
+    for key in ('ctx_per_slot', 'ctx'):
+        try:
+            value = int(profile.get(key, 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def format_model_health(app: AppConfig, model: ModelConfig, status: str = 'STOPPED') -> Tuple[str, str]:
+    try:
+        valid_target, target_reason = app.validate_model_target(model)
+    except Exception:
+        valid_target, target_reason = True, ''
+    if not valid_target:
+        return 'FAIL', target_reason
+
+    try:
+        engine_command = app.active_runtime_binary_for_model(model)
+        engine_exists = app.command_exists(engine_command)
+    except Exception:
+        engine_command, engine_exists = '', True
+    if not engine_exists:
+        return 'FAIL', f'engine missing: {engine_command or "-"}'
+
+    verification = (getattr(model, 'verification_status', '') or '').strip().lower()
+    if verification == 'failed':
+        return 'FAIL', getattr(model, 'verification_summary', '') or 'verification failed'
+
+    freshness = benchmark_freshness_label(app, model)
+    if freshness == 'failed' and not _measured_profile_for_recommendation(model)[1]:
+        return 'FAIL', 'last benchmark failed'
+    if freshness == 'stale':
+        return 'STALE', 'benchmark stale'
+
+    try:
+        engine = active_engine_key(app, model)
+        capabilities = app.engine_capabilities()
+        if engine != 'vllm' and not str(getattr(capabilities, 'help_text', '') or '').strip():
+            return 'WARN', 'engine capabilities unknown'
+    except Exception:
+        pass
+
+    warning = active_engine_warning_line(app, model)
+    if warning:
+        return 'WARN', warning
+
+    arch = (getattr(model, 'architecture_type', '') or '').strip().lower()
+    if arch in ('', 'unknown'):
+        return 'WARN', 'metadata unknown'
+    if not _measured_profile_for_recommendation(model)[1]:
+        return 'WARN', 'no measured profile'
+    return 'OK', 'ready'
+
+
+def build_model_row_summary(app: AppConfig, model: ModelConfig, status: str = 'STOPPED') -> Dict[str, object]:
+    recommendation = format_model_recommendation(app, model)
+    _key, measured = _measured_profile_for_recommendation(model)
+    measured_ctx = _profile_context(measured)
+    ctx = measured_ctx or context_per_slot(model)
+    try:
+        tok_s = float(measured.get('tokens_per_sec', getattr(model, 'last_benchmark_tokens_per_sec', 0.0)) or 0.0)
+    except Exception:
+        tok_s = 0.0
+    engine_id = active_engine_key(app, model)
+    health, health_reason = format_model_health(app, model, status)
+    return {
+        'display_name': getattr(model, 'name', '') or getattr(model, 'id', '') or '-',
+        'state': format_model_state(status),
+        'pick': recommendation,
+        'ctx': ctx,
+        'tokens_per_sec': tok_s,
+        'engine': format_engine_badge(engine_id),
+        'health': health,
+        'health_reason': health_reason,
+    }
+
+
+def compact_browser_header(left_w: int) -> str:
+    return compact_browser_model_line(None, None, '', '', left_w, header=True)
+
+
+def compact_browser_model_line(
+    app: Optional[AppConfig],
+    model: Optional[ModelConfig],
+    status: str,
+    machine_pick_id: str,
+    left_w: int,
+    header: bool = False,
+) -> str:
+    name_w = max(12, int(left_w or 80) - 54)
+    if header:
+        return (
+            f' {"MODEL":{name_w}} {"STATE":8} {"PICK":11} '
+            f'{"CTX":>7} {"TOK/S":>7} {"ENGINE":11} {"HEALTH":6}'
+        )
+    assert app is not None and model is not None
+    summary = build_model_row_summary(app, model, status)
+    display_name = str(summary['display_name'])
+    if getattr(model, 'favorite', False) and name_w >= 14:
+        display_name = '* ' + display_name
+    if model.id == machine_pick_id and name_w >= 15:
+        display_name = f'{display_name} BEST'
+    ctx = int(summary.get('ctx', 0) or 0)
+    ctx_text = str(ctx) if ctx > 0 else '-'
+    tok_s = float(summary.get('tokens_per_sec', 0.0) or 0.0)
+    tok_text = f'{tok_s:.1f}' if tok_s > 0 else '-'
+    return (
+        f' {ellipsize(display_name, name_w):{name_w}} '
+        f'{str(summary["state"])[:8]:8} '
+        f'{str(summary["pick"])[:11]:11} '
+        f'{ctx_text:>7} {tok_text:>7} '
+        f'{str(summary["engine"])[:11]:11} '
+        f'{str(summary["health"])[:6]:6}'
+    )
+
+
+def browser_header_for_view(browser_view: str, left_w: int) -> str:
+    if normalize_choice(browser_view, tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact') == 'advanced':
+        return BROWSER_HEADER
+    return compact_browser_header(left_w)
+
+
+def browser_model_line_for_view(
+    app: AppConfig,
+    model: ModelConfig,
+    status: str,
+    machine_pick_id: str,
+    left_w: int,
+    browser_view: str,
+) -> str:
+    if normalize_choice(browser_view, tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact') == 'advanced':
+        return browser_model_line(app, model, status, machine_pick_id, left_w)
+    return compact_browser_model_line(app, model, status, machine_pick_id, left_w)
 
 
 def browser_model_line(
@@ -412,6 +610,40 @@ def runtime_engine_source_line(app: AppConfig, model: ModelConfig) -> str:
 def active_engine_detail_line(app: AppConfig, model: ModelConfig) -> str:
     binary = active_engine_binary(app, model) or '-'
     return f'active engine: {active_engine_short(app, model)}  binary: {binary}  kv: {active_engine_kv(app, model)}'
+
+
+def active_engine_badge_line(app: AppConfig, model: Optional[ModelConfig] = None) -> str:
+    if model is not None:
+        engine = format_engine_badge(active_engine_key(app, model))
+        binary = active_engine_binary(app, model)
+        kv = active_engine_kv(app, model)
+    else:
+        profile = getattr(app, 'runtime_profile', None)
+        engine = format_engine_badge(str(getattr(profile, 'engine', '') or getattr(profile, 'engine_id', '') or 'llama.cpp'))
+        binary = str(getattr(profile, 'server_command', '') or getattr(app, 'llama_server', '') or '')
+        try:
+            kv = profile.engine_kv_pair()
+            kv = f'key={kv[0]} value={kv[1]}'
+        except Exception:
+            kv = '-'
+    try:
+        binary_ok = bool(app.command_exists(binary))
+    except Exception:
+        binary_ok = bool(binary)
+    binary_state = 'binary ok' if binary_ok else 'binary missing'
+    return f'ENGINE: {engine} | KV {kv or "-"} | {binary_state}'
+
+
+def active_engine_badge_kind(app: AppConfig, model: Optional[ModelConfig] = None) -> str:
+    binary = active_engine_binary(app, model) if model is not None else str(getattr(getattr(app, 'runtime_profile', None), 'server_command', '') or getattr(app, 'llama_server', '') or '')
+    try:
+        if not app.command_exists(binary):
+            return 'error'
+    except Exception:
+        pass
+    if model is not None and active_engine_warning_line(app, model):
+        return 'error' if 'binary warning' in active_engine_warning_line(app, model).lower() else 'warning'
+    return 'engine'
 
 
 def active_engine_warning_line(app: AppConfig, model: ModelConfig) -> str:
@@ -849,7 +1081,8 @@ def build_header_config_items(app: AppConfig, message: str, width: int) -> List[
     continue_path = getattr(getattr(app, 'continue_settings', None), 'path', '') or '<unset>'
     ui_summary = (
         f'sort={sort_mode_label(getattr(getattr(app, "ui", None), "preferred_sort", "port"))} '
-        f'detail={detail_density_label(getattr(getattr(app, "ui", None), "detail_density", "simple"))}'
+        f'detail={detail_density_label(getattr(getattr(app, "ui", None), "detail_density", "simple"))} '
+        f'browser={browser_view_label(getattr(getattr(app, "ui", None), "browser_view", "compact"))}'
     )
     roots_summary = (
         f'hf={app.hf_cache_root} | llmfit={app.llmfit_cache_root} | '
@@ -857,8 +1090,9 @@ def build_header_config_items(app: AppConfig, message: str, width: int) -> List[
     )
     lines = [
         (f'config: {app.config_path}', 'muted'),
+        (f'code path: {Path(__file__).resolve().parents[1]}', 'muted'),
         (f'llama-server: {app.llama_server}', 'muted'),
-        (f'active engine binary: {getattr(getattr(app, "runtime_profile", None), "server_command", app.llama_server)}', 'muted'),
+        (active_engine_badge_line(app), active_engine_badge_kind(app)),
         (app.runtime_indicator(), 'muted'),
         (f'vllm: {app.vllm_command}', 'muted'),
         (f'opencode: {app.opencode.path or "<unset>"}  continue: {continue_path}  hermes: {getattr(app.hermes, "command", "hermes")}', 'muted'),
@@ -882,6 +1116,7 @@ def build_header_dashboard_items(
     hardware_summary: str,
     error_history: List[str],
     width: int,
+    app: Optional[AppConfig] = None,
 ) -> List[Tuple[str, str]]:
     body_width = max(12, int(width or 12))
     counts = {'READY': 0, 'LOADING': 0, 'STARTING': 0, 'STOPPED': 0, 'ERROR': 0}
@@ -897,6 +1132,7 @@ def build_header_dashboard_items(
             active_line += f' ({detail_text})'
     else:
         active_line = 'active: none'
+    engine_line = active_engine_badge_line(app, active_model) if app is not None and active_model is not None else ''
 
     view_line = f'view: {VIEW_LABELS.get(view_mode, view_mode or "Models")}'
 
@@ -915,12 +1151,16 @@ def build_header_dashboard_items(
     latest_error = compact_message(str(error_history[-1])) if error_history else 'none'
     lines = [
         (f'counts: READY:{counts["READY"]} LOADING:{loading} STOPPED:{counts["STOPPED"]} ERROR:{counts["ERROR"]}', 'counts'),
+    ]
+    if engine_line:
+        lines.append((engine_line, active_engine_badge_kind(app, active_model) if app is not None and active_model is not None else 'muted'))
+    lines.extend([
         (active_line, 'status' if status == 'READY' else 'error' if status == 'ERROR' else 'muted'),
         (view_line, 'muted'),
         (bench_line, 'benchmark' if benchmark_active else 'muted'),
         (f'hardware: {hardware_summary or "-"}', 'muted'),
         (f'last error: {latest_error}', 'error' if error_history else 'muted'),
-    ]
+    ])
     return [(ellipsize(text, body_width), kind) for text, kind in lines]
 
 
@@ -983,6 +1223,8 @@ def build_benchmark_progress_items(
             ('latest result:', accent_attr),
             (benchmark_row_text(latest), normal_attr),
         ])
+        for line in benchmark_launch_profile_detail_lines(latest):
+            items.append((line, normal_attr))
         latest_detail = compact_message(str(latest.get('detail', '') or ''))
         if latest_detail:
             items.append((f'detail: {latest_detail}', normal_attr))
@@ -1320,6 +1562,9 @@ def benchmark_row_text(record: Dict[str, object]) -> str:
     failure_category = str(record.get('failure_category', '') or '')
     if failure_category and status.lower() not in ('ok', 'probe ok', 'tests passed'):
         suffix_parts.append(f'fail={failure_category}')
+    benchmark_profile = str(record.get('benchmark_profile', '') or '')
+    if benchmark_profile:
+        suffix_parts.append(f'profile={benchmark_profile}')
     suffix = (' ' + ' '.join(suffix_parts)) if suffix_parts else ''
     return (
         f'{label[:18]:18} {score:7.2f} {score_label:5} {seconds:6.1f}s '
@@ -1327,8 +1572,49 @@ def benchmark_row_text(record: Dict[str, object]) -> str:
     )
 
 
+def benchmark_launch_profile_detail_lines(record: Dict[str, object]) -> List[str]:
+    profile = str(record.get('benchmark_profile', '') or '')
+    if not profile:
+        return []
+    engine = str(record.get('engine', '') or '-')
+    ctx = int(record.get('ctx', 0) or 0)
+    output = int(record.get('output', 0) or 0)
+    measurement = int(record.get('measurement_output', 0) or 0)
+    kv_key = str(record.get('kv_key', '') or record.get('ctk', '') or '-')
+    kv_value = str(record.get('kv_value', '') or record.get('ctv', '') or '-')
+    flash = str(record.get('flash_attn', '') or record.get('flash_attn_mode', '') or '-')
+    fit = 'on' if bool(record.get('fit', record.get('runtime_fit', False))) else 'off'
+    fit_context = int(record.get('fit_context', 0) or 0)
+    no_shift = 'yes' if bool(record.get('no_context_shift', False)) else 'no'
+    sampling = (
+        f'temp={record.get("temp", "-")} top_p={record.get("top_p", "-")} '
+        f'top_k={record.get("top_k", "-")} repeat={record.get("repeat_penalty", "-")} '
+        f'presence={record.get("presence_penalty", "-")}'
+    )
+    def format_value(value: object) -> str:
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        return str(value)
+
+    kwargs = dict(record.get('chat_template_kwargs', {}) or {})
+    kwargs_text = ','.join(f'{key}={format_value(value)}' for key, value in kwargs.items()) if kwargs else '-'
+    unsupported = ','.join(str(item) for item in list(record.get('unsupported_launch_flags', []) or [])) or '-'
+    return [
+        f'  profile: {profile} engine={engine} ctx={ctx} output={output} measure={measurement}',
+        (
+            f'  kv: key={kv_key} value={kv_value} flash={flash} fit={fit}'
+            + (f' fit_ctx={fit_context}' if fit_context else '')
+            + f' no_ctx_shift={no_shift}'
+        ),
+        f'  sampling: {sampling}',
+        f'  template: {kwargs_text} unsupported={unsupported}',
+    ]
+
+
 def benchmark_record_display_items(record: Dict[str, object], attr: int = 0) -> List[Tuple[str, int]]:
     items: List[Tuple[str, int]] = [(benchmark_row_text(record), attr)]
+    for line in benchmark_launch_profile_detail_lines(record):
+        items.append((line, attr))
     detail = compact_message(str(record.get('detail', '') or ''))
     if detail:
         items.append((f'  detail: {detail}', attr))
@@ -2302,6 +2588,7 @@ def settings_form_fields(app: AppConfig, section: str = 'all') -> List[Dict[str,
         'ui': [
         form_field('preferred_sort', 'preferred_sort', getattr(app.ui, 'preferred_sort', 'port'), 'favorites/recent/name/benchmark/context/port'),
         form_field('detail_density', 'detail_density', getattr(app.ui, 'detail_density', 'simple'), 'simple or advanced'),
+        form_field('browser_view', 'browser_view', getattr(app.ui, 'browser_view', 'compact'), 'compact or advanced'),
         ],
     }
     if section == 'all':
@@ -2341,6 +2628,9 @@ def parse_settings_form_answers(answers: Dict[str, str]) -> Tuple[Optional[Dict[
     detail_density = normalize_choice(cleaned.get('detail_density', ''), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
     if detail_density != (cleaned.get('detail_density', '').lower() or 'simple'):
         errors['detail_density'] = 'detail_density must be simple or advanced'
+    browser_view = normalize_choice(cleaned.get('browser_view', ''), tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact')
+    if browser_view != (cleaned.get('browser_view', '').lower() or 'compact'):
+        errors['browser_view'] = 'browser_view must be compact or advanced'
     continue_merge_mode = cleaned.get('continue_merge_mode', 'preserve_sections') or 'preserve_sections'
     if continue_merge_mode not in CONTINUE_MERGE_MODES:
         errors['continue_merge_mode'] = 'must be preserve_sections or managed_file'
@@ -2395,6 +2685,7 @@ def parse_settings_form_answers(answers: Dict[str, str]) -> Tuple[Optional[Dict[
         'ui': {
             'preferred_sort': preferred_sort,
             'detail_density': detail_density,
+            'browser_view': browser_view,
         },
     }
     if errors:
@@ -2647,8 +2938,10 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
     hermes_ok = app.command_exists(getattr(app.hermes, 'command', 'hermes') or 'hermes')
     continue_path = getattr(app.continue_settings, 'path', '') or ''
     items.extend([
+        (f'code path: {Path(__file__).resolve().parents[1]}', 'muted'),
         (f'llama-server: {"ok" if llama_ok else "missing"}  {app.llama_server}', 'success' if llama_ok else 'error'),
-        (f'active engine: {"ok" if active_ok else "missing"}  {active_engine}  {active_binary}', 'success' if active_ok else 'error'),
+        (active_engine_badge_line(app, active_model), active_engine_badge_kind(app, active_model)),
+        (f'active engine path: {"ok" if active_ok else "missing"}  {active_engine}  {active_binary}', 'success' if active_ok else 'error'),
         (f'vLLM: {"ok" if vllm_ok else "missing"}  {app.vllm_command}', 'success' if vllm_ok else 'warning'),
         (f'Hermes: {"ok" if hermes_ok else "missing"}  {getattr(app.hermes, "command", "hermes") or "hermes"}', 'success' if hermes_ok else 'warning'),
         (f'OpenCode config: {app.opencode.path or "<unset>"}', 'success' if app.opencode.path else 'warning'),
@@ -2846,46 +3139,76 @@ def show_compare_overlay(stdscr, colors, app: AppConfig, left: Optional[ModelCon
         stdscr.nodelay(True)
 
 
-def prompt_command_palette(stdscr, colors) -> str:
-    return prompt_modal_choice(stdscr, colors, 'Command Palette', [
+def command_palette_options(app: Optional[AppConfig] = None) -> List[Tuple[str, str, str]]:
+    current_density = normalize_choice(getattr(getattr(app, 'ui', None), 'detail_density', 'simple'), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+    next_density = 'advanced' if current_density == 'simple' else 'simple'
+    current_browser = normalize_choice(getattr(getattr(app, 'ui', None), 'browser_view', 'compact'), tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact')
+    next_browser = 'advanced' if current_browser == 'compact' else 'compact'
+    return [
         ('1', 'Search models', 'search'),
         ('2', 'Set filters', 'filters'),
         ('3', 'Sort models', 'sort'),
         ('4', 'Toggle favorite', 'favorite'),
-        ('5', 'Toggle detail density', 'density'),
-        ('6', 'Open help', 'help'),
-        ('7', 'Open settings', 'settings'),
-        ('8', 'Detect models', 'detect'),
-        ('9', 'Compare with machine pick', 'compare'),
+        ('5', f'Detail Density: {detail_density_label(current_density)} -> {detail_density_label(next_density)}', 'density'),
+        ('6', f'Browser View: {browser_view_label(current_browser)} -> {browser_view_label(next_browser)}', 'toggle_browser_view'),
+        ('7', 'Open help', 'help'),
+        ('8', 'Settings...', 'settings'),
+        ('9', 'Detect models', 'detect'),
+        ('p', 'Raw Speed Benchmark...', 'raw_speed_benchmark'),
+        ('m', 'Compare with machine pick', 'compare'),
         ('o', 'Export OpenCode config', 'export_opencode'),
         ('c', 'Export Continue config', 'export_continue'),
         ('g', 'Export Hermes config', 'export_hermes'),
         ('v', 'Verify selected model', 'verify_selected'),
         ('a', 'Verify all benchmark proof', 'verify_all'),
-        ('!', 'Open config doctor', 'config_doctor'),
+        ('!', 'Config Doctor...', 'config_doctor'),
         ('q', 'Cancel', 'cancel'),
-    ])
+    ]
+
+
+def prompt_command_palette(stdscr, colors, app: Optional[AppConfig] = None) -> str:
+    return prompt_modal_choice(stdscr, colors, 'Actions', command_palette_options(app))
+
+
 def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str, str]]) -> str:
     h, w = stdscr.getmaxyx()
     box_w = min(68, max(48, w - 8))
-    box_h = max(8, len(options) + 6)
-    if h < box_h + 4 or w < box_w + 4:
+    box_h = min(max(8, len(options) + 6), max(8, h - 4))
+    if h < 12 or w < box_w + 4:
         return 'cancel'
     box_x = max(2, (w - box_w) // 2)
     box_y = max(2, (h - box_h) // 2)
     modal = curses.newwin(box_h + 1, box_w, box_y, box_x)
     modal.keypad(True)
     stdscr.nodelay(False)
+    scroll = 0
+    visible_rows = max(1, box_h - 5)
     while True:
+        scroll = clamp_scroll(scroll, len(options), visible_rows)
         modal.erase()
         draw_box(modal, 0, 0, box_h - 1, box_w, title, colors['accent'] | curses.A_BOLD, colors['accent'])
-        modal.addstr(2, 2, 'Choose an option:', colors['panel'] | curses.A_BOLD)
-        for idx, (key, label, _val) in enumerate(options):
-            modal.addstr(3 + idx, 4, f'[{key}] {label}'[: box_w - 8], colors['panel'])
-        modal.addstr(box_h - 1, 2, 'Press key to continue...'[: box_w - 6], colors['muted'])
+        safe_addstr(modal, 2, 2, ellipsize('Choose an action:', box_w - 4), colors['panel'] | curses.A_BOLD)
+        for row, (option_key, label, _val) in enumerate(options[scroll: scroll + visible_rows]):
+            marker = ''
+            if row == 0 and scroll > 0:
+                marker = '^ '
+            elif row == visible_rows - 1 and scroll + visible_rows < len(options):
+                marker = 'v '
+            safe_addstr(modal, 3 + row, 4, ellipsize(f'{marker}[{option_key}] {label}', box_w - 8), colors['panel'])
+        safe_addstr(modal, box_h - 1, 2, ellipsize('Press key to run. Up/Down scroll. Esc cancels.', box_w - 6), colors['muted'])
         modal.refresh()
         key = modal.getch()
         if key == -1:
+            continue
+        if key in (27, ord('q')):
+            stdscr.touchwin()
+            stdscr.nodelay(True)
+            return 'cancel'
+        if key in (curses.KEY_UP, ord('k')):
+            scroll -= 1
+            continue
+        if key in (curses.KEY_DOWN, ord('j')):
+            scroll += 1
             continue
         key_str = chr(key).lower() if 0 <= key <= 255 else ''
         for option_key, _label, value in options:
@@ -3109,6 +3432,10 @@ def draw_header_dashboard(
             attr = colors['error'] | curses.A_BOLD
         elif kind == 'status':
             attr = colors['success'] | curses.A_BOLD
+        elif kind == 'engine':
+            attr = colors['accent'] | curses.A_BOLD
+        elif kind == 'warning':
+            attr = colors['warning'] | curses.A_BOLD
         elif kind in ('action', 'benchmark'):
             attr = colors['warning'] | curses.A_BOLD
         safe_addstr(stdscr, row_y, row_x, ellipsize(str(line), width), attr)
@@ -3922,6 +4249,7 @@ def tui(stdscr, app: AppConfig):
                 app.hardware_profile().short_summary(),
                 error_history,
                 header_right_w - 4,
+                app=app,
             )
             draw_header_dashboard(
                 stdscr,
@@ -3992,7 +4320,7 @@ def tui(stdscr, app: AppConfig):
                 error_count=len(error_source_lines),
             )
         else:
-            draw_box(stdscr, box_top, right_x, right_panel_h, right_w, 'Details / Logs / Roles', colors['accent'] | curses.A_BOLD, colors['accent'])
+            draw_box(stdscr, box_top, right_x, right_panel_h, right_w, 'Details / Engine / Exports', colors['accent'] | curses.A_BOLD, colors['accent'])
 
         if view_mode == 'machine_results':
             summary = machine_summary or current_machine_summary()
@@ -4196,6 +4524,7 @@ def tui(stdscr, app: AppConfig):
                 ('[Esc] back   [Enter/l] actions   [T] try   [B] deep bench   [F] fast bench   [O] opencode bench   [H] hermes bench   [R] results   [z] auto   [v] detail density', colors['accent'] | curses.A_BOLD),
                 ('', curses.A_NORMAL),
                 (f'name: {model.name}', curses.A_BOLD),
+                (active_engine_badge_line(app, model), colors['accent'] | curses.A_BOLD),
                 (runtime_engine_source_line(app, model), curses.A_NORMAL),
                 (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
                 (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
@@ -4230,68 +4559,14 @@ def tui(stdscr, app: AppConfig):
             if engine_warning:
                 detail_rows.insert(5, (engine_warning, active_engine_warning_attr(engine_warning, colors)))
             if detail_density == 'advanced':
-                benchmark_rows = list(getattr(model, 'last_benchmark_results', []) or [])
-                if not benchmark_rows and benchmark_score > 0:
-                    preset_tier = (getattr(model, 'last_benchmark_profile', '') or 'winner/-').split()[0]
-                    preset, _, tier = preset_tier.partition('/')
-                    benchmark_rows = [{
-                        'preset': preset or 'winner',
-                        'tier': tier or '-',
-                        'status': 'ok',
-                        'tokens_per_sec': benchmark_score,
-                        'seconds': benchmark_seconds,
-                        'ctx': model.ctx,
-                        'parallel': model.parallel,
-                        'threads': model.threads,
-                        'ngl': model.ngl,
-                    }]
-                detail_rows.extend([('', curses.A_NORMAL), ('server benchmark table:', colors['accent'] | curses.A_BOLD)])
-                if benchmark_rows:
-                    detail_rows.extend(benchmark_ranking_items(
-                        {
-                            'kind': 'server',
-                            'records': benchmark_rows,
-                            'winners': getattr(model, 'measured_profiles', {}) or {},
-                        },
-                        width=left_w - 5,
-                        success_attr=colors['success'] | curses.A_BOLD,
-                        warning_attr=colors['warning'],
-                        error_attr=colors['error'],
-                        heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
-                        normal_attr=curses.A_NORMAL,
-                    ))
-                else:
-                    detail_rows.append((' no benchmark rows yet; server start is still available', colors['warning']))
-
-                opencode_rows = list(getattr(model, 'last_opencode_benchmark_results', []) or [])
-                detail_rows.extend([('', curses.A_NORMAL), ('opencode workflow table:', colors['accent'] | curses.A_BOLD)])
-                if opencode_rows:
-                    detail_rows.extend(benchmark_ranking_items(
-                        {'kind': 'opencode', 'records': opencode_rows, 'winners': {}},
-                        width=left_w - 5,
-                        success_attr=colors['success'] | curses.A_BOLD,
-                        warning_attr=colors['warning'],
-                        error_attr=colors['error'],
-                        heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
-                        normal_attr=curses.A_NORMAL,
-                    ))
-                else:
-                    detail_rows.append((' no opencode workflow rows yet; press O to run', colors['warning']))
-
-                hermes_rows = list(getattr(model, 'last_hermes_benchmark_results', []) or [])
-                detail_rows.extend([('', curses.A_NORMAL), ('hermes workflow table:', colors['accent'] | curses.A_BOLD)])
-                if hermes_rows:
-                    detail_rows.extend(benchmark_ranking_items(
-                        {'kind': 'hermes', 'records': hermes_rows, 'winners': {}},
-                        width=left_w - 5,
-                        success_attr=colors['success'] | curses.A_BOLD,
-                        warning_attr=colors['warning'],
-                        error_attr=colors['error'],
-                        heading_attr=colors['accent'] | curses.A_UNDERLINE | curses.A_BOLD,
-                        normal_attr=curses.A_NORMAL,
-                    ))
-                else:
-                    detail_rows.append((' no Hermes workflow rows yet; press H to run', colors['warning']))
+                detail_rows.extend([
+                    ('', curses.A_NORMAL),
+                    ('advanced details:', colors['accent'] | curses.A_BOLD),
+                    ('Use the right-side Benchmarks tab for full benchmark tables.', colors['muted']),
+                    (f'server rows: {len(getattr(model, "last_benchmark_results", []) or [])}', colors['muted']),
+                    (f'opencode rows: {len(getattr(model, "last_opencode_benchmark_results", []) or [])}', colors['muted']),
+                    (f'hermes rows: {len(getattr(model, "last_hermes_benchmark_results", []) or [])}', colors['muted']),
+                ])
             else:
                 detail_rows.extend([
                     ('benchmark tables hidden in Simple mode; press v for Advanced details.', colors['muted']),
@@ -4304,13 +4579,14 @@ def tui(stdscr, app: AppConfig):
             for i, (line, attr) in enumerate(detail_items[:content_rows]):
                 safe_addstr(stdscr, box_top + 2 + i, 3, line[: left_w - 4], attr)
         elif browser_list:
-            header = BROWSER_HEADER
+            browser_view = normalize_choice(getattr(app.ui, 'browser_view', 'compact'), tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact')
+            header = browser_header_for_view(browser_view, left_w)
             if content_rows > 0:
                 summary = (
                     f'search={list_search or "-"}  runtime={filter_option_label(FILTER_RUNTIME_OPTIONS, filter_runtime)}  '
                     f'source={filter_option_label(FILTER_SOURCE_OPTIONS, filter_source)}  '
                     f'status={filter_option_label(FILTER_STATUS_OPTIONS, filter_status)}  '
-                    f'tag={filter_tag}  sort={sort_mode_label(sort_mode)}'
+                    f'tag={filter_tag}  sort={sort_mode_label(sort_mode)}  view={browser_view_label(browser_view)}'
                 )
                 safe_addstr(stdscr, box_top + 2, 3, ellipsize(summary, left_w - 4), colors['muted'])
             if content_rows > 1:
@@ -4319,7 +4595,7 @@ def tui(stdscr, app: AppConfig):
             for idx in range(start_idx, end_idx):
                 model = browser_list[idx]
                 status, _ = statuses.get(model.id, ('?', ''))
-                line = browser_model_line(app, model, status, machine_pick_id, left_w)
+                line = browser_model_line_for_view(app, model, status, machine_pick_id, left_w, browser_view)
                 row_y = box_top + 4 + idx - start_idx
                 if idx == selected:
                     try:
@@ -4328,8 +4604,9 @@ def tui(stdscr, app: AppConfig):
                         safe_addstr(stdscr, row_y, 3, line[: left_w - 3], curses.A_REVERSE)
                 else:
                     safe_addstr(stdscr, row_y, 3, line[: left_w - 3])
-                    status_x = 3 + 1 + 14 + 1 + 4 + 2
-                    safe_addstr(stdscr, row_y, status_x, f'{status_symbol(status)} {status[:6]:6}', status_attr(colors, status))
+                    if browser_view == 'advanced':
+                        status_x = 3 + 1 + 14 + 1 + 4 + 2
+                        safe_addstr(stdscr, row_y, status_x, f'{status_symbol(status)} {status[:6]:6}', status_attr(colors, status))
             if visible_rows > 1 and len(browser_list) > max(1, visible_rows - 1):
                 bar_h = max(1, visible_rows - 1)
                 track_x = left_w - 1
@@ -4403,27 +4680,59 @@ def tui(stdscr, app: AppConfig):
                 benchmark_score = float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0)
                 opencode_score = float(getattr(model, 'last_opencode_benchmark_score', 0.0) or 0.0)
                 hermes_score = float(getattr(model, 'last_hermes_benchmark_score', 0.0) or 0.0)
-                if right_active_tab == 'summary':
+                row_summary = build_model_row_summary(app, model, status)
+                if right_active_tab == 'overview':
+                    warnings = [
+                        str(row_summary.get('health_reason', '') or ''),
+                        active_engine_warning_line(app, model),
+                    ]
+                    warnings = [compact_message(item) for item in warnings if compact_message(item)]
                     right_items = [
                         (f'name: {model.name}', curses.A_BOLD),
                         (runtime_engine_source_line(app, model), curses.A_NORMAL),
                         (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
-                        (f'path: {model.path}', curses.A_NORMAL),
-                        (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
-                        (f'quant/architecture/offload: {extract_quant(model)} / {classify_model_type(model)} / {display_offload(model)}', curses.A_NORMAL),
-                        (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
-                        (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
-                        (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
-                        (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
+                        (f'recommendation: {row_summary.get("pick", "-")}', colors['accent'] | curses.A_BOLD),
+                        (f'health: {row_summary.get("health", "-")} / {row_summary.get("health_reason", "-")}', colors['success'] | curses.A_BOLD if row_summary.get('health') == 'OK' else colors['warning'] if row_summary.get('health') in ('WARN', 'STALE') else colors['error'] | curses.A_BOLD),
                         (f'status: {status} ({detail})', status_attr(colors, status)),
                         (f'pid/roles: {pid or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
-                        (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
+                        (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
+                        (f'freshness: {benchmark_freshness_display(app, model)}', curses.A_NORMAL),
+                    ]
+                    if warnings:
+                        right_items.extend([('', curses.A_NORMAL), ('top advisories:', colors['accent'] | curses.A_BOLD)])
+                        right_items.extend((f'- {item}', colors['warning']) for item in warnings[:3])
+                elif right_active_tab == 'launch':
+                    right_items = [
+                        ('launch actions:', colors['accent'] | curses.A_BOLD),
+                        ('Enter/l opens start/stop actions', curses.A_NORMAL),
+                        ('T opens Try It Out', curses.A_NORMAL),
+                        ('B/F/O/H run benchmark workflows', curses.A_NORMAL),
+                        ('z applies automatic tuning', curses.A_NORMAL),
+                        ('', curses.A_NORMAL),
+                        ('saved launch settings:', colors['accent'] | curses.A_BOLD),
+                        (f'alias/bind: {model.alias} / {model.host}:{model.port}', curses.A_NORMAL),
+                        (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
+                        (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
+                        (f'last benchmark: {benchmark_score:.2f} tok/s {getattr(model, "last_benchmark_profile", "")}', curses.A_NORMAL),
+                    ]
+                elif right_active_tab == 'tuning':
+                    right_items = [
+                        ('tuning settings:', colors['accent'] | curses.A_BOLD),
+                        (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
+                        (f'ctx range: {getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)}', curses.A_NORMAL),
+                        (f'ngl/threads/parallel: {model.ngl} / {model.threads} / {model.parallel}', curses.A_NORMAL),
+                        (f'cache_ram/temp: {model.cache_ram} / {model.temp}', curses.A_NORMAL),
+                        (f'optimize mode/tier: {model.optimize_mode} / {model.optimize_tier}', curses.A_NORMAL),
+                        (f'memory reserve: {getattr(model, "memory_reserve_percent", 25)}%', curses.A_NORMAL),
+                        (f'kv: {active_engine_kv(app, model)}', curses.A_NORMAL),
+                        (f'extra args: {" ".join(getattr(model, "extra_args", []) or []) or "-"}', curses.A_NORMAL),
                     ]
                 elif right_active_tab == 'logs':
                     right_items = [(f'log: {app.logfile(model.id)}', colors['accent'] | curses.A_BOLD)]
                     right_items.extend(build_log_items(log_lines, curses.A_NORMAL, colors['muted']))
-                elif right_active_tab == 'errors':
-                    right_items = build_error_items(error_source_lines, colors['error'], colors['muted'])
+                    if error_source_lines:
+                        right_items.extend([('', curses.A_NORMAL), ('recent errors:', colors['error'] | curses.A_BOLD)])
+                        right_items.extend(build_error_items(error_source_lines, colors['error'], colors['muted']))
                 elif right_active_tab == 'command':
                     right_items = [
                         ('command preview:', colors['accent'] | curses.A_BOLD),
@@ -4482,6 +4791,42 @@ def tui(stdscr, app: AppConfig):
                         ))
                     else:
                         right_items.append(('no Hermes workflow rows yet', colors['muted']))
+                elif right_active_tab == 'exports':
+                    continue_roles = []
+                    for label, value in (
+                        ('default', getattr(app.continue_settings, 'default_model_id', '')),
+                        ('edit', getattr(app.continue_settings, 'edit_model_id', '')),
+                        ('autocomplete', getattr(app.continue_settings, 'autocomplete_model_id', '')),
+                    ):
+                        if value == model.id:
+                            continue_roles.append(label)
+                    opencode_roles = []
+                    for label, value in (
+                        ('default', getattr(app.opencode, 'default_model_id', '')),
+                        ('small', getattr(app.opencode, 'small_model_id', '')),
+                        ('build', getattr(app.opencode, 'build_model_id', '')),
+                        ('plan', getattr(app.opencode, 'plan_model_id', '')),
+                    ):
+                        if value == model.id:
+                            opencode_roles.append(label)
+                    hermes_roles = []
+                    for label, value in (
+                        ('default', getattr(app.hermes, 'default_model_id', '')),
+                        ('code', getattr(app.hermes, 'code_model_id', '')),
+                    ):
+                        if value == model.id:
+                            hermes_roles.append(label)
+                    right_items = [
+                        ('export roles:', colors['accent'] | curses.A_BOLD),
+                        (f'OpenCode: {", ".join(opencode_roles) or "-"}', curses.A_NORMAL),
+                        (f'Continue: {", ".join(continue_roles) or "-"}', curses.A_NORMAL),
+                        (f'Hermes: {", ".join(hermes_roles) or "-"}', curses.A_NORMAL),
+                        ('', curses.A_NORMAL),
+                        ('config paths:', colors['accent'] | curses.A_BOLD),
+                        (f'OpenCode: {getattr(app.opencode, "path", "") or "-"}', curses.A_NORMAL),
+                        (f'Continue: {getattr(app.continue_settings, "path", "") or "-"}', curses.A_NORMAL),
+                        (f'Hermes home: {getattr(app.hermes, "home_root", "") or "-"}', curses.A_NORMAL),
+                    ]
 
             elif view_mode == 'benchmark':
                 records = list(benchmark_state.get('records', []) or [])
@@ -4659,8 +5004,8 @@ def tui(stdscr, app: AppConfig):
             footer = '[Enter] send  Tab/] next tab  Shift-Tab/[ prev tab  [Esc] stop model + exit'
             footer2 = '[Up/Down] prompt  [Ctrl+P/N/B/F/A/E] convo  [PgUp/PgDn/Home/End] right tab.'
         elif view_mode == 'benchmark':
-            footer = '[Esc] details  [F] fast bench  [R] results  [W] wiki  Tab/] next  Shift-Tab/[ prev  [A] abort'
-            footer2 = '[Up/Down/PgUp/PgDn/Home/End] scroll active right tab.'
+            footer = '[Esc] details  [F] fast  [R] results  [W] wiki  Tab/] next  [A] abort'
+            footer2 = '[Up/Down/PgUp/PgDn/Home/End] scroll right tab.'
         elif view_mode == 'results':
             footer = '[Esc] details  [Up/Down] select run  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab.'
@@ -4668,15 +5013,15 @@ def tui(stdscr, app: AppConfig):
             footer = '[Esc] models  [D] deep all  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab  [M] refresh rankings.'
         elif view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] actions  [T] try  [B/F/O/H] benchmarks  [R] results  [v] density'
-            footer2 = 'Tab/] next tab  Shift-Tab/[ prev tab  [g/c/G] exports  [Y/y] verify  [:] palette  [?] help'
+            footer = '[Esc] models  [Enter/l] actions  [T] try  [B/F/O/H] bench  [R] results'
+            footer2 = 'Tab/] next  Shift-Tab/[ prev  [v] density  [g/c/G] exports  [Y/y] verify  [:] actions'
         else:
             footer = '[Enter] details  [/] search  [f] filter  [T] sort  [C] clear browser  [*] favorite'
             footer2 = '[a/e/d] models  [x/X] detect/prune  [R/M] ranks  [Y/y] verify  [:] palette  [?] help  [q] quit'
         if action_running():
             footer = '[A] abort active action   ' + footer
-        safe_addstr(stdscr, h - 2, 2, footer[: w - 4], colors['accent'] | curses.A_BOLD)
-        safe_addstr(stdscr, h - 1, 2, footer2[: w - 4], colors['muted'] | curses.A_BOLD)
+        safe_addstr(stdscr, h - 2, 2, ellipsize(footer, w - 4), colors['accent'] | curses.A_BOLD)
+        safe_addstr(stdscr, h - 1, 2, ellipsize(footer2, w - 4), colors['muted'] | curses.A_BOLD)
         stdscr.refresh()
 
         try:
@@ -4707,13 +5052,12 @@ def tui(stdscr, app: AppConfig):
                 message = 'Need at least two models for compare.'
             continue
         if key == ord(':'):
-            action = prompt_command_palette(stdscr, colors)
+            action = prompt_command_palette(stdscr, colors, app)
             palette_keys = {
                 'search': ord('/'),
                 'filters': ord('f'),
                 'sort': ord('T'),
                 'favorite': ord('*'),
-                'density': ord('v'),
                 'help': ord('?'),
                 'settings': ord('o'),
                 'detect': ord('x'),
@@ -4726,11 +5070,55 @@ def tui(stdscr, app: AppConfig):
             }
             if action in palette_keys:
                 key = palette_keys[action]
+            elif action == 'density':
+                current_density = normalize_choice(getattr(app.ui, 'detail_density', 'simple'), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+                app.ui.detail_density = 'advanced' if current_density == 'simple' else 'simple'
+                app.save()
+                model = active_detail_model() or selected_model()
+                if view_mode != 'detail' and model is not None:
+                    open_model_details(model)
+                message = (
+                    f'Detail density: {detail_density_label(app.ui.detail_density)}. '
+                    'Advanced shows extra benchmark detail in the Benchmarks tab.'
+                )
+                continue
             elif action == 'clear_browser':
                 key = ord('C')
+            elif action == 'toggle_browser_view':
+                current = normalize_choice(getattr(app.ui, 'browser_view', 'compact'), tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact')
+                app.ui.browser_view = 'advanced' if current == 'compact' else 'compact'
+                app.save()
+                if view_mode != 'list':
+                    model = active_detail_model()
+                    if view_mode == 'try':
+                        exit_try_view()
+                    view_mode = 'list'
+                    detail_model_id = ''
+                    if model is not None:
+                        select_model_in_browser(model.id)
+                message = f'Browser view: {browser_view_label(app.ui.browser_view)}. Returned to Models so the change is visible.'
+                continue
             elif action == 'config_doctor':
                 show_config_doctor_overlay(stdscr, colors, app, active_detail_model() or selected_model())
                 message = 'Config Doctor closed.'
+                continue
+            elif action == 'raw_speed_benchmark':
+                model = active_detail_model() or selected_model()
+                if model is None:
+                    message = 'No model selected for raw speed benchmark.'
+                    continue
+                start_background_action(
+                    model,
+                    'raw speed benchmark',
+                    lambda progress, token, model=model: benchmark_raw_speed_profile(
+                        app,
+                        model,
+                        progress=progress,
+                        cancel_token=token,
+                    ),
+                    done_event='benchmark_done',
+                    run_kind='raw_speed',
+                )
                 continue
             else:
                 message = 'Command palette cancelled.'

@@ -16,6 +16,12 @@ class ModelConfig:
     threads: int = 6
     ngl: int = 999
     temp: float = 0.7
+    top_p: float = 0.95
+    top_k: int = 40
+    repeat_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    no_context_shift: bool = False
+    preserve_thinking: str = 'auto'
     parallel: int = 1
     cache_ram: int = 0
     flash_attn: bool = True
@@ -70,6 +76,7 @@ class ModelConfig:
     turboquant_source: str = ''
     turboquant_reason: str = ''
     extra_args: List[str] = field(default_factory=list)
+    launch_overrides: Dict[str, object] = field(default_factory=dict)
     favorite: bool = False
     last_used_at: str = ''
     sort_rank: int = 0
@@ -127,3 +134,4 @@ class HermesSettings:
 class UiSettings:
     preferred_sort: str = 'port'
     detail_density: str = 'simple'
+    browser_view: str = 'compact'

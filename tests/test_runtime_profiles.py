@@ -14,8 +14,10 @@ from llama_tui.benchmark import (
     adaptive_record_from_candidate,
     benchmark_adaptive_candidate,
     benchmark_all_models_runner,
+    benchmark_completion,
     benchmark_exhaustive_profiles,
     benchmark_fast_profiles,
+    benchmark_raw_speed_profile,
     benchmark_run_summary,
     benchmark_runtime_profile_with_retry,
     classify_benchmark_failure,
@@ -29,6 +31,7 @@ from llama_tui.benchmark import (
     select_measured_profiles,
 )
 from llama_tui.hardware import HardwareProfile
+from llama_tui.launch_profiles import build_benchmark_launch_profile
 from llama_tui.main import (
     build_cli_parser,
     ensure_engine_session_lock,
@@ -150,6 +153,29 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(caps.supports_cache_type_kv)
         self.assertEqual(caps.gpu_layers_flag, '--n-gpu-layers')
 
+    def test_capability_parser_detects_benchmark_relevant_flags(self):
+        caps = parse_engine_capabilities(
+            'usage: llama-server --chat-template-kwargs JSON --reasoning auto --reasoning-budget N '
+            '--context-shift --no-context-shift --cache-prompt --cache-reuse N --fit-target R '
+            '--top-p P --top-k K --min-p P --repeat-penalty N --presence-penalty N --samplers LIST --seed SEED',
+            engine_id='llama.cpp',
+        )
+
+        self.assertTrue(caps.supports_chat_template_kwargs)
+        self.assertTrue(caps.supports_reasoning)
+        self.assertTrue(caps.supports_reasoning_budget)
+        self.assertTrue(caps.supports_context_shift)
+        self.assertTrue(caps.supports_cache_prompt)
+        self.assertTrue(caps.supports_cache_reuse)
+        self.assertTrue(caps.supports_fit_target)
+        self.assertTrue(caps.supports_top_p)
+        self.assertTrue(caps.supports_top_k)
+        self.assertTrue(caps.supports_min_p)
+        self.assertTrue(caps.supports_repeat_penalty)
+        self.assertTrue(caps.supports_presence_penalty)
+        self.assertTrue(caps.supports_samplers)
+        self.assertTrue(caps.supports_seed)
+
     def test_buun_command_uses_value_flash_and_strips_generic_cache_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
@@ -188,6 +214,129 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('--cache-type-k', cmd)
         self.assertNotIn('--cache-type-v', cmd)
         self.assertEqual(cmd[cmd.index('--flash-attn') + 1], 'on')
+
+    def test_command_builder_adds_supported_benchmark_profile_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='tiny',
+                name='Tiny Reasoning',
+                path='/models/tiny.gguf',
+                alias='tiny',
+                port=18080,
+                temp=0.33,
+                top_p=0.8,
+                top_k=24,
+                repeat_penalty=1.08,
+                presence_penalty=0.1,
+                no_context_shift=True,
+                preserve_thinking='on',
+                extra_args=['--top-p', '0.1', '--no-context-shift', '--seed', '999'],
+                launch_overrides={
+                    'min_p': 0.05,
+                    'seed': 123,
+                    'samplers': 'top_k;top_p',
+                    'reasoning': 'auto',
+                    'reasoning_budget': 256,
+                    'cache_prompt': True,
+                    'cache_reuse': 64,
+                    'fit_target': '0.85',
+                },
+            )
+            caps = EngineCapabilities(
+                flash_attn_syntax='value',
+                flash_attn_flag='--flash-attn',
+                supports_cache_type_kv=True,
+                supports_parallel=True,
+                supports_context_shift=True,
+                supports_chat_template_kwargs=True,
+                supports_reasoning=True,
+                supports_reasoning_budget=True,
+                supports_cache_prompt=True,
+                supports_cache_reuse=True,
+                supports_fit_target=True,
+                supports_top_p=True,
+                supports_top_k=True,
+                supports_min_p=True,
+                supports_repeat_penalty=True,
+                supports_presence_penalty=True,
+                supports_samplers=True,
+                supports_seed=True,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model)
+
+        self.assertEqual(cmd[cmd.index('--temp') + 1], '0.33')
+        self.assertEqual(cmd.count('--top-p'), 1)
+        self.assertEqual(cmd.count('--no-context-shift'), 1)
+        self.assertEqual(cmd.count('--seed'), 1)
+        self.assertEqual(cmd[cmd.index('--top-p') + 1], '0.8')
+        self.assertEqual(cmd[cmd.index('--top-k') + 1], '24')
+        self.assertEqual(cmd[cmd.index('--min-p') + 1], '0.05')
+        self.assertEqual(cmd[cmd.index('--repeat-penalty') + 1], '1.08')
+        self.assertEqual(cmd[cmd.index('--presence-penalty') + 1], '0.1')
+        self.assertIn('--no-context-shift', cmd)
+        self.assertIn('--cache-prompt', cmd)
+        self.assertEqual(cmd[cmd.index('--cache-reuse') + 1], '64')
+        self.assertEqual(cmd[cmd.index('--reasoning') + 1], 'auto')
+        self.assertEqual(cmd[cmd.index('--reasoning-budget') + 1], '256')
+        self.assertEqual(cmd[cmd.index('-fitt') + 1], '0.85')
+        self.assertIn('--chat-template-kwargs', cmd)
+        self.assertIn('"preserve_thinking": true', cmd[cmd.index('--chat-template-kwargs') + 1])
+
+    def test_command_builder_omits_unsupported_profile_flags_and_strips_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='tiny',
+                name='Tiny',
+                path='/models/tiny.gguf',
+                alias='tiny',
+                port=18080,
+                top_p=0.8,
+                no_context_shift=True,
+                preserve_thinking='on',
+                extra_args=['--top-p', '0.1', '--no-context-shift'],
+            )
+            caps = EngineCapabilities(
+                flash_attn_syntax='unsupported',
+                supports_cache_type_kv=True,
+                supports_parallel=True,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model)
+
+        self.assertIn('--temp', cmd)
+        self.assertNotIn('--top-p', cmd)
+        self.assertNotIn('--no-context-shift', cmd)
+        self.assertNotIn('--chat-template-kwargs', cmd)
+
+    def test_vllm_command_is_not_polluted_with_llama_server_profile_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            app.vllm_command = 'vllm'
+            model = ModelConfig(
+                id='tiny',
+                name='Tiny',
+                path='/models/tiny',
+                alias='tiny',
+                port=18080,
+                runtime='vllm',
+                top_p=0.8,
+                no_context_shift=True,
+                preserve_thinking='on',
+            )
+            profile = build_benchmark_launch_profile(model, purpose='serve_default')
+
+            cmd = app.build_command(model, benchmark_profile=profile)
+
+        self.assertEqual(cmd[:2], ['vllm', 'serve'])
+        self.assertNotIn('--temp', cmd)
+        self.assertNotIn('--top-p', cmd)
+        self.assertNotIn('--no-context-shift', cmd)
+        self.assertNotIn('--chat-template-kwargs', cmd)
 
     def test_turboquant_command_uses_short_cache_flags_for_manual_safe_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -453,7 +602,7 @@ class RuntimeProfileTests(unittest.TestCase):
             def add_or_update(self, saved):
                 self.saved.append(saved)
 
-            def start(self, _model, runtime_profile=None):
+            def start(self, _model, runtime_profile=None, benchmark_profile=None):
                 self.started_runtime_profiles.append(runtime_profile)
                 return True, 'started'
 
@@ -841,10 +990,10 @@ class RuntimeProfileTests(unittest.TestCase):
                     gpu_memory_free=7 * 1024**3,
                 )
 
-            def build_command(self, _model, runtime_profile=None):
+            def build_command(self, _model, runtime_profile=None, benchmark_profile=None):
                 return ['llama-server']
 
-            def start(self, _model, runtime_profile=None):
+            def start(self, _model, runtime_profile=None, benchmark_profile=None):
                 return True, 'started'
 
             def wait_until_ready(self, _model, timeout=180, cancel_token=None):
@@ -1434,6 +1583,118 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(context['binary_path'], app.runtime_profile.server_command)
         self.assertIn('turbo4', context['help_supported_cache_types'])
 
+    def test_runtime_record_context_includes_launch_profile_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='dense',
+                name='Dense',
+                path='/models/dense.gguf',
+                alias='dense',
+                port=18080,
+                output=4096,
+            )
+            profile = build_benchmark_launch_profile(model, purpose='serve_default', depth='fast')
+
+            with patch.object(app, 'engine_capabilities', return_value=EngineCapabilities()):
+                context = runtime_record_context(app, model, benchmark_profile=profile)
+
+        self.assertEqual(context['benchmark_profile'], 'serve_default')
+        self.assertEqual(context['benchmark_purpose'], 'serve_default')
+        self.assertEqual(context['measurement_output'], 512)
+        self.assertEqual(context['ctx'], model.ctx)
+        self.assertEqual(context['temp'], model.temp)
+
+    def test_benchmark_completion_payload_uses_launch_profile_sampling(self):
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny',
+            path='/models/tiny.gguf',
+            alias='tiny',
+            port=18080,
+            output=4096,
+            temp=0.31,
+            top_p=0.82,
+            top_k=17,
+            repeat_penalty=1.04,
+            presence_penalty=0.2,
+            launch_overrides={'min_p': 0.03, 'seed': 99},
+        )
+        profile = build_benchmark_launch_profile(model, purpose='serve_default', depth='fast')
+
+        with patch(
+            'llama_tui.benchmark.post_json',
+            return_value={
+                'usage': {'completion_tokens': 12, 'prompt_tokens': 8},
+                'choices': [{'message': {'content': 'done'}}],
+            },
+        ) as post:
+            ok, result = benchmark_completion(model, launch_profile=profile)
+
+        payload = post.call_args.args[1]
+        self.assertTrue(ok)
+        self.assertGreater(result['tokens_per_sec'], 0)
+        self.assertEqual(payload['temperature'], 0.31)
+        self.assertEqual(payload['max_tokens'], 512)
+        self.assertEqual(payload['top_p'], 0.82)
+        self.assertEqual(payload['top_k'], 17)
+        self.assertEqual(payload['repeat_penalty'], 1.04)
+        self.assertEqual(payload['presence_penalty'], 0.2)
+        self.assertEqual(payload['min_p'], 0.03)
+        self.assertEqual(payload['seed'], 99)
+
+    def test_raw_speed_benchmark_records_history_without_updating_measured_profiles(self):
+        original = ModelConfig(
+            id='tiny',
+            name='Tiny',
+            path='/models/tiny.gguf',
+            alias='tiny',
+            port=18080,
+            measured_profiles={'auto': {'tokens_per_sec': 9.0}},
+            last_benchmark_tokens_per_sec=9.0,
+        )
+
+        class FakeApp:
+            models = [original]
+
+            def __init__(self):
+                self.saved = None
+
+            def hardware_profile(self, refresh=False):
+                return HardwareProfile(memory_available=16 * 1024**3)
+
+            def runtime_profile_from_model(self, *_args, **_kwargs):
+                return None
+
+            def engine_capabilities(self):
+                return EngineCapabilities()
+
+            def add_or_update(self, saved):
+                self.saved = saved
+
+        record = {
+            'status': 'ok',
+            'objective': 'raw_speed',
+            'tokens_per_sec': 33.0,
+            'benchmark_profile': 'raw_speed',
+            'benchmark_purpose': 'raw_speed',
+            'measurement_output': 512,
+            'engine': 'llama.cpp',
+        }
+        app = FakeApp()
+
+        with patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'clean')), \
+            patch('llama_tui.benchmark.benchmark_adaptive_candidate', return_value=(record, dict(record))) as runner:
+            ok, msg = benchmark_raw_speed_profile(app, original)
+
+        self.assertTrue(ok)
+        self.assertIn('raw speed benchmark saved', msg)
+        self.assertEqual(app.saved.measured_profiles, original.measured_profiles)
+        self.assertEqual(app.saved.last_benchmark_tokens_per_sec, original.last_benchmark_tokens_per_sec)
+        self.assertEqual(app.saved.benchmark_runs[0]['kind'], 'raw_speed')
+        self.assertEqual(app.saved.benchmark_runs[0]['benchmark_profiles'], ['raw_speed'])
+        self.assertEqual(runner.call_args.kwargs['benchmark_purpose'], 'raw_speed')
+
     def test_fit_discovery_metadata_persists_on_measured_profiles(self):
         candidate = ModelConfig(id='dense', name='Dense', path='/models/dense.gguf', alias='dense', port=18080, ctx=8192)
         record = adaptive_record_from_candidate(
@@ -1750,7 +2011,7 @@ class RuntimeProfileTests(unittest.TestCase):
         )
 
         class FakeApp:
-            def build_command(self, _model, runtime_profile=None):
+            def build_command(self, _model, runtime_profile=None, benchmark_profile=None):
                 return ['buun-llama-server']
 
         with patch('llama_tui.benchmark.benchmark_adaptive_candidate', return_value=(failed, None)) as runner:
@@ -2523,6 +2784,19 @@ class RuntimeProfileTests(unittest.TestCase):
         args = build_cli_parser().parse_args(['--kill-existing'])
 
         self.assertTrue(args.kill_existing)
+
+    def test_cli_help_documents_engines_examples_and_env_vars(self):
+        help_text = build_cli_parser().format_help()
+
+        self.assertIn('examples:', help_text)
+        self.assertIn('llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4', help_text)
+        self.assertIn('llama-tui --engine buun --kill-existing', help_text)
+        self.assertIn('supported runtimes: llama.cpp, turboquant, buun, vLLM saved model entries', help_text)
+        self.assertIn('config path:', help_text)
+        self.assertIn('TURBOQUANT_LLAMA_SERVER_BIN', help_text)
+        self.assertIn('BUUN_LLAMA_SERVER_BIN', help_text)
+        self.assertIn('VLLM_COMMAND', help_text)
+        self.assertIn('--help exits before curses starts', help_text)
 
 
 class EngineSessionTests(unittest.TestCase):

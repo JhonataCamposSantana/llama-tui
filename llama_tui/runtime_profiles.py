@@ -45,8 +45,28 @@ RUNTIME_TUNING_FLAGS = (
     '-fit',
     '--fit-ctx',
     '-fitc',
+    '--fit-target',
+    '-fitt',
     '--warmup',
     '--no-warmup',
+    '--temp',
+    '--temperature',
+    '--top-p',
+    '--top-k',
+    '--min-p',
+    '--repeat-penalty',
+    '--presence-penalty',
+    '--samplers',
+    '--seed',
+    '--context-shift',
+    '--no-context-shift',
+    '--chat-template-kwargs',
+    '--reasoning',
+    '-rea',
+    '--reasoning-budget',
+    '--cache-prompt',
+    '--no-cache-prompt',
+    '--cache-reuse',
 )
 
 
@@ -59,7 +79,21 @@ class EngineCapabilities:
     supports_parallel: bool = True
     supports_fit: bool = False
     supports_fit_ctx: bool = False
+    supports_fit_target: bool = False
     supports_no_warmup: bool = False
+    supports_context_shift: bool = False
+    supports_chat_template_kwargs: bool = False
+    supports_reasoning: bool = False
+    supports_reasoning_budget: bool = False
+    supports_cache_prompt: bool = False
+    supports_cache_reuse: bool = False
+    supports_top_p: bool = False
+    supports_top_k: bool = False
+    supports_min_p: bool = False
+    supports_repeat_penalty: bool = False
+    supports_presence_penalty: bool = False
+    supports_samplers: bool = False
+    supports_seed: bool = False
     gpu_layers_flag: str = '--n-gpu-layers'
     supported_kv_modes: Tuple[str, ...] = ()
     help_text: str = ''
@@ -404,7 +438,21 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
     supports_parallel = '--parallel' in low if '--parallel' in low else defaults.supports_parallel
     supports_fit = bool(re.search(r'(^|\s)--?fit(\s|,|$)', low) or defaults.supports_fit)
     supports_fit_ctx = ('-fitc' in low or '--fit-ctx' in low or defaults.supports_fit_ctx)
+    supports_fit_target = ('-fitt' in low or '--fit-target' in low or defaults.supports_fit_target)
     supports_no_warmup = ('--no-warmup' in low or defaults.supports_no_warmup)
+    supports_context_shift = ('--context-shift' in low or '--no-context-shift' in low or defaults.supports_context_shift)
+    supports_chat_template_kwargs = ('--chat-template-kwargs' in low or defaults.supports_chat_template_kwargs)
+    supports_reasoning = ('--reasoning' in low or re.search(r'(^|\s)-rea(\s|,|$)', low) is not None or defaults.supports_reasoning)
+    supports_reasoning_budget = ('--reasoning-budget' in low or defaults.supports_reasoning_budget)
+    supports_cache_prompt = ('--cache-prompt' in low or '--no-cache-prompt' in low or defaults.supports_cache_prompt)
+    supports_cache_reuse = ('--cache-reuse' in low or defaults.supports_cache_reuse)
+    supports_top_p = ('--top-p' in low or defaults.supports_top_p)
+    supports_top_k = ('--top-k' in low or defaults.supports_top_k)
+    supports_min_p = ('--min-p' in low or defaults.supports_min_p)
+    supports_repeat_penalty = ('--repeat-penalty' in low or defaults.supports_repeat_penalty)
+    supports_presence_penalty = ('--presence-penalty' in low or defaults.supports_presence_penalty)
+    supports_samplers = ('--samplers' in low or defaults.supports_samplers)
+    supports_seed = (re.search(r'(^|\s)-s(\s|,|$)', low) is not None or '--seed' in low or defaults.supports_seed)
     if '--n-gpu-layers' in low:
         gpu_layers_flag = '--n-gpu-layers'
     elif re.search(r'(^|\s)-ngl(\s|,|$)', low):
@@ -422,7 +470,21 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_parallel=supports_parallel,
         supports_fit=supports_fit,
         supports_fit_ctx=supports_fit_ctx,
+        supports_fit_target=supports_fit_target,
         supports_no_warmup=supports_no_warmup,
+        supports_context_shift=supports_context_shift,
+        supports_chat_template_kwargs=supports_chat_template_kwargs,
+        supports_reasoning=supports_reasoning,
+        supports_reasoning_budget=supports_reasoning_budget,
+        supports_cache_prompt=supports_cache_prompt,
+        supports_cache_reuse=supports_cache_reuse,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_min_p=supports_min_p,
+        supports_repeat_penalty=supports_repeat_penalty,
+        supports_presence_penalty=supports_presence_penalty,
+        supports_samplers=supports_samplers,
+        supports_seed=supports_seed,
         gpu_layers_flag=gpu_layers_flag,
         supported_kv_modes=supported_kv_modes,
         help_text=text,

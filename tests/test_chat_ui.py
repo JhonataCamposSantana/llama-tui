@@ -18,6 +18,7 @@ from llama_tui.ui import (
     body_pane_layout,
     body_pane_height,
     active_engine_detail_line,
+    active_engine_badge_line,
     active_engine_warning_line,
     browser_models,
     build_error_source_lines,
@@ -29,20 +30,27 @@ from llama_tui.ui import (
     header_dashboard_layout,
     header_dashboard_title,
     benchmark_elapsed_text,
+    benchmark_launch_profile_detail_lines,
     benchmark_progress_fraction,
     benchmark_record_display_items,
     benchmark_ranking_rows,
     benchmark_row_text,
     benchmark_run_line,
     benchmark_runs_for_model,
+    build_model_row_summary,
+    browser_header_for_view,
     browser_model_line,
+    browser_model_line_for_view,
+    browser_view_label,
     BROWSER_HEADER,
     benchmark_wiki_lines,
     benchmark_command_lines,
     build_try_live_stat_lines,
     build_try_transcript_items,
     clamp_scroll,
+    compact_browser_model_line,
     config_doctor_items,
+    command_palette_options,
     deep_benchmark_all_options,
     finish_try_live_metrics,
     machine_category_items,
@@ -110,6 +118,10 @@ class ChatPayloadTests(unittest.TestCase):
         self.assertEqual(payload['messages'], messages)
         self.assertEqual(payload['temperature'], 0.42)
         self.assertEqual(payload['max_tokens'], 321)
+        self.assertEqual(payload['top_p'], 0.95)
+        self.assertEqual(payload['top_k'], 40)
+        self.assertEqual(payload['repeat_penalty'], 1.0)
+        self.assertEqual(payload['presence_penalty'], 0.0)
         self.assertTrue(payload['stream'])
 
     def test_sse_parser_handles_chunks_done_and_noise(self):
@@ -266,11 +278,13 @@ class BrowserAndFormTests(unittest.TestCase):
             'hermes_last_workspace_path': '/tmp/project',
             'preferred_sort': 'recent',
             'detail_density': 'dense',
+            'browser_view': 'wide',
         })
 
         self.assertIsNone(parsed)
         self.assertIn('hermes_quiet', errors)
         self.assertIn('detail_density', errors)
+        self.assertIn('browser_view', errors)
 
     def test_parse_settings_form_answers_round_trips_continue_roles(self):
         parsed, errors = parse_settings_form_answers({
@@ -313,6 +327,7 @@ class BrowserAndFormTests(unittest.TestCase):
             'hermes_last_workspace_path': '/tmp/project',
             'preferred_sort': 'recent',
             'detail_density': 'advanced',
+            'browser_view': 'advanced',
         })
 
         self.assertFalse(errors)
@@ -321,6 +336,7 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertEqual(parsed['continue']['edit_model_id'], 'continue-edit')
         self.assertEqual(parsed['continue']['autocomplete_model_id'], 'continue-small')
         self.assertEqual(parsed['continue']['merge_mode'], 'preserve_sections')
+        self.assertEqual(parsed['ui']['browser_view'], 'advanced')
 
     def test_browser_models_filters_and_sorts_by_user_preferences(self):
         alpha = ModelConfig(id='alpha', name='Alpha', path='alpha.gguf', alias='alpha', port=18080, runtime='llama.cpp')
@@ -441,6 +457,9 @@ class BrowserAndFormTests(unittest.TestCase):
         rows = config_doctor_items(FakeApp(), active_model=passed)
         text = '\n'.join(row for row, _kind in rows)
 
+        self.assertIn('code path:', text)
+        self.assertIn('ENGINE: vLLM', text)
+        self.assertIn('active engine path:', text)
         self.assertIn('model verification: needs_benchmark:1 passed:1', text)
         self.assertIn('Continue Agent tools: tool_use exported for 2 model(s); MCP requires Agent Mode', text)
         self.assertIn('server endpoints split: 2 endpoints', text)
@@ -503,6 +522,30 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn('binary: buun-llama-server', active_engine_detail_line(FakeApp(), model))
         self.assertIn('key=turbo4 value=turbo4', active_engine_detail_line(FakeApp(), model))
 
+    def test_active_engine_badge_line_is_prominent(self):
+        model = ModelConfig(id='gemma', name='Gemma', path='gemma.gguf', alias='gemma', port=18080)
+        model.turboquant_status = 'native'
+
+        class Profile:
+            def buun_kv_pair(self):
+                return 'turbo4', 'turbo4'
+
+        class FakeApp:
+            runtime_profile = Profile()
+
+            def command_exists(self, _command):
+                return True
+
+            def active_engine_key_for_model(self, _model):
+                return 'buun'
+
+            def active_runtime_binary_for_model(self, _model):
+                return 'buun-llama-server'
+
+        line = active_engine_badge_line(FakeApp(), model)
+
+        self.assertEqual(line, 'ENGINE: Buun | KV key=turbo4 value=turbo4 | binary ok')
+
     def test_turboquant_active_engine_label_kv_and_warning(self):
         model = ModelConfig(id='oss', name='GPT OSS', path='oss.gguf', alias='oss', port=18080)
         model.turboquant_status = 'incompatible'
@@ -547,6 +590,74 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn('key=q8_0 value=q8_0', active_engine_detail_line(FakeApp(), model))
         self.assertIn('head_dim=64', warning)
         self.assertIn('binary warning', warning)
+
+    def test_compact_fleet_view_summarizes_launch_decision_fields(self):
+        model = ModelConfig(id='code', name='Code Model', path='code.gguf', alias='code', port=18080)
+        model.architecture_type = 'dense'
+        model.default_benchmark_status = 'done'
+        model.benchmark_fingerprint = 'fresh'
+        model.measured_profiles = {
+            'opencode_ready': {
+                'status': 'ok',
+                'tokens_per_sec': 18.4,
+                'ctx_per_slot': 16384,
+            },
+            'auto': {
+                'status': 'ok',
+                'tokens_per_sec': 16.0,
+                'ctx_per_slot': 8192,
+            },
+        }
+
+        class FakeApp:
+            def model_fingerprint(self, _model):
+                return 'fresh'
+
+            def active_engine_key_for_model(self, _model):
+                return 'turboquant'
+
+            def active_runtime_binary_for_model(self, _model):
+                return '/bin/sh'
+
+            def command_exists(self, _command):
+                return True
+
+            def validate_model_target(self, _model):
+                return True, ''
+
+            def turboquant_session_advisory(self, _model):
+                return ''
+
+            def turboquant_binary_warning(self, _model):
+                return ''
+
+        summary = build_model_row_summary(FakeApp(), model, 'STOPPED')
+        line = compact_browser_model_line(FakeApp(), model, 'STOPPED', '', 100)
+
+        self.assertEqual(summary['pick'], 'OpenCode')
+        self.assertEqual(summary['ctx'], 16384)
+        self.assertEqual(summary['engine'], 'TurboQuant+')
+        self.assertEqual(summary['health'], 'OK')
+        self.assertIn('Code Model', line)
+        self.assertIn('OpenCode', line)
+        self.assertIn('16384', line)
+        self.assertIn('TurboQuant+', line)
+        self.assertIn('OK', line)
+        self.assertIn('MODEL', browser_header_for_view('compact', 100))
+        self.assertEqual(browser_view_label('advanced'), 'Advanced')
+
+    def test_advanced_browser_view_preserves_dense_line(self):
+        model = ModelConfig(id='dense', name='Dense', path='dense.gguf', alias='dense', port=18080)
+
+        class FakeApp:
+            def role_badges(self, _model_id):
+                return '-'
+
+        line = browser_model_line_for_view(FakeApp(), model, 'STOPPED', '', 120, 'advanced')
+
+        self.assertIn(' ENGINE ', browser_header_for_view('advanced', 120))
+        self.assertIn('dense', line)
+        self.assertNotIn('HEALTH', browser_header_for_view('advanced', 120))
 
     def test_machine_best_summary_includes_explanatory_reason(self):
         model = ModelConfig(id='balanced', name='Balanced', path='balanced.gguf', alias='balanced', port=18080)
@@ -714,16 +825,16 @@ class ProfileUiTests(unittest.TestCase):
         self.assertTrue(wrapped[1].startswith('  '))
 
     def test_right_tabs_by_view_and_defaults(self):
-        self.assertEqual(right_tabs_for_view('detail'), ['summary', 'logs', 'errors', 'command', 'benchmarks'])
+        self.assertEqual(right_tabs_for_view('detail'), ['overview', 'launch', 'tuning', 'benchmarks', 'logs', 'command', 'exports'])
         self.assertEqual(right_tabs_for_view('benchmark'), ['progress', 'results', 'commands', 'logs', 'errors'])
         self.assertEqual(right_tabs_for_view('try'), ['profile', 'logs', 'errors', 'stats', 'command'])
         self.assertEqual(right_tabs_for_view('results'), ['run_summary', 'rankings', 'failures'])
         self.assertEqual(right_tabs_for_view('machine_results'), ['overview', 'rankings', 'failures'])
 
-        self.assertEqual(default_right_tab('detail'), 'summary')
+        self.assertEqual(default_right_tab('detail'), 'overview')
         self.assertEqual(default_right_tab('benchmark'), 'progress')
         self.assertEqual(default_right_tab('machine_results'), 'overview')
-        self.assertEqual(normalize_right_tab('detail', 'missing'), 'summary')
+        self.assertEqual(normalize_right_tab('detail', 'missing'), 'overview')
 
     def test_right_tab_cycling_and_scroll_keys(self):
         self.assertEqual(cycle_right_tab('benchmark', 'progress', 1), 'results')
@@ -893,6 +1004,23 @@ class ProfileUiTests(unittest.TestCase):
             'completed': 1,
             'total': 4,
         })
+
+        class FakeApp:
+            def command_exists(self, _command):
+                return True
+
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp'
+
+            def active_runtime_binary_for_model(self, _model):
+                return '/bin/llama-server'
+
+            def turboquant_session_advisory(self, _model):
+                return ''
+
+            def turboquant_binary_warning(self, _model):
+                return ''
+
         items = build_header_dashboard_items(
             {
                 'tiny': ('READY', 'ok'),
@@ -908,11 +1036,13 @@ class ProfileUiTests(unittest.TestCase):
             'cpu=8 ram=12/32GiB',
             ['Hermes not ready, needs 64000 ctx/slot'],
             width=80,
+            app=FakeApp(),
         )
         text = '\n'.join(line for line, _kind in items)
 
         self.assertEqual(header_dashboard_title('benchmark'), 'Benchmark Status')
         self.assertIn('READY:1', text)
+        self.assertIn('ENGINE: llama.cpp', text)
         self.assertIn('LOADING:1', text)
         self.assertIn('ERROR:1', text)
         self.assertIn('active: tiny READY', text)
@@ -937,11 +1067,20 @@ class ProfileUiTests(unittest.TestCase):
             class Hermes:
                 command = 'hermes'
 
+            class Ui:
+                preferred_sort = 'port'
+                detail_density = 'simple'
+                browser_view = 'compact'
+
             opencode = OpenCode()
             hermes = Hermes()
+            ui = Ui()
 
             def runtime_indicator(self):
                 return 'Engine: llama.cpp | KV: - | Context: model default'
+
+            def command_exists(self, command):
+                return command == '/bin/llama-server'
 
             def lm_studio_roots(self):
                 return [Path('/lmstudio/models'), Path('/lmstudio/hub/models')]
@@ -950,12 +1089,28 @@ class ProfileUiTests(unittest.TestCase):
         text = '\n'.join(line for line, _kind in items)
 
         self.assertIn('config: /tmp/models.json', text)
+        self.assertIn('code path:', text)
+        self.assertIn('ENGINE: llama.cpp', text)
         self.assertIn('llama-server: /bin/llama-server', text)
+        self.assertIn('browser=Compact', text)
         self.assertIn('Engine: llama.cpp', text)
         self.assertIn('opencode: /tmp/opencode.json', text)
         self.assertIn('hermes: hermes', text)
         self.assertIn('lm-studio=/lmstudio/models, /lmstudio/hub/models', text)
         self.assertIn('message: Ready.', text)
+
+    def test_command_palette_options_show_toggle_state(self):
+        app = SimpleNamespace(ui=SimpleNamespace(detail_density='simple', browser_view='compact'))
+
+        options = command_palette_options(app)
+        text = '\n'.join(label for _key, label, _value in options)
+
+        self.assertIn('Detail Density: Simple -> Advanced', text)
+        self.assertIn('Browser View: Compact -> Advanced', text)
+        self.assertIn('Raw Speed Benchmark...', text)
+        self.assertIn('Settings...', text)
+        self.assertIn('Config Doctor...', text)
+        self.assertTrue(all(len(f'[{key}] {label}') <= 68 for key, label, _value in options))
 
     def test_log_and_error_tab_builders_are_separate(self):
         logs = build_log_items(['server line'], log_attr=2, muted_attr=4)
@@ -1324,6 +1479,23 @@ class BenchmarkDashboardTests(unittest.TestCase):
             'fit_discovery_phase': 'weight_fit',
             'viable_ngl': 28,
             'viable_ngl_source': 'offloaded_layers',
+            'benchmark_profile': 'serve_default',
+            'engine': 'TurboQuant+',
+            'measurement_output': 512,
+            'output': 4096,
+            'kv_key': 'q8_0',
+            'kv_value': 'turbo4',
+            'flash_attn': 'on',
+            'fit': True,
+            'fit_context': 16384,
+            'no_context_shift': True,
+            'temp': 0.4,
+            'top_p': 0.95,
+            'top_k': 40,
+            'repeat_penalty': 1.05,
+            'presence_penalty': 0.0,
+            'preserve_thinking': True,
+            'chat_template_kwargs': {'preserve_thinking': True},
             'samples': [{
                 'task': 'fix_calc',
                 'status': 'hermes command failed',
@@ -1340,6 +1512,10 @@ class BenchmarkDashboardTests(unittest.TestCase):
 
         self.assertIn('detail: bad flag', text)
         self.assertIn('failure: alloc_tensor_range: failed to allocate CUDA0 buffer', text)
+        self.assertIn('profile: serve_default engine=TurboQuant+ ctx=2048 output=4096 measure=512', text)
+        self.assertIn('kv: key=q8_0 value=turbo4 flash=on fit=on fit_ctx=16384 no_ctx_shift=yes', text)
+        self.assertIn('sampling: temp=0.4 top_p=0.95 top_k=40 repeat=1.05 presence=0.0', text)
+        self.assertIn('template: preserve_thinking=true', text)
         self.assertIn('log: /tmp/runtime/turboquant/m.log', text)
         self.assertIn('fit discovery: phase=weight_fit viable_ngl=28 source=offloaded_layers', text)
         self.assertIn('architecture: MoE 8x2 from gguf_metadata', text)
@@ -1348,6 +1524,31 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('command: hermes chat -q fix', text)
         self.assertIn('config: /tmp/hermes/config.yaml', text)
         self.assertIn('stderr: bad flag', text)
+
+    def test_benchmark_launch_profile_detail_lines_stay_compact(self):
+        record = {
+            'benchmark_profile': 'serve_default',
+            'engine': 'llama.cpp',
+            'ctx': 8192,
+            'output': 4096,
+            'measurement_output': 512,
+            'kv_key': 'q8_0',
+            'kv_value': 'q8_0',
+            'flash_attn': 'on',
+            'fit': False,
+            'no_context_shift': False,
+            'temp': 0.0,
+            'unsupported_launch_flags': ['--chat-template-kwargs'],
+        }
+
+        lines = benchmark_launch_profile_detail_lines(record)
+        wrapped = []
+        for line in lines:
+            wrapped.extend(wrap_display_item_lines(line, width=58))
+
+        self.assertTrue(lines)
+        self.assertTrue(all(len(line) <= 58 for line in wrapped))
+        self.assertIn('profile: serve_default engine=llama.cpp ctx=8192 output=4096 measure=512', lines[0])
 
     def test_benchmark_runs_for_model_falls_back_to_legacy_rows(self):
         model = ModelConfig(

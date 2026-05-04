@@ -12,6 +12,13 @@ from .control import CancelToken, CancelledError, check_cancelled, sleep_with_ca
 from .discovery import extract_quant
 from .gguf import architecture_label, extra_arg_value, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
+from .launch_profiles import (
+    BenchmarkLaunchProfile,
+    benchmark_launch_metadata,
+    benchmark_profile_request_fields,
+    benchmark_profile_server_args,
+    build_benchmark_launch_profile,
+)
 from .memory_guardrail import (
     MemoryGuardrailDecision,
     MemoryGuardrailState,
@@ -132,9 +139,14 @@ def benchmark_command_preview(
     app: AppConfig,
     model: ModelConfig,
     runtime_profile: Optional[RuntimeProfile] = None,
+    benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
 ) -> str:
     try:
-        return shlex.join([str(item) for item in app.build_command(model, runtime_profile=runtime_profile)])
+        return shlex.join([str(item) for item in app.build_command(
+            model,
+            runtime_profile=runtime_profile,
+            benchmark_profile=benchmark_profile,
+        )])
     except Exception:
         return ''
 
@@ -1956,23 +1968,30 @@ BENCHMARK_PROMPTS = [
 
 def benchmark_completion(
     model: ModelConfig,
-    max_tokens: int = 64,
+    max_tokens: Optional[int] = None,
     timeout: int = 180,
     prompt: Optional[str] = None,
     cancel_token: Optional[CancelToken] = None,
+    launch_profile: Optional[BenchmarkLaunchProfile] = None,
 ) -> Tuple[bool, Dict]:
     check_cancelled(cancel_token)
     prompt = prompt or BENCHMARK_PROMPTS[0]
+    if launch_profile is not None:
+        request_fields = benchmark_profile_request_fields(launch_profile, max_tokens=max_tokens)
+    else:
+        request_fields = {
+            'max_tokens': max(1, int(max_tokens or 64)),
+            'temperature': 0,
+        }
     payload = {
         'model': model.alias,
         'messages': [
             {'role': 'system', 'content': 'You are a concise local model benchmark assistant.'},
             {'role': 'user', 'content': prompt},
         ],
-        'max_tokens': max_tokens,
-        'temperature': 0,
         'stream': False,
     }
+    payload.update(request_fields)
     url = f'http://{model.host}:{model.port}/v1/chat/completions'
     started = time.time()
     try:
@@ -2001,12 +2020,20 @@ def benchmark_completion_suite(
     max_tokens: int = BENCHMARK_SAMPLE_TOKENS,
     timeout: int = BENCHMARK_SAMPLE_TIMEOUT,
     cancel_token: Optional[CancelToken] = None,
+    launch_profile: Optional[BenchmarkLaunchProfile] = None,
 ) -> Tuple[bool, Dict]:
     samples = []
     failures = []
     for prompt in BENCHMARK_PROMPTS:
         check_cancelled(cancel_token)
-        ok, bench = benchmark_completion(model, max_tokens=max_tokens, timeout=timeout, prompt=prompt, cancel_token=cancel_token)
+        ok, bench = benchmark_completion(
+            model,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            prompt=prompt,
+            cancel_token=cancel_token,
+            launch_profile=launch_profile,
+        )
         if ok:
             samples.append(bench)
         else:
@@ -2155,8 +2182,9 @@ def _run_server_benchmark_candidates(
         score: float = 0.0,
         elapsed: float = 0.0,
         detail: str = '',
+        launch_profile: Optional[BenchmarkLaunchProfile] = None,
     ):
-        runtime_context = runtime_record_context(app, candidate)
+        runtime_context = runtime_record_context(app, candidate, benchmark_profile=launch_profile)
         record = {
             'preset': preset,
             'tier': tier,
@@ -2184,18 +2212,29 @@ def _run_server_benchmark_candidates(
         record.update(current_process_pressure_payload())
         benchmark_records.append(record)
 
-    current: Optional[Tuple[str, str, ModelConfig]] = None
+    current: Optional[Tuple[str, str, ModelConfig, Optional[BenchmarkLaunchProfile]]] = None
     try:
         for attempt, (preset, tier, candidate, tune_msg) in enumerate(candidates, start=1):
             check_cancelled(cancel_token)
-            current = (preset, tier, candidate)
+            try:
+                capabilities = app.engine_capabilities()
+            except Exception:
+                capabilities = None
+            launch_profile = build_benchmark_launch_profile(
+                candidate,
+                None,
+                capabilities,
+                purpose='serve_default',
+                depth='full',
+            )
+            current = (preset, tier, candidate, launch_profile)
             if progress:
                 progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier}: {tune_msg}')
-            ok, msg = app.start(candidate)
+            ok, msg = app.start(candidate, benchmark_profile=launch_profile)
             if not ok:
                 if progress:
                     progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} failed to start: {concise_failure(msg)}')
-                add_benchmark_record(preset, tier, candidate, 'start failed', detail=msg)
+                add_benchmark_record(preset, tier, candidate, 'start failed', detail=msg, launch_profile=launch_profile)
                 failures.append(f'{preset}/{tier}: start failed ({concise_failure(msg)})')
                 continue
 
@@ -2206,7 +2245,7 @@ def _run_server_benchmark_candidates(
                 if not ready_ok:
                     if progress:
                         progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} not ready: {concise_failure(ready_msg)}')
-                    add_benchmark_record(preset, tier, candidate, 'not ready', detail=ready_msg)
+                    add_benchmark_record(preset, tier, candidate, 'not ready', detail=ready_msg, launch_profile=launch_profile)
                     failures.append(f'{preset}/{tier}: {concise_failure(ready_msg)}')
                     continue
 
@@ -2214,25 +2253,34 @@ def _run_server_benchmark_candidates(
                     progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} ready; warming benchmark prompt...')
                 benchmark_completion(
                     candidate,
-                    max_tokens=BENCHMARK_WARMUP_TOKENS,
+                    max_tokens=min(BENCHMARK_WARMUP_TOKENS, max(1, launch_profile.measurement_output)),
                     timeout=BENCHMARK_WARMUP_TIMEOUT,
                     cancel_token=cancel_token,
+                    launch_profile=launch_profile,
                 )
                 if progress:
                     progress(
                         f'candidate {attempt}/{len(candidates)} {preset}/{tier} '
-                        f'measuring {len(BENCHMARK_PROMPTS)}x{BENCHMARK_SAMPLE_TOKENS}-token completion suite...'
+                        f'measuring {len(BENCHMARK_PROMPTS)}x{launch_profile.measurement_output}-token serve_default suite...'
                     )
                 bench_ok, bench = benchmark_completion_suite(
                     candidate,
-                    max_tokens=BENCHMARK_SAMPLE_TOKENS,
+                    max_tokens=max(1, launch_profile.measurement_output),
                     timeout=BENCHMARK_SAMPLE_TIMEOUT,
                     cancel_token=cancel_token,
+                    launch_profile=launch_profile,
                 )
                 if not bench_ok:
                     if progress:
                         progress(f'candidate {attempt}/{len(candidates)} {preset}/{tier} benchmark failed: {bench.get("error", "unknown error")}')
-                    add_benchmark_record(preset, tier, candidate, 'benchmark failed', detail=str(bench.get('error', 'unknown error')))
+                    add_benchmark_record(
+                        preset,
+                        tier,
+                        candidate,
+                        'benchmark failed',
+                        detail=str(bench.get('error', 'unknown error')),
+                        launch_profile=launch_profile,
+                    )
                     failures.append(f'{preset}/{tier}: benchmark failed ({bench.get("error", "unknown error")})')
                     continue
 
@@ -2243,7 +2291,7 @@ def _run_server_benchmark_candidates(
                         f'candidate {attempt}/{len(candidates)} {preset}/{tier} '
                         f'scored median {score:.2f} tok/s across {int(bench.get("sample_count", 1))} sample(s)'
                     )
-                add_benchmark_record(preset, tier, candidate, 'ok', score=score, elapsed=elapsed)
+                add_benchmark_record(preset, tier, candidate, 'ok', score=score, elapsed=elapsed, launch_profile=launch_profile)
                 results.append({
                     'score': score,
                     'preset': preset,
@@ -2261,8 +2309,15 @@ def _run_server_benchmark_candidates(
                 sleep_with_cancel(0.5, cancel_token)
     except CancelledError:
         if current is not None:
-            preset, tier, candidate = current
-            add_benchmark_record(preset, tier, candidate, 'aborted', detail='user requested abort')
+            preset, tier, candidate, launch_profile = current
+            add_benchmark_record(
+                preset,
+                tier,
+                candidate,
+                'aborted',
+                detail='user requested abort',
+                launch_profile=launch_profile,
+            )
             app.stop(candidate, managed_only=True)
         recorded_model = clone_model_config(model)
         recorded_model.last_benchmark_results = benchmark_records
@@ -2366,8 +2421,31 @@ def adaptive_profile_dict(
         'engine',
         'server_bin',
         'runtime_profile',
+        'benchmark_profile',
+        'benchmark_purpose',
+        'measurement_output',
+        'top_p',
+        'top_k',
+        'repeat_penalty',
+        'presence_penalty',
+        'min_p',
+        'seed',
+        'samplers',
         'kv_preset',
+        'kv_key',
+        'kv_value',
         'flash_attn_mode',
+        'fit',
+        'fit_target',
+        'no_context_shift',
+        'cache_prompt',
+        'cache_reuse',
+        'reasoning',
+        'reasoning_budget',
+        'preserve_thinking',
+        'preserve_thinking_source',
+        'chat_template_kwargs',
+        'unsupported_launch_flags',
         'kv_family',
         'kv_quality_tier',
         'kv_compression_tier',
@@ -2928,6 +3006,26 @@ def build_benchmark_run(
         'failed': len(failed),
         'hardware': hardware,
     }
+    run['benchmark_profiles'] = sorted({
+        str(row.get('benchmark_profile', '') or '')
+        for row in records
+        if str(row.get('benchmark_profile', '') or '')
+    })
+    run['benchmark_purposes'] = sorted({
+        str(row.get('benchmark_purpose', '') or '')
+        for row in records
+        if str(row.get('benchmark_purpose', '') or '')
+    })
+    run['engines'] = sorted({
+        str(row.get('engine', '') or '')
+        for row in records
+        if str(row.get('engine', '') or '')
+    })
+    run['measurement_outputs'] = sorted({
+        int(row.get('measurement_output', 0) or 0)
+        for row in records
+        if int(row.get('measurement_output', 0) or 0) > 0
+    })
     run.update(current_process_pressure_payload())
     return run
 
@@ -2950,15 +3048,20 @@ def adaptive_record_from_candidate(
     engine: str = '',
     server_bin: str = '',
     runtime_profile: str = '',
+    benchmark_profile: str = '',
+    benchmark_purpose: str = '',
     kv_preset: str = '',
     flash_attn_mode: str = '',
+    flash_attn: str = '',
     kv_family: str = 'default',
     kv_quality_tier: str = '',
     kv_compression_tier: str = '',
     kv_score_penalty: float = 0.0,
     benchmark_depth: str = '',
     runtime_fit: bool = False,
+    fit: bool = False,
     fit_context: int = 0,
+    fit_target: str = '',
     runtime_no_warmup: bool = False,
     gpu_layers_mode: str = '',
     batch_size: int = 0,
@@ -2986,6 +3089,28 @@ def adaptive_record_from_candidate(
     prompt_tokens_per_sec: float = 0.0,
     peak_vram_used: int = 0,
     gpu_memory_total: int = 0,
+    ctx: Optional[int] = None,
+    output: Optional[int] = None,
+    measurement_output: int = 0,
+    temp: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    repeat_penalty: Optional[float] = None,
+    presence_penalty: Optional[float] = None,
+    min_p: Optional[float] = None,
+    seed: Optional[int] = None,
+    samplers: str = '',
+    kv_key: str = '',
+    kv_value: str = '',
+    no_context_shift: bool = False,
+    cache_prompt: Optional[bool] = None,
+    cache_reuse: int = 0,
+    reasoning: str = '',
+    reasoning_budget: Optional[int] = None,
+    preserve_thinking: bool = False,
+    preserve_thinking_source: str = '',
+    chat_template_kwargs: Optional[Dict[str, object]] = None,
+    unsupported_launch_flags: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     if not startup_result:
         startup_result = 'READY' if status == 'ok' else 'FAILED' if status in ('start failed', 'not ready') else ''
@@ -3005,14 +3130,22 @@ def adaptive_record_from_candidate(
         'warmup_seconds': round(float(warmup_seconds), 2),
         'prompt_tokens': int(prompt_tokens or 0),
         'generated_tokens': int(generated_tokens or 0),
-        'ctx': int(getattr(candidate, 'ctx', 0) or 0),
+        'ctx': int(ctx if ctx is not None else getattr(candidate, 'ctx', 0) or 0),
         'ctx_per_slot': ctx_per_slot(candidate),
         'parallel': int(getattr(candidate, 'parallel', 0) or 0),
         'threads': int(getattr(candidate, 'threads', 0) or 0),
         'ngl': int(getattr(candidate, 'ngl', 0) or 0),
-        'output': int(getattr(candidate, 'output', 0) or 0),
+        'output': int(output if output is not None else getattr(candidate, 'output', 0) or 0),
+        'measurement_output': int(measurement_output or 0),
         'cache_ram': int(getattr(candidate, 'cache_ram', 0) or 0),
-        'temp': float(getattr(candidate, 'temp', 0.7) or 0.7),
+        'temp': float(temp if temp is not None else getattr(candidate, 'temp', 0.7) or 0.7),
+        'top_p': top_p,
+        'top_k': top_k,
+        'repeat_penalty': repeat_penalty,
+        'presence_penalty': presence_penalty,
+        'min_p': min_p,
+        'seed': seed,
+        'samplers': samplers,
         'memory_reserve_percent': int(getattr(candidate, 'memory_reserve_percent', 0) or 0),
         'extra_args': list(getattr(candidate, 'extra_args', []) or []),
         'ram_available': int(ram_available or 0),
@@ -3022,20 +3155,27 @@ def adaptive_record_from_candidate(
         'engine': engine or getattr(candidate, 'runtime', 'llama.cpp'),
         'server_bin': server_bin,
         'runtime_profile': runtime_profile,
+        'benchmark_profile': benchmark_profile,
+        'benchmark_purpose': benchmark_purpose,
         'kv_preset': kv_preset,
         'flash_attn_mode': flash_attn_mode,
+        'flash_attn': flash_attn or flash_attn_mode,
         'kv_family': kv_family,
         'kv_quality_tier': kv_quality_tier,
         'kv_compression_tier': kv_compression_tier,
         'kv_score_penalty': round(float(kv_score_penalty or 0.0), 4),
         'benchmark_depth': benchmark_depth,
         'runtime_fit': bool(runtime_fit),
+        'fit': bool(fit or runtime_fit),
         'fit_context': int(fit_context or 0),
+        'fit_target': fit_target,
         'runtime_no_warmup': bool(runtime_no_warmup),
         'batch_size': int(batch_size or 0),
         'ubatch_size': int(ubatch_size or 0),
         'ctk': ctk,
         'ctv': ctv,
+        'kv_key': kv_key or ctk,
+        'kv_value': kv_value or ctv,
         'detected_head_dim': int(detected_head_dim or 0),
         'model_quant': model_quant,
         'model_family': model_family,
@@ -3055,6 +3195,15 @@ def adaptive_record_from_candidate(
         'failure_reason': concise_failure(failure_reason, limit=500),
         'suggested_fix': suggested_fix,
         'command': command,
+        'no_context_shift': bool(no_context_shift),
+        'cache_prompt': cache_prompt,
+        'cache_reuse': int(cache_reuse or 0),
+        'reasoning': reasoning,
+        'reasoning_budget': reasoning_budget,
+        'preserve_thinking': bool(preserve_thinking),
+        'preserve_thinking_source': preserve_thinking_source,
+        'chat_template_kwargs': dict(chat_template_kwargs or {}),
+        'unsupported_launch_flags': list(unsupported_launch_flags or []),
         'detail': concise_failure(detail, limit=500),
         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
     }
@@ -3076,6 +3225,7 @@ def runtime_record_context(
     app: AppConfig,
     candidate: ModelConfig,
     runtime_profile: Optional[RuntimeProfile] = None,
+    benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
     command: str = '',
 ) -> Dict[str, object]:
     try:
@@ -3088,7 +3238,7 @@ def runtime_record_context(
     except Exception:
         profile = runtime_profile
     if not command:
-        command = benchmark_command_preview(app, candidate, profile)
+        command = benchmark_command_preview(app, candidate, profile, benchmark_profile)
     engine = ''
     server_bin = ''
     if hasattr(app, 'active_engine_key_for_model'):
@@ -3100,7 +3250,7 @@ def runtime_record_context(
         engine = profile.engine_id
     if hasattr(app, 'runtime_server_command'):
         try:
-            server_bin = app.runtime_server_command('llama.cpp')
+            server_bin = app.runtime_server_command(str(getattr(candidate, 'runtime', 'llama.cpp') or 'llama.cpp'))
         except Exception:
             server_bin = ''
     runtime_log_path = ''
@@ -3121,14 +3271,16 @@ def runtime_record_context(
         else:
             kv_family = 'default'
     supported_cache_types: List[str] = []
+    unsupported_launch_flags: List[str] = []
     if hasattr(app, 'engine_capabilities'):
         try:
-            supported_cache_types = [
-                str(item) for item in list(getattr(app.engine_capabilities(), 'supported_kv_modes', ()) or ())
-            ]
+            capabilities = app.engine_capabilities()
+            supported_cache_types = [str(item) for item in list(getattr(capabilities, 'supported_kv_modes', ()) or ())]
+            if benchmark_profile is not None and str(getattr(candidate, 'runtime', 'llama.cpp') or 'llama.cpp') != 'vllm':
+                _args, unsupported_launch_flags = benchmark_profile_server_args(benchmark_profile, capabilities)
         except Exception:
             supported_cache_types = []
-    return {
+    context = {
         'engine': engine or getattr(candidate, 'runtime', 'llama.cpp'),
         'server_bin': server_bin,
         'binary_path': server_bin,
@@ -3174,6 +3326,9 @@ def runtime_record_context(
         ),
         'command': command,
     }
+    if benchmark_profile is not None:
+        context.update(benchmark_launch_metadata(benchmark_profile, unsupported_launch_flags))
+    return context
 
 
 def apply_failure_context(record: Dict[str, object], detail: str, default_category: str = 'SERVER_TIMEOUT') -> Dict[str, object]:
@@ -3192,11 +3347,25 @@ def benchmark_adaptive_candidate(
     progress: Optional[Callable[[str], None]],
     cancel_token: Optional[CancelToken],
     runtime_profile: Optional[RuntimeProfile] = None,
+    benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
+    benchmark_purpose: str = 'serve_default',
+    benchmark_depth: str = 'full',
 ) -> Tuple[Dict[str, object], Optional[Dict[str, object]]]:
     check_cancelled(cancel_token)
     process_snapshots: Dict[str, Dict[str, object]] = {'before': current_process_pressure_payload()}
     before_hw = app.hardware_profile(refresh=True)
-    runtime_context = runtime_record_context(app, candidate, runtime_profile)
+    try:
+        detected_capabilities = app.engine_capabilities()
+    except Exception:
+        detected_capabilities = None
+    launch_profile = benchmark_profile or build_benchmark_launch_profile(
+        candidate,
+        runtime_profile,
+        detected_capabilities,
+        purpose=benchmark_purpose,
+        depth=benchmark_depth,
+    )
+    runtime_context = runtime_record_context(app, candidate, runtime_profile, benchmark_profile=launch_profile)
     estimated_safe_ctx = candidate_safe_context_estimate(candidate, before_hw)
     observed_floor = observed_opencode_context_floor(candidate)
     guardrail_state = MemoryGuardrailState()
@@ -3217,9 +3386,9 @@ def benchmark_adaptive_candidate(
         return memory_guardrail_skip_record(candidate, objective, admission, runtime_context, process_snapshots), None
     start_at = time.monotonic()
     if runtime_profile is not None:
-        ok, msg = app.start(candidate, runtime_profile=runtime_profile)
+        ok, msg = app.start(candidate, runtime_profile=runtime_profile, benchmark_profile=launch_profile)
     else:
-        ok, msg = app.start(candidate)
+        ok, msg = app.start(candidate, benchmark_profile=launch_profile)
     startup_seconds = time.monotonic() - start_at
     if not ok:
         process_snapshots['after_start'] = current_process_pressure_payload()
@@ -3299,9 +3468,10 @@ def benchmark_adaptive_candidate(
         warmup_start = time.monotonic()
         benchmark_completion(
             candidate,
-            max_tokens=BENCHMARK_WARMUP_TOKENS,
+            max_tokens=min(BENCHMARK_WARMUP_TOKENS, max(1, launch_profile.measurement_output)),
             timeout=BENCHMARK_WARMUP_TIMEOUT,
             cancel_token=cancel_token,
+            launch_profile=launch_profile,
         )
         warmup_seconds = time.monotonic() - warmup_start
         if guardrail_state.stop_decision is not None:
@@ -3319,9 +3489,10 @@ def benchmark_adaptive_candidate(
             return apply_memory_guardrail_record(record, guardrail_state.stop_decision, guardrail_state), None
         bench_ok, bench = benchmark_completion_suite(
             candidate,
-            max_tokens=BENCHMARK_SAMPLE_TOKENS,
+            max_tokens=max(1, launch_profile.measurement_output),
             timeout=BENCHMARK_SAMPLE_TIMEOUT,
             cancel_token=cancel_token,
+            launch_profile=launch_profile,
         )
         if not bench_ok:
             process_snapshots['after_generation'] = current_process_pressure_payload()
@@ -3467,6 +3638,10 @@ def adaptive_benchmark_candidates(
     contexts_by_variant: Dict[str, List[int]] = {}
     probe_completed = 0
     probe_total = max(1, len(variants) * ADAPTIVE_MAX_CONTEXT_PROBES)
+    try:
+        capabilities = app.engine_capabilities()
+    except Exception:
+        capabilities = None
     for variant in variants:
         if time.monotonic() >= deadline:
             break
@@ -3490,7 +3665,15 @@ def adaptive_benchmark_candidates(
             if time.monotonic() >= deadline:
                 return False
             candidate = configure_adaptive_candidate(model, profile, 'long_context', value, 1, variant)
-            ok, msg = app.start(candidate)
+            launch_profile = build_benchmark_launch_profile(
+                candidate,
+                None,
+                capabilities,
+                purpose='serve_default',
+                depth='fast',
+            )
+            runtime_context = runtime_record_context(app, candidate, benchmark_profile=launch_profile)
+            ok, msg = app.start(candidate, benchmark_profile=launch_profile)
             if not ok:
                 if progress:
                     progress(f'context probe {variant} ctx={value} start failed: {concise_failure(msg)}')
@@ -3505,7 +3688,13 @@ def adaptive_benchmark_candidates(
                     completed=probe_completed,
                     total=probe_total,
                     candidate=f'{variant} ctx={value}',
-                    record=adaptive_record_from_candidate(candidate, 'long_context', 'start failed', detail=msg),
+                    record=adaptive_record_from_candidate(
+                        candidate,
+                        'long_context',
+                        'start failed',
+                        detail=msg,
+                        **runtime_context,
+                    ),
                 )
                 return False
             try:
@@ -3529,6 +3718,8 @@ def adaptive_benchmark_candidates(
                         'long_context',
                         'probe ok' if ready_ok else 'probe failed',
                         detail=ready_msg,
+                        startup_result='READY' if ready_ok else 'FAILED',
+                        **runtime_context,
                     ),
                 )
                 return ready_ok
@@ -4163,10 +4354,17 @@ def benchmark_config_fingerprint(candidate: ModelConfig) -> str:
         'output': int(getattr(candidate, 'output', 0) or 0),
         'cache_ram': int(getattr(candidate, 'cache_ram', 0) or 0),
         'temp': float(getattr(candidate, 'temp', 0.7) or 0.7),
+        'top_p': float(getattr(candidate, 'top_p', 0.95) or 0.95),
+        'top_k': int(getattr(candidate, 'top_k', 40) or 0),
+        'repeat_penalty': float(getattr(candidate, 'repeat_penalty', 1.0) or 1.0),
+        'presence_penalty': float(getattr(candidate, 'presence_penalty', 0.0) or 0.0),
+        'no_context_shift': bool(getattr(candidate, 'no_context_shift', False)),
+        'preserve_thinking': getattr(candidate, 'preserve_thinking', 'auto') or 'auto',
         'flash_attn': bool(getattr(candidate, 'flash_attn', True)),
         'jinja': bool(getattr(candidate, 'jinja', True)),
         'memory_reserve_percent': int(getattr(candidate, 'memory_reserve_percent', 0) or 0),
         'extra_args': list(getattr(candidate, 'extra_args', []) or []),
+        'launch_overrides': dict(getattr(candidate, 'launch_overrides', {}) or {}),
         'architecture_type': getattr(candidate, 'architecture_type', 'unknown') or 'unknown',
         'architecture': getattr(candidate, 'architecture', '') or '',
         'expert_count': int(getattr(candidate, 'expert_count', 0) or 0),
@@ -4402,7 +4600,19 @@ def benchmark_exhaustive_candidate_with_retry(
         check_cancelled(cancel_token)
         candidate = configure_adaptive_candidate(base_model, profile, objective, ctx, parallel, variant)
         estimated_safe_ctx = candidate_safe_context_estimate(candidate, profile)
-        command_preview = benchmark_command_preview(app, candidate)
+        try:
+            capabilities = app.engine_capabilities()
+        except Exception:
+            capabilities = None
+        launch_depth = 'fast' if run_kind == 'server_fast' or scan_level == 'fast' else 'full'
+        launch_profile = build_benchmark_launch_profile(
+            candidate,
+            None,
+            capabilities,
+            purpose='serve_default',
+            depth=launch_depth,
+        )
+        command_preview = benchmark_command_preview(app, candidate, benchmark_profile=launch_profile)
         if progress:
             progress(
                 f'{benchmark_label} candidate {candidate_label} attempt={attempt} '
@@ -4420,7 +4630,16 @@ def benchmark_exhaustive_candidate_with_retry(
             candidate=candidate_label,
             command=command_preview,
         )
-        record, measured_item = benchmark_adaptive_candidate(app, candidate, objective, progress, cancel_token)
+        record, measured_item = benchmark_adaptive_candidate(
+            app,
+            candidate,
+            objective,
+            progress,
+            cancel_token,
+            benchmark_profile=launch_profile,
+            benchmark_purpose='serve_default',
+            benchmark_depth=launch_depth,
+        )
         completed += 1
         ok = record.get('status') == 'ok'
         break_point = not ok and attempt == 2
@@ -4477,6 +4696,7 @@ def benchmark_runtime_profile_with_retry(
     run_kind: str = 'server',
     max_attempts: int = 2,
     benchmark_depth: str = 'full',
+    benchmark_purpose: str = 'serve_default',
 ) -> Tuple[bool, bool, List[Dict[str, object]], List[Dict[str, object]], int]:
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
@@ -4490,7 +4710,18 @@ def benchmark_runtime_profile_with_retry(
         check_cancelled(cancel_token)
         candidate = model_for_runtime_profile(base_model, runtime_profile)
         profile_fingerprint = runtime_profile_config_fingerprint(candidate, runtime_profile)
-        command_preview = benchmark_command_preview(app, candidate, runtime_profile)
+        try:
+            capabilities = app.engine_capabilities()
+        except Exception:
+            capabilities = None
+        launch_profile = build_benchmark_launch_profile(
+            candidate,
+            runtime_profile,
+            capabilities,
+            purpose=benchmark_purpose,
+            depth=benchmark_depth,
+        )
+        command_preview = benchmark_command_preview(app, candidate, runtime_profile, launch_profile)
         if progress:
             progress(f'runtime profile candidate {candidate_label} attempt={attempt}')
         emit_benchmark_event(
@@ -4512,6 +4743,9 @@ def benchmark_runtime_profile_with_retry(
             progress,
             cancel_token,
             runtime_profile=runtime_profile,
+            benchmark_profile=launch_profile,
+            benchmark_purpose=benchmark_purpose,
+            benchmark_depth=benchmark_depth,
         )
         completed += 1
         ok = record.get('status') == 'ok'
@@ -4569,8 +4803,19 @@ def benchmark_frontier_probe_candidate(
     cancel_token: Optional[CancelToken],
 ) -> Tuple[Dict[str, object], bool]:
     check_cancelled(cancel_token)
-    runtime_context = runtime_record_context(app, candidate)
-    ok, msg = app.start(candidate)
+    try:
+        capabilities = app.engine_capabilities()
+    except Exception:
+        capabilities = None
+    launch_profile = build_benchmark_launch_profile(
+        candidate,
+        None,
+        capabilities,
+        purpose='serve_default',
+        depth='fast',
+    )
+    runtime_context = runtime_record_context(app, candidate, benchmark_profile=launch_profile)
+    ok, msg = app.start(candidate, benchmark_profile=launch_profile)
     if not ok:
         record = adaptive_record_from_candidate(candidate, objective, 'start failed', detail=msg, **runtime_context)
         apply_failure_context(record, msg, default_category='SERVER_TIMEOUT')
@@ -4589,9 +4834,10 @@ def benchmark_frontier_probe_candidate(
             progress(f'frontier probe ready: ctx={candidate.ctx} slot={ctx_per_slot(candidate)} variant={getattr(candidate, "variant", "default")}')
         warm_ok, warm = benchmark_completion(
             candidate,
-            max_tokens=BENCHMARK_WARMUP_TOKENS,
+            max_tokens=min(BENCHMARK_WARMUP_TOKENS, max(1, launch_profile.measurement_output)),
             timeout=BENCHMARK_WARMUP_TIMEOUT,
             cancel_token=cancel_token,
+            launch_profile=launch_profile,
         )
         if not warm_ok:
             detail = str(warm.get('error', 'warmup failed'))
@@ -5630,6 +5876,122 @@ def benchmark_adaptive_profiles(
         records=records,
     )
     return True, msg
+
+
+def benchmark_raw_speed_profile(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'raw_speed', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
+
+    run_id = f'raw-speed-{int(time.time())}'
+    started_at = datetime.now().isoformat(timespec='seconds')
+    profile = app.hardware_profile(refresh=True)
+    try:
+        runtime_profile = app.runtime_profile_from_model(
+            model,
+            int(getattr(model, 'ctx', 0) or 0),
+            int(getattr(model, 'parallel', 1) or 1),
+            int(getattr(model, 'ngl', 0) or 0),
+        )
+    except Exception:
+        runtime_profile = None
+    total = 1
+    start_msg = f'raw speed benchmark started: deterministic request, {profile.short_summary()}'
+    if progress:
+        progress(start_msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_started',
+        model,
+        'raw_speed',
+        message=start_msg,
+        phase='raw speed',
+        completed=0,
+        total=total,
+    )
+    records: List[Dict[str, object]] = []
+    completed = 0
+    try:
+        check_cancelled(cancel_token)
+        candidate = model_for_runtime_profile(model, runtime_profile) if runtime_profile is not None else ModelConfig(**asdict(model))
+        try:
+            capabilities = app.engine_capabilities()
+        except Exception:
+            capabilities = None
+        launch_profile = build_benchmark_launch_profile(
+            candidate,
+            runtime_profile,
+            capabilities,
+            purpose='raw_speed',
+            depth='fast',
+        )
+        command_preview = benchmark_command_preview(app, candidate, runtime_profile, launch_profile)
+        emit_benchmark_event(
+            progress,
+            'benchmark_candidate',
+            model,
+            'raw_speed',
+            message='raw speed candidate',
+            phase='raw speed',
+            completed=0,
+            total=total,
+            candidate='raw_speed',
+            command=command_preview,
+        )
+        record, _measured_item = benchmark_adaptive_candidate(
+            app,
+            candidate,
+            'raw_speed',
+            progress,
+            cancel_token,
+            runtime_profile=runtime_profile,
+            benchmark_profile=launch_profile,
+            benchmark_purpose='raw_speed',
+            benchmark_depth='fast',
+        )
+        completed = 1
+        record['config_fingerprint'] = (
+            runtime_profile_config_fingerprint(candidate, runtime_profile)
+            if runtime_profile is not None else benchmark_config_fingerprint(candidate)
+        )
+        records.append(record)
+        emit_exhaustive_result(progress, model, record, completed, total, 'raw_speed', run_kind='raw_speed')
+    except CancelledError:
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        run = build_benchmark_run(run_id, 'raw_speed', 'aborted', records, {}, started_at, ended_at, profile.short_summary())
+        saved = ModelConfig(**asdict(model))
+        upsert_benchmark_run(saved, run)
+        app.add_or_update(saved)
+        msg = '⚠ raw speed benchmark aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(progress, 'benchmark_aborted', model, 'raw_speed', message=msg, phase='aborted', completed=completed, total=total, records=records)
+        return False, msg
+
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    status = 'done' if records and records[-1].get('status') == 'ok' else 'failed'
+    run = build_benchmark_run(run_id, 'raw_speed', status, records, {}, started_at, ended_at, profile.short_summary())
+    saved = ModelConfig(**asdict(model))
+    upsert_benchmark_run(saved, run)
+    app.add_or_update(saved)
+    if status == 'done':
+        score = float(records[-1].get('tokens_per_sec', 0.0) or 0.0)
+        msg = f'✅ raw speed benchmark saved: {score:.2f} tok/s'
+        event = 'benchmark_done'
+        ok = True
+    else:
+        msg = f'❌ raw speed benchmark failed: {benchmark_failure_summary(records, "no raw speed measurement completed")}'
+        event = 'benchmark_error'
+        ok = False
+    if progress:
+        progress(msg)
+    emit_benchmark_event(progress, event, model, 'raw_speed', message=msg, phase='complete', completed=completed, total=total, records=records)
+    return ok, msg
 
 
 def benchmark_best_optimization(

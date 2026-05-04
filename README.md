@@ -14,7 +14,8 @@ The project is intentionally small: it uses only the Python standard library, st
 - Probe CPU, RAM, NVIDIA VRAM, and current process pressure with `/proc` and `nvidia-smi`.
 - Read GGUF metadata to estimate KV cache memory and safe context sizes.
 - Auto-tune context size, CPU threads, GPU layer offload, KV cache type, batch size, and vLLM scheduler limits.
-- Benchmark adaptive profiles and persist measured Fast Chat, Long Context, OpenCode-ready, and Auto results.
+- Benchmark real serving launch profiles and persist measured Fast Chat, Long Context, OpenCode-ready, and Auto results.
+- Run a separate Raw Speed Benchmark for deterministic engine-speed checks without changing saved serving recommendations.
 - Run Deep Benchmark All across managed models and show machine-wide winners.
 - Benchmark OpenCode coding workflows against disposable fixture projects.
 - Try a model from inside the TUI with a temporary streaming chat console.
@@ -35,8 +36,10 @@ llama_tui/
   chat.py                 OpenAI-compatible streaming chat helper
   constants.py            paths and defaults
   discovery.py            model detection and naming helpers
+  engines.py              built-in engine registry and path/capability health helpers
   gguf.py                 GGUF metadata reader and cache-size estimates
   hardware.py             CPU/RAM/GPU probes
+  launch_profiles.py      benchmark launch/request profile builder
   main.py                 entrypoint and shutdown cleanup
   models.py               dataclasses
   opencode_benchmark.py   OpenCode workflow benchmark fixtures and scoring
@@ -107,6 +110,14 @@ Override it for one run:
 LLAMA_TUI_CONFIG=/path/to/models.json llama-tui
 ```
 
+CLI help exits before curses starts:
+
+```bash
+llama-tui --help
+llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4
+llama-tui --engine buun --kill-existing
+```
+
 Useful top-level settings:
 
 - `llama_server`: path or command for `llama-server`.
@@ -118,7 +129,7 @@ Useful top-level settings:
 - `opencode`: export settings and role assignments.
 - `continue`: Continue export settings.
 - `hermes`: Hermes export and launch settings.
-- `ui`: saved UI preferences.
+- `ui`: saved UI preferences, including `browser_view` (`compact` Fleet View or `advanced`) and detail density.
 - `models`: registered model entries.
 
 Useful per-model fields:
@@ -133,6 +144,8 @@ Useful per-model fields:
 - `parallel`: llama.cpp parallel slots.
 - `cache_ram`: llama.cpp prompt cache RAM value.
 - `flash_attn`, `jinja`, `extra_args`: runtime flags. Continue tool-capable llama.cpp, buun, and TurboQuant+ exports force `--jinja` at launch; add `--chat-template-file ...` in `extra_args` when a GGUF needs a tool-use template override.
+- `top_p`, `top_k`, `repeat_penalty`, `presence_penalty`, `no_context_shift`, `preserve_thinking`: optional generation/runtime defaults used by Try-It-Out, normal serving when the engine supports server-side flags, and benchmark request payloads.
+- `launch_overrides`: advanced config-only launch/benchmark overrides. Supported keys include `top_p`, `top_k`, `min_p`, `seed`, `samplers`, `repeat_penalty`, `presence_penalty`, `no_context_shift`, `preserve_thinking`, `reasoning`, `reasoning_budget`, `cache_prompt`, `cache_reuse`, `fit_target`, `measurement_output`, and `extra_args`.
 - `optimize_mode`: `max_context_safe` or `manual`.
 - `optimize_tier`: `safe`, `moderate`, or `extreme`.
 - `ctx_min`, `ctx_max`, `memory_reserve_percent`: guardrails for auto tuning.
@@ -169,13 +182,17 @@ Useful per-model fields:
 - `c`: generate Continue `config.yaml`.
 - `G`: generate Hermes `config.yaml` for the selected model.
 - `o`: edit settings.
-- `:`: open the command palette, including export actions and Config Doctor.
+- `:`: open Actions, including Raw Speed Benchmark, stateful browser/detail toggles, export actions, and Config Doctor.
 - `r`: sync inventory.
 - `q`: quit.
 
-The details screen shows the command preview, hardware profile, server status, PID, roles, recent logs, and the saved benchmark table.
+The model browser defaults to compact Fleet View: model name, server state, recommended pick, effective context, measured tok/s, active engine, and health. Actions can toggle Advanced View when you need the denser legacy columns; toggling from another screen returns to Models so the change is visible immediately.
 
-Settings are split into Runtime, Model Roots, OpenCode, Continue, Hermes, and UI sections. Config Doctor is available from the command palette and summarizes runtime commands, terminal launcher detection, VS Code, export paths, generated-config state, and model proof status.
+The top dashboard and selected-model Overview show a prominent active-engine badge such as `ENGINE: TurboQuant+ | KV key=q8_0 value=turbo4 | binary ok`. Missing binaries or engine warnings use the existing warning/error styling.
+
+The details screen is split into Overview, Launch, Tuning, Benchmarks, Logs, Command, and Exports tabs so launch decisions stay separate from lower-level settings and generated-config status. Benchmark tables live in the Benchmarks tab to keep the main detail pane readable.
+
+Settings are split into Runtime, Model Roots, OpenCode, Continue, Hermes, and UI sections. Config Doctor is available from Actions and summarizes runtime commands, active code path, active engine resolution, terminal launcher detection, VS Code, export paths, generated-config state, and model proof status.
 
 ## Running Servers
 
@@ -220,7 +237,10 @@ Experimental GGUF engines are selected for the whole TUI session:
 ```bash
 python -m llama_tui.main --engine turboquant
 python -m llama_tui.main --engine turboquant --kv-key q8_0 --kv-value turbo4
+python -m llama_tui.main --engine buun
 ```
+
+Engine path resolution is centralized but remains backward compatible: llama.cpp uses `LLAMA_SERVER` / `llama_server`, TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` or its existing defaults, Buun uses `BUUN_LLAMA_SERVER_BIN` or `buun-llama-server`, and vLLM uses `VLLM_COMMAND` / `vllm_command`.
 
 TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` when set, otherwise it looks for `~/llama-cpp-turboquant/build/bin/llama-server` and then `turboquant-llama-server` in `PATH`. v1 does not download or install binaries. The `tqp-v0.1.1` release documents prebuilts for macOS arm64 Metal and Windows x64 CUDA 12.4; Linux CUDA users should build `TheTom/llama-cpp-turboquant` from source first.
 
@@ -336,7 +356,11 @@ If the full model fits, `ngl=999` is still used. If not, llama-tui chooses a par
 
 ## Benchmark Logic
 
-Press `B` on a stopped model to run the adaptive benchmark. It can take a while by design; the target budget is about 20 minutes per model, and `A` can abort it.
+Press `B` on a stopped model to run the adaptive benchmark. It can take a while by design; the target budget is about 20 minutes per model, and `A` can abort it. Press `F` for the faster bounded benchmark.
+
+`B` and `F` now run explicit `serve_default` profile benchmarks. That means benchmark server launches go through the same canonical command builder as normal serving, including the selected engine, context, KV cache profile, flash attention, fit behavior, context-shift setting, template kwargs, and supported sampling flags. The HTTP chat-completion requests also use the profile sampling values.
+
+Actions includes `Raw Speed Benchmark...`. Raw speed uses a separate `raw_speed` profile with deterministic/near-deterministic sampling, a fixed 512-token measurement, and no quality scoring. It writes a benchmark-history run and record rows, but it does not update `measured_profiles`, `last_benchmark_tokens_per_sec`, machine rankings, or benchmark-proof freshness.
 
 Press `D` to run Deep Benchmark All. The default batch walks the registered models, skips fresh benchmark results, skips disabled entries, skips unmanaged external servers, and benchmarks pending, stale, failed, aborted, or missing measured profiles. If a model is already running under llama-tui management, the batch stops it for the benchmark and restores it on normal completion. The force-refresh option reruns every enabled managed model. This uses a safer adaptive batch benchmark instead of the full single-model quality-first run behind `B`, so it is better suited to large model libraries and lower-memory machines.
 
@@ -355,6 +379,38 @@ The benchmark runner:
 
 The prompt suite is intentionally short and stable. It is not a model quality benchmark. It measures local serving throughput for the selected runtime and hardware.
 
+Output policy is intentionally bounded for this first profile milestone:
+
+- `raw_speed`: measures 512 tokens.
+- `serve_default` fast runs: store the intended model output, but measure up to 512 tokens.
+- `serve_default` full runs: store the intended model output, but measure up to 1024 tokens.
+
+Benchmark details show the compact launch profile for each row: benchmark profile, engine, context, intended output, measurement cap, KV key/value, flash attention, fit state, no-context-shift state, sampling, template kwargs, and unsupported optional launch flags. The main Fleet View stays uncluttered.
+
+`preserve_thinking` defaults to `auto`. Explicit `on` or `off` wins. In `auto`, llama-tui looks for GGUF template/thinking/reasoning metadata and broad reasoning-family signals such as QwQ, DeepSeek-R1, GPT-OSS, or Qwen3 plus thinking/reasoning markers. If uncertain, it resolves off. When resolved on and the active server supports it, llama-tui emits `--chat-template-kwargs '{"preserve_thinking": true}'`.
+
+`launch_overrides` is intentionally config-only for now. It lets advanced users tune request/server profile details without adding more fields to the model edit form:
+
+```json
+"launch_overrides": {
+  "top_p": 0.95,
+  "top_k": 20,
+  "repeat_penalty": 1.05,
+  "presence_penalty": 0.0,
+  "no_context_shift": true,
+  "preserve_thinking": "on",
+  "min_p": 0.05,
+  "seed": 123,
+  "samplers": "top_k;top_p;min_p;temperature",
+  "reasoning": "auto",
+  "reasoning_budget": 8192,
+  "cache_prompt": true,
+  "cache_reuse": 256,
+  "fit_target": "0.85",
+  "extra_args": []
+}
+```
+
 Pressing `A` while a launch or benchmark is running requests cancellation. The active candidate server is stopped after the current blocking operation unwinds, and benchmark-launched OpenCode subprocess groups are terminated.
 
 Saved benchmark rows include:
@@ -368,6 +424,7 @@ Saved benchmark rows include:
 - parallel,
 - GPU layers,
 - engine, cache key/value modes, detected head dim, model quant/family, binary path, and help-supported cache types,
+- benchmark profile, intended output, measurement cap, sampling values, fit/context-shift/template kwargs, command preview, and unsupported optional launch flags,
 - RAM/VRAM/process-pressure headroom,
 - status and detail.
 

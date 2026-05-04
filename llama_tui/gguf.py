@@ -30,6 +30,7 @@ GGUF_VALUE_SIZES = {
 }
 
 GGUF_METADATA_CACHE: Dict[str, Dict[str, object]] = {}
+GGUF_TEMPLATE_METADATA_CACHE: Dict[str, Dict[str, object]] = {}
 GGUF_TENSOR_DESCRIPTOR_CACHE: Dict[str, List[Dict[str, object]]] = {}
 
 
@@ -208,6 +209,45 @@ def read_gguf_metadata(path: str | Path) -> Dict[str, object]:
     except Exception:
         metadata = {}
     GGUF_METADATA_CACHE[target] = metadata
+    return metadata
+
+
+def read_gguf_template_metadata(path: str | Path) -> Dict[str, object]:
+    source_path = Path(path).expanduser()
+    target = str(source_path.resolve(strict=False))
+    cached = GGUF_TEMPLATE_METADATA_CACHE.get(target)
+    if cached is not None:
+        return cached
+    metadata: Dict[str, object] = {}
+    if not source_path.exists() or source_path.suffix.lower() != '.gguf':
+        return metadata
+    try:
+        with open(source_path, 'rb') as file_obj:
+            if _read_exact(file_obj, 4) != b'GGUF':
+                GGUF_TEMPLATE_METADATA_CACHE[target] = metadata
+                return metadata
+            _version = struct.unpack('<I', _read_exact(file_obj, 4))[0]
+            _tensor_count = struct.unpack('<Q', _read_exact(file_obj, 8))[0]
+            metadata_count = struct.unpack('<Q', _read_exact(file_obj, 8))[0]
+            for _ in range(metadata_count):
+                key = _read_gguf_string(file_obj)
+                value_type = struct.unpack('<I', _read_exact(file_obj, 4))[0]
+                if value_type == 9:
+                    _skip_gguf_value(file_obj, value_type)
+                    continue
+                value = _read_gguf_scalar(file_obj, value_type)
+                normalized = key.lower()
+                if (
+                    'chat_template' in normalized
+                    or 'template' in normalized
+                    or 'reasoning' in normalized
+                    or 'thinking' in normalized
+                    or normalized in ('general.name', 'general.basename', 'general.architecture')
+                ):
+                    metadata[key] = value
+    except Exception:
+        metadata = {}
+    GGUF_TEMPLATE_METADATA_CACHE[target] = metadata
     return metadata
 
 

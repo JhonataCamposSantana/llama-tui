@@ -9,13 +9,22 @@ CHAT_TIMEOUT_SECONDS = 180
 
 
 def build_chat_payload(model: ModelConfig, messages: List[Dict[str, str]], stream: bool = True) -> Dict[str, object]:
-    return {
+    payload = {
         'model': model.alias or model.id,
         'messages': messages,
         'temperature': float(getattr(model, 'temp', 0.7) or 0.7),
         'max_tokens': max(1, int(getattr(model, 'output', 512) or 512)),
         'stream': bool(stream),
     }
+    if getattr(model, 'top_p', None) is not None:
+        payload['top_p'] = float(getattr(model, 'top_p', 0.95) or 0.95)
+    if getattr(model, 'top_k', None) is not None:
+        payload['top_k'] = int(getattr(model, 'top_k', 40) or 0)
+    if getattr(model, 'repeat_penalty', None) is not None:
+        payload['repeat_penalty'] = float(getattr(model, 'repeat_penalty', 1.0) or 1.0)
+    if getattr(model, 'presence_penalty', None) is not None:
+        payload['presence_penalty'] = float(getattr(model, 'presence_penalty', 0.0) or 0.0)
+    return payload
 
 
 def chat_completion_url(model: ModelConfig) -> str:
