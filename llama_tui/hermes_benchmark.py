@@ -10,36 +10,44 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .benchmark import (
     architecture_payload,
+    active_engine_runtime_profiles,
     build_benchmark_run,
+    benchmark_runtime_profile_with_retry,
     clone_model_config,
     concise_failure,
     ctx_per_slot,
     current_process_pressure_payload,
     emit_benchmark_event,
+    fit_ceiling_from_records,
+    model_and_runtime_profile_from_measured_profile,
     parse_context_requirement,
+    runtime_profile_fit_phase,
+    runtime_profile_uses_fit,
+    runtime_profile_with_fit_ceiling,
     upsert_benchmark_run,
 )
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
-from .models import ModelConfig
+from .models import HERMES_DEFAULT_MIN_CONTEXT_TOKENS, ModelConfig
 from .opencode_benchmark import (
     OPENCODE_WORKFLOW_TASKS,
     WorkflowTask,
     compact_sample_details,
     detected_unittest_command,
     detect_vscode_pressure,
-    opencode_candidate_models,
     run_process_with_metrics,
     sample_timeout_type,
     score_opencode_samples,
     verify_fixture,
     write_fixture,
 )
+from .runtime_profiles import RuntimeProfile
 
 HERMES_PREFLIGHT_TIMEOUT = 20
 HERMES_TASK_TIMEOUT = 300
 HERMES_NO_OUTPUT_TIMEOUT = 45
 HERMES_IDLE_OUTPUT_TIMEOUT = 90
 HERMES_WORKFLOW_TASKS = OPENCODE_WORKFLOW_TASKS
+HermesCandidate = Tuple[str, str, ModelConfig, str, Optional[RuntimeProfile]]
 
 
 def write_temp_hermes_config(app, model: ModelConfig, home: Path) -> Path:
@@ -91,6 +99,325 @@ def hermes_benchmark_record_context(model: ModelConfig) -> Dict[str, object]:
     payload = architecture_payload(model)
     payload.update(current_process_pressure_payload())
     return payload
+
+
+def hermes_required_context(app) -> int:
+    configured = getattr(app.hermes, 'min_context_tokens', HERMES_DEFAULT_MIN_CONTEXT_TOKENS)
+    return max(1, int(configured or HERMES_DEFAULT_MIN_CONTEXT_TOKENS))
+
+
+def hermes_experimental_context_override_enabled(app) -> bool:
+    override = max(0, int(getattr(app.hermes, 'experimental_context_override_tokens', 0) or 0))
+    return bool(getattr(app.hermes, 'allow_experimental_context_override', False)) and override > 0
+
+
+def normalize_engine_key(value: object) -> str:
+    raw = str(value or '').strip().lower()
+    if 'turboquant' in raw:
+        return 'turboquant'
+    if 'buun' in raw:
+        return 'buun'
+    if raw == 'vllm':
+        return 'vllm'
+    return 'llama.cpp'
+
+
+def hermes_active_engine_key(app, model: ModelConfig) -> str:
+    if hasattr(app, 'active_engine_key_for_model'):
+        return normalize_engine_key(app.active_engine_key_for_model(model))
+    return normalize_engine_key(getattr(model, 'runtime', 'llama.cpp'))
+
+
+def hermes_profile_engine_matches(app, model: ModelConfig, profile: Dict[str, object]) -> bool:
+    active = hermes_active_engine_key(app, model)
+    raw = str(profile.get('engine', '') or '').strip()
+    if not raw:
+        return active == normalize_engine_key(getattr(model, 'runtime', 'llama.cpp'))
+    return normalize_engine_key(raw) == active
+
+
+def hermes_profile_ctx_per_slot(profile: Dict[str, object]) -> int:
+    try:
+        slot = int(profile.get('ctx_per_slot', 0) or 0)
+    except Exception:
+        slot = 0
+    if slot > 0:
+        return slot
+    try:
+        ctx = int(profile.get('ctx', 0) or 0)
+        parallel = max(1, int(profile.get('parallel', 1) or 1))
+    except Exception:
+        return 0
+    return ctx // parallel
+
+
+def hermes_profile_score(profile: Dict[str, object]) -> float:
+    for key in ('selection_score', 'tokens_per_sec', 'score'):
+        try:
+            value = float(profile.get(key, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 0.0:
+            return value
+    return float(hermes_profile_ctx_per_slot(profile))
+
+
+def hermes_candidate_key(candidate: ModelConfig, runtime_profile: Optional[RuntimeProfile], profile: Dict[str, object]) -> Tuple[object, ...]:
+    if runtime_profile is not None:
+        runtime_name = runtime_profile.name or runtime_profile.engine_id
+        kv_preset = runtime_profile.kv_preset
+        fit = bool(runtime_profile.fit)
+        gpu_layers = 'fit' if runtime_profile.gpu_layers is None else int(runtime_profile.gpu_layers)
+    else:
+        runtime_name = str(profile.get('runtime_profile', '') or profile.get('variant', '') or profile.get('objective', '') or '')
+        kv_preset = str(profile.get('kv_preset', '') or '')
+        fit = bool(profile.get('runtime_fit', False) or profile.get('fit', False))
+        gpu_layers = int(profile.get('ngl', 0) or 0)
+    return (
+        normalize_engine_key(profile.get('engine', getattr(candidate, 'runtime', 'llama.cpp'))),
+        runtime_name,
+        int(getattr(candidate, 'ctx', 0) or 0),
+        int(getattr(candidate, 'parallel', 1) or 1),
+        kv_preset,
+        tuple(getattr(candidate, 'extra_args', []) or []),
+        fit,
+        gpu_layers,
+    )
+
+
+def hermes_candidate_from_profile(
+    model: ModelConfig,
+    key: str,
+    profile: Dict[str, object],
+) -> Tuple[Optional[ModelConfig], Optional[RuntimeProfile]]:
+    temp_model = clone_model_config(model)
+    temp_model.measured_profiles = {key: dict(profile)}
+    return model_and_runtime_profile_from_measured_profile(temp_model, key)
+
+
+def hermes_profile_sources(model: ModelConfig) -> List[Tuple[str, str, Dict[str, object], str]]:
+    sources: List[Tuple[str, str, Dict[str, object], str]] = []
+    measured = getattr(model, 'measured_profiles', {}) or {}
+    preferred_keys = ['hermes_floor', 'opencode_ready', 'long_context', 'auto', 'fast_chat']
+    ordered_keys = preferred_keys + sorted(key for key in measured.keys() if key not in preferred_keys)
+    for key in ordered_keys:
+        profile = measured.get(key)
+        if isinstance(profile, dict):
+            slot = hermes_profile_ctx_per_slot(profile)
+            sources.append((key, 'measured', dict(profile), f'measured {key} ctx_per_slot={slot}'))
+
+    for run in getattr(model, 'benchmark_runs', []) or []:
+        if not isinstance(run, dict) or str(run.get('kind', '') or '') == 'hermes':
+            continue
+        for record in run.get('records', []) or []:
+            if not isinstance(record, dict):
+                continue
+            if str(record.get('status', '') or '').lower() != 'ok':
+                continue
+            if str(record.get('measurement_type', 'full') or 'full') != 'full':
+                continue
+            profile = dict(record)
+            label = str(profile.get('objective', '') or profile.get('runtime_profile', '') or 'server')
+            slot = hermes_profile_ctx_per_slot(profile)
+            detail = f'history {run.get("kind", "server")} {label} ctx_per_slot={slot}'
+            sources.append((label, 'history', profile, detail))
+
+    for record in getattr(model, 'last_benchmark_results', []) or []:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get('status', '') or '').lower() != 'ok':
+            continue
+        if str(record.get('measurement_type', 'full') or 'full') != 'full':
+            continue
+        profile = dict(record)
+        label = str(profile.get('objective', '') or profile.get('runtime_profile', '') or 'server')
+        slot = hermes_profile_ctx_per_slot(profile)
+        sources.append((label, 'history', profile, f'latest server {label} ctx_per_slot={slot}'))
+    return sources
+
+
+def hermes_best_available_context(app, model: ModelConfig) -> int:
+    best = ctx_per_slot(model)
+    for _label, _tier, profile, _detail in hermes_profile_sources(model):
+        if not hermes_profile_engine_matches(app, model, profile):
+            continue
+        best = max(best, hermes_profile_ctx_per_slot(profile))
+    return best
+
+
+def hermes_candidate_models(app, model: ModelConfig, required_context: Optional[int] = None) -> List[HermesCandidate]:
+    required = int(required_context or hermes_required_context(app))
+    experimental = hermes_experimental_context_override_enabled(app)
+    candidates: List[Tuple[float, HermesCandidate]] = []
+    seen = set()
+    for label, tier, profile, detail in hermes_profile_sources(model):
+        if str(profile.get('status', 'ok') or 'ok') != 'ok':
+            continue
+        if not hermes_profile_engine_matches(app, model, profile):
+            continue
+        slot = hermes_profile_ctx_per_slot(profile)
+        if not experimental and slot < required:
+            continue
+        key = f'hermes_{tier}_{label}_{len(candidates)}'
+        candidate, runtime_profile = hermes_candidate_from_profile(model, key, profile)
+        if candidate is None:
+            continue
+        dedupe_key = hermes_candidate_key(candidate, runtime_profile, profile)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        candidates.append((hermes_profile_score(profile), (label, tier, candidate, detail, runtime_profile)))
+
+    def sort_key(item: Tuple[float, HermesCandidate]) -> Tuple[int, float, int, str, str]:
+        score, (label, tier, candidate, _detail, _runtime_profile) = item
+        slot = ctx_per_slot(candidate)
+        floor_rank = 0 if slot == required else 1
+        return (floor_rank, -float(score or 0.0), slot, str(label), str(tier))
+
+    return [candidate for _score, candidate in sorted(candidates, key=sort_key)]
+
+
+def hermes_has_floor_candidate(candidates: List[HermesCandidate], required_context: int) -> bool:
+    return any(ctx_per_slot(candidate) == int(required_context or 0) for _label, _tier, candidate, _detail, _runtime_profile in candidates)
+
+
+def hermes_no_ready_record(app, model: ModelConfig, required: int, best_available: int, detail: str = '') -> Dict[str, object]:
+    fields = hermes_context_record_fields(app, model)
+    fields['required_context'] = int(required or fields.get('required_context', 0) or 0)
+    fields['actual_ctx_per_slot'] = int(best_available or fields.get('actual_ctx_per_slot', 0) or 0)
+    reason = detail or f'no active-engine benchmark candidate reached {required} ctx/slot'
+    return {
+        'runtime': 'hermes',
+        'preset': 'hermes_floor',
+        'tier': 'readiness',
+        'status': 'not Hermes-ready',
+        'score': 0.0,
+        'seconds': 0.0,
+        'passed': 0,
+        'tasks': 0,
+        'detail': f'not Hermes-ready: needs {required} ctx/slot; best available {best_available}. {reason}',
+        'ctx': int(getattr(model, 'ctx', 0) or 0),
+        'ctx_per_slot': ctx_per_slot(model),
+        'parallel': int(getattr(model, 'parallel', 0) or 0),
+        'threads': int(getattr(model, 'threads', 0) or 0),
+        'ngl': int(getattr(model, 'ngl', 0) or 0),
+        'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+        **fields,
+    }
+
+
+def select_hermes_floor_probe_profiles(
+    app,
+    model: ModelConfig,
+    profile,
+    required_context: int,
+) -> List[RuntimeProfile]:
+    runtime_profiles = active_engine_runtime_profiles(app, model, profile, depth='full')
+    exact = [item for item in runtime_profiles if int(getattr(item, 'ctx_size', 0) or 0) == int(required_context)]
+    if not exact:
+        return []
+    target = exact[0]
+    sequence: List[RuntimeProfile] = []
+    if runtime_profile_fit_phase(target) == 'context_growth':
+        weight_fit = next(
+            (
+                item for item in runtime_profiles
+                if getattr(item, 'engine_id', '') == getattr(target, 'engine_id', '')
+                and runtime_profile_fit_phase(item) == 'weight_fit'
+            ),
+            None,
+        )
+        if weight_fit is not None:
+            sequence.append(weight_fit)
+    sequence.append(target)
+    return sequence
+
+
+def run_hermes_floor_probe(
+    app,
+    model: ModelConfig,
+    profile,
+    required_context: int,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    runtime_profiles = select_hermes_floor_probe_profiles(app, model, profile, required_context)
+    if not runtime_profiles:
+        return False, f'no active-engine runtime profile could target {required_context} ctx/slot'
+
+    records: List[Dict[str, object]] = []
+    completed = 0
+    total = len(runtime_profiles)
+    started_at = datetime.now().isoformat(timespec='seconds')
+    run_id = f'hermes-floor-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    fit_succeeded_engines: set[str] = set()
+    fit_ceiling_by_engine: Dict[str, Tuple[int, str, str]] = {}
+    target_name = runtime_profiles[-1].name
+    target_ok = False
+    target_profile: Dict[str, object] = {}
+
+    if progress:
+        progress(f'Hermes floor probe: measuring active-engine {required_context} ctx/slot before workflow run')
+    for runtime_profile in runtime_profiles:
+        check_cancelled(cancel_token)
+        runtime_engine = str(getattr(runtime_profile, 'engine_id', '') or '')
+        fit_phase = runtime_profile_fit_phase(runtime_profile)
+        if fit_phase == 'context_growth' and runtime_engine not in fit_succeeded_engines:
+            msg = f'Hermes floor probe skipped {runtime_profile.name}: weight-fit discovery has no viable ceiling yet'
+            if progress:
+                progress(msg)
+            break
+        if fit_phase == 'context_growth' and runtime_engine in fit_ceiling_by_engine:
+            runtime_profile = runtime_profile_with_fit_ceiling(runtime_profile, *fit_ceiling_by_engine[runtime_engine])
+        ok, _broke, new_records, new_measured, completed = benchmark_runtime_profile_with_retry(
+            app,
+            model,
+            runtime_profile,
+            'opencode_ready',
+            progress,
+            cancel_token,
+            completed,
+            total,
+            run_kind='server_fast',
+            max_attempts=1,
+            benchmark_depth='full',
+        )
+        records.extend(new_records)
+        if ok and runtime_profile_uses_fit(runtime_profile):
+            fit_succeeded_engines.add(runtime_engine)
+            if fit_phase == 'weight_fit' or runtime_engine not in fit_ceiling_by_engine:
+                fit_ceiling_by_engine[runtime_engine] = fit_ceiling_from_records(new_records)
+        if runtime_profile.name == target_name:
+            target_ok = ok
+            if ok:
+                if new_measured:
+                    target_profile = dict(new_measured[-1])
+                elif new_records:
+                    target_profile = dict(new_records[-1])
+        if not ok:
+            break
+
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    status = 'done' if target_ok else 'failed'
+    saved = clone_model_config(app.get_model(model.id) or model)
+    saved.last_benchmark_results = records
+    saved.default_benchmark_status = status
+    saved.default_benchmark_at = ended_at
+    winners = {'hermes_floor': target_profile} if target_ok and target_profile else {}
+    if winners:
+        saved.measured_profiles = dict(getattr(saved, 'measured_profiles', {}) or {})
+        saved.measured_profiles['hermes_floor'] = dict(target_profile)
+    run = build_benchmark_run(run_id, 'server_fast', status, records, winners, started_at, ended_at, profile.short_summary())
+    run['summary'] = (
+        f'Hermes floor probe {required_context} ctx/slot ready'
+        if target_ok
+        else f'Hermes floor probe failed for {required_context} ctx/slot'
+    )
+    upsert_benchmark_run(saved, run)
+    app.add_or_update(saved)
+    if target_ok:
+        return True, f'Hermes floor probe measured {required_context} ctx/slot'
+    return False, f'Hermes floor probe failed for {required_context} ctx/slot'
 
 
 def isolated_hermes_env(app, model: ModelConfig, home: Path) -> Dict[str, str]:
@@ -338,39 +665,6 @@ def summarize_hermes_sample_status(samples: List[Dict[str, object]]) -> str:
     return 'tests failed' if samples else 'failed'
 
 
-def hermes_context_skip_record(
-    app,
-    preset: str,
-    tier: str,
-    candidate: ModelConfig,
-    candidate_detail: str,
-) -> Dict[str, object]:
-    fields = hermes_context_record_fields(app, candidate)
-    required = int(fields.get('required_context', 0) or 0)
-    actual = int(fields.get('actual_ctx_per_slot', 0) or 0)
-    return {
-        'runtime': 'hermes',
-        'preset': preset,
-        'tier': tier,
-        'status': 'not Hermes-ready',
-        'score': 0.0,
-        'seconds': 0.0,
-        'passed': 0,
-        'tasks': 0,
-        'detail': (
-            f'not Hermes-ready: needs {required} ctx/slot; '
-            f'candidate has {actual}. {candidate_detail}'
-        ),
-        'ctx': int(getattr(candidate, 'ctx', 0) or 0),
-        'ctx_per_slot': ctx_per_slot(candidate),
-        'parallel': int(getattr(candidate, 'parallel', 0) or 0),
-        'threads': int(getattr(candidate, 'threads', 0) or 0),
-        'ngl': int(getattr(candidate, 'ngl', 0) or 0),
-        'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
-        **fields,
-    }
-
-
 def benchmark_hermes_workflow(
     app,
     model: ModelConfig,
@@ -388,26 +682,26 @@ def benchmark_hermes_workflow(
         return False, '❌ Stop the model before running Hermes workflow benchmark.'
 
     profile = app.hardware_profile(refresh=True)
-    all_candidates = opencode_candidate_models(model, profile)
-    candidates: List[Tuple[str, str, ModelConfig, str]] = []
-    skipped_records: List[Dict[str, object]] = []
-    for preset, tier, candidate, candidate_detail in all_candidates:
-        fields = hermes_context_record_fields(app, candidate)
-        actual = int(fields.get('actual_ctx_per_slot', 0) or 0)
-        required = int(fields.get('required_context', 0) or 0)
-        experimental = bool(fields.get('experimental_context_override', False))
-        if not experimental and actual < required:
-            skipped_records.append(hermes_context_skip_record(app, preset, tier, candidate, candidate_detail))
-            continue
-        candidates.append((preset, tier, candidate, candidate_detail))
+    required_context = hermes_required_context(app)
+    candidates = hermes_candidate_models(app, model, required_context)
+    if (
+        not hermes_experimental_context_override_enabled(app)
+        and not hermes_has_floor_candidate(candidates, required_context)
+    ):
+        probe_ok, probe_msg = run_hermes_floor_probe(app, model, profile, required_context, progress, cancel_token)
+        if progress:
+            progress(probe_msg)
+        if probe_ok:
+            model = app.get_model(model.id) or model
+            candidates = hermes_candidate_models(app, model, required_context)
     vscode = detect_vscode_pressure()
     records: List[Dict[str, object]] = []
     results: List[Dict[str, object]] = []
-    total_steps = max(1, len(skipped_records) + len(candidates) * max(1, len(HERMES_WORKFLOW_TASKS)))
+    total_steps = max(1, len(candidates) * max(1, len(HERMES_WORKFLOW_TASKS)))
     completed_steps = 0
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'hermes-{datetime.now().strftime("%Y%m%d-%H%M%S")}'
-    current: Optional[Tuple[str, str, ModelConfig]] = None
+    current: Optional[Tuple[str, str, ModelConfig, Optional[RuntimeProfile]]] = None
     pressure_payload = current_process_pressure_payload()
 
     emit_benchmark_event(
@@ -424,47 +718,29 @@ def benchmark_hermes_workflow(
         completed=0,
         total=total_steps,
     )
-    if not all_candidates:
-        msg = '❌ Hermes workflow benchmark failed: no viable model candidates'
-        emit_benchmark_event(progress, 'benchmark_error', model, 'hermes', message=msg, records=records)
-        return False, msg
-    for record in skipped_records:
-        completed_steps += 1
+    if not candidates:
+        best_available = hermes_best_available_context(app, model)
+        record = hermes_no_ready_record(app, model, required_context, best_available)
         record.update(hermes_benchmark_record_context(model))
         records.append(record)
-        emit_benchmark_event(
-            progress,
-            'benchmark_result',
-            model,
-            'hermes',
-            message=str(record.get('detail', 'not Hermes-ready')),
-            phase='Hermes readiness',
-            completed=completed_steps,
-            total=total_steps,
-            candidate=f'{record.get("preset", "-")}/{record.get("tier", "-")}',
-            record=record,
-        )
-    if not candidates:
-        best_available = max([int(row.get('actual_ctx_per_slot', 0) or 0) for row in skipped_records] or [0])
-        required = max([int(row.get('required_context', 0) or 0) for row in skipped_records] or [int(getattr(app.hermes, 'min_context_tokens', 64000) or 64000)])
         recorded_model = clone_model_config(model)
         recorded_model.last_hermes_benchmark_score = 0.0
         recorded_model.last_hermes_benchmark_seconds = 0.0
         recorded_model.last_hermes_benchmark_profile = (
-            f'failed: not Hermes-ready; needs {required} ctx/slot, best available {best_available}'
+            f'failed: not Hermes-ready; needs {required_context} ctx/slot, best available {best_available}'
         )
         recorded_model.last_hermes_benchmark_results = records
         run = build_benchmark_run(run_id, 'hermes', 'failed', records, {}, started_at, datetime.now().isoformat(timespec='seconds'), profile.short_summary())
-        run['summary'] = f'Hermes not ready: needs {required} ctx/slot; best available {best_available}'
+        run['summary'] = f'Hermes not ready: needs {required_context} ctx/slot; best available {best_available}'
         upsert_benchmark_run(recorded_model, run)
         app.add_or_update(recorded_model)
-        msg = f'❌ Hermes workflow benchmark failed: not Hermes-ready; needs {required} ctx/slot, best available {best_available}'
+        msg = f'❌ Hermes workflow benchmark failed: not Hermes-ready; needs {required_context} ctx/slot, best available {best_available}'
         emit_benchmark_event(progress, 'benchmark_error', model, 'hermes', message=msg, phase='failed', records=records)
         return False, msg
 
     try:
-        for attempt, (preset, tier, candidate, candidate_detail) in enumerate(candidates, start=1):
-            current = (preset, tier, candidate)
+        for attempt, (preset, tier, candidate, candidate_detail, runtime_profile) in enumerate(candidates, start=1):
+            current = (preset, tier, candidate, runtime_profile)
             check_cancelled(cancel_token)
             if progress:
                 progress(f'headless Hermes candidate {attempt}/{len(candidates)} {preset}/{tier}: {candidate_detail}')
@@ -479,7 +755,10 @@ def benchmark_hermes_workflow(
                 completed=completed_steps,
                 total=total_steps,
             )
-            ok, msg = app.start(candidate)
+            try:
+                ok, msg = app.start(candidate, runtime_profile=runtime_profile)
+            except TypeError:
+                ok, msg = app.start(candidate)
             if not ok:
                 completed_steps += len(HERMES_WORKFLOW_TASKS)
                 record = {
@@ -635,7 +914,7 @@ def benchmark_hermes_workflow(
                 sleep_with_cancel(0.5, cancel_token)
     except CancelledError:
         if current is not None:
-            preset, tier, candidate = current
+            preset, tier, candidate, _runtime_profile = current
             app.stop(candidate, managed_only=True)
             record = {
                 'runtime': 'hermes',

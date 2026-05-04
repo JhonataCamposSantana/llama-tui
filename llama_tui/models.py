@@ -4,6 +4,10 @@ from typing import Dict, List
 from .constants import DEFAULT_HOST, DEFAULT_MODEL_PORT
 
 
+HERMES_DEFAULT_MIN_CONTEXT_TOKENS = 65536
+HERMES_LEGACY_DEFAULT_MIN_CONTEXT_TOKENS = 64000
+
+
 @dataclass
 class ModelConfig:
     id: str
@@ -124,7 +128,7 @@ class HermesSettings:
     toolsets: List[str] = field(default_factory=lambda: ['terminal', 'file', 'todo'])
     max_turns: int = 20
     quiet: bool = True
-    min_context_tokens: int = 64000
+    min_context_tokens: int = HERMES_DEFAULT_MIN_CONTEXT_TOKENS
     experimental_context_override_tokens: int = 0
     allow_experimental_context_override: bool = False
     workspace_presets: List[str] = field(default_factory=list)

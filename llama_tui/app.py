@@ -53,7 +53,15 @@ from .launch_profiles import (
     benchmark_profile_server_args,
     build_benchmark_launch_profile,
 )
-from .models import ContinueSettings, HermesSettings, ModelConfig, OpencodeSettings, UiSettings
+from .models import (
+    ContinueSettings,
+    HERMES_DEFAULT_MIN_CONTEXT_TOKENS,
+    HERMES_LEGACY_DEFAULT_MIN_CONTEXT_TOKENS,
+    HermesSettings,
+    ModelConfig,
+    OpencodeSettings,
+    UiSettings,
+)
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
 from .runtime_profiles import (
     EngineCapabilities,
@@ -349,6 +357,7 @@ class AppConfig:
         self.llmfit_cache_root = data.get('llmfit_cache_root', self.llmfit_cache_root)
         self.llm_models_cache_root = data.get('llm_models_cache_root', self.llm_models_cache_root)
         self.lm_studio_model_roots = data.get('lm_studio_model_roots', self.lm_studio_model_roots)
+        settings_changed = False
         self.opencode = self._load_settings(OpencodeSettings, data.get('opencode', {}), self.opencode, 'opencode')
         self.continue_settings = self._load_settings(ContinueSettings, data.get('continue', {}), self.continue_settings, 'continue')
         if not self.continue_settings.path:
@@ -360,6 +369,13 @@ class AppConfig:
         self.hermes = self._load_settings(HermesSettings, data.get('hermes', {}), self.hermes, 'hermes')
         if not self.hermes.home_root:
             self.hermes.home_root = str(CACHE_DIR / 'hermes')
+        try:
+            if int(getattr(self.hermes, 'min_context_tokens', 0) or 0) == HERMES_LEGACY_DEFAULT_MIN_CONTEXT_TOKENS:
+                self.hermes.min_context_tokens = HERMES_DEFAULT_MIN_CONTEXT_TOKENS
+                settings_changed = True
+        except Exception:
+            self.hermes.min_context_tokens = HERMES_DEFAULT_MIN_CONTEXT_TOKENS
+            settings_changed = True
         self.ui = self._load_settings(UiSettings, data.get('ui', {}), self.ui, 'ui')
         loaded_models: List[ModelConfig] = []
         raw_models = data.get('models', [])
@@ -397,7 +413,7 @@ class AppConfig:
                 roots_changed = True
         if self._normalize_model_ranks():
             roots_changed = True
-        if len(loaded_models) != len(raw_models) or roots_changed:
+        if len(loaded_models) != len(raw_models) or roots_changed or settings_changed:
             self.save()
 
     def save(self):
@@ -1396,7 +1412,13 @@ class AppConfig:
     def hermes_context_policy(self, model: ModelConfig) -> Dict[str, object]:
         parallel = max(1, int(getattr(model, 'parallel', 1) or 1))
         actual_ctx = max(0, int(getattr(model, 'ctx', 0) or 0) // parallel)
-        required = max(1, int(getattr(self.hermes, 'min_context_tokens', 64000) or 64000))
+        required = max(
+            1,
+            int(
+                getattr(self.hermes, 'min_context_tokens', HERMES_DEFAULT_MIN_CONTEXT_TOKENS)
+                or HERMES_DEFAULT_MIN_CONTEXT_TOKENS
+            ),
+        )
         override = max(0, int(getattr(self.hermes, 'experimental_context_override_tokens', 0) or 0))
         experimental = bool(getattr(self.hermes, 'allow_experimental_context_override', False)) and override > 0
         configured = override if experimental else actual_ctx

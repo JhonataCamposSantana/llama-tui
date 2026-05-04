@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,13 +9,16 @@ from llama_tui.app import AppConfig
 from llama_tui.hermes_benchmark import (
     benchmark_hermes_workflow,
     build_hermes_run_command,
+    hermes_candidate_models,
     hermes_cli_preflight,
     isolated_hermes_env,
+    run_hermes_floor_probe,
     run_hermes_task,
     write_temp_hermes_config,
 )
 from llama_tui.models import ModelConfig
 from llama_tui.opencode_benchmark import WorkflowTask
+from llama_tui.runtime_profiles import RuntimeProfile, make_runtime_profile
 
 
 class HermesIntegrationTests(unittest.TestCase):
@@ -59,16 +63,29 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(backups[0].read_text(encoding='utf-8'), 'old hermes config')
 
     def test_hermes_settings_round_trip_context_policy(self):
-        self.app.hermes.min_context_tokens = 64000
+        self.app.hermes.min_context_tokens = 65536
         self.app.hermes.allow_experimental_context_override = True
         self.app.hermes.experimental_context_override_tokens = 70000
         self.app.save()
 
         loaded = AppConfig(self.config_path)
 
-        self.assertEqual(loaded.hermes.min_context_tokens, 64000)
+        self.assertEqual(loaded.hermes.min_context_tokens, 65536)
         self.assertTrue(loaded.hermes.allow_experimental_context_override)
         self.assertEqual(loaded.hermes.experimental_context_override_tokens, 70000)
+
+    def test_hermes_settings_normalize_legacy_default_floor(self):
+        self.config_path.write_text(json.dumps({
+            'hermes': {
+                'home_root': str(Path(self.tmp.name) / 'hermes-home'),
+                'min_context_tokens': 64000,
+            },
+            'models': [],
+        }), encoding='utf-8')
+
+        loaded = AppConfig(self.config_path)
+
+        self.assertEqual(loaded.hermes.min_context_tokens, 65536)
 
     def test_temp_hermes_config_uses_experimental_context_override(self):
         self.app.hermes.allow_experimental_context_override = True
@@ -192,8 +209,19 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertTrue(any('Hermes stderr tail' in str(call.args[1]) for call in append_log.call_args_list))
 
     def test_hermes_benchmark_persists_score_and_history_with_fakes(self):
-        candidate = ModelConfig(**self.model.__dict__)
-        candidate.ctx = 65536
+        self.model.measured_profiles = {
+            'hermes_floor': {
+                'status': 'ok',
+                'ctx': 65536,
+                'ctx_per_slot': 65536,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 12.0,
+                'extra_args': [],
+            },
+        }
         sample = {
             'task': 'fake',
             'command_preview': 'hermes chat -q fix',
@@ -222,12 +250,11 @@ class HermesIntegrationTests(unittest.TestCase):
             with patch.object(self.app, 'health', return_value=('STOPPED', '')):
                 with patch.object(self.app, 'get_pid', return_value=None):
                     with patch.object(self.app, 'hardware_profile', return_value=profile):
-                        with patch('llama_tui.hermes_benchmark.opencode_candidate_models', return_value=[('auto', 'measured', candidate, 'fake')]):
-                            with patch.object(self.app, 'start', return_value=(True, 'started')):
-                                with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
-                                    with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
-                                        with patch('llama_tui.hermes_benchmark.run_hermes_task', return_value=sample):
-                                            ok, msg = benchmark_hermes_workflow(self.app, self.model)
+                        with patch.object(self.app, 'start', return_value=(True, 'started')):
+                            with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
+                                with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
+                                    with patch('llama_tui.hermes_benchmark.run_hermes_task', return_value=sample):
+                                        ok, msg = benchmark_hermes_workflow(self.app, self.model)
 
         saved = self.app.get_model(self.model.id)
         self.assertTrue(ok)
@@ -236,14 +263,25 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(saved.benchmark_runs[0]['kind'], 'hermes')
 
     def test_hermes_benchmark_skips_candidates_below_context_floor(self):
-        candidate = ModelConfig(**self.model.__dict__)
-        candidate.ctx = 35968
+        self.model.measured_profiles = {
+            'opencode_ready': {
+                'status': 'ok',
+                'ctx': 35968,
+                'ctx_per_slot': 35968,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 12.0,
+                'extra_args': [],
+            },
+        }
         profile = SimpleNamespace(short_summary=lambda: 'fake hardware')
         with patch('llama_tui.hermes_benchmark.hermes_cli_preflight', return_value=(True, 'Hermes CLI ready')):
             with patch.object(self.app, 'health', return_value=('STOPPED', '')):
                 with patch.object(self.app, 'get_pid', return_value=None):
                     with patch.object(self.app, 'hardware_profile', return_value=profile):
-                        with patch('llama_tui.hermes_benchmark.opencode_candidate_models', return_value=[('opencode_ready', 'estimated', candidate, 'fake')]):
+                        with patch('llama_tui.hermes_benchmark.run_hermes_floor_probe', return_value=(False, 'probe failed')):
                             with patch.object(self.app, 'start') as start:
                                 ok, msg = benchmark_hermes_workflow(self.app, self.model)
 
@@ -254,14 +292,25 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(saved.benchmark_runs[0]['status'], 'failed')
         row = saved.last_hermes_benchmark_results[0]
         self.assertEqual(row['status'], 'not Hermes-ready')
-        self.assertEqual(row['required_context'], 64000)
+        self.assertEqual(row['required_context'], 65536)
         self.assertEqual(row['actual_ctx_per_slot'], 35968)
 
     def test_hermes_benchmark_experimental_override_allows_low_context_candidate(self):
         self.app.hermes.allow_experimental_context_override = True
         self.app.hermes.experimental_context_override_tokens = 70000
-        candidate = ModelConfig(**self.model.__dict__)
-        candidate.ctx = 35968
+        self.model.measured_profiles = {
+            'auto': {
+                'status': 'ok',
+                'ctx': 35968,
+                'ctx_per_slot': 35968,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 12.0,
+                'extra_args': [],
+            },
+        }
         sample = {
             'task': 'fake',
             'command_preview': 'hermes chat -q fix',
@@ -286,7 +335,7 @@ class HermesIntegrationTests(unittest.TestCase):
             'detail': 'OK',
             'configured_context_length': 70000,
             'actual_ctx_per_slot': 35968,
-            'required_context': 64000,
+            'required_context': 65536,
             'experimental_context_override': True,
         }
         profile = SimpleNamespace(short_summary=lambda: 'fake hardware')
@@ -294,12 +343,11 @@ class HermesIntegrationTests(unittest.TestCase):
             with patch.object(self.app, 'health', return_value=('STOPPED', '')):
                 with patch.object(self.app, 'get_pid', return_value=None):
                     with patch.object(self.app, 'hardware_profile', return_value=profile):
-                        with patch('llama_tui.hermes_benchmark.opencode_candidate_models', return_value=[('auto', 'experimental', candidate, 'fake')]):
-                            with patch.object(self.app, 'start', return_value=(True, 'started')) as start:
-                                with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
-                                    with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
-                                        with patch('llama_tui.hermes_benchmark.run_hermes_task', return_value=sample):
-                                            ok, msg = benchmark_hermes_workflow(self.app, self.model)
+                        with patch.object(self.app, 'start', return_value=(True, 'started')) as start:
+                            with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
+                                with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
+                                    with patch('llama_tui.hermes_benchmark.run_hermes_task', return_value=sample):
+                                        ok, msg = benchmark_hermes_workflow(self.app, self.model)
 
         saved = self.app.get_model(self.model.id)
         self.assertTrue(ok)
@@ -311,8 +359,19 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(row['actual_ctx_per_slot'], 35968)
 
     def test_hermes_benchmark_with_zero_passes_is_failed_not_winner(self):
-        candidate = ModelConfig(**self.model.__dict__)
-        candidate.ctx = 65536
+        self.model.measured_profiles = {
+            'hermes_floor': {
+                'status': 'ok',
+                'ctx': 65536,
+                'ctx_per_slot': 65536,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 12.0,
+                'extra_args': [],
+            },
+        }
         sample = {
             'task': 'fake',
             'command_preview': 'hermes chat -q fix',
@@ -341,12 +400,11 @@ class HermesIntegrationTests(unittest.TestCase):
             with patch.object(self.app, 'health', return_value=('STOPPED', '')):
                 with patch.object(self.app, 'get_pid', return_value=None):
                     with patch.object(self.app, 'hardware_profile', return_value=profile):
-                        with patch('llama_tui.hermes_benchmark.opencode_candidate_models', return_value=[('auto', 'measured', candidate, 'fake')]):
-                            with patch.object(self.app, 'start', return_value=(True, 'started')):
-                                with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
-                                    with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
-                                        with patch('llama_tui.hermes_benchmark.run_hermes_task', return_value=sample):
-                                            ok, msg = benchmark_hermes_workflow(self.app, self.model)
+                        with patch.object(self.app, 'start', return_value=(True, 'started')):
+                            with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
+                                with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
+                                    with patch('llama_tui.hermes_benchmark.run_hermes_task', return_value=sample):
+                                        ok, msg = benchmark_hermes_workflow(self.app, self.model)
 
         saved = self.app.get_model(self.model.id)
         self.assertFalse(ok)
@@ -354,6 +412,172 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(saved.last_hermes_benchmark_score, 0.0)
         self.assertEqual(saved.benchmark_runs[0]['kind'], 'hermes')
         self.assertEqual(saved.benchmark_runs[0]['status'], 'failed')
+
+    def test_hermes_candidates_skip_under_floor_and_run_all_viable(self):
+        self.model.measured_profiles = {
+            'opencode_ready': {'status': 'ok', 'ctx': 32768, 'ctx_per_slot': 32768, 'parallel': 1, 'tokens_per_sec': 20.0},
+            'auto': {'status': 'ok', 'ctx': 8192, 'ctx_per_slot': 8192, 'parallel': 1, 'tokens_per_sec': 30.0},
+            'hermes_floor': {'status': 'ok', 'ctx': 65536, 'ctx_per_slot': 65536, 'parallel': 1, 'tokens_per_sec': 10.0},
+            'long_context': {'status': 'ok', 'ctx': 98304, 'ctx_per_slot': 98304, 'parallel': 1, 'tokens_per_sec': 11.0},
+        }
+
+        candidates = hermes_candidate_models(self.app, self.model)
+
+        self.assertEqual([candidate.ctx for _label, _tier, candidate, _detail, _runtime in candidates], [65536, 98304])
+
+    def test_hermes_candidates_reuse_turboquant_history_runtime_profile(self):
+        app = AppConfig(self.config_path, runtime_profile=make_runtime_profile('turboquant', 'llama-server'))
+        model = ModelConfig(
+            id='tq',
+            name='TurboQuant Model',
+            path=__file__,
+            alias='tq',
+            port=18080,
+            ctx=8192,
+            benchmark_runs=[{
+                'kind': 'server_fast',
+                'records': [{
+                    'status': 'ok',
+                    'measurement_type': 'full',
+                    'objective': 'opencode_ready',
+                    'engine': 'turboquant',
+                    'ctx': 65536,
+                    'ctx_per_slot': 65536,
+                    'parallel': 1,
+                    'ngl': 0,
+                    'tokens_per_sec': 9.0,
+                    'runtime_profile': 'fit_context_growth_sweep_65536_q8_0_turbo4',
+                    'kv_preset': 'q8_0/turbo4',
+                    'runtime_fit': True,
+                    'fit_context': 4096,
+                    'runtime_no_warmup': True,
+                    'gpu_layers_mode': 'fit',
+                }],
+            }],
+        )
+
+        candidates = hermes_candidate_models(app, model)
+
+        self.assertEqual(len(candidates), 1)
+        _label, tier, candidate, _detail, runtime_profile = candidates[0]
+        self.assertEqual(tier, 'history')
+        self.assertEqual(candidate.ctx, 65536)
+        self.assertIsNotNone(runtime_profile)
+        self.assertEqual(runtime_profile.engine_id, 'turboquant')
+        self.assertTrue(runtime_profile.fit)
+        self.assertEqual(runtime_profile.kv_preset, 'q8_0/turbo4')
+
+    def test_hermes_benchmark_triggers_floor_probe_when_missing_exact_floor(self):
+        self.model.measured_profiles = {
+            'long_context': {
+                'status': 'ok',
+                'ctx': 98304,
+                'ctx_per_slot': 98304,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 12.0,
+                'extra_args': [],
+            },
+        }
+        self.app.add_or_update(self.model)
+        sample = {
+            'task': 'fake',
+            'command_preview': 'hermes chat -q fix',
+            'ok': True,
+            'tests_ok': True,
+            'status': 'tests passed',
+            'exit_code': 0,
+            'timed_out': False,
+            'no_output_timeout': False,
+            'idle_output_timeout': False,
+            'aborted': False,
+            'elapsed': 1.0,
+            'first_output': 0.1,
+            'min_ram_available': 2 * 1024**3,
+            'min_gpu_memory_free': 1024**3,
+            'stdout_tail': ['python -m unittest -q'],
+            'stderr_tail': [],
+            'json_event_tail': [],
+            'raw_event_tail': ['python -m unittest -q'],
+            'unittest_command_seen': True,
+            'context_required': 0,
+            'detail': 'OK',
+        }
+
+        def fake_probe(app, model, _profile, _required, *_args, **_kwargs):
+            saved = app.get_model(model.id) or model
+            saved.benchmark_runs = [{
+                'kind': 'server_fast',
+                'records': [{
+                    'status': 'ok',
+                    'measurement_type': 'full',
+                    'objective': 'opencode_ready',
+                    'engine': 'llama.cpp',
+                    'ctx': 65536,
+                    'ctx_per_slot': 65536,
+                    'parallel': 1,
+                    'threads': 6,
+                    'ngl': 0,
+                    'output': 1024,
+                    'tokens_per_sec': 10.0,
+                }],
+            }]
+            app.add_or_update(saved)
+            return True, 'probe ok'
+
+        profile = SimpleNamespace(short_summary=lambda: 'fake hardware')
+        with patch('llama_tui.hermes_benchmark.hermes_cli_preflight', return_value=(True, 'Hermes CLI ready')):
+            with patch.object(self.app, 'health', return_value=('STOPPED', '')):
+                with patch.object(self.app, 'get_pid', return_value=None):
+                    with patch.object(self.app, 'hardware_profile', return_value=profile):
+                        with patch('llama_tui.hermes_benchmark.run_hermes_floor_probe', side_effect=fake_probe) as probe:
+                            with patch.object(self.app, 'start', return_value=(True, 'started')) as start:
+                                with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
+                                    with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
+                                        with patch('llama_tui.hermes_benchmark.run_hermes_task', return_value=sample):
+                                            ok, msg = benchmark_hermes_workflow(self.app, self.model)
+
+        self.assertTrue(ok, msg)
+        probe.assert_called_once()
+        self.assertEqual(start.call_count, 2)
+        started_ctxs = [call.args[0].ctx for call in start.call_args_list]
+        self.assertEqual(started_ctxs, [65536, 98304])
+
+    def test_hermes_floor_probe_persists_reusable_floor_profile(self):
+        runtime_profile = RuntimeProfile(
+            engine_id='llama.cpp',
+            ctx_size=65536,
+            gpu_layers=0,
+            parallel=1,
+            name='serve_65536',
+        )
+        measured = {
+            'status': 'ok',
+            'measurement_type': 'full',
+            'objective': 'opencode_ready',
+            'engine': 'llama.cpp',
+            'ctx': 65536,
+            'ctx_per_slot': 65536,
+            'parallel': 1,
+            'tokens_per_sec': 10.0,
+            'runtime_profile': 'serve_65536',
+        }
+        profile = SimpleNamespace(short_summary=lambda: 'fake hardware')
+
+        with patch('llama_tui.hermes_benchmark.select_hermes_floor_probe_profiles', return_value=[runtime_profile]):
+            with patch(
+                'llama_tui.hermes_benchmark.benchmark_runtime_profile_with_retry',
+                return_value=(True, False, [measured], [measured], 1),
+            ):
+                ok, msg = run_hermes_floor_probe(self.app, self.model, profile, 65536)
+
+        saved = self.app.get_model(self.model.id)
+        self.assertTrue(ok, msg)
+        self.assertEqual(saved.measured_profiles['hermes_floor']['ctx_per_slot'], 65536)
+        self.assertEqual(saved.benchmark_runs[0]['kind'], 'server_fast')
+        self.assertEqual(saved.benchmark_runs[0]['winners']['hermes_floor']['ctx_per_slot'], 65536)
 
 
 if __name__ == '__main__':

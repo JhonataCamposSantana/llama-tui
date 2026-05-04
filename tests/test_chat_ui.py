@@ -276,7 +276,7 @@ class BrowserAndFormTests(unittest.TestCase):
             'hermes_toolsets': 'terminal, file',
             'hermes_max_turns': '20',
             'hermes_quiet': 'not-bool',
-            'hermes_min_context_tokens': '64000',
+            'hermes_min_context_tokens': '65536',
             'hermes_allow_experimental_context_override': 'false',
             'hermes_experimental_context_override_tokens': '0',
             'hermes_terminal_command': '',
@@ -325,7 +325,7 @@ class BrowserAndFormTests(unittest.TestCase):
             'hermes_toolsets': 'terminal, file',
             'hermes_max_turns': '20',
             'hermes_quiet': 'true',
-            'hermes_min_context_tokens': '64000',
+            'hermes_min_context_tokens': '65536',
             'hermes_allow_experimental_context_override': 'false',
             'hermes_experimental_context_override_tokens': '0',
             'hermes_terminal_command': '',
@@ -1068,7 +1068,7 @@ class ProfileUiTests(unittest.TestCase):
             True,
             'Hermes workflow',
             'cpu=8 ram=12/32GiB',
-            ['Hermes not ready, needs 64000 ctx/slot'],
+            ['Hermes not ready, needs 65536 ctx/slot'],
             width=80,
             app=FakeApp(),
         )
@@ -1195,9 +1195,9 @@ class ProfileUiTests(unittest.TestCase):
                 'ctx_per_slot': 4096,
                 'parallel': 1,
                 'status': 'not Hermes-ready',
-                'required_context': 64000,
+                'required_context': 65536,
                 'actual_ctx_per_slot': 4096,
-                'detail': 'not Hermes-ready: needs 64000 ctx/slot; candidate has 4096',
+                'detail': 'not Hermes-ready: needs 65536 ctx/slot; candidate has 4096',
             }],
         })
 
@@ -1213,7 +1213,7 @@ class ProfileUiTests(unittest.TestCase):
         self.assertIn('profile:', text)
         self.assertIn('runtime:', text)
         self.assertIn('latest result:', text)
-        self.assertIn('Hermes readiness: needs 64000', text)
+        self.assertIn('Hermes readiness: needs 65536', text)
 
 
 class TryLiveStatsTests(unittest.TestCase):
@@ -1501,7 +1501,7 @@ class BenchmarkDashboardTests(unittest.TestCase):
             'parallel': 1,
             'status': 'hermes command failed',
             'detail': 'bad flag',
-            'required_context': 64000,
+            'required_context': 65536,
             'configured_context_length': 70000,
             'actual_ctx_per_slot': 2048,
             'experimental_context_override': True,
@@ -1554,7 +1554,7 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('fit discovery: phase=weight_fit viable_ngl=28 source=offloaded_layers', text)
         self.assertIn('architecture: MoE 8x2 from gguf_metadata', text)
         self.assertIn('process pressure: pressure=medium apps=ide:1', text)
-        self.assertIn('context: required=64000 configured=70000 actual_slot=2048 experimental override', text)
+        self.assertIn('context: required=65536 configured=70000 actual_slot=2048 experimental override', text)
         self.assertIn('command: hermes chat -q fix', text)
         self.assertIn('config: /tmp/hermes/config.yaml', text)
         self.assertIn('stderr: bad flag', text)
