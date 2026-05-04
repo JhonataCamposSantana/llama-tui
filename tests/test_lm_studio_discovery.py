@@ -226,10 +226,17 @@ class LmStudioDiscoveryTests(unittest.TestCase):
             app.remember_workspace_preset('opencode', str(root / 'one'))
             app.remember_workspace_preset('opencode', str(root / 'two'))
             app.remember_workspace_preset('opencode', str(root / 'one'))
+            app.remember_workspace_preset('hermes', str(root / 'hermes-one'))
+            app.remember_workspace_preset('hermes', str(root / 'hermes-two'))
+            app.remember_workspace_preset('hermes', str(root / 'hermes-one'))
 
         self.assertEqual(
             app.workspace_presets('opencode'),
             [str(root / 'one'), str(root / 'two')],
+        )
+        self.assertEqual(
+            app.workspace_presets('hermes'),
+            [str(root / 'hermes-one'), str(root / 'hermes-two')],
         )
 
 

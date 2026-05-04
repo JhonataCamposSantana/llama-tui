@@ -2230,6 +2230,38 @@ def _clip_form_value(value: str, width: int, cursor: int) -> Tuple[str, int]:
     return text[start:end].ljust(width), cursor - start
 
 
+def form_is_single_field(field_count: int) -> bool:
+    return int(field_count or 0) <= 1
+
+
+def form_key_submits(key: int, field_count: int) -> bool:
+    if key in (19, getattr(curses, 'KEY_F2', -1)):
+        return True
+    if form_is_single_field(field_count) and key in (10, 13, getattr(curses, 'KEY_ENTER', -1)):
+        return True
+    return False
+
+
+def form_key_advances(key: int, field_count: int) -> bool:
+    if key in (curses.KEY_DOWN, 9):
+        return True
+    if not form_is_single_field(field_count) and key in (10, 13, getattr(curses, 'KEY_ENTER', -1)):
+        return True
+    return False
+
+
+def form_status_text(field_count: int) -> str:
+    if form_is_single_field(field_count):
+        return 'Edit value in place. Enter/F2 saves. Esc cancels.'
+    return 'Edit values in place. F2 saves. Enter moves to next field. Esc cancels.'
+
+
+def form_footer_text(field_count: int) -> str:
+    if form_is_single_field(field_count):
+        return '[Enter/F2] save  [Esc] cancel  [Ctrl+U] clear field'
+    return '[F2] save  [Enter/Tab] next  [Esc] cancel  [Ctrl+U] clear field'
+
+
 def prompt_form(
     stdscr,
     colors,
@@ -2253,7 +2285,8 @@ def prompt_form(
     cursor = len(values[fields[0]['key']]) if fields else 0
     scroll = 0
     errors: Dict[str, str] = {}
-    status = 'Edit values in place. Ctrl+S/F2 saves. Esc cancels.'
+    field_count = len(fields)
+    status = form_status_text(field_count)
     preset_values = list(presets or [])[:9]
     label_w = max(16, min(28, max(len(field['label']) for field in fields) + 1 if fields else 18))
     stdscr.nodelay(False)
@@ -2306,13 +2339,13 @@ def prompt_form(
                     line = f'{field_name}: {error}'
                     attr = colors['error'] | curses.A_BOLD
                 safe_addstr(modal, box_h - 4 + idx, 2, ellipsize(line, box_w - 4), attr)
-            safe_addstr(modal, box_h - 2, 2, ellipsize('[Ctrl+S/F2] save  [Esc] cancel  [Ctrl+U] clear field', box_w - 4), colors['accent'] | curses.A_BOLD)
+            safe_addstr(modal, box_h - 2, 2, ellipsize(form_footer_text(field_count), box_w - 4), colors['accent'] | curses.A_BOLD)
             modal.refresh()
 
             key = modal.getch()
             if key in (27,):
                 return None
-            if key in (19, getattr(curses, 'KEY_F2', -1)):
+            if form_key_submits(key, field_count):
                 result, validation_errors = validator(dict(values))
                 if validation_errors:
                     errors = validation_errors
@@ -2329,7 +2362,7 @@ def prompt_form(
                 selected = max(0, selected - 1)
                 cursor = len(values.get(fields[selected]['key'], ''))
                 continue
-            if key in (curses.KEY_DOWN, 9, 10, 13, curses.KEY_ENTER):
+            if form_key_advances(key, field_count):
                 selected = min(len(fields) - 1, selected + 1)
                 cursor = len(values.get(fields[selected]['key'], ''))
                 continue

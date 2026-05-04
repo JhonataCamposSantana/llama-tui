@@ -53,6 +53,10 @@ from llama_tui.ui import (
     command_palette_options,
     deep_benchmark_all_options,
     finish_try_live_metrics,
+    form_footer_text,
+    form_key_advances,
+    form_key_submits,
+    form_status_text,
     machine_category_items,
     machine_gap_items,
     machine_ranking_items,
@@ -95,6 +99,7 @@ from llama_tui.ui import (
     runtime_engine_source_line,
     update_try_live_metrics,
     visible_selection_window,
+    workspace_form_fields,
     wrap_display_item_lines,
 )
 from llama_tui.textutil import is_error_message
@@ -986,6 +991,35 @@ class ProfileUiTests(unittest.TestCase):
         self.assertEqual(right_scroll_action_for_view('results', ord('j')), '')
         self.assertEqual(right_scroll_action_for_view('try', curses.KEY_UP), '')
         self.assertEqual(right_scroll_action_for_view('list', curses.KEY_NPAGE), '')
+
+    def test_single_field_forms_submit_on_enter_and_keep_f2_ctrl_s(self):
+        self.assertTrue(form_key_submits(10, 1))
+        self.assertTrue(form_key_submits(13, 1))
+        self.assertTrue(form_key_submits(getattr(curses, 'KEY_ENTER', -1), 1))
+        self.assertTrue(form_key_submits(getattr(curses, 'KEY_F2', -1), 1))
+        self.assertTrue(form_key_submits(19, 1))
+        self.assertFalse(form_key_advances(10, 1))
+        self.assertIn('Enter/F2 saves', form_status_text(1))
+        self.assertIn('[Enter/F2] save', form_footer_text(1))
+        self.assertNotIn('Ctrl+S', form_status_text(1))
+        self.assertNotIn('Ctrl+S', form_footer_text(1))
+
+    def test_multi_field_forms_still_advance_on_enter_and_save_on_f2(self):
+        self.assertFalse(form_key_submits(10, 2))
+        self.assertTrue(form_key_advances(10, 2))
+        self.assertTrue(form_key_advances(9, 2))
+        self.assertTrue(form_key_submits(getattr(curses, 'KEY_F2', -1), 2))
+        self.assertTrue(form_key_submits(19, 2))
+        self.assertIn('Enter moves to next field', form_status_text(2))
+        self.assertIn('[F2] save', form_footer_text(2))
+        self.assertNotIn('Ctrl+S', form_status_text(2))
+        self.assertNotIn('Ctrl+S', form_footer_text(2))
+
+    def test_workspace_form_is_single_field_for_enter_submit(self):
+        fields = workspace_form_fields('/tmp/project')
+
+        self.assertEqual([field['key'] for field in fields], ['workspace'])
+        self.assertTrue(form_key_submits(10, len(fields)))
 
     def test_deep_benchmark_all_menu_options(self):
         options = deep_benchmark_all_options()
