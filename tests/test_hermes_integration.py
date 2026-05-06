@@ -248,6 +248,17 @@ class HermesIntegrationTests(unittest.TestCase):
 
     def test_hermes_benchmark_persists_score_and_history_with_fakes(self):
         self.model.measured_profiles = {
+            'auto': {
+                'status': 'ok',
+                'ctx': 8192,
+                'ctx_per_slot': 8192,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 24.0,
+                'extra_args': [],
+            },
             'hermes_floor': {
                 'status': 'ok',
                 'ctx': 65536,
@@ -299,6 +310,9 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn('Hermes workflow winner', msg)
         self.assertGreater(saved.last_hermes_benchmark_score, 0.0)
         self.assertEqual(saved.benchmark_runs[0]['kind'], 'hermes')
+        self.assertIn('auto', saved.measured_profiles)
+        self.assertIn('hermes_floor', saved.measured_profiles)
+        self.assertNotIn('hermes_measured_hermes_floor_0', saved.measured_profiles)
 
     def test_hermes_benchmark_skips_candidates_below_context_floor(self):
         self.model.measured_profiles = {

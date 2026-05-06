@@ -657,7 +657,13 @@ def active_engine_badge_kind(app: AppConfig, model: Optional[ModelConfig] = None
 
 def active_engine_warning_line(app: AppConfig, model: ModelConfig) -> str:
     messages = []
-    for name in ('turboquant_session_advisory', 'turboquant_binary_warning', 'tq3_session_advisory', 'tq3_binary_warning'):
+    for name in (
+        'turboquant_session_advisory',
+        'turboquant_binary_warning',
+        'tq3_session_advisory',
+        'tq3_binary_warning',
+        'tq3_launch_diagnostic',
+    ):
         try:
             value = str(getattr(app, name)(model) or '')
         except Exception:

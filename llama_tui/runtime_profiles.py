@@ -21,6 +21,7 @@ DEFAULT_TQ3_LLAMA_SERVER = (
 BUUN_KV_MODES = ('turbo4', 'turbo3_tcq', 'turbo2_tcq', 'turbo3', 'turbo2')
 TURBOQUANT_KV_MODES = ('q8_0', 'turbo4', 'turbo3', 'turbo2')
 TQ3_KV_MODES = ('q8_0', 'tq3_0')
+TQ3_BENCHMARK_FALLBACK_KV_MODES = ('q8_0',)
 COMMON_KV_MODES = (
     'f32',
     'f16',
@@ -74,6 +75,13 @@ RUNTIME_TUNING_FLAGS = (
     '--cache-prompt',
     '--no-cache-prompt',
     '--cache-reuse',
+    '--cpu-moe',
+    '-cmoe',
+    '--n-cpu-moe',
+    '-ncmoe',
+    '--override-tensor',
+    '--override-tensors',
+    '-ot',
 )
 
 
@@ -101,6 +109,12 @@ class EngineCapabilities:
     supports_presence_penalty: bool = False
     supports_samplers: bool = False
     supports_seed: bool = False
+    supports_cpu_moe: bool = False
+    supports_n_cpu_moe: bool = False
+    supports_override_tensor: bool = False
+    cpu_moe_flag: str = '-cmoe'
+    n_cpu_moe_flag: str = '-ncmoe'
+    override_tensor_flag: str = '-ot'
     gpu_layers_flag: str = '--n-gpu-layers'
     supported_kv_modes: Tuple[str, ...] = ()
     help_text: str = ''
@@ -141,16 +155,21 @@ TURBOQUANT_KV_PROFILES: Tuple[TurboKvProfile, ...] = (
     TurboKvProfile('turbo2/turbo2', 'symmetric turbo2', 'symmetric', '2.125bpv', 'full', 0.18, False, 'symmetric'),
 )
 
+TQ3_KV_PROFILES: Tuple[TurboKvProfile, ...] = (
+    TurboKvProfile('q8_0/q8_0', 'q8 baseline', 'baseline', '8.5bpv', 'fast', 0.0, False, 'baseline'),
+    TurboKvProfile('tq3_0/tq3_0', 'TQ3 compressed', 'experimental', 'tq3', 'full', 0.10, False, 'experimental'),
+)
+
 
 def turbo_kv_profile_for_preset(kv_preset: str) -> Optional[TurboKvProfile]:
     normalized = (kv_preset or '').strip().lower()
-    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES):
+    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES, TQ3_KV_PROFILES):
         for profile in profile_set:
             if profile.kv_preset == normalized:
                 return profile
     key_mode, value_mode = kv_modes_from_preset(normalized)
     symmetric = f'{key_mode}/{value_mode}' if key_mode and value_mode else ''
-    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES):
+    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES, TQ3_KV_PROFILES):
         for profile in profile_set:
             if profile.kv_preset == symmetric:
                 return profile
@@ -164,8 +183,15 @@ def supported_turbo_kv_profiles(
 ) -> List[TurboKvProfile]:
     normalized_depth = (depth or 'full').strip().lower()
     engine = (engine_id or 'buun').strip().lower()
-    defaults = TURBOQUANT_KV_MODES if engine == 'turboquant' else BUUN_KV_MODES
-    profile_set = TURBOQUANT_KV_PROFILES if engine == 'turboquant' else TURBO_KV_PROFILES
+    if engine == 'turboquant':
+        defaults = TURBOQUANT_KV_MODES
+        profile_set = TURBOQUANT_KV_PROFILES
+    elif engine == 'tq3':
+        defaults = TQ3_BENCHMARK_FALLBACK_KV_MODES
+        profile_set = TQ3_KV_PROFILES
+    else:
+        defaults = BUUN_KV_MODES
+        profile_set = TURBO_KV_PROFILES
     allowed = {mode.strip().lower() for mode in capabilities.supported_kv_modes or defaults}
     profiles: List[TurboKvProfile] = []
     for profile in profile_set:
@@ -275,6 +301,10 @@ class RuntimeProfile:
     fit_selected_ngl: int = 0
     fit_selected_ngl_source: str = ''
     fit_log_excerpt: str = ''
+    placement_strategy: str = ''
+    cpu_moe: bool = False
+    n_cpu_moe: int = 0
+    tensor_overrides: Tuple[str, ...] = field(default_factory=tuple)
 
 
 def resolve_buun_kv_modes(
@@ -422,7 +452,7 @@ def default_engine_capabilities(engine_id: str = 'llama.cpp') -> EngineCapabilit
             supports_cache_type_kv=True,
             supports_parallel=True,
             gpu_layers_flag='-ngl',
-            supported_kv_modes=TQ3_KV_MODES,
+            supported_kv_modes=TQ3_BENCHMARK_FALLBACK_KV_MODES,
         )
     return EngineCapabilities(supported_kv_modes=('f16', 'q8_0', 'q4_0'))
 
@@ -461,8 +491,6 @@ def parse_supported_kv_modes(help_text: str, engine_id: str, defaults: EngineCap
         return BUUN_KV_MODES
     if normalized_engine == 'turboquant' and defaults.supports_ctk_ctv:
         return TURBOQUANT_KV_MODES
-    if normalized_engine == 'tq3' and defaults.supports_ctk_ctv:
-        return TQ3_KV_MODES
     return defaults.supported_kv_modes
 
 
@@ -509,6 +537,29 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
     supports_presence_penalty = ('--presence-penalty' in low or defaults.supports_presence_penalty)
     supports_samplers = ('--samplers' in low or defaults.supports_samplers)
     supports_seed = (re.search(r'(^|\s)-s(\s|,|$)', low) is not None or '--seed' in low or defaults.supports_seed)
+    has_short_cpu_moe = re.search(r'(^|\s|,)-cmoe(\s|,|$)', low) is not None
+    has_long_cpu_moe = '--cpu-moe' in low
+    supports_cpu_moe = has_short_cpu_moe or has_long_cpu_moe or defaults.supports_cpu_moe
+    cpu_moe_flag = '-cmoe' if has_short_cpu_moe else '--cpu-moe' if has_long_cpu_moe else defaults.cpu_moe_flag
+    has_short_n_cpu_moe = re.search(r'(^|\s|,)-ncmoe(\s|,|$)', low) is not None
+    has_long_n_cpu_moe = '--n-cpu-moe' in low
+    supports_n_cpu_moe = has_short_n_cpu_moe or has_long_n_cpu_moe or defaults.supports_n_cpu_moe
+    n_cpu_moe_flag = '-ncmoe' if has_short_n_cpu_moe else '--n-cpu-moe' if has_long_n_cpu_moe else defaults.n_cpu_moe_flag
+    has_short_override_tensor = re.search(r'(^|\s|,)-ot(\s|,|$)', low) is not None
+    has_long_override_tensor = re.search(r'(^|\s|,)--override-tensor(\s|,|$)', low) is not None
+    has_long_override_tensors = re.search(r'(^|\s|,)--override-tensors(\s|,|$)', low) is not None
+    supports_override_tensor = (
+        has_short_override_tensor
+        or has_long_override_tensor
+        or has_long_override_tensors
+        or defaults.supports_override_tensor
+    )
+    override_tensor_flag = (
+        '-ot' if has_short_override_tensor
+        else '--override-tensor' if has_long_override_tensor
+        else '--override-tensors' if has_long_override_tensors
+        else defaults.override_tensor_flag
+    )
     if '--n-gpu-layers' in low:
         gpu_layers_flag = '--n-gpu-layers'
     elif re.search(r'(^|\s)-ngl(\s|,|$)', low):
@@ -541,6 +592,12 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_presence_penalty=supports_presence_penalty,
         supports_samplers=supports_samplers,
         supports_seed=supports_seed,
+        supports_cpu_moe=supports_cpu_moe,
+        supports_n_cpu_moe=supports_n_cpu_moe,
+        supports_override_tensor=supports_override_tensor,
+        cpu_moe_flag=cpu_moe_flag,
+        n_cpu_moe_flag=n_cpu_moe_flag,
+        override_tensor_flag=override_tensor_flag,
         gpu_layers_flag=gpu_layers_flag,
         supported_kv_modes=supported_kv_modes,
         help_text=text,
@@ -634,6 +691,7 @@ def runtime_profile_extra_args(
     existing_args: Sequence[str] = (),
 ) -> List[str]:
     args = strip_runtime_tuning_args(existing_args)
+    profile_extra_args = strip_runtime_tuning_args(runtime_profile.extra_args)
     args.extend(build_flash_attn_args(runtime_profile.flash_attn, capabilities))
     kv_key, kv_value = kv_modes_from_preset(runtime_profile.kv_preset)
     if (engine.is_turboquant or engine.is_tq3) and kv_key and kv_value and capabilities.supports_ctk_ctv:
@@ -653,5 +711,14 @@ def runtime_profile_extra_args(
             args += ['-fitc', str(int(runtime_profile.fit_context))]
     if runtime_profile.no_warmup and capabilities.supports_no_warmup:
         args.append('--no-warmup')
-    args.extend(str(item) for item in runtime_profile.extra_args)
+    if bool(getattr(runtime_profile, 'cpu_moe', False)) and capabilities.supports_cpu_moe:
+        args.append(capabilities.cpu_moe_flag or '-cmoe')
+    elif int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0) > 0 and capabilities.supports_n_cpu_moe:
+        args += [capabilities.n_cpu_moe_flag or '-ncmoe', str(int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0))]
+    if capabilities.supports_override_tensor:
+        for override in tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ()):
+            value = str(override or '').strip()
+            if value:
+                args += [capabilities.override_tensor_flag or '-ot', value]
+    args.extend(str(item) for item in profile_extra_args)
     return args

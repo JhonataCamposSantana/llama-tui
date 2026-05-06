@@ -83,6 +83,10 @@ class ModelConfig:
     tq3_weight_format: str = ''
     tq3_source: str = ''
     tq3_reason: str = ''
+    moe_placement_strategy: str = ''
+    cpu_moe: bool = False
+    n_cpu_moe: int = 0
+    tensor_overrides: List[str] = field(default_factory=list)
     extra_args: List[str] = field(default_factory=list)
     launch_overrides: Dict[str, object] = field(default_factory=dict)
     favorite: bool = False

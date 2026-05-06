@@ -200,6 +200,20 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(caps.supports_samplers)
         self.assertTrue(caps.supports_seed)
 
+    def test_capability_parser_detects_moe_placement_flags(self):
+        caps = parse_engine_capabilities(
+            'usage: llama-server --flash-attn on|off|auto -cmoe --cpu-moe -ncmoe N '
+            '--n-cpu-moe N -ot TENSOR=CPU --override-tensors TENSOR=CPU -ngl N',
+            engine_id='llama.cpp',
+        )
+
+        self.assertTrue(caps.supports_cpu_moe)
+        self.assertTrue(caps.supports_n_cpu_moe)
+        self.assertTrue(caps.supports_override_tensor)
+        self.assertEqual(caps.cpu_moe_flag, '-cmoe')
+        self.assertEqual(caps.n_cpu_moe_flag, '-ncmoe')
+        self.assertEqual(caps.override_tensor_flag, '-ot')
+
     def test_buun_command_uses_value_flash_and_strips_generic_cache_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
@@ -416,6 +430,146 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('-ctv') + 1], 'q8_0')
         self.assertNotIn('--cache-type-k', cmd)
 
+    def test_runtime_profile_emits_moe_placement_flags_and_strips_stale_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='moe',
+                name='MoE',
+                path='/models/moe.gguf',
+                alias='moe',
+                port=18080,
+                extra_args=['-ncmoe', '8', '--override-tensor', 'old=CPU'],
+            )
+            profile = RuntimeProfile(
+                engine_id='llama.cpp',
+                name='n_cpu_moe_32',
+                ctx_size=8192,
+                gpu_layers=999,
+                parallel=1,
+                n_cpu_moe=32,
+                tensor_overrides=('blk.*ffn=CPU',),
+                placement_strategy='n_cpu_moe_32',
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp'),
+                supports_n_cpu_moe=True,
+                supports_override_tensor=True,
+                n_cpu_moe_flag='-ncmoe',
+                override_tensor_flag='-ot',
+                gpu_layers_flag='-ngl',
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model, runtime_profile=profile)
+
+        self.assertIn('-ncmoe', cmd)
+        self.assertEqual(cmd[cmd.index('-ncmoe') + 1], '32')
+        self.assertIn('-ot', cmd)
+        self.assertEqual(cmd[cmd.index('-ot') + 1], 'blk.*ffn=CPU')
+        self.assertNotIn('8', cmd)
+        self.assertNotIn('old=CPU', cmd)
+
+    def test_cpu_moe_wins_over_n_cpu_moe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(id='moe', name='MoE', path='/models/moe.gguf', alias='moe', port=18080)
+            profile = RuntimeProfile(
+                engine_id='llama.cpp',
+                name='cpu_moe_all',
+                ctx_size=8192,
+                gpu_layers=999,
+                parallel=1,
+                cpu_moe=True,
+                n_cpu_moe=32,
+                placement_strategy='cpu_moe_all',
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp'),
+                supports_cpu_moe=True,
+                supports_n_cpu_moe=True,
+                cpu_moe_flag='-cmoe',
+                n_cpu_moe_flag='-ncmoe',
+                gpu_layers_flag='-ngl',
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model, runtime_profile=profile)
+
+        self.assertIn('-cmoe', cmd)
+        self.assertNotIn('-ncmoe', cmd)
+
+    def test_vllm_command_is_not_polluted_by_runtime_profile_placement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='v',
+                name='V',
+                path='repo/model',
+                alias='v',
+                port=18080,
+                runtime='vllm',
+            )
+            profile = RuntimeProfile(
+                engine_id='llama.cpp',
+                name='cpu_moe_all',
+                ctx_size=8192,
+                gpu_layers=999,
+                parallel=1,
+                cpu_moe=True,
+                placement_strategy='cpu_moe_all',
+            )
+            cmd = app.build_command(model, runtime_profile=profile)
+
+        self.assertNotIn('-cmoe', cmd)
+        self.assertNotIn('-ncmoe', cmd)
+
+    def test_model_config_round_trips_moe_placement_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'models.json'
+            app = AppConfig(config_path)
+            app.models = [
+                ModelConfig(
+                    id='moe',
+                    name='MoE',
+                    path='/models/moe.gguf',
+                    alias='moe',
+                    port=18080,
+                    moe_placement_strategy='n_cpu_moe_32',
+                    cpu_moe=False,
+                    n_cpu_moe=32,
+                    tensor_overrides=['blk.*ffn=CPU'],
+                )
+            ]
+            app.save()
+
+            loaded = AppConfig(config_path)
+
+        self.assertEqual(loaded.models[0].moe_placement_strategy, 'n_cpu_moe_32')
+        self.assertFalse(loaded.models[0].cpu_moe)
+        self.assertEqual(loaded.models[0].n_cpu_moe, 32)
+        self.assertEqual(loaded.models[0].tensor_overrides, ['blk.*ffn=CPU'])
+
+    def test_model_config_missing_moe_fields_loads_safe_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'models.json'
+            config_path.write_text(json.dumps({
+                'models': [{
+                    'id': 'm',
+                    'name': 'M',
+                    'path': '/models/m.gguf',
+                    'alias': 'm',
+                    'port': 18080,
+                }],
+            }), encoding='utf-8')
+
+            loaded = AppConfig(config_path)
+
+        self.assertEqual(loaded.models[0].moe_placement_strategy, '')
+        self.assertFalse(loaded.models[0].cpu_moe)
+        self.assertEqual(loaded.models[0].n_cpu_moe, 0)
+        self.assertEqual(loaded.models[0].tensor_overrides, [])
+
     def test_turboquant_head_dim_64_forces_q8_baseline_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
@@ -608,6 +762,40 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(runtime_profile.kv_preset, 'turbo4/turbo4')
         self.assertEqual(runtime_profile.batch_size, 128)
         self.assertEqual(runtime_profile.ubatch_size, 64)
+
+    def test_measured_tq3_profile_replays_moe_placement_metadata(self):
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path='/models/m.TQ3_4S.gguf',
+            alias='m',
+            port=18200,
+            measured_profiles={
+                'opencode_ready': {
+                    'status': 'ok',
+                    'ctx': 32768,
+                    'ctx_per_slot': 32768,
+                    'parallel': 1,
+                    'ngl': 999,
+                    'tokens_per_sec': 20.0,
+                    'engine': 'tq3',
+                    'runtime_profile': 'partial_gpu_probe_n_cpu_moe_32',
+                    'kv_preset': 'tq3_0/tq3_0',
+                    'placement_strategy': 'n_cpu_moe_32',
+                    'n_cpu_moe': 32,
+                    'tensor_overrides': [],
+                    'gpu_layers_mode': 'fixed',
+                }
+            },
+        )
+
+        runtime_profile = measured_profile_runtime_profile(model, 'opencode_ready')
+
+        self.assertIsNotNone(runtime_profile)
+        self.assertEqual(runtime_profile.engine_id, 'tq3')
+        self.assertEqual(runtime_profile.kv_preset, 'tq3_0/tq3_0')
+        self.assertEqual(runtime_profile.placement_strategy, 'n_cpu_moe_32')
+        self.assertEqual(runtime_profile.n_cpu_moe, 32)
 
     def test_launch_with_failsafe_starts_measured_profile_with_runtime_replay(self):
         model = ModelConfig(
@@ -1961,6 +2149,40 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(winners['long_context']['kv_preset'], 'turbo3_tcq/turbo2_tcq')
         self.assertEqual(winners['opencode_ready']['kv_preset'], 'turbo3_tcq/turbo2_tcq')
 
+    def test_tq3_low_speed_records_do_not_promote_long_or_opencode_winners(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path=__file__,
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            ctx_max=32768,
+        )
+        candidate = ModelConfig(id='m', name='MoE TQ3', path=__file__, alias='m', port=18200, ctx=32768, parallel=1)
+        measured = [
+            {
+                'status': 'ok',
+                'measurement_type': 'full',
+                'objective': 'long_context',
+                'model': candidate,
+                'tokens_per_sec': 1.93,
+                'decode_tokens_per_sec': 1.93,
+                'ctx_per_slot': 32768,
+                'parallel': 1,
+                'engine': 'tq3',
+                'kv_preset': 'q8_0/q8_0',
+            },
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertNotIn('long_context', winners)
+        self.assertEqual(winners['opencode_ready']['status'], 'not_ready')
+        self.assertEqual(winners['fast_chat']['kv_preset'], 'q8_0/q8_0')
+        self.assertIn('TQ3 low-speed profile(s) held back', benchmark_run_summary(winners, measured))
+
     def test_runtime_profile_runners_use_expected_depth_and_attempts(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)
         hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
@@ -2768,6 +2990,155 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(all(item.engine_id == 'tq3' for item in native_profiles))
         self.assertTrue(any(item.kv_preset == 'q8_0/q8_0' for item in native_profiles))
         self.assertEqual(regular_profiles, [])
+
+    def test_tq3_compressed_kv_profiles_are_help_gated(self):
+        help_caps = parse_engine_capabilities(
+            'usage: llama-server --flash-attn on|off|auto -ctk TYPE -ctv TYPE -ngl N\n'
+            'allowed values: q8_0 q4_0 tq3_0',
+            engine_id='tq3',
+        )
+        no_tq3_caps = parse_engine_capabilities(
+            'usage: llama-server --flash-attn on|off|auto -ctk TYPE -ctv TYPE -ngl N\n'
+            'allowed values: q8_0 q4_0',
+            engine_id='tq3',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='native',
+                name='Native TQ3',
+                path='/models/native.TQ3_4S.gguf',
+                alias='native',
+                port=18080,
+                architecture='llama',
+                architecture_type='dense',
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=help_caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=5 * 1024**3):
+                supported_profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+            with patch.object(app, 'engine_capabilities', return_value=no_tq3_caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=5 * 1024**3):
+                unsupported_profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        supported_presets = {item.kv_preset for item in supported_profiles}
+        unsupported_presets = {item.kv_preset for item in unsupported_profiles}
+        self.assertIn('q8_0/q8_0', supported_presets)
+        self.assertNotIn('q4_0/tq3_0', supported_presets)
+        self.assertIn('tq3_0/tq3_0', supported_presets)
+        self.assertNotIn('q4_0/tq3_0', unsupported_presets)
+        self.assertNotIn('tq3_0/tq3_0', unsupported_presets)
+
+    def test_tq3_launch_diagnostic_reports_partial_offload_and_speed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='native',
+                name='Qwen MoE TQ3',
+                path='/models/native.TQ3_4S.gguf',
+                alias='native',
+                port=18080,
+                output=1024,
+                architecture_type='moe',
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+            )
+            log_lines = [
+                'llama_model_load: offloaded 17/41 layers to GPU',
+                'llama_model_load: CPU_Mapped model buffer size = 7523.81 MiB',
+                'llama_model_load: CUDA0 model buffer size = 5148.50 MiB',
+                'llama_print_timings: eval time = 265177.24 ms / 512 tokens ( 517.92 ms per token, 1.93 tokens per second)',
+                '--chat-template-kwargs {"preserve_thinking": true}',
+            ]
+
+            with patch.object(app, '_runtime_log_after_last_launch', return_value=log_lines):
+                diagnostic = app.tq3_launch_diagnostic(model)
+
+        self.assertIn('GPU offload 17/41 layers', diagnostic)
+        self.assertIn('CPU-mapped model buffer 7523.8 MiB', diagnostic)
+        self.assertIn('recent decode 1.93 tok/s', diagnostic)
+        self.assertIn('1024-token cap ~= 8.8 min', diagnostic)
+        self.assertIn('preserve_thinking is on', diagnostic)
+
+    def test_tq3_moe_profiles_prioritize_placement_before_context_growth(self):
+        caps = replace(
+            default_engine_capabilities('tq3'),
+            supports_n_cpu_moe=True,
+            supported_kv_modes=('q8_0', 'tq3_0'),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='moe',
+                name='Qwen MoE TQ3',
+                path='/models/moe.TQ3_4S.gguf',
+                alias='moe',
+                port=18080,
+                architecture_type='moe',
+                expert_count=128,
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+                ctx_min=4096,
+                ctx_max=65536,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=18 * 1024**3), \
+                patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        placement_indices = [idx for idx, item in enumerate(profiles) if item.n_cpu_moe > 0 or item.cpu_moe]
+        growth_indices = [idx for idx, item in enumerate(profiles) if item.name.startswith('context_growth_sweep')]
+        self.assertTrue(placement_indices)
+        self.assertTrue(growth_indices)
+        self.assertLess(min(placement_indices), min(growth_indices))
+
+    def test_moe_runtime_profiles_include_bounded_placement_candidates(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp'),
+            supports_cpu_moe=True,
+            supports_n_cpu_moe=True,
+            supports_override_tensor=True,
+            gpu_layers_flag='-ngl',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            model = ModelConfig(
+                id='moe',
+                name='MoE',
+                path='/models/moe.gguf',
+                alias='moe',
+                port=18080,
+                architecture_type='moe',
+                expert_count=64,
+                expert_used_count=8,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=12 * 1024**3), \
+                patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='fast')
+
+        self.assertTrue(any(item.placement_strategy == 'baseline_ngl' for item in profiles))
+        self.assertTrue(any(item.cpu_moe for item in profiles))
+        self.assertTrue(any(item.n_cpu_moe == 40 for item in profiles))
+        self.assertLessEqual(len({item.placement_strategy for item in profiles if item.placement_strategy}), 3)
 
     def test_small_moe_gguf_can_plan_full_gpu_without_model_specific_names(self):
         with tempfile.TemporaryDirectory() as tmp:

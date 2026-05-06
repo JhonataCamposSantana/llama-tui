@@ -25,6 +25,7 @@ from .memory_guardrail import (
     memory_guardrail_record_fields,
     start_memory_guardrail_watchdog,
 )
+from .moe_placement import MoePlacementCandidate, generate_moe_placement_candidates
 from .models import ModelConfig
 from .optimize import (
     apply_hardware_baseline,
@@ -575,7 +576,15 @@ def runtime_profile_skip_reason(runtime_profile: RuntimeProfile, disabled: set[T
     return ''
 
 
-def _runtime_profile_memory_shape(runtime_profile: RuntimeProfile) -> Tuple[str, str, str, str, str]:
+def _runtime_profile_placement_shape(runtime_profile: RuntimeProfile) -> str:
+    placement = str(getattr(runtime_profile, 'placement_strategy', '') or '')
+    cpu_moe = 'cmoe' if bool(getattr(runtime_profile, 'cpu_moe', False)) else ''
+    n_cpu_moe = str(int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0))
+    tensor_overrides = ','.join(str(item) for item in tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ()))
+    return '|'.join((placement, cpu_moe, n_cpu_moe, tensor_overrides))
+
+
+def _runtime_profile_memory_shape(runtime_profile: RuntimeProfile) -> Tuple[str, str, str, str, str, str]:
     engine = str(getattr(runtime_profile, 'engine_id', '') or '')
     kv_preset = str(getattr(runtime_profile, 'kv_preset', '') or '')
     if getattr(runtime_profile, 'gpu_layers', None) is None and bool(getattr(runtime_profile, 'fit', False)):
@@ -588,7 +597,8 @@ def _runtime_profile_memory_shape(runtime_profile: RuntimeProfile) -> Tuple[str,
         mode = 'default'
         layers = ''
     parallel = str(max(1, int(getattr(runtime_profile, 'parallel', 1) or 1)))
-    return engine, kv_preset, mode, layers, parallel
+    placement = _runtime_profile_placement_shape(runtime_profile)
+    return engine, kv_preset, mode, layers, parallel, placement
 
 
 def runtime_profile_memory_disable_key(record: Dict[str, object], runtime_profile: RuntimeProfile) -> Tuple[str, ...]:
@@ -596,7 +606,7 @@ def runtime_profile_memory_disable_key(record: Dict[str, object], runtime_profil
     if category in ('FIXED_GPU_LAYERS_FIT_FAILED',) or (
         category == 'CUDA_OOM_WEIGHTS' and getattr(runtime_profile, 'gpu_layers', None) is not None
     ):
-        return ('fixed_ngl', str(getattr(runtime_profile, 'engine_id', '') or ''))
+        return ('fixed_ngl', str(getattr(runtime_profile, 'engine_id', '') or ''), _runtime_profile_placement_shape(runtime_profile))
     if category in ('MEMORY_FIT_FAILED', 'CUDA_OOM_WEIGHTS') and bool(getattr(runtime_profile, 'fit', False)):
         return ('fit_engine', str(getattr(runtime_profile, 'engine_id', '') or ''))
     if category in ('CUDA_OOM_KV', 'MEMORY_GUARDRAIL'):
@@ -612,15 +622,20 @@ def runtime_profile_memory_skip_reason(runtime_profile: RuntimeProfile, disabled
         if not key:
             continue
         if key[0] == 'fixed_ngl' and len(key) >= 2:
-            if key[1] == engine and getattr(runtime_profile, 'gpu_layers', None) is not None:
+            bad_placement = key[2] if len(key) >= 3 else ''
+            if (
+                key[1] == engine
+                and getattr(runtime_profile, 'gpu_layers', None) is not None
+                and bad_placement == _runtime_profile_placement_shape(runtime_profile)
+            ):
                 return 'fixed GPU-layer profiles were already rejected by memory fit/OOM for this run'
         if key[0] == 'fit_engine' and len(key) >= 2:
             if key[1] == engine and bool(getattr(runtime_profile, 'fit', False)):
                 return 'fit discovery already failed for this engine in this run'
-        if key[0] == 'context_shape' and len(key) >= 7:
-            bad_shape = tuple(key[1:6])
+        if key[0] == 'context_shape' and len(key) >= 3:
+            bad_shape = tuple(key[1:-1])
             try:
-                bad_ctx = int(key[6] or 0)
+                bad_ctx = int(key[-1] or 0)
             except Exception:
                 bad_ctx = 0
             if shape == bad_shape and bad_ctx > 0 and ctx >= bad_ctx:
@@ -937,6 +952,25 @@ def _record_kv_quality_penalty(record: Dict[str, object]) -> float:
     return max(0.0, float(profile.score_penalty if profile else 0.0))
 
 
+LOW_SPEED_PROMOTION_TOKENS_PER_SEC = 3.0
+
+
+def low_speed_guardrail_reason(record: Dict[str, object]) -> str:
+    engine = str(record.get('engine', '') or '').strip().lower()
+    if engine != 'tq3':
+        return ''
+    try:
+        tps = float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
+    except Exception:
+        tps = 0.0
+    if 0.0 < tps < LOW_SPEED_PROMOTION_TOKENS_PER_SEC:
+        return (
+            f'TQ3 decode speed {tps:.2f} tok/s is below the '
+            f'{LOW_SPEED_PROMOTION_TOKENS_PER_SEC:.1f} tok/s promotion floor'
+        )
+    return ''
+
+
 def score_fast_chat(record: Dict[str, object], model: ModelConfig) -> float:
     cap = 16384 if model_is_moe(model) else 8192
     tps = float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
@@ -1090,6 +1124,34 @@ def _command_flag_value(tokens: List[str], *flags: str) -> str:
     return ''
 
 
+def _command_flag_values(tokens: List[str], *flags: str) -> List[str]:
+    values: List[str] = []
+    flag_set = {flag for flag in flags if flag}
+    idx = 0
+    while idx < len(tokens):
+        token = str(tokens[idx])
+        matched = ''
+        for flag in flag_set:
+            if token == flag:
+                matched = flag
+                break
+            prefix = f'{flag}='
+            if token.startswith(prefix):
+                value = token[len(prefix):].strip()
+                if value:
+                    values.append(value)
+                matched = flag
+                break
+        if matched and token == matched and idx + 1 < len(tokens):
+            value = str(tokens[idx + 1]).strip()
+            if value:
+                values.append(value)
+            idx += 2
+            continue
+        idx += 1
+    return values
+
+
 def _command_has_flag(tokens: List[str], *flags: str) -> bool:
     flag_set = {flag for flag in flags if flag}
     return any(token in flag_set for token in tokens)
@@ -1113,11 +1175,41 @@ def measured_profile_runtime_profile(
         'batch_size',
         'ubatch_size',
         'runtime_profile',
+        'placement_strategy',
+        'cpu_moe',
+        'n_cpu_moe',
+        'tensor_overrides',
     )
     has_replay_data = (
         any(bool(profile.get(field)) for field in replay_fields)
-        or any(field in fingerprint for field in ('engine_id', 'runtime_profile', 'fit', 'gpu_layers', 'kv_preset'))
-        or any(token in command_tokens for token in ('-fit', '--fit', '-fitc', '--fit-ctx', '-ctk', '-ctv', '--cache-type-k', '--cache-type-v'))
+        or any(field in fingerprint for field in (
+            'engine_id',
+            'runtime_profile',
+            'fit',
+            'gpu_layers',
+            'kv_preset',
+            'placement_strategy',
+            'cpu_moe',
+            'n_cpu_moe',
+            'tensor_overrides',
+        ))
+        or any(token in command_tokens for token in (
+            '-fit',
+            '--fit',
+            '-fitc',
+            '--fit-ctx',
+            '-ctk',
+            '-ctv',
+            '--cache-type-k',
+            '--cache-type-v',
+            '-cmoe',
+            '--cpu-moe',
+            '-ncmoe',
+            '--n-cpu-moe',
+            '-ot',
+            '--override-tensor',
+            '--override-tensors',
+        ))
     )
     if not has_replay_data:
         return None
@@ -1125,6 +1217,8 @@ def measured_profile_runtime_profile(
     engine = str(profile.get('engine') or fingerprint.get('engine_id') or getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp')
     if 'turboquant' in engine.lower():
         engine = 'turboquant'
+    elif 'tq3' in engine.lower():
+        engine = 'tq3'
     elif 'buun' in engine.lower():
         engine = 'buun'
     elif engine.strip().lower() == 'vllm':
@@ -1188,6 +1282,29 @@ def measured_profile_runtime_profile(
     if not family:
         family = 'turbo' if turbo_profile is not None else 'cache' if kv_preset and kv_preset != 'default' else 'default'
     extra_args = fingerprint.get('extra_args') if isinstance(fingerprint.get('extra_args'), list) else ()
+    tensor_overrides = profile.get('tensor_overrides')
+    if not isinstance(tensor_overrides, list):
+        tensor_overrides = fingerprint.get('tensor_overrides') if isinstance(fingerprint.get('tensor_overrides'), list) else []
+    tensor_values = [str(item).strip() for item in tensor_overrides if str(item).strip()]
+    for value in _command_flag_values(command_tokens, '-ot', '--override-tensor', '--override-tensors'):
+        if value not in tensor_values:
+            tensor_values.append(value)
+    cpu_moe = (
+        _profile_bool(profile, 'cpu_moe')
+        or bool(fingerprint.get('cpu_moe'))
+        or _command_has_flag(command_tokens, '-cmoe', '--cpu-moe')
+    )
+    n_cpu_moe = _profile_int(profile, 'n_cpu_moe', int(fingerprint.get('n_cpu_moe', 0) or 0))
+    if n_cpu_moe <= 0:
+        n_cpu_moe = int(_command_flag_value(command_tokens, '-ncmoe', '--n-cpu-moe') or 0)
+    placement_strategy = str(profile.get('placement_strategy') or fingerprint.get('placement_strategy') or '').strip()
+    if not placement_strategy:
+        if cpu_moe:
+            placement_strategy = 'cpu_moe_all'
+        elif n_cpu_moe > 0:
+            placement_strategy = f'n_cpu_moe_{n_cpu_moe}'
+        elif tensor_values:
+            placement_strategy = 'tensor_override'
     return RuntimeProfile(
         engine_id=engine,
         name=runtime_name or f'measured_{key}',
@@ -1213,6 +1330,10 @@ def measured_profile_runtime_profile(
         fit_selected_ngl=max(0, int(profile.get('fit_selected_ngl', 0) or 0)),
         fit_selected_ngl_source=str(profile.get('fit_selected_ngl_source') or ''),
         fit_log_excerpt=str(profile.get('fit_log_excerpt') or ''),
+        placement_strategy=placement_strategy,
+        cpu_moe=bool(cpu_moe),
+        n_cpu_moe=max(0, int(n_cpu_moe or 0)),
+        tensor_overrides=tuple(tensor_values),
     )
 
 
@@ -1238,6 +1359,14 @@ def apply_measured_profile(model: ModelConfig, key: str) -> Tuple[bool, str]:
         model.jinja = bool(profile['jinja'])
     if isinstance(profile.get('extra_args'), list):
         model.extra_args = [str(item) for item in profile.get('extra_args', [])]
+    if 'placement_strategy' in profile:
+        model.moe_placement_strategy = str(profile.get('placement_strategy') or '')
+    if 'cpu_moe' in profile:
+        model.cpu_moe = bool(profile.get('cpu_moe'))
+    if 'n_cpu_moe' in profile:
+        model.n_cpu_moe = max(0, int(profile.get('n_cpu_moe') or 0))
+    if isinstance(profile.get('tensor_overrides'), list):
+        model.tensor_overrides = [str(item).strip() for item in profile.get('tensor_overrides', []) if str(item).strip()]
     model.optimize_mode = f'measured_{key}'
     model.optimize_tier = 'measured'
     return True, (
@@ -2555,27 +2684,23 @@ def select_measured_profiles(
     opencode_floor = max(observed_opencode_context_floor(model), 16384 if model_is_moe(model) else 0)
 
     fast_pool = [item for item in successful if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or successful
-    long_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
+    long_candidates = [item for item in successful if int(item.get('parallel', 1) or 1) == 1]
+    long_pool = [item for item in long_candidates if not low_speed_guardrail_reason(item)]
     opencode_single_slot_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
     opencode_pool = (
         [item for item in opencode_single_slot_pool if int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor]
         if opencode_floor
         else opencode_single_slot_pool
     )
+    opencode_pool = [item for item in opencode_pool if not low_speed_guardrail_reason(item)]
 
     fast = max(fast_pool, key=lambda item: (score_fast_chat(item, model), float(item.get('tokens_per_sec', 0.0) or 0.0)))
-    long = max(long_pool, key=lambda item: (score_long_context(item, model), int(item.get('ctx_per_slot', 0) or 0)))
     auto = max(successful, key=lambda item: score_auto(item, model))
     winner_specs = {
         'fast_chat': (
             fast,
             float(fast.get('tokens_per_sec', 0.0) or 0.0),
             f'fastest full measurement with ctx/slot >= {fast_floor}',
-        ),
-        'long_context': (
-            long,
-            float(long.get('ctx_per_slot', 0) or 0),
-            'largest full single-slot context, tok/s as tie-breaker',
         ),
         'auto': (
             auto,
@@ -2585,6 +2710,13 @@ def select_measured_profiles(
             ),
         ),
     }
+    if long_pool:
+        long = max(long_pool, key=lambda item: (score_long_context(item, model), int(item.get('ctx_per_slot', 0) or 0)))
+        winner_specs['long_context'] = (
+            long,
+            float(long.get('ctx_per_slot', 0) or 0),
+            'largest full single-slot context, tok/s as tie-breaker',
+        )
     if opencode_pool:
         opencode = max(opencode_pool, key=lambda item: (score_opencode_ready(item, model), int(item.get('ctx_per_slot', 0) or 0)))
         winner_specs['opencode_ready'] = (
@@ -2948,7 +3080,10 @@ def opencode_profile_status_text(winners: Dict[str, Dict[str, object]]) -> str:
 
 
 def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Optional[List[Dict[str, object]]] = None) -> str:
+    low_speed_count = sum(1 for row in list(records or []) if low_speed_guardrail_reason(row))
     if not winners:
+        if low_speed_count:
+            return f'no winners, {low_speed_count} TQ3 low-speed profile(s) held back'
         return 'no winners'
     parts = []
     fast = winners.get('fast_chat') or {}
@@ -2973,6 +3108,8 @@ def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Option
     )
     if failed_count and any(str(row.get('status', '') or '').lower() == 'ok' for row in list(winners.values())):
         parts.append(f'{failed_count} candidate failure(s), winners saved')
+    if low_speed_count:
+        parts.append(f'{low_speed_count} TQ3 low-speed profile(s) held back')
     return ', '.join(parts) if parts else 'no winners'
 
 
@@ -3090,6 +3227,10 @@ def adaptive_record_from_candidate(
     fit_selected_ngl: int = 0,
     fit_selected_ngl_source: str = '',
     fit_log_excerpt: str = '',
+    placement_strategy: str = '',
+    cpu_moe: bool = False,
+    n_cpu_moe: int = 0,
+    tensor_overrides: Optional[List[str]] = None,
     startup_result: str = '',
     failure_category: str = '',
     failure_reason: str = '',
@@ -3123,6 +3264,21 @@ def adaptive_record_from_candidate(
 ) -> Dict[str, object]:
     if not startup_result:
         startup_result = 'READY' if status == 'ok' else 'FAILED' if status in ('start failed', 'not ready') else ''
+    tensor_override_values = (
+        [str(item).strip() for item in tensor_overrides if str(item).strip()]
+        if isinstance(tensor_overrides, list)
+        else [str(item).strip() for item in list(getattr(candidate, 'tensor_overrides', []) or []) if str(item).strip()]
+    )
+    placement_strategy = str(placement_strategy or getattr(candidate, 'moe_placement_strategy', '') or '').strip()
+    cpu_moe = bool(cpu_moe or getattr(candidate, 'cpu_moe', False))
+    n_cpu_moe = max(0, int(n_cpu_moe or getattr(candidate, 'n_cpu_moe', 0) or 0))
+    if not placement_strategy:
+        if cpu_moe:
+            placement_strategy = 'cpu_moe_all'
+        elif n_cpu_moe > 0:
+            placement_strategy = f'n_cpu_moe_{n_cpu_moe}'
+        elif tensor_override_values:
+            placement_strategy = 'tensor_override'
     record = {
         'objective': objective,
         'preset': objective,
@@ -3201,6 +3357,10 @@ def adaptive_record_from_candidate(
         'fit_selected_ngl_source': fit_selected_ngl_source,
         'fit_log_excerpt': fit_log_excerpt,
         'gpu_layers_mode': gpu_layers_mode,
+        'placement_strategy': placement_strategy,
+        'cpu_moe': bool(cpu_moe),
+        'n_cpu_moe': int(n_cpu_moe or 0),
+        'tensor_overrides': tensor_override_values,
         'startup_result': startup_result,
         'failure_category': failure_category,
         'failure_reason': concise_failure(failure_reason, limit=500),
@@ -3332,6 +3492,10 @@ def runtime_record_context(
         'fit_selected_ngl': int(getattr(profile, 'fit_selected_ngl', 0) or 0) if profile is not None else 0,
         'fit_selected_ngl_source': getattr(profile, 'fit_selected_ngl_source', '') if profile is not None else '',
         'fit_log_excerpt': getattr(profile, 'fit_log_excerpt', '') if profile is not None else '',
+        'placement_strategy': getattr(profile, 'placement_strategy', '') if profile is not None else '',
+        'cpu_moe': bool(getattr(profile, 'cpu_moe', False)) if profile is not None else False,
+        'n_cpu_moe': int(getattr(profile, 'n_cpu_moe', 0) or 0) if profile is not None else 0,
+        'tensor_overrides': list(getattr(profile, 'tensor_overrides', ()) or ()) if profile is not None else [],
         'gpu_layers_mode': (
             'fit' if profile is not None and getattr(profile, 'gpu_layers', None) is None and getattr(profile, 'fit', False)
             else 'fixed' if profile is not None and getattr(profile, 'gpu_layers', None) is not None
@@ -3975,7 +4139,7 @@ def active_engine_runtime_profiles(
     if engine == 'turboquant':
         turbo_profiles = turboquant_auto_profiles(model, capabilities, benchmark_depth)
     else:
-        turbo_profiles = supported_turbo_kv_profiles(capabilities, benchmark_depth)
+        turbo_profiles = supported_turbo_kv_profiles(capabilities, benchmark_depth, engine_id=engine)
     turboquant_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
     turboquant_compatible = turboquant_status in ('native', 'padded')
     supports_turbo = bool(
@@ -4003,6 +4167,118 @@ def active_engine_runtime_profiles(
     )
     profiles: List[RuntimeProfile] = []
     seen = set()
+    moe_placements = generate_moe_placement_candidates(model, profile, capabilities, engine, benchmark_depth)
+    baseline_placement = moe_placements[0] if moe_placements else None
+
+    def placement_key(placement: Optional[MoePlacementCandidate]) -> Tuple[str, bool, int, Tuple[str, ...]]:
+        if placement is None:
+            return '', False, 0, ()
+        return (
+            placement.name,
+            bool(placement.cpu_moe),
+            int(placement.n_cpu_moe or 0),
+            tuple(placement.tensor_overrides or ()),
+        )
+
+    def apply_placement(
+        runtime_profile: RuntimeProfile,
+        placement: Optional[MoePlacementCandidate],
+        name: Optional[str] = None,
+    ) -> RuntimeProfile:
+        if placement is None:
+            return runtime_profile
+        gpu_layers = runtime_profile.gpu_layers
+        if placement.gpu_layers is not None:
+            gpu_layers = int(placement.gpu_layers)
+        return replace(
+            runtime_profile,
+            name=name or runtime_profile.name,
+            gpu_layers=gpu_layers,
+            placement_strategy=placement.name,
+            cpu_moe=bool(placement.cpu_moe),
+            n_cpu_moe=max(0, int(placement.n_cpu_moe or 0)),
+            tensor_overrides=tuple(placement.tensor_overrides or ()),
+        )
+
+    def finalized_profiles() -> List[RuntimeProfile]:
+        if not moe_placements:
+            return profiles
+        updated: List[RuntimeProfile] = [apply_placement(item, baseline_placement) for item in profiles]
+        profile_keys = {
+            (
+                item.name,
+                item.ctx_size,
+                item.gpu_layers,
+                item.kv_preset,
+                item.placement_strategy,
+                item.cpu_moe,
+                item.n_cpu_moe,
+                item.tensor_overrides,
+            )
+            for item in updated
+        }
+        preferred_seed_names = (
+            'partial_gpu_probe',
+            'kv_compression_probe',
+            'gpu_layer_sweep_full',
+        )
+        seeds = [
+            item for item in updated
+            if not item.fit
+            and item.gpu_layers is not None
+            and item.ctx_size == base_ctx
+            and (
+                item.name in preferred_seed_names
+                or item.name.startswith('kv_compression_probe_')
+                or item.name.startswith('gpu_layer_sweep_')
+            )
+        ]
+        if not seeds:
+            seeds = [
+                item for item in updated
+                if not item.fit and item.gpu_layers is not None and item.ctx_size == base_ctx
+            ]
+        if not seeds and has_gpu and updated:
+            source = updated[0]
+            seeds = [replace(
+                source,
+                name='moe_placement_probe',
+                ctx_size=base_ctx,
+                gpu_layers=partial_ngl,
+                fit=False,
+                fit_context=0,
+                no_warmup=bool(capabilities.supports_no_warmup),
+            )]
+        seed_limit = 1 if benchmark_depth == 'fast' else 2
+        selected_seeds: List[RuntimeProfile] = []
+        for seed in seeds:
+            if len(selected_seeds) >= seed_limit:
+                break
+            if seed.kv_preset not in {item.kv_preset for item in selected_seeds}:
+                selected_seeds.append(seed)
+        placement_updates: List[RuntimeProfile] = []
+        for placement in moe_placements[1:]:
+            for seed in selected_seeds:
+                candidate = apply_placement(seed, placement, name=f'{seed.name}_{placement.name}')
+                key = (
+                    candidate.name,
+                    candidate.ctx_size,
+                    candidate.gpu_layers,
+                    candidate.kv_preset,
+                    candidate.placement_strategy,
+                    candidate.cpu_moe,
+                    candidate.n_cpu_moe,
+                    candidate.tensor_overrides,
+                )
+                if key in profile_keys:
+                    continue
+                profile_keys.add(key)
+                placement_updates.append(candidate)
+        if placement_updates and engine == 'tq3' and moe:
+            insert_at = next((idx for idx, item in enumerate(updated) if int(item.ctx_size or 0) > base_ctx), len(updated))
+            return updated[:insert_at] + placement_updates + updated[insert_at:]
+        updated.extend(placement_updates)
+        return updated
 
     def kv_for_strategy(strategy: str) -> str:
         if supports_cache_kv and strategy in ('kv_compression_probe', 'context_growth_sweep'):
@@ -4040,10 +4316,21 @@ def active_engine_runtime_profiles(
         fit_discovery_phase: str = '',
         viable_ngl: int = 0,
         viable_ngl_source: str = '',
+        placement: Optional[MoePlacementCandidate] = None,
     ):
         ctx = max(ctx_min, min(ctx_max, int(ctx or base_ctx)))
         ngl_key = 'fit' if ngl is None else int(ngl)
-        key = (name, ctx, ngl_key, kv_preset, bool(fit), int(fit_context or 0), bool(no_warmup))
+        effective_placement = placement or baseline_placement
+        key = (
+            name,
+            ctx,
+            ngl_key,
+            kv_preset,
+            bool(fit),
+            int(fit_context or 0),
+            bool(no_warmup),
+            placement_key(effective_placement),
+        )
         if key in seen:
             return
         seen.add(key)
@@ -4051,7 +4338,7 @@ def active_engine_runtime_profiles(
             family = 'turbo' if any(mode.startswith('turbo') for mode in kv_modes_from_preset(kv_preset)) else 'cache'
         else:
             family = 'cache' if kv_preset and kv_preset != 'default' else 'default'
-        profiles.append(RuntimeProfile(
+        profile_item = RuntimeProfile(
             engine_id=engine,
             name=name,
             ctx_size=ctx,
@@ -4072,7 +4359,8 @@ def active_engine_runtime_profiles(
             fit_discovery_phase=fit_discovery_phase,
             viable_ngl=max(0, int(viable_ngl or 0)),
             viable_ngl_source=viable_ngl_source,
-        ))
+        )
+        profiles.append(apply_placement(profile_item, effective_placement))
 
     def fit_context_for(ctx: int) -> int:
         return min(int(ctx or base_ctx), max(ctx_min, 4096))
@@ -4148,6 +4436,41 @@ def active_engine_runtime_profiles(
                 no_warmup=capabilities.supports_no_warmup,
             )
 
+    if engine == 'tq3':
+        baseline_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/q8_0'), None)
+        baseline_kv = baseline_profile.kv_preset if baseline_profile is not None else 'q8_0/q8_0'
+
+        if not has_gpu:
+            add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile)
+            return finalized_profiles()
+
+        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, kv_profile=baseline_profile)
+        for kv_profile in turbo_profiles:
+            if kv_profile.kv_preset == baseline_kv:
+                continue
+            add(
+                f'kv_compression_probe_{kv_profile.name_slug}',
+                base_ctx,
+                partial_ngl,
+                kv_profile.kv_preset,
+                kv_profile=kv_profile,
+            )
+        if benchmark_depth == 'full':
+            sweep_kv = baseline_kv
+            if fits_gpu:
+                add('gpu_layer_sweep_full', base_ctx, 999, sweep_kv, kv_profile=baseline_profile)
+            else:
+                sweep_center = max(4, partial_ngl)
+                sweep_values = [max(1, sweep_center - 4), sweep_center, sweep_center + 4, sweep_center + 8, sweep_center + 12]
+                for ngl in sorted(set(value for value in sweep_values if value > 0)):
+                    add(f'gpu_layer_sweep_ngl{ngl}', base_ctx, ngl, sweep_kv, kv_profile=baseline_profile)
+        growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
+        growth_kv = baseline_kv
+        for ctx in growth_contexts:
+            suffix = baseline_profile.name_slug if baseline_profile is not None else 'q8_0_q8_0'
+            add(f'context_growth_sweep_{ctx}_{suffix}', ctx, partial_ngl, growth_kv, kv_profile=baseline_profile)
+        return finalized_profiles()
+
     if engine == 'turboquant':
         baseline_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/q8_0'), None)
         safe_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/turbo4'), None)
@@ -4157,7 +4480,7 @@ def active_engine_runtime_profiles(
 
         if not has_gpu:
             add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile)
-            return profiles
+            return finalized_profiles()
 
         if capabilities.supports_fit:
             discovery_ctx = max(ctx_min, min(ctx_max, max(8192, chat_min_ctx_per_slot(model))))
@@ -4204,7 +4527,7 @@ def active_engine_runtime_profiles(
                         no_warmup=capabilities.supports_no_warmup,
                         fit_discovery_phase='context_growth',
                     )
-            return profiles
+            return finalized_profiles()
 
         add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, kv_profile=baseline_profile)
         for kv_profile in turbo_profiles:
@@ -4233,7 +4556,7 @@ def active_engine_runtime_profiles(
         for ctx in growth_contexts:
             suffix = preferred_profile.name_slug if preferred_profile is not None else 'q8_0_q8_0'
             add(f'context_growth_sweep_{ctx}_{suffix}', ctx, partial_ngl, growth_kv, kv_profile=preferred_profile)
-        return profiles
+        return finalized_profiles()
 
     if not (engine == 'buun' and has_gpu):
         add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, 'default', batch=128, ubatch=64)
@@ -4301,7 +4624,7 @@ def active_engine_runtime_profiles(
                 add_buun_fit_growth_profiles(include_turbo_ladder=True)
             else:
                 add_buun_fit_growth_profiles(include_turbo_ladder=False)
-            return profiles
+            return finalized_profiles()
         add('partial_gpu_probe', base_ctx, partial_ngl, kv_for_strategy('partial_gpu_probe'))
         if supports_turbo:
             for kv_profile in turbo_profiles:
@@ -4344,7 +4667,7 @@ def active_engine_runtime_profiles(
         for ctx in context_points:
             if ctx > base_ctx and ctx <= ctx_max:
                 add(f'context_growth_sweep_{ctx}', ctx, context_seed_ngl, context_kv)
-    return profiles
+    return finalized_profiles()
 
 
 def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfile) -> ModelConfig:
@@ -4353,6 +4676,10 @@ def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfil
     candidate.ngl = int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else candidate.ngl)
     candidate.parallel = max(1, int(runtime_profile.parallel or 1))
     candidate.flash_attn = str(runtime_profile.flash_attn or 'on').strip().lower() != 'off'
+    candidate.moe_placement_strategy = str(getattr(runtime_profile, 'placement_strategy', '') or '')
+    candidate.cpu_moe = bool(getattr(runtime_profile, 'cpu_moe', False))
+    candidate.n_cpu_moe = max(0, int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0))
+    candidate.tensor_overrides = [str(item) for item in tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ())]
     candidate.optimize_mode = 'manual'
     candidate.optimize_tier = 'measured'
     return candidate
@@ -4385,6 +4712,10 @@ def benchmark_config_fingerprint(candidate: ModelConfig) -> str:
         'expert_count': int(getattr(candidate, 'expert_count', 0) or 0),
         'expert_used_count': int(getattr(candidate, 'expert_used_count', 0) or 0),
         'active_expert_ratio': float(getattr(candidate, 'active_expert_ratio', 0.0) or 0.0),
+        'moe_placement_strategy': getattr(candidate, 'moe_placement_strategy', '') or '',
+        'cpu_moe': bool(getattr(candidate, 'cpu_moe', False)),
+        'n_cpu_moe': int(getattr(candidate, 'n_cpu_moe', 0) or 0),
+        'tensor_overrides': list(getattr(candidate, 'tensor_overrides', []) or []),
     }
     arch_record = architecture_payload(candidate)
     for key in (
@@ -4414,6 +4745,10 @@ def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: 
         'no_warmup': bool(runtime_profile.no_warmup),
         'fit_discovery_phase': str(getattr(runtime_profile, 'fit_discovery_phase', '') or ''),
         'viable_ngl': int(getattr(runtime_profile, 'viable_ngl', 0) or 0),
+        'placement_strategy': str(getattr(runtime_profile, 'placement_strategy', '') or ''),
+        'cpu_moe': bool(getattr(runtime_profile, 'cpu_moe', False)),
+        'n_cpu_moe': int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0),
+        'tensor_overrides': list(getattr(runtime_profile, 'tensor_overrides', ()) or ()),
         'extra_args': list(runtime_profile.extra_args or ()),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))

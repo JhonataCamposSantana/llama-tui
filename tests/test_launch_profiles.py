@@ -5,6 +5,8 @@ from llama_tui.launch_profiles import (
     RAW_SPEED_OUTPUT,
     SERVE_DEFAULT_FAST_OUTPUT_CAP,
     SERVE_DEFAULT_FULL_OUTPUT_CAP,
+    TQ3_MOE_FAST_OUTPUT_CAP,
+    TQ3_MOE_FULL_OUTPUT_CAP,
     benchmark_launch_metadata,
     benchmark_profile_request_fields,
     build_benchmark_launch_profile,
@@ -154,6 +156,61 @@ class LaunchProfileTests(unittest.TestCase):
         self.assertTrue(metadata['fit'])
         self.assertEqual(metadata['fit_context'], 4096)
         self.assertEqual(metadata['unsupported_launch_flags'], ['--chat-template-kwargs'])
+
+    def test_tq3_moe_profiles_use_interactive_measurement_caps(self):
+        model = ModelConfig(
+            id='moe',
+            name='Qwen MoE TQ3',
+            path='moe.TQ3_4S.gguf',
+            alias='moe',
+            port=18080,
+            output=4096,
+            architecture_type='moe',
+            expert_count=128,
+            tq3_status='native',
+            tq3_weight_format='TQ3_4S',
+        )
+        runtime = RuntimeProfile(
+            engine_id='tq3',
+            name='q8',
+            ctx_size=8192,
+            parallel=1,
+            gpu_layers=17,
+            kv_preset='q8_0/q8_0',
+        )
+
+        fast = build_benchmark_launch_profile(model, runtime, purpose='serve_default', depth='fast')
+        full = build_benchmark_launch_profile(model, runtime, purpose='serve_default', depth='full')
+
+        self.assertEqual(fast.measurement_output, TQ3_MOE_FAST_OUTPUT_CAP)
+        self.assertEqual(full.measurement_output, TQ3_MOE_FULL_OUTPUT_CAP)
+
+    def test_dense_tq3_profile_keeps_standard_measurement_caps(self):
+        model = ModelConfig(
+            id='dense',
+            name='Dense TQ3',
+            path='dense.TQ3_4S.gguf',
+            alias='dense',
+            port=18080,
+            output=4096,
+            architecture_type='dense',
+            tq3_status='native',
+            tq3_weight_format='TQ3_4S',
+        )
+        runtime = RuntimeProfile(
+            engine_id='tq3',
+            name='q8',
+            ctx_size=8192,
+            parallel=1,
+            gpu_layers=99,
+            kv_preset='q8_0/q8_0',
+        )
+
+        fast = build_benchmark_launch_profile(model, runtime, purpose='serve_default', depth='fast')
+        full = build_benchmark_launch_profile(model, runtime, purpose='serve_default', depth='full')
+
+        self.assertEqual(fast.measurement_output, SERVE_DEFAULT_FAST_OUTPUT_CAP)
+        self.assertEqual(full.measurement_output, SERVE_DEFAULT_FULL_OUTPUT_CAP)
 
 
 if __name__ == '__main__':

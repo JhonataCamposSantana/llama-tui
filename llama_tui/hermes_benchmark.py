@@ -193,7 +193,15 @@ def hermes_candidate_from_profile(
 ) -> Tuple[Optional[ModelConfig], Optional[RuntimeProfile]]:
     temp_model = clone_model_config(model)
     temp_model.measured_profiles = {key: dict(profile)}
-    return model_and_runtime_profile_from_measured_profile(temp_model, key)
+    candidate, runtime_profile = model_and_runtime_profile_from_measured_profile(temp_model, key)
+    if candidate is not None:
+        candidate.measured_profiles = {
+            str(existing_key): (
+                dict(existing_profile) if isinstance(existing_profile, dict) else existing_profile
+            )
+            for existing_key, existing_profile in (getattr(model, 'measured_profiles', {}) or {}).items()
+        }
+    return candidate, runtime_profile
 
 
 def hermes_profile_sources(model: ModelConfig) -> List[Tuple[str, str, Dict[str, object], str]]:

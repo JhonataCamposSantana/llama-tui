@@ -10,6 +10,8 @@ from .runtime_profiles import EngineCapabilities, RuntimeProfile, kv_modes_from_
 BENCHMARK_PURPOSES = ('raw_speed', 'serve_default')
 SERVE_DEFAULT_FAST_OUTPUT_CAP = 512
 SERVE_DEFAULT_FULL_OUTPUT_CAP = 1024
+TQ3_MOE_FAST_OUTPUT_CAP = 128
+TQ3_MOE_FULL_OUTPUT_CAP = 256
 RAW_SPEED_OUTPUT = 512
 
 
@@ -126,6 +128,24 @@ def _override_sequence(overrides: Dict[str, object], key: str) -> Tuple[str, ...
     return ()
 
 
+def _runtime_engine_id(runtime_profile: Optional[RuntimeProfile]) -> str:
+    return str(getattr(runtime_profile, 'engine_id', '') or '').strip().lower()
+
+
+def _is_tq3_moe_profile(model: ModelConfig, runtime_profile: Optional[RuntimeProfile]) -> bool:
+    if _runtime_engine_id(runtime_profile) != 'tq3':
+        return False
+    if int(getattr(model, 'expert_count', 0) or 0) > 0:
+        return True
+    if int(getattr(model, 'expert_used_count', 0) or 0) > 0:
+        return True
+    text = ' '.join(
+        str(getattr(model, name, '') or '')
+        for name in ('architecture_type', 'architecture', 'model_family', 'name', 'id')
+    ).lower()
+    return 'moe' in text
+
+
 def build_benchmark_launch_profile(
     model: ModelConfig,
     runtime_profile: Optional[RuntimeProfile] = None,
@@ -154,6 +174,8 @@ def build_benchmark_launch_profile(
     else:
         output = max(1, int(getattr(model, 'output', 4096) or 4096))
         cap = SERVE_DEFAULT_FAST_OUTPUT_CAP if depth_key == 'fast' else SERVE_DEFAULT_FULL_OUTPUT_CAP
+        if _is_tq3_moe_profile(model, runtime_profile):
+            cap = TQ3_MOE_FAST_OUTPUT_CAP if depth_key == 'fast' else TQ3_MOE_FULL_OUTPUT_CAP
         measurement_output = max(1, min(output, cap))
         temp = float(getattr(model, 'temp', 0.7) or 0.7)
         top_p = _maybe_float(getattr(model, 'top_p', 0.95), 0.95)

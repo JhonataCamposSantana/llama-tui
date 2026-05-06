@@ -1,0 +1,88 @@
+import unittest
+from unittest.mock import patch
+
+from llama_tui.hardware import HardwareProfile
+from llama_tui.models import ModelConfig
+from llama_tui.moe_placement import generate_moe_placement_candidates
+from llama_tui.runtime_profiles import EngineCapabilities
+
+
+class MoePlacementTests(unittest.TestCase):
+    def model(self, architecture_type: str = 'moe') -> ModelConfig:
+        return ModelConfig(
+            id='model',
+            name='Model',
+            path='/models/model.gguf',
+            alias='model',
+            port=18080,
+            architecture_type=architecture_type,
+            expert_count=64 if architecture_type == 'moe' else 0,
+            expert_used_count=8 if architecture_type == 'moe' else 0,
+        )
+
+    def test_dense_model_returns_no_candidates(self):
+        caps = EngineCapabilities(supports_cpu_moe=True, supports_n_cpu_moe=True)
+        candidates = generate_moe_placement_candidates(
+            self.model('dense'),
+            HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3),
+            caps,
+            'llama.cpp',
+            'full',
+        )
+
+        self.assertEqual(candidates, [])
+
+    def test_small_gpu_prioritizes_high_cpu_moe_ladder(self):
+        caps = EngineCapabilities(
+            supports_cpu_moe=True,
+            supports_n_cpu_moe=True,
+            supports_override_tensor=True,
+        )
+
+        with patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+            candidates = generate_moe_placement_candidates(
+                self.model(),
+                HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3),
+                caps,
+                'llama.cpp',
+                'full',
+            )
+
+        names = [item.name for item in candidates]
+        self.assertEqual(names[0], 'baseline_ngl')
+        self.assertEqual(names[1], 'cpu_moe_all')
+        self.assertEqual(names[2], 'n_cpu_moe_40')
+        self.assertIn('experts_cpu_override', names)
+        self.assertLessEqual(len(candidates), 6)
+
+    def test_unsupported_capabilities_suppress_cpu_moe_candidates(self):
+        caps = EngineCapabilities()
+
+        with patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+            candidates = generate_moe_placement_candidates(
+                self.model(),
+                HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3),
+                caps,
+                'llama.cpp',
+                'fast',
+            )
+
+        names = {item.name for item in candidates}
+        self.assertNotIn('cpu_moe_all', names)
+        self.assertFalse(any(name.startswith('n_cpu_moe_') for name in names))
+
+    def test_non_llama_family_engine_returns_no_candidates(self):
+        caps = EngineCapabilities(supports_cpu_moe=True, supports_n_cpu_moe=True)
+        candidates = generate_moe_placement_candidates(
+            self.model(),
+            HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3),
+            caps,
+            'vllm',
+            'full',
+        )
+
+        self.assertEqual(candidates, [])
+
+
+if __name__ == '__main__':
+    unittest.main()

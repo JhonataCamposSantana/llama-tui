@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -40,7 +41,7 @@ from .engines import (
     turboquant_binary_warning as engine_turboquant_binary_warning,
 )
 from .control import CancelToken, check_cancelled, sleep_with_cancel
-from .gguf import estimate_kv_bytes_per_token, extra_arg_value, read_gguf_metadata
+from .gguf import estimate_kv_bytes_per_token, extra_arg_value, has_extra_flag, read_gguf_metadata
 from .gguf import (
     TQ3_STATUSES,
     TURBOQUANT_STATUSES,
@@ -628,6 +629,15 @@ class AppConfig:
         payload['tq3_weight_format'] = str(payload.get('tq3_weight_format', '') or '').strip().upper()
         payload['tq3_source'] = str(payload.get('tq3_source', '') or '')
         payload['tq3_reason'] = str(payload.get('tq3_reason', '') or '')
+        payload['moe_placement_strategy'] = str(payload.get('moe_placement_strategy', '') or '').strip()
+        payload['cpu_moe'] = bool(payload.get('cpu_moe', False))
+        payload['n_cpu_moe'] = max(0, int(payload.get('n_cpu_moe', 0) or 0))
+        tensor_overrides = payload.get('tensor_overrides', [])
+        payload['tensor_overrides'] = (
+            [str(item).strip() for item in tensor_overrides if str(item).strip()]
+            if isinstance(tensor_overrides, list)
+            else []
+        )
         payload['favorite'] = bool(payload.get('favorite', False))
         payload['last_used_at'] = str(payload.get('last_used_at', '') or '')
         payload['sort_rank'] = int(payload.get('sort_rank', index + 1) or (index + 1))
@@ -886,6 +896,54 @@ class AppConfig:
             except Exception:
                 return 0
 
+        def extra_arg_values(*flags: str) -> List[str]:
+            values: List[str] = []
+            flag_set = {flag for flag in flags if flag}
+            idx = 0
+            while idx < len(args):
+                token = str(args[idx])
+                matched = ''
+                for flag in flag_set:
+                    if token == flag:
+                        matched = flag
+                        break
+                    if token.startswith(f'{flag}='):
+                        value = token[len(flag) + 1:].strip()
+                        if value:
+                            values.append(value)
+                        matched = flag
+                        break
+                if matched and token == matched and idx + 1 < len(args):
+                    value = str(args[idx + 1]).strip()
+                    if value:
+                        values.append(value)
+                    idx += 2
+                    continue
+                idx += 1
+            return values
+
+        cpu_moe = bool(getattr(model, 'cpu_moe', False)) or has_extra_flag(args, '--cpu-moe', '-cmoe')
+        n_cpu_moe = max(
+            0,
+            int(getattr(model, 'n_cpu_moe', 0) or 0) or int_extra('--n-cpu-moe', '-ncmoe'),
+        )
+        tensor_overrides = [
+            str(item).strip()
+            for item in list(getattr(model, 'tensor_overrides', []) or [])
+            if str(item).strip()
+        ]
+        for value in extra_arg_values('--override-tensor', '--override-tensors', '-ot'):
+            if value not in tensor_overrides:
+                tensor_overrides.append(value)
+        placement_strategy = str(getattr(model, 'moe_placement_strategy', '') or '').strip()
+        if not placement_strategy:
+            if cpu_moe:
+                placement_strategy = 'cpu_moe_all'
+            elif n_cpu_moe > 0:
+                placement_strategy = f'n_cpu_moe_{n_cpu_moe}'
+            elif tensor_overrides:
+                placement_strategy = 'tensor_override'
+
         return RuntimeProfile(
             engine_id=engine_id,
             ctx_size=max(1, int(ctx_value or 1)),
@@ -897,6 +955,10 @@ class AppConfig:
             ubatch_size=int_extra('--ubatch-size', '-ub'),
             extra_args=(),
             name='manual',
+            placement_strategy=placement_strategy,
+            cpu_moe=cpu_moe,
+            n_cpu_moe=n_cpu_moe,
+            tensor_overrides=tuple(tensor_overrides),
         )
 
     def runtime_indicator(self) -> str:
@@ -986,6 +1048,75 @@ class AppConfig:
         except Exception:
             return ''
         return engine_tq3_binary_warning(command, capabilities)
+
+    def tq3_launch_diagnostic(
+        self,
+        model: ModelConfig,
+        benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
+    ) -> str:
+        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
+            return ''
+        stats = {
+            'offloaded_layers': 0,
+            'total_layers': 0,
+            'cpu_mapped_mib': 0.0,
+            'cuda_model_mib': 0.0,
+            'decode_tps': 0.0,
+            'preserve_thinking': False,
+        }
+        for line in self._runtime_log_after_last_launch(model, max_lines=800):
+            offload = re.search(r'offloaded\s+(\d+)\s*/\s*(\d+)\s+layers', line, re.IGNORECASE)
+            if offload:
+                stats['offloaded_layers'] = int(offload.group(1))
+                stats['total_layers'] = int(offload.group(2))
+            cpu = re.search(r'CPU_Mapped model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
+            if cpu:
+                stats['cpu_mapped_mib'] = float(cpu.group(1))
+            cuda = re.search(r'CUDA\d* model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
+            if cuda:
+                stats['cuda_model_mib'] = float(cuda.group(1))
+            decode = re.search(
+                r'(?:^|:\s*)eval time\s*=.*?/\s*\d+\s+tokens.*?,\s*([0-9.]+)\s+tokens per second',
+                line,
+                re.IGNORECASE,
+            )
+            if decode:
+                stats['decode_tps'] = float(decode.group(1))
+            if 'preserve_thinking' in line and 'true' in line.lower():
+                stats['preserve_thinking'] = True
+
+        parts: List[str] = []
+        offloaded = int(stats['offloaded_layers'])
+        total = int(stats['total_layers'])
+        if offloaded and total:
+            parts.append(f'GPU offload {offloaded}/{total} layers')
+            if offloaded < total:
+                parts.append('partial GPU offload; replies may be CPU-bound')
+        cpu_mapped = float(stats['cpu_mapped_mib'])
+        if cpu_mapped > 0:
+            parts.append(f'CPU-mapped model buffer {cpu_mapped:.1f} MiB')
+        cuda_model = float(stats['cuda_model_mib'])
+        if cuda_model > 0:
+            parts.append(f'CUDA model buffer {cuda_model:.1f} MiB')
+        decode_tps = float(stats['decode_tps'])
+        if decode_tps > 0:
+            parts.append(f'recent decode {decode_tps:.2f} tok/s')
+            output_cap = int(
+                getattr(benchmark_profile, 'measurement_output', 0)
+                or getattr(model, 'output', 0)
+                or 0
+            )
+            if output_cap > 0:
+                seconds = output_cap / max(0.001, decode_tps)
+                if seconds >= 60:
+                    parts.append(f'{output_cap}-token cap ~= {seconds / 60.0:.1f} min')
+                else:
+                    parts.append(f'{output_cap}-token cap ~= {seconds:.0f} sec')
+        if bool(stats['preserve_thinking']) or str(getattr(model, 'preserve_thinking', 'auto') or '').strip().lower() == 'on':
+            parts.append('preserve_thinking is on; disabling it can improve interactive latency')
+        if not parts:
+            return ''
+        return 'TQ3 launch diagnostic: ' + '; '.join(parts)
 
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
@@ -2401,6 +2532,7 @@ class AppConfig:
         tq3_advisory = self.tq3_session_advisory(model)
         tq_binary_warning = self.turboquant_binary_warning(model)
         tq3_binary_warning = self.tq3_binary_warning(model)
+        tq3_launch_diagnostic = self.tq3_launch_diagnostic(model, benchmark_profile=benchmark_profile)
         if runtime_profile is not None:
             profile = {
                 'ctx': int(runtime_profile.ctx_size or getattr(model, 'ctx', 0) or 0),
@@ -2453,6 +2585,8 @@ class AppConfig:
             self.append_log(model.id, tq_binary_warning)
         if tq3_binary_warning:
             self.append_log(model.id, tq3_binary_warning)
+        if tq3_launch_diagnostic:
+            self.append_log(model.id, tq3_launch_diagnostic)
         self.append_log(model.id, f'launch command: {shlex.join(command)}')
         try:
             with open(log_path, 'ab') as log_file:
@@ -2479,6 +2613,8 @@ class AppConfig:
             detail += f' | {tq_binary_warning}'
         if tq3_binary_warning:
             detail += f' | {tq3_binary_warning}'
+        if tq3_launch_diagnostic:
+            detail += f' | {tq3_launch_diagnostic}'
         return True, detail
 
     def _runtime_log_after_last_launch(self, model: ModelConfig, max_lines: int = 400) -> List[str]:
