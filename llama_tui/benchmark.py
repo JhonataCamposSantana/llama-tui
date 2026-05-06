@@ -1,15 +1,20 @@
 import json
+import os
 import re
+import signal
 import shlex
 import statistics
+import subprocess
 import time
 from dataclasses import asdict, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib import request
 
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .discovery import extract_quant
+from .engines import ENGINE_TQ3, resolve_engine_install
 from .gguf import architecture_label, extra_arg_value, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
 from .launch_profiles import (
@@ -38,6 +43,7 @@ from .optimize import (
 )
 from .runtime_profiles import (
     RuntimeProfile,
+    TurboKvProfile,
     default_engine_capabilities,
     kv_modes_from_preset,
     supported_turbo_kv_profiles,
@@ -153,6 +159,7 @@ def benchmark_command_preview(
 
 
 FAILURE_CATEGORIES = (
+    'ENGINE_BINARY_MISSING',
     'CLI_INVALID',
     'MEMORY_GUARDRAIL',
     'MEMORY_FIT_FAILED',
@@ -163,6 +170,7 @@ FAILURE_CATEGORIES = (
     'BUUN_FIT_FAILED',
     'BUUN_CPU_WARMUP_ABORT',
     'MODEL_LOAD_FAILED',
+    'RAW_ENGINE_TIMEOUT',
     'SERVER_TIMEOUT',
     'API_TIMEOUT',
     'PORT_UNREACHABLE',
@@ -285,6 +293,11 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
     reason = excerpt or detail or category
     suggested = ''
     terminal = False
+    if 'engine_binary_missing' in low or ('llama.cpp-tq3 server not found' in low and 'tq3_llama_server_bin' in low):
+        category = 'ENGINE_BINARY_MISSING'
+        reason = detail or 'The active TQ3 server binary is missing.'
+        suggested = 'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
+        terminal = True
     if re.search(r'(unknown|invalid|unrecognized).{0,80}(argument|option|value|flag)', low) or 'requires an argument' in low:
         category = 'CLI_INVALID'
         suggested = 'Check the generated command and use syntax supported by this server binary.'
@@ -373,7 +386,11 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         category = 'PORT_UNREACHABLE'
         suggested = 'The server process did not expose the expected API port.'
     if not terminal and ('timed out' in low or 'timeout' in low):
-        category = 'API_TIMEOUT' if default_category == 'API_TIMEOUT' else 'SERVER_TIMEOUT'
+        if default_category == 'RAW_ENGINE_TIMEOUT':
+            category = 'RAW_ENGINE_TIMEOUT'
+            suggested = suggested or 'Keep raw engine probes bounded; promote only candidates that pass server validation.'
+        else:
+            category = 'API_TIMEOUT' if default_category == 'API_TIMEOUT' else 'SERVER_TIMEOUT'
         suggested = suggested or 'Retry with a smaller context or lower GPU layer count.'
     return {
         'failure_category': category,
@@ -493,6 +510,18 @@ def benchmark_preflight_cleanup(
     cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
     check_cancelled(cancel_token)
+    try:
+        active_engine = app.active_engine_key_for_model(model) if hasattr(app, 'active_engine_key_for_model') else ''
+    except Exception:
+        active_engine = ''
+    if active_engine == ENGINE_TQ3:
+        install = resolve_engine_install(app, ENGINE_TQ3)
+        if not install.exists:
+            command = str(install.resolved_command or 'tq3-llama-server')
+            return False, (
+                f'ENGINE_BINARY_MISSING: llama.cpp-tq3 server not found: {command}. '
+                'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
+            )
     if hasattr(app, 'active_engine_model_compatibility'):
         try:
             compatible, compatibility_msg = app.active_engine_model_compatibility(model)
@@ -971,6 +1000,93 @@ def low_speed_guardrail_reason(record: Dict[str, object]) -> str:
     return ''
 
 
+def _record_decode_tps(record: Dict[str, object]) -> float:
+    try:
+        return float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _is_tq3_cpu_moe_placement(record: Dict[str, object]) -> bool:
+    return (
+        str(record.get('engine', '') or '').strip().lower() == 'tq3'
+        and (bool(record.get('cpu_moe', False)) or int(record.get('n_cpu_moe', 0) or 0) > 0)
+    )
+
+
+def _is_tq3_partial_fixed_offload(record: Dict[str, object]) -> bool:
+    if str(record.get('engine', '') or '').strip().lower() != 'tq3':
+        return False
+    if _is_tq3_cpu_moe_placement(record):
+        return False
+    if str(record.get('gpu_layers_mode', '') or '').strip().lower() not in ('', 'fixed'):
+        return False
+    try:
+        ngl = int(record.get('ngl', 0) or 0)
+    except Exception:
+        ngl = 0
+    return 0 < ngl < 999
+
+
+def reject_slow_tq3_partial_offload_rows(records: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    faster = [
+        item for item in records
+        if item.get('status') == 'ok'
+        and str(item.get('measurement_type', 'full') or 'full') == 'full'
+        and _is_tq3_cpu_moe_placement(item)
+        and _record_decode_tps(item) > 0
+    ]
+    if not faster:
+        return records
+    fastest = max(faster, key=_record_decode_tps)
+    fastest_tps = _record_decode_tps(fastest)
+    kept = []
+    for item in records:
+        tps = _record_decode_tps(item)
+        if _is_tq3_partial_fixed_offload(item) and tps > 0 and fastest_tps > tps * 3.0:
+            item['rejection_reason'] = 'rejected_slow_partial_offload'
+            item['selection_rejection_reason'] = 'rejected_slow_partial_offload'
+            item['rejected_by_profile'] = str(fastest.get('runtime_profile', '') or fastest.get('placement_strategy', '') or 'tq3_moe_placement')
+            item['rejected_by_tokens_per_sec'] = round(fastest_tps, 2)
+            continue
+        kept.append(item)
+    return kept
+
+
+def propagate_rejection_reasons(records: List[Dict[str, object]], measured: List[Dict[str, object]]) -> None:
+    rejected = [
+        item for item in measured
+        if str(item.get('rejection_reason', '') or item.get('selection_rejection_reason', '') or '')
+    ]
+    if not rejected:
+        return
+    for rejected_item in rejected:
+        reason = str(rejected_item.get('rejection_reason', '') or rejected_item.get('selection_rejection_reason', '') or '')
+        fingerprint = str(rejected_item.get('config_fingerprint', '') or '')
+        shape = (
+            str(rejected_item.get('runtime_profile', '') or ''),
+            str(rejected_item.get('kv_preset', '') or ''),
+            str(rejected_item.get('placement_strategy', '') or ''),
+            int(rejected_item.get('ngl', 0) or 0),
+            int(rejected_item.get('ctx', 0) or 0),
+        )
+        for record in records:
+            if fingerprint and str(record.get('config_fingerprint', '') or '') == fingerprint:
+                record['rejection_reason'] = reason
+                record['selection_rejection_reason'] = reason
+                continue
+            record_shape = (
+                str(record.get('runtime_profile', '') or ''),
+                str(record.get('kv_preset', '') or ''),
+                str(record.get('placement_strategy', '') or ''),
+                int(record.get('ngl', 0) or 0),
+                int(record.get('ctx', 0) or 0),
+            )
+            if record_shape == shape:
+                record['rejection_reason'] = reason
+                record['selection_rejection_reason'] = reason
+
+
 def score_fast_chat(record: Dict[str, object], model: ModelConfig) -> float:
     cap = 16384 if model_is_moe(model) else 8192
     tps = float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
@@ -1179,6 +1295,9 @@ def measured_profile_runtime_profile(
         'cpu_moe',
         'n_cpu_moe',
         'tensor_overrides',
+        'reasoning',
+        'reasoning_budget',
+        'reasoning_format',
     )
     has_replay_data = (
         any(bool(profile.get(field)) for field in replay_fields)
@@ -1192,6 +1311,9 @@ def measured_profile_runtime_profile(
             'cpu_moe',
             'n_cpu_moe',
             'tensor_overrides',
+            'reasoning',
+            'reasoning_budget',
+            'reasoning_format',
         ))
         or any(token in command_tokens for token in (
             '-fit',
@@ -1209,6 +1331,9 @@ def measured_profile_runtime_profile(
             '-ot',
             '--override-tensor',
             '--override-tensors',
+            '--reasoning',
+            '--reasoning-budget',
+            '--reasoning-format',
         ))
     )
     if not has_replay_data:
@@ -1305,6 +1430,18 @@ def measured_profile_runtime_profile(
             placement_strategy = f'n_cpu_moe_{n_cpu_moe}'
         elif tensor_values:
             placement_strategy = 'tensor_override'
+    reasoning = str(profile.get('reasoning') or fingerprint.get('reasoning') or '').strip().lower()
+    if not reasoning:
+        reasoning = _command_flag_value(command_tokens, '--reasoning', '-rea').strip().lower()
+    if reasoning not in ('', 'on', 'off', 'auto'):
+        reasoning = ''
+    reasoning_budget = _profile_int(profile, 'reasoning_budget', int(fingerprint.get('reasoning_budget', -1) or -1))
+    if reasoning_budget < 0:
+        budget_text = _command_flag_value(command_tokens, '--reasoning-budget')
+        reasoning_budget = int(budget_text) if budget_text else -1
+    reasoning_format = str(profile.get('reasoning_format') or fingerprint.get('reasoning_format') or '').strip().lower()
+    if not reasoning_format:
+        reasoning_format = _command_flag_value(command_tokens, '--reasoning-format').strip().lower()
     return RuntimeProfile(
         engine_id=engine,
         name=runtime_name or f'measured_{key}',
@@ -1334,6 +1471,9 @@ def measured_profile_runtime_profile(
         cpu_moe=bool(cpu_moe),
         n_cpu_moe=max(0, int(n_cpu_moe or 0)),
         tensor_overrides=tuple(tensor_values),
+        reasoning=reasoning,
+        reasoning_budget=reasoning_budget,
+        reasoning_format=reasoning_format,
     )
 
 
@@ -2578,6 +2718,8 @@ def adaptive_profile_dict(
         'cache_reuse',
         'reasoning',
         'reasoning_budget',
+        'reasoning_format',
+        'reasoning_mode',
         'preserve_thinking',
         'preserve_thinking_source',
         'chat_template_kwargs',
@@ -2608,6 +2750,14 @@ def adaptive_profile_dict(
         'fit_selected_ngl',
         'fit_selected_ngl_source',
         'fit_log_excerpt',
+        'placement_strategy',
+        'cpu_moe',
+        'n_cpu_moe',
+        'tensor_overrides',
+        'rejection_reason',
+        'selection_rejection_reason',
+        'rejected_by_profile',
+        'rejected_by_tokens_per_sec',
         'config_fingerprint',
         'command',
     ):
@@ -2678,15 +2828,18 @@ def select_measured_profiles(
     ]
     if not successful:
         return {}
+    promotion_pool = reject_slow_tq3_partial_offload_rows(successful)
+    if not promotion_pool:
+        promotion_pool = successful
     max_tps = max(float(item.get('tokens_per_sec', 0.0) or 0.0) for item in successful) or 1.0
     max_ctx = max(int(item.get('ctx_per_slot', 0) or 0) for item in successful) or 1
     fast_floor = chat_min_ctx_per_slot(model)
     opencode_floor = max(observed_opencode_context_floor(model), 16384 if model_is_moe(model) else 0)
 
-    fast_pool = [item for item in successful if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or successful
-    long_candidates = [item for item in successful if int(item.get('parallel', 1) or 1) == 1]
+    fast_pool = [item for item in promotion_pool if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or promotion_pool
+    long_candidates = [item for item in promotion_pool if int(item.get('parallel', 1) or 1) == 1]
     long_pool = [item for item in long_candidates if not low_speed_guardrail_reason(item)]
-    opencode_single_slot_pool = [item for item in successful if int(item.get('parallel', 1) or 1) == 1] or successful
+    opencode_single_slot_pool = [item for item in promotion_pool if int(item.get('parallel', 1) or 1) == 1] or promotion_pool
     opencode_pool = (
         [item for item in opencode_single_slot_pool if int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor]
         if opencode_floor
@@ -2695,7 +2848,7 @@ def select_measured_profiles(
     opencode_pool = [item for item in opencode_pool if not low_speed_guardrail_reason(item)]
 
     fast = max(fast_pool, key=lambda item: (score_fast_chat(item, model), float(item.get('tokens_per_sec', 0.0) or 0.0)))
-    auto = max(successful, key=lambda item: score_auto(item, model))
+    auto = max(promotion_pool, key=lambda item: score_auto(item, model))
     winner_specs = {
         'fast_chat': (
             fast,
@@ -3081,9 +3234,15 @@ def opencode_profile_status_text(winners: Dict[str, Dict[str, object]]) -> str:
 
 def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Optional[List[Dict[str, object]]] = None) -> str:
     low_speed_count = sum(1 for row in list(records or []) if low_speed_guardrail_reason(row))
+    rejected_partial_count = sum(
+        1 for row in list(records or [])
+        if str(row.get('rejection_reason', '') or row.get('selection_rejection_reason', '') or '') == 'rejected_slow_partial_offload'
+    )
     if not winners:
         if low_speed_count:
             return f'no winners, {low_speed_count} TQ3 low-speed profile(s) held back'
+        if rejected_partial_count:
+            return f'no winners, {rejected_partial_count} slow partial-offload profile(s) rejected'
         return 'no winners'
     parts = []
     fast = winners.get('fast_chat') or {}
@@ -3110,6 +3269,8 @@ def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Option
         parts.append(f'{failed_count} candidate failure(s), winners saved')
     if low_speed_count:
         parts.append(f'{low_speed_count} TQ3 low-speed profile(s) held back')
+    if rejected_partial_count:
+        parts.append(f'{rejected_partial_count} slow partial-offload profile(s) rejected')
     return ', '.join(parts) if parts else 'no winners'
 
 
@@ -3119,6 +3280,51 @@ def upsert_benchmark_run(model: ModelConfig, run: Dict[str, object], limit: int 
     filtered = [item for item in existing if str(item.get('id', '') or '') != run_id]
     filtered.insert(0, dict(run))
     model.benchmark_runs = filtered[: max(1, int(limit or BENCHMARK_HISTORY_LIMIT))]
+
+
+def close_stale_running_benchmark_runs(
+    model: ModelConfig,
+    ended_at: str,
+    reason: str = 'aborted_stale_previous_run',
+) -> bool:
+    changed = False
+    runs: List[Dict[str, object]] = []
+    for item in list(getattr(model, 'benchmark_runs', []) or []):
+        run = dict(item)
+        if str(run.get('status', '') or '').strip().lower() == 'running':
+            run['status'] = 'aborted'
+            run['ended_at'] = ended_at
+            run['stale_reason'] = reason
+            summary = str(run.get('summary', '') or '').strip()
+            run['summary'] = f'{summary}; {reason}' if summary else reason
+            changed = True
+        runs.append(run)
+    if runs:
+        model.benchmark_runs = runs[:BENCHMARK_HISTORY_LIMIT]
+    if str(getattr(model, 'default_benchmark_status', '') or '').strip().lower() == 'running':
+        model.default_benchmark_status = 'aborted'
+        model.default_benchmark_at = ended_at
+        changed = True
+    return changed
+
+
+def persist_running_benchmark_progress(
+    app,
+    model: ModelConfig,
+    run_id: str,
+    kind: str,
+    records: List[Dict[str, object]],
+    started_at: str,
+    hardware: str = '',
+):
+    running_model = ModelConfig(**asdict(model))
+    close_stale_running_benchmark_runs(running_model, started_at)
+    running_model.last_benchmark_results = [dict(row) for row in records]
+    running_model.default_benchmark_status = 'running'
+    running_model.default_benchmark_at = started_at
+    run = build_benchmark_run(run_id, kind, 'running', records, {}, started_at, hardware=hardware)
+    upsert_benchmark_run(running_model, run)
+    app.add_or_update(running_model)
 
 
 def build_benchmark_run(
@@ -3257,6 +3463,8 @@ def adaptive_record_from_candidate(
     cache_reuse: int = 0,
     reasoning: str = '',
     reasoning_budget: Optional[int] = None,
+    reasoning_format: str = '',
+    reasoning_mode: str = '',
     preserve_thinking: bool = False,
     preserve_thinking_source: str = '',
     chat_template_kwargs: Optional[Dict[str, object]] = None,
@@ -3371,6 +3579,12 @@ def adaptive_record_from_candidate(
         'cache_reuse': int(cache_reuse or 0),
         'reasoning': reasoning,
         'reasoning_budget': reasoning_budget,
+        'reasoning_format': reasoning_format,
+        'reasoning_mode': reasoning_mode or (
+            str(reasoning or '')
+            + (f'/{reasoning_format}' if reasoning_format else '')
+            + (f' budget={reasoning_budget}' if reasoning_budget is not None else '')
+        ).strip(),
         'preserve_thinking': bool(preserve_thinking),
         'preserve_thinking_source': preserve_thinking_source,
         'chat_template_kwargs': dict(chat_template_kwargs or {}),
@@ -4102,6 +4316,531 @@ def dynamic_context_growth_targets(
     return sorted(ctx for ctx in values if ctx_min <= ctx <= health_ceiling)
 
 
+def tq3_model_card_q4_tq3_kv_enabled(model: ModelConfig) -> bool:
+    text = ' '.join(
+        str(getattr(model, key, '') or '')
+        for key in ('id', 'name', 'path', 'alias', 'model_family', 'architecture')
+    ).lower()
+    return (
+        'ytan2000' in text
+        and 'qwen3.6' in text
+        and '35b' in text
+        and 'tq3' in text
+    )
+
+
+def tq3_kv_profiles_for_model(
+    model: ModelConfig,
+    capabilities,
+    depth: str,
+) -> List[TurboKvProfile]:
+    profiles = supported_turbo_kv_profiles(capabilities, depth, engine_id='tq3')
+    allowed = {str(item).strip().lower() for item in tuple(getattr(capabilities, 'supported_kv_modes', ()) or ())}
+    if (
+        tq3_model_card_q4_tq3_kv_enabled(model)
+        and 'q4_0' in allowed
+        and 'tq3_0' in allowed
+        and (depth or '').strip().lower() != 'fast'
+        and not any(item.kv_preset == 'q4_0/tq3_0' for item in profiles)
+    ):
+        profiles.append(TurboKvProfile(
+            'q4_0/tq3_0',
+            'Qwen3.6 q4/TQ3',
+            'model_specific',
+            'qwen3.6-tq3',
+            'full',
+            0.12,
+            False,
+            'model-card',
+        ))
+    return profiles
+
+
+def sibling_llama_bench_for_server(server_bin: str) -> str:
+    parts = shlex.split(server_bin or '')
+    if not parts:
+        return 'llama-bench'
+    first = os.path.expanduser(parts[0])
+    if '/' in first or first.startswith('.'):
+        return str(Path(first).expanduser().with_name('llama-bench'))
+    return 'llama-bench'
+
+
+def _command_exists_for_app(app, command: str) -> bool:
+    if hasattr(app, 'command_exists'):
+        try:
+            return bool(app.command_exists(command))
+        except Exception:
+            pass
+    parts = shlex.split(command or '')
+    if not parts:
+        return False
+    first = os.path.expanduser(parts[0])
+    if '/' in first or first.startswith('.'):
+        return Path(first).expanduser().exists()
+    return subprocess.run(['sh', '-c', f'command -v {shlex.quote(first)} >/dev/null 2>&1']).returncode == 0
+
+
+def _tq3_raw_profile_key(runtime_profile: RuntimeProfile) -> Tuple[object, ...]:
+    return (
+        runtime_profile.gpu_layers,
+        runtime_profile.kv_preset,
+        bool(runtime_profile.cpu_moe),
+        int(runtime_profile.n_cpu_moe or 0),
+        tuple(runtime_profile.tensor_overrides or ()),
+    )
+
+
+TQ3_RAW_BENCH_CASES: Tuple[Tuple[str, int, int], ...] = (
+    ('raw_pp', 1024, 0),
+    ('raw_tg', 0, 64),
+    ('raw_combined', 1024, 64),
+)
+
+
+def _tq3_raw_profile_rank(runtime_profile: RuntimeProfile, original_index: int) -> Tuple[int, int, int]:
+    n_cpu_moe = int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0)
+    if n_cpu_moe == 32:
+        priority = 0
+    elif n_cpu_moe == 30:
+        priority = 1
+    elif n_cpu_moe > 0:
+        priority = 20 + abs(n_cpu_moe - 32)
+    elif bool(getattr(runtime_profile, 'cpu_moe', False)):
+        priority = 100
+    else:
+        priority = 999
+    return priority, original_index, n_cpu_moe
+
+
+def _tq3_raw_runtime_profiles(runtime_profiles: List[RuntimeProfile], depth: str) -> List[RuntimeProfile]:
+    candidates: List[Tuple[Tuple[int, int, int], RuntimeProfile]] = []
+    seen = set()
+    fast = (depth or '').strip().lower() == 'fast'
+    limit = 1 if fast else 2
+    for index, profile in enumerate(runtime_profiles):
+        if profile.engine_id != 'tq3' or profile.fit:
+            continue
+        if not (profile.cpu_moe or int(profile.n_cpu_moe or 0) > 0):
+            continue
+        if str(profile.kv_preset or '') != 'q8_0/q8_0':
+            continue
+        if tuple(profile.tensor_overrides or ()):
+            continue
+        if (
+            str(getattr(profile, 'reasoning', '') or '').strip()
+            or int(getattr(profile, 'reasoning_budget', -1) or -1) >= 0
+            or str(getattr(profile, 'reasoning_format', '') or '').strip()
+        ):
+            continue
+        key = _tq3_raw_profile_key(profile)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append((_tq3_raw_profile_rank(profile, index), profile))
+    candidates.sort(key=lambda item: item[0])
+    return [profile for _rank, profile in candidates[:limit]]
+
+
+def tq3_raw_presearch_case_total(runtime_profiles: List[RuntimeProfile], depth: str) -> int:
+    return len(_tq3_raw_runtime_profiles(runtime_profiles, depth)) * len(TQ3_RAW_BENCH_CASES)
+
+
+def tq3_llama_bench_command(
+    llama_bench_bin: str,
+    model: ModelConfig,
+    runtime_profile: RuntimeProfile,
+    prompt_tokens: int,
+    generated_tokens: int,
+    threads: int,
+) -> List[str]:
+    cmd = [
+        llama_bench_bin,
+        '-m', str(getattr(model, 'path', '') or ''),
+        '-p', str(int(prompt_tokens)),
+        '-n', str(int(generated_tokens)),
+    ]
+    if runtime_profile.gpu_layers is not None:
+        cmd += ['-ngl', str(int(runtime_profile.gpu_layers))]
+    if runtime_profile.cpu_moe:
+        cmd.append('-cmoe')
+    elif int(runtime_profile.n_cpu_moe or 0) > 0:
+        cmd += ['-ncmoe', str(int(runtime_profile.n_cpu_moe or 0))]
+    key_mode, value_mode = kv_modes_from_preset(runtime_profile.kv_preset)
+    if key_mode and value_mode:
+        cmd += ['-ctk', key_mode, '-ctv', value_mode]
+    if int(runtime_profile.batch_size or 0) > 0:
+        cmd += ['-b', str(int(runtime_profile.batch_size))]
+    if int(runtime_profile.ubatch_size or 0) > 0:
+        cmd += ['-ub', str(int(runtime_profile.ubatch_size))]
+    if str(runtime_profile.flash_attn or '').strip().lower() in ('on', 'auto', ''):
+        cmd += ['-fa', '1']
+    if int(threads or 0) > 0:
+        cmd += ['-t', str(int(threads))]
+    return cmd
+
+
+def parse_llama_bench_tokens_per_sec(output: str) -> float:
+    values = []
+    for match in re.finditer(r'([0-9]+(?:\.[0-9]+)?)\s*(?:±[^|\n]+)?\s*tok/s', output or '', re.IGNORECASE):
+        try:
+            values.append(float(match.group(1)))
+        except Exception:
+            pass
+    return values[-1] if values else 0.0
+
+
+def _raw_bench_candidate_model(model: ModelConfig, runtime_profile: RuntimeProfile) -> ModelConfig:
+    candidate = ModelConfig(**asdict(model))
+    candidate.ctx = max(1, int(runtime_profile.ctx_size or candidate.ctx or 1))
+    candidate.parallel = max(1, int(runtime_profile.parallel or 1))
+    if runtime_profile.gpu_layers is not None:
+        candidate.ngl = int(runtime_profile.gpu_layers)
+    candidate.moe_placement_strategy = str(runtime_profile.placement_strategy or '')
+    candidate.cpu_moe = bool(runtime_profile.cpu_moe)
+    candidate.n_cpu_moe = int(runtime_profile.n_cpu_moe or 0)
+    candidate.tensor_overrides = [str(item) for item in tuple(runtime_profile.tensor_overrides or ())]
+    return candidate
+
+
+def _terminate_process_group(process: subprocess.Popen):
+    if process.poll() is not None:
+        return
+    try:
+        if hasattr(os, 'killpg'):
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            process.terminate()
+        except Exception:
+            return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            if hasattr(os, 'killpg'):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+
+def _run_tq3_raw_process(
+    cmd: List[str],
+    timeout_seconds: float,
+    cancel_token: Optional[CancelToken] = None,
+) -> Dict[str, object]:
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
+        )
+    except FileNotFoundError as exc:
+        return {
+            'returncode': 127,
+            'stdout': str(exc),
+            'seconds': time.monotonic() - started,
+            'timed_out': False,
+            'cancelled': False,
+        }
+    except Exception as exc:
+        return {
+            'returncode': -1,
+            'stdout': str(exc),
+            'seconds': time.monotonic() - started,
+            'timed_out': False,
+            'cancelled': False,
+        }
+
+    timed_out = False
+    cancelled = False
+    timeout_seconds = max(1.0, float(timeout_seconds or 1.0))
+    while process.poll() is None:
+        if cancel_token is not None and cancel_token.is_cancelled():
+            cancelled = True
+            _terminate_process_group(process)
+            break
+        if time.monotonic() - started >= timeout_seconds:
+            timed_out = True
+            _terminate_process_group(process)
+            break
+        if cancel_token is not None and cancel_token.wait(0.5):
+            continue
+        time.sleep(0.5)
+
+    try:
+        stdout, _stderr = process.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process)
+        try:
+            stdout, _stderr = process.communicate(timeout=1)
+        except Exception:
+            stdout = ''
+    return {
+        'returncode': int(process.returncode if process.returncode is not None else -1),
+        'stdout': stdout or '',
+        'seconds': time.monotonic() - started,
+        'timed_out': timed_out,
+        'cancelled': cancelled,
+    }
+
+
+def run_tq3_raw_llama_bench_presearch(
+    app,
+    model: ModelConfig,
+    hardware: HardwareProfile,
+    runtime_profiles: List[RuntimeProfile],
+    depth: str,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+    on_record: Optional[Callable[[Dict[str, object]], None]] = None,
+    completed_offset: int = 0,
+    total: Optional[int] = None,
+    run_kind: str = 'server',
+) -> Tuple[List[Dict[str, object]], List[RuntimeProfile]]:
+    try:
+        engine = app.active_engine_key_for_model(model)
+    except Exception:
+        engine = ''
+    if engine != ENGINE_TQ3 or not model_is_moe(model):
+        return [], []
+
+    server_install = resolve_engine_install(app, ENGINE_TQ3)
+    server_bin = str(server_install.resolved_command or '')
+    llama_bench_bin = sibling_llama_bench_for_server(server_bin)
+    raw_profiles = _tq3_raw_runtime_profiles(runtime_profiles, depth)
+    if not raw_profiles:
+        return [], []
+    if not _command_exists_for_app(app, llama_bench_bin):
+        candidate = _raw_bench_candidate_model(model, raw_profiles[0])
+        detail = (
+            f'ENGINE_BINARY_MISSING: llama.cpp-tq3 llama-bench not found: {llama_bench_bin}. '
+            f'Build llama-bench next to {server_bin or "llama-server"}.'
+        )
+        record = adaptive_record_from_candidate(
+            candidate,
+            'raw_engine_search',
+            'start failed',
+            detail=detail,
+            engine=ENGINE_TQ3,
+            server_bin=server_bin,
+            binary_path=llama_bench_bin,
+            runtime_profile=raw_profiles[0].name,
+            kv_preset=raw_profiles[0].kv_preset,
+            benchmark_depth=depth,
+            placement_strategy=raw_profiles[0].placement_strategy,
+            cpu_moe=raw_profiles[0].cpu_moe,
+            n_cpu_moe=raw_profiles[0].n_cpu_moe,
+            tensor_overrides=list(raw_profiles[0].tensor_overrides or ()),
+            failure_category='ENGINE_BINARY_MISSING',
+            failure_reason=detail,
+            suggested_fix='Build llama-bench or set TQ3_LLAMA_SERVER_BIN to the matching llama-server.',
+        )
+        record['benchmark_kind'] = 'raw_engine_search'
+        record['measurement_type'] = 'raw_engine_search'
+        record['llama_bench_bin'] = llama_bench_bin
+        if on_record:
+            on_record(dict(record))
+        return [record], []
+
+    threads = max(1, int(getattr(model, 'threads', 0) or getattr(hardware, 'cpu_physical', 0) or getattr(hardware, 'cpu_logical', 0) or 1))
+    records: List[Dict[str, object]] = []
+    scores: Dict[Tuple[object, ...], float] = {}
+    profiles_by_key = {_tq3_raw_profile_key(item): item for item in raw_profiles}
+    fast = (depth or '').strip().lower() == 'fast'
+    phase_budget = 90.0 if fast else 180.0
+    case_timeout = 30.0 if fast else 45.0
+    raw_total = len(raw_profiles) * len(TQ3_RAW_BENCH_CASES)
+    phase_deadline = time.monotonic() + phase_budget
+    raw_index = 0
+    cancelled = False
+    if progress:
+        progress(
+            f'TQ3 raw llama-bench pre-search: {len(raw_profiles)} profile(s), '
+            f'{raw_total} case(s), timeout<={int(case_timeout)}s, budget={int(phase_budget)}s, binary={llama_bench_bin}'
+        )
+    for profile_index, runtime_profile in enumerate(raw_profiles, start=1):
+        check_cancelled(cancel_token)
+        candidate = _raw_bench_candidate_model(model, runtime_profile)
+        key = _tq3_raw_profile_key(runtime_profile)
+        for measurement_type, prompt_tokens, generated_tokens in TQ3_RAW_BENCH_CASES:
+            check_cancelled(cancel_token)
+            raw_index += 1
+            remaining = phase_deadline - time.monotonic()
+            if remaining <= 0:
+                if progress:
+                    progress(f'TQ3 raw llama-bench phase budget exhausted after {len(records)} case(s)')
+                break
+            cmd = tq3_llama_bench_command(
+                llama_bench_bin,
+                model,
+                runtime_profile,
+                prompt_tokens,
+                generated_tokens,
+                threads,
+            )
+            timeout = min(case_timeout, max(1.0, remaining))
+            command_preview = shlex.join(str(item) for item in cmd)
+            candidate_label = f'{runtime_profile.name}/{measurement_type}'
+            emit_benchmark_event(
+                progress,
+                'benchmark_candidate',
+                model,
+                run_kind,
+                message=(
+                    f'TQ3 raw llama-bench {measurement_type} '
+                    f'{raw_index}/{raw_total}: {runtime_profile.name}'
+                ),
+                phase='raw_engine_search',
+                completed=int(completed_offset + raw_index - 1),
+                total=int(total if total is not None else raw_total),
+                candidate=candidate_label,
+                command=command_preview,
+            )
+            output = ''
+            status = 'benchmark failed'
+            tps = 0.0
+            exit_code = -1
+            result = _run_tq3_raw_process(cmd, timeout, cancel_token)
+            output = str(result.get('stdout', '') or '')
+            raw_returncode = result.get('returncode', -1)
+            exit_code = int(raw_returncode if raw_returncode is not None else -1)
+            seconds = float(result.get('seconds', 0.0) or 0.0)
+            timed_out = bool(result.get('timed_out', False))
+            cancelled_case = bool(result.get('cancelled', False))
+            if timed_out:
+                output = output or f'raw llama-bench timed out after {timeout:.1f}s'
+                status = 'benchmark failed'
+            elif cancelled_case:
+                output = output or 'raw llama-bench cancelled by user'
+                status = 'aborted'
+                cancelled = True
+            else:
+                tps = parse_llama_bench_tokens_per_sec(output)
+                status = 'ok' if exit_code == 0 and tps > 0 else 'benchmark failed'
+            record = adaptive_record_from_candidate(
+                candidate,
+                'raw_engine_search',
+                status,
+                tokens_per_sec=tps,
+                prompt_tokens_per_sec=tps if generated_tokens == 0 else 0.0,
+                seconds=seconds,
+                detail=concise_failure(output, limit=500),
+                engine=ENGINE_TQ3,
+                server_bin=server_bin,
+                binary_path=llama_bench_bin,
+                runtime_profile=runtime_profile.name,
+                kv_preset=runtime_profile.kv_preset,
+                benchmark_depth=depth,
+                placement_strategy=runtime_profile.placement_strategy,
+                cpu_moe=runtime_profile.cpu_moe,
+                n_cpu_moe=runtime_profile.n_cpu_moe,
+                tensor_overrides=list(runtime_profile.tensor_overrides or ()),
+                batch_size=runtime_profile.batch_size,
+                ubatch_size=runtime_profile.ubatch_size,
+                ctk=kv_modes_from_preset(runtime_profile.kv_preset)[0],
+                ctv=kv_modes_from_preset(runtime_profile.kv_preset)[1],
+                prompt_tokens=prompt_tokens,
+                generated_tokens=generated_tokens,
+                command=command_preview,
+            )
+            record['benchmark_kind'] = 'raw_engine_search'
+            record['measurement_type'] = measurement_type
+            record['llama_bench_bin'] = llama_bench_bin
+            record['exit_code'] = exit_code
+            record['raw_phase'] = 'raw_engine_search'
+            record['raw_profile_index'] = profile_index
+            record['raw_profile_total'] = len(raw_profiles)
+            record['case_index'] = raw_index
+            record['case_total'] = raw_total
+            record['timeout_seconds'] = round(float(timeout), 2)
+            record['phase_budget_seconds'] = int(phase_budget)
+            record['timed_out'] = timed_out
+            record['cancelled'] = cancelled_case
+            if status != 'ok':
+                if timed_out:
+                    apply_failure_context(record, output, default_category='RAW_ENGINE_TIMEOUT')
+                elif cancelled_case:
+                    record['failure_category'] = ''
+                    record['failure_reason'] = 'cancelled'
+                    record['suggested_fix'] = ''
+                else:
+                    apply_failure_context(record, output, default_category='API_TIMEOUT')
+            else:
+                weight = 1.0 if measurement_type in ('raw_tg', 'raw_combined') else 0.25
+                scores[key] = max(scores.get(key, 0.0), float(tps) * weight)
+            records.append(record)
+            if on_record:
+                on_record(dict(record))
+            emit_benchmark_event(
+                progress,
+                'benchmark_result',
+                model,
+                run_kind,
+                message=(
+                    f'TQ3 raw llama-bench {measurement_type} {status}: '
+                    f'{float(tps or 0.0):.2f} tok/s {runtime_profile.name}'
+                ),
+                phase='raw_engine_search',
+                completed=int(completed_offset + raw_index),
+                total=int(total if total is not None else raw_total),
+                candidate=candidate_label,
+                record=record,
+            )
+            if cancelled:
+                break
+        if cancelled or phase_deadline <= time.monotonic():
+            break
+
+    promoted_keys = [
+        key for key, _score in sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if _score > 0
+    ][:2]
+    promoted = [profiles_by_key[key] for key in promoted_keys if key in profiles_by_key]
+    if cancelled:
+        raise CancelledError(cancel_token.reason if cancel_token is not None else 'cancelled')
+    return records, promoted
+
+
+def dedupe_runtime_profiles(runtime_profiles: List[RuntimeProfile]) -> List[RuntimeProfile]:
+    selected: List[RuntimeProfile] = []
+    seen = set()
+    for profile in runtime_profiles:
+        key = (
+            profile.engine_id,
+            profile.name,
+            profile.ctx_size,
+            profile.gpu_layers,
+            profile.kv_preset,
+            profile.placement_strategy,
+            profile.cpu_moe,
+            profile.n_cpu_moe,
+            tuple(profile.tensor_overrides or ()),
+            profile.reasoning,
+            profile.reasoning_budget,
+            profile.reasoning_format,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(profile)
+    return selected
+
+
 def active_engine_runtime_profiles(
     app: AppConfig,
     model: ModelConfig,
@@ -4138,6 +4877,8 @@ def active_engine_runtime_profiles(
     moe = model_is_moe(model)
     if engine == 'turboquant':
         turbo_profiles = turboquant_auto_profiles(model, capabilities, benchmark_depth)
+    elif engine == 'tq3':
+        turbo_profiles = tq3_kv_profiles_for_model(model, capabilities, benchmark_depth)
     else:
         turbo_profiles = supported_turbo_kv_profiles(capabilities, benchmark_depth, engine_id=engine)
     turboquant_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
@@ -4200,9 +4941,46 @@ def active_engine_runtime_profiles(
             tensor_overrides=tuple(placement.tensor_overrides or ()),
         )
 
+    def with_tq3_reasoning_off_candidates(items: List[RuntimeProfile]) -> List[RuntimeProfile]:
+        if not (
+            engine == 'tq3'
+            and moe
+            and capabilities.supports_reasoning
+            and capabilities.supports_reasoning_budget
+            and capabilities.supports_reasoning_format
+        ):
+            return items
+        selected = [
+            item for item in items
+            if int(item.ctx_size or 0) == base_ctx
+            and not item.fit
+            and (bool(item.cpu_moe) or int(item.n_cpu_moe or 0) > 0)
+        ][:2]
+        if not selected:
+            return items
+        result: List[RuntimeProfile] = []
+        emitted = set()
+        selected_ids = {id(item) for item in selected}
+        for item in items:
+            result.append(item)
+            if id(item) not in selected_ids:
+                continue
+            key = (item.name, item.ctx_size, item.kv_preset, item.placement_strategy, item.n_cpu_moe, item.cpu_moe)
+            if key in emitted:
+                continue
+            emitted.add(key)
+            result.append(replace(
+                item,
+                name=f'{item.name}_reasoning_off',
+                reasoning='off',
+                reasoning_budget=0,
+                reasoning_format='deepseek',
+            ))
+        return result
+
     def finalized_profiles() -> List[RuntimeProfile]:
         if not moe_placements:
-            return profiles
+            return with_tq3_reasoning_off_candidates(profiles)
         updated: List[RuntimeProfile] = [apply_placement(item, baseline_placement) for item in profiles]
         profile_keys = {
             (
@@ -4259,7 +5037,18 @@ def active_engine_runtime_profiles(
         placement_updates: List[RuntimeProfile] = []
         for placement in moe_placements[1:]:
             for seed in selected_seeds:
-                candidate = apply_placement(seed, placement, name=f'{seed.name}_{placement.name}')
+                if placement.name == 'baseline_ngl':
+                    candidate = replace(
+                        seed,
+                        name=f'{seed.name}_{placement.name}',
+                        gpu_layers=partial_ngl,
+                        placement_strategy='baseline_ngl',
+                        cpu_moe=False,
+                        n_cpu_moe=0,
+                        tensor_overrides=(),
+                    )
+                else:
+                    candidate = apply_placement(seed, placement, name=f'{seed.name}_{placement.name}')
                 key = (
                     candidate.name,
                     candidate.ctx_size,
@@ -4276,9 +5065,9 @@ def active_engine_runtime_profiles(
                 placement_updates.append(candidate)
         if placement_updates and engine == 'tq3' and moe:
             insert_at = next((idx for idx, item in enumerate(updated) if int(item.ctx_size or 0) > base_ctx), len(updated))
-            return updated[:insert_at] + placement_updates + updated[insert_at:]
+            return with_tq3_reasoning_off_candidates(updated[:insert_at] + placement_updates + updated[insert_at:])
         updated.extend(placement_updates)
-        return updated
+        return with_tq3_reasoning_off_candidates(updated)
 
     def kv_for_strategy(strategy: str) -> str:
         if supports_cache_kv and strategy in ('kv_compression_probe', 'context_growth_sweep'):
@@ -4749,6 +5538,9 @@ def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: 
         'cpu_moe': bool(getattr(runtime_profile, 'cpu_moe', False)),
         'n_cpu_moe': int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0),
         'tensor_overrides': list(getattr(runtime_profile, 'tensor_overrides', ()) or ()),
+        'reasoning': str(getattr(runtime_profile, 'reasoning', '') or ''),
+        'reasoning_budget': int(getattr(runtime_profile, 'reasoning_budget', -1) or -1),
+        'reasoning_format': str(getattr(runtime_profile, 'reasoning_format', '') or ''),
         'extra_args': list(runtime_profile.extra_args or ()),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
@@ -5301,6 +6093,9 @@ def benchmark_exhaustive_profiles(
         24,
         SMART_FRONTIER_MAX_PROBES * 2 + 16,
     )
+    raw_total = tq3_raw_presearch_case_total(runtime_profiles, 'full')
+    if raw_total:
+        total += raw_total
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
@@ -5311,6 +6106,10 @@ def benchmark_exhaustive_profiles(
     disabled_runtime_memory: set[Tuple[str, ...]] = set()
 
     running_model = ModelConfig(**asdict(model))
+    if close_stale_running_benchmark_runs(running_model, started_at):
+        model.benchmark_runs = list(running_model.benchmark_runs)
+        model.default_benchmark_status = running_model.default_benchmark_status
+        model.default_benchmark_at = running_model.default_benchmark_at
     running_model.default_benchmark_status = 'running'
     running_run = build_benchmark_run(run_id, 'server', 'running', [], {}, started_at, hardware=profile.short_summary())
     upsert_benchmark_run(running_model, running_run)
@@ -5345,6 +6144,38 @@ def benchmark_exhaustive_profiles(
         completed=0,
         total=total,
     )
+
+    def persist_raw_record(record: Dict[str, object]):
+        nonlocal completed
+        records.append(dict(record))
+        completed += 1
+        persist_running_benchmark_progress(
+            app,
+            model,
+            run_id,
+            'server',
+            records,
+            started_at,
+            profile.short_summary(),
+        )
+
+    _raw_records, raw_promotions = run_tq3_raw_llama_bench_presearch(
+        app,
+        model,
+        profile,
+        runtime_profiles,
+        'full',
+        progress,
+        cancel_token,
+        on_record=persist_raw_record,
+        completed_offset=completed,
+        total=total,
+        run_kind='server',
+    )
+    if raw_promotions:
+        runtime_profiles = dedupe_runtime_profiles(raw_promotions + runtime_profiles)
+        if progress:
+            progress(f'TQ3 raw llama-bench promoted {len(raw_promotions)} candidate(s) into server validation')
 
     def optional_refinement_allowed() -> bool:
         return smart_should_continue_optional(started_monotonic, measured, model, profile)
@@ -5650,6 +6481,7 @@ def benchmark_exhaustive_profiles(
         return False, msg
 
     winners = select_measured_profiles(model, measured, profile)
+    propagate_rejection_reasons(records, measured)
     annotate_spectrum_records(records, winners)
     ended_at = datetime.now().isoformat(timespec='seconds')
     if not winners:
@@ -5737,6 +6569,9 @@ def benchmark_fast_profiles(
     contexts = fast_benchmark_contexts(model, profile)
     parallel_values = fast_benchmark_parallel_values(profile, model)
     total = max(1, len(runtime_profiles) if runtime_profiles else len(contexts) * (2 + len(parallel_values)) * 2)
+    raw_total = tq3_raw_presearch_case_total(runtime_profiles, 'fast')
+    if raw_total:
+        total += raw_total
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
@@ -5745,6 +6580,10 @@ def benchmark_fast_profiles(
     disabled_runtime_memory: set[Tuple[str, ...]] = set()
 
     running_model = ModelConfig(**asdict(model))
+    if close_stale_running_benchmark_runs(running_model, started_at):
+        model.benchmark_runs = list(running_model.benchmark_runs)
+        model.default_benchmark_status = running_model.default_benchmark_status
+        model.default_benchmark_at = running_model.default_benchmark_at
     running_model.default_benchmark_status = 'running'
     running_run = build_benchmark_run(run_id, 'server_fast', 'running', [], {}, started_at, hardware=profile.short_summary())
     upsert_benchmark_run(running_model, running_run)
@@ -5777,6 +6616,38 @@ def benchmark_fast_profiles(
         completed=0,
         total=total,
     )
+
+    def persist_raw_record(record: Dict[str, object]):
+        nonlocal completed
+        records.append(dict(record))
+        completed += 1
+        persist_running_benchmark_progress(
+            app,
+            model,
+            run_id,
+            'server_fast',
+            records,
+            started_at,
+            profile.short_summary(),
+        )
+
+    _raw_records, raw_promotions = run_tq3_raw_llama_bench_presearch(
+        app,
+        model,
+        profile,
+        runtime_profiles,
+        'fast',
+        progress,
+        cancel_token,
+        on_record=persist_raw_record,
+        completed_offset=completed,
+        total=total,
+        run_kind='server_fast',
+    )
+    if raw_promotions:
+        runtime_profiles = dedupe_runtime_profiles(raw_promotions + runtime_profiles)
+        if progress:
+            progress(f'TQ3 raw llama-bench promoted {len(raw_promotions)} candidate(s) into server validation')
 
     try:
         if runtime_profiles:
@@ -5951,6 +6822,7 @@ def benchmark_fast_profiles(
         return False, msg
 
     winners = select_measured_profiles(model, measured, profile)
+    propagate_rejection_reasons(records, measured)
     annotate_spectrum_records(records, winners)
     ended_at = datetime.now().isoformat(timespec='seconds')
     if not winners:
@@ -6164,6 +7036,7 @@ def benchmark_adaptive_profiles(
         return False, msg
 
     winners = select_measured_profiles(model, measured, profile)
+    propagate_rejection_reasons(records, measured)
     annotate_spectrum_records(records, winners)
     if not winners:
         ended_at = datetime.now().isoformat(timespec='seconds')

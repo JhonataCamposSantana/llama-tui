@@ -56,6 +56,43 @@ def _candidate_limit(tier: str) -> int:
     return 3 if normalized == 'fast' else 6
 
 
+def _tq3_small_gpu_candidates(
+    capabilities: EngineCapabilities,
+    layer_count: int,
+) -> List[MoePlacementCandidate]:
+    body: List[MoePlacementCandidate] = []
+    if capabilities.supports_n_cpu_moe:
+        seen_values = set()
+        for value in (32, 30, 36, 40):
+            if layer_count > 0:
+                value = max(1, min(layer_count, int(value)))
+            if value in seen_values:
+                continue
+            seen_values.add(value)
+            body.append(MoePlacementCandidate(
+                name=f'n_cpu_moe_{value}',
+                gpu_layers=999,
+                n_cpu_moe=value,
+                expected_vram_saving_hint=f'first {value} MoE expert layers on CPU',
+                risk='safe',
+            ))
+    if capabilities.supports_cpu_moe:
+        body.append(MoePlacementCandidate(
+            name='cpu_moe_all',
+            gpu_layers=999,
+            cpu_moe=True,
+            expected_vram_saving_hint='all MoE experts on CPU',
+            risk='safe',
+        ))
+    body.append(MoePlacementCandidate(
+        name='baseline_ngl',
+        gpu_layers=None,
+        expected_vram_saving_hint='last-resort partial GPU-layer behavior',
+        risk='baseline',
+    ))
+    return body
+
+
 def generate_moe_placement_candidates(
     model: ModelConfig,
     profile: Optional[HardwareProfile],
@@ -87,6 +124,9 @@ def generate_moe_placement_candidates(
     gpu_total = int(getattr(profile, 'gpu_memory_total', 0) or 0) if profile is not None else 0
     small_gpu = bool(0 < gpu_total <= 9 * 1024**3)
     layer_count = _layer_count(model)
+    if engine == 'tq3' and small_gpu:
+        return _tq3_small_gpu_candidates(capabilities, layer_count)
+
     body: List[MoePlacementCandidate] = []
 
     cpu_all = MoePlacementCandidate(

@@ -1012,13 +1012,27 @@ class AppConfig:
         return f'TQ3 status {status or "unknown"}'
 
     def active_engine_model_compatibility(self, model: ModelConfig) -> Tuple[bool, str]:
-        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
-            return True, ''
+        active_engine = self.active_engine_key_for_model(model)
         if self.model_tq3_native(model):
-            return True, self.tq3_compatibility_reason(model)
+            if active_engine == ENGINE_TQ3:
+                return True, self.tq3_compatibility_reason(model)
+            return False, (
+                'TQ3-native GGUFs (TQ3_1S/TQ3_4S) require the tq3 engine in llama-tui. '
+                f'Active engine is {active_engine}; selected model is {self.tq3_compatibility_reason(model)}.'
+            )
+        if active_engine != ENGINE_TQ3:
+            return True, ''
         return False, (
             'llama.cpp-tq3 only accepts TQ3-native GGUFs in llama-tui '
             f'(TQ3_1S/TQ3_4S). Selected model is {self.tq3_compatibility_reason(model)}.'
+        )
+
+    def tq3_binary_missing_message(self) -> str:
+        install = resolve_engine_install(self, ENGINE_TQ3)
+        command = str(install.resolved_command or self.runtime_server_command('llama.cpp') or 'tq3-llama-server')
+        return (
+            f'ENGINE_BINARY_MISSING: llama.cpp-tq3 server not found: {command}. '
+            'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
         )
 
     def tq3_session_advisory(self, model: ModelConfig) -> str:
@@ -2523,6 +2537,8 @@ class AppConfig:
         if not compatible:
             return False, compatibility_msg
         if not self.command_exists(command):
+            if engine_key == ENGINE_TQ3:
+                return False, self.tq3_binary_missing_message()
             return False, f'{label} not found: {command}'
         runtime_ok, runtime_msg = self.runtime_command_ready(runtime, command)
         if not runtime_ok:

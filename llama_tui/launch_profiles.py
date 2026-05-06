@@ -41,6 +41,7 @@ class BenchmarkLaunchProfile:
     cache_reuse: int = 0
     reasoning: str = ''
     reasoning_budget: Optional[int] = None
+    reasoning_format: str = ''
     preserve_thinking: bool = False
     preserve_thinking_source: str = 'default'
     chat_template_kwargs: Dict[str, object] = field(default_factory=dict)
@@ -198,10 +199,17 @@ def build_benchmark_launch_profile(
     no_context_shift = bool(_maybe_bool(overrides.get('no_context_shift'), no_context_shift))
     cache_prompt = _maybe_bool(overrides.get('cache_prompt'), cache_prompt)
     cache_reuse = max(0, _maybe_int(overrides.get('cache_reuse'), 0) or 0)
-    reasoning = str(overrides.get('reasoning', '') or '').strip().lower()
+    reasoning = str(
+        overrides.get('reasoning', getattr(runtime_profile, 'reasoning', '') if runtime_profile is not None else '') or ''
+    ).strip().lower()
     if reasoning not in ('', 'on', 'off', 'auto'):
         reasoning = ''
-    reasoning_budget = _maybe_int(overrides.get('reasoning_budget'), None)
+    runtime_reasoning_budget = getattr(runtime_profile, 'reasoning_budget', -1) if runtime_profile is not None else -1
+    reasoning_budget_default = int(runtime_reasoning_budget) if isinstance(runtime_reasoning_budget, int) and runtime_reasoning_budget >= 0 else None
+    reasoning_budget = _maybe_int(overrides.get('reasoning_budget'), reasoning_budget_default)
+    reasoning_format = str(
+        overrides.get('reasoning_format', getattr(runtime_profile, 'reasoning_format', '') if runtime_profile is not None else '') or ''
+    ).strip().lower()
     fit_target = str(overrides.get('fit_target', '') or '').strip()
 
     preserve_thinking, preserve_source = resolve_preserve_thinking(model)
@@ -235,6 +243,7 @@ def build_benchmark_launch_profile(
         cache_reuse=cache_reuse,
         reasoning=reasoning,
         reasoning_budget=reasoning_budget,
+        reasoning_format=reasoning_format,
         preserve_thinking=bool(preserve_thinking),
         preserve_thinking_source=preserve_source,
         chat_template_kwargs=chat_kwargs,
@@ -297,6 +306,7 @@ def benchmark_profile_server_args(
             unsupported.append('--chat-template-kwargs')
     add_supported('--reasoning', profile.reasoning, capabilities.supports_reasoning)
     add_supported('--reasoning-budget', profile.reasoning_budget, capabilities.supports_reasoning_budget)
+    add_supported('--reasoning-format', profile.reasoning_format, capabilities.supports_reasoning_format)
     if profile.cache_prompt is not None:
         if capabilities.supports_cache_prompt:
             args.append('--cache-prompt' if profile.cache_prompt else '--no-cache-prompt')
@@ -337,6 +347,12 @@ def benchmark_launch_metadata(
         'cache_reuse': int(profile.cache_reuse),
         'reasoning': profile.reasoning,
         'reasoning_budget': profile.reasoning_budget,
+        'reasoning_format': profile.reasoning_format,
+        'reasoning_mode': (
+            profile.reasoning
+            + (f'/{profile.reasoning_format}' if profile.reasoning_format else '')
+            + (f' budget={profile.reasoning_budget}' if profile.reasoning_budget is not None else '')
+        ).strip(),
         'preserve_thinking': bool(profile.preserve_thinking),
         'preserve_thinking_source': profile.preserve_thinking_source,
         'chat_template_kwargs': dict(profile.chat_template_kwargs),

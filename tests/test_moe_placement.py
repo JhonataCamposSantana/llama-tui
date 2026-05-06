@@ -71,6 +71,25 @@ class MoePlacementTests(unittest.TestCase):
         self.assertNotIn('cpu_moe_all', names)
         self.assertFalse(any(name.startswith('n_cpu_moe_') for name in names))
 
+    def test_tq3_small_gpu_prioritizes_ncmoe_before_cmoe_and_partial(self):
+        caps = EngineCapabilities(supports_cpu_moe=True, supports_n_cpu_moe=True)
+
+        with patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+            candidates = generate_moe_placement_candidates(
+                self.model(),
+                HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3),
+                caps,
+                'tq3',
+                'full',
+            )
+
+        self.assertEqual(
+            [item.name for item in candidates[:6]],
+            ['n_cpu_moe_32', 'n_cpu_moe_30', 'n_cpu_moe_36', 'n_cpu_moe_40', 'cpu_moe_all', 'baseline_ngl'],
+        )
+        self.assertTrue(all((item.gpu_layers == 999) for item in candidates[:5]))
+        self.assertIsNone(candidates[-1].gpu_layers)
+
     def test_non_llama_family_engine_returns_no_candidates(self):
         caps = EngineCapabilities(supports_cpu_moe=True, supports_n_cpu_moe=True)
         candidates = generate_moe_placement_candidates(

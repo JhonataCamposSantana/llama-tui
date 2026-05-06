@@ -72,6 +72,7 @@ RUNTIME_TUNING_FLAGS = (
     '--reasoning',
     '-rea',
     '--reasoning-budget',
+    '--reasoning-format',
     '--cache-prompt',
     '--no-cache-prompt',
     '--cache-reuse',
@@ -100,6 +101,7 @@ class EngineCapabilities:
     supports_chat_template_kwargs: bool = False
     supports_reasoning: bool = False
     supports_reasoning_budget: bool = False
+    supports_reasoning_format: bool = False
     supports_cache_prompt: bool = False
     supports_cache_reuse: bool = False
     supports_top_p: bool = False
@@ -305,6 +307,9 @@ class RuntimeProfile:
     cpu_moe: bool = False
     n_cpu_moe: int = 0
     tensor_overrides: Tuple[str, ...] = field(default_factory=tuple)
+    reasoning: str = ''
+    reasoning_budget: int = -1
+    reasoning_format: str = ''
 
 
 def resolve_buun_kv_modes(
@@ -528,6 +533,7 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
     supports_chat_template_kwargs = ('--chat-template-kwargs' in low or defaults.supports_chat_template_kwargs)
     supports_reasoning = ('--reasoning' in low or re.search(r'(^|\s)-rea(\s|,|$)', low) is not None or defaults.supports_reasoning)
     supports_reasoning_budget = ('--reasoning-budget' in low or defaults.supports_reasoning_budget)
+    supports_reasoning_format = ('--reasoning-format' in low or defaults.supports_reasoning_format)
     supports_cache_prompt = ('--cache-prompt' in low or '--no-cache-prompt' in low or defaults.supports_cache_prompt)
     supports_cache_reuse = ('--cache-reuse' in low or defaults.supports_cache_reuse)
     supports_top_p = ('--top-p' in low or defaults.supports_top_p)
@@ -583,6 +589,7 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_chat_template_kwargs=supports_chat_template_kwargs,
         supports_reasoning=supports_reasoning,
         supports_reasoning_budget=supports_reasoning_budget,
+        supports_reasoning_format=supports_reasoning_format,
         supports_cache_prompt=supports_cache_prompt,
         supports_cache_reuse=supports_cache_reuse,
         supports_top_p=supports_top_p,

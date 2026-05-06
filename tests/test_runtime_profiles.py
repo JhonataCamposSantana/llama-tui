@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -10,6 +11,8 @@ from unittest.mock import patch
 
 from llama_tui.app import AppConfig
 from llama_tui.benchmark import (
+    _run_tq3_raw_process,
+    _tq3_raw_runtime_profiles,
     active_engine_runtime_profiles,
     adaptive_record_from_candidate,
     benchmark_adaptive_candidate,
@@ -17,9 +20,11 @@ from llama_tui.benchmark import (
     benchmark_completion,
     benchmark_exhaustive_profiles,
     benchmark_fast_profiles,
+    benchmark_preflight_cleanup,
     benchmark_raw_speed_profile,
     benchmark_run_summary,
     benchmark_runtime_profile_with_retry,
+    close_stale_running_benchmark_runs,
     classify_benchmark_failure,
     launch_with_failsafe,
     measured_profile_runtime_profile,
@@ -28,8 +33,11 @@ from llama_tui.benchmark import (
     runtime_record_context,
     runtime_profile_memory_disable_key,
     runtime_profile_memory_skip_reason,
+    run_tq3_raw_llama_bench_presearch,
     select_measured_profiles,
+    tq3_raw_presearch_case_total,
 )
+from llama_tui.control import CancelToken, CancelledError
 from llama_tui.hardware import HardwareProfile
 from llama_tui.launch_profiles import build_benchmark_launch_profile
 from llama_tui.main import (
@@ -180,7 +188,7 @@ class RuntimeProfileTests(unittest.TestCase):
     def test_capability_parser_detects_benchmark_relevant_flags(self):
         caps = parse_engine_capabilities(
             'usage: llama-server --chat-template-kwargs JSON --reasoning auto --reasoning-budget N '
-            '--context-shift --no-context-shift --cache-prompt --cache-reuse N --fit-target R '
+            '--reasoning-format deepseek --context-shift --no-context-shift --cache-prompt --cache-reuse N --fit-target R '
             '--top-p P --top-k K --min-p P --repeat-penalty N --presence-penalty N --samplers LIST --seed SEED',
             engine_id='llama.cpp',
         )
@@ -188,6 +196,7 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(caps.supports_chat_template_kwargs)
         self.assertTrue(caps.supports_reasoning)
         self.assertTrue(caps.supports_reasoning_budget)
+        self.assertTrue(caps.supports_reasoning_format)
         self.assertTrue(caps.supports_context_shift)
         self.assertTrue(caps.supports_cache_prompt)
         self.assertTrue(caps.supports_cache_reuse)
@@ -276,6 +285,7 @@ class RuntimeProfileTests(unittest.TestCase):
                     'samplers': 'top_k;top_p',
                     'reasoning': 'auto',
                     'reasoning_budget': 256,
+                    'reasoning_format': 'deepseek',
                     'cache_prompt': True,
                     'cache_reuse': 64,
                     'fit_target': '0.85',
@@ -290,6 +300,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 supports_chat_template_kwargs=True,
                 supports_reasoning=True,
                 supports_reasoning_budget=True,
+                supports_reasoning_format=True,
                 supports_cache_prompt=True,
                 supports_cache_reuse=True,
                 supports_fit_target=True,
@@ -319,6 +330,7 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('--cache-reuse') + 1], '64')
         self.assertEqual(cmd[cmd.index('--reasoning') + 1], 'auto')
         self.assertEqual(cmd[cmd.index('--reasoning-budget') + 1], '256')
+        self.assertEqual(cmd[cmd.index('--reasoning-format') + 1], 'deepseek')
         self.assertEqual(cmd[cmd.index('-fitt') + 1], '0.85')
         self.assertIn('--chat-template-kwargs', cmd)
         self.assertIn('"preserve_thinking": true', cmd[cmd.index('--chat-template-kwargs') + 1])
@@ -2183,6 +2195,302 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(winners['fast_chat']['kv_preset'], 'q8_0/q8_0')
         self.assertIn('TQ3 low-speed profile(s) held back', benchmark_run_summary(winners, measured))
 
+    def test_tq3_auto_rejects_slow_partial_when_cpu_moe_is_three_times_faster(self):
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path=__file__,
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            expert_count=128,
+            ctx_max=32768,
+        )
+        partial = ModelConfig(id='m', name='MoE TQ3', path=__file__, alias='m', port=18200, ctx=32768, parallel=1, ngl=18)
+        ncmoe = ModelConfig(id='m', name='MoE TQ3', path=__file__, alias='m', port=18200, ctx=8192, parallel=1, ngl=999)
+        measured = [
+            {
+                'status': 'ok',
+                'measurement_type': 'full',
+                'objective': 'long_context',
+                'model': partial,
+                'tokens_per_sec': 10.0,
+                'decode_tokens_per_sec': 10.0,
+                'ctx_per_slot': 32768,
+                'parallel': 1,
+                'engine': 'tq3',
+                'ngl': 18,
+                'gpu_layers_mode': 'fixed',
+                'kv_preset': 'q8_0/q8_0',
+                'runtime_profile': 'partial_gpu_probe',
+            },
+            {
+                'status': 'ok',
+                'measurement_type': 'full',
+                'objective': 'long_context',
+                'model': ncmoe,
+                'tokens_per_sec': 35.0,
+                'decode_tokens_per_sec': 35.0,
+                'ctx_per_slot': 8192,
+                'parallel': 1,
+                'engine': 'tq3',
+                'ngl': 999,
+                'gpu_layers_mode': 'fixed',
+                'kv_preset': 'q8_0/q8_0',
+                'runtime_profile': 'n_cpu_moe_32',
+                'placement_strategy': 'n_cpu_moe_32',
+                'n_cpu_moe': 32,
+            },
+        ]
+
+        winners = select_measured_profiles(model, measured, profile)
+
+        self.assertEqual(winners['auto']['n_cpu_moe'], 32)
+        self.assertEqual(measured[0]['rejection_reason'], 'rejected_slow_partial_offload')
+        self.assertIn('slow partial-offload profile(s) rejected', benchmark_run_summary(winners, measured))
+
+    def test_tq3_raw_llama_bench_records_are_separate_and_promote_only_for_validation(self):
+        class FakeApp:
+            runtime_profile = make_runtime_profile('tq3', 'llama-server')
+
+            def active_engine_key_for_model(self, _model):
+                return 'tq3'
+
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path='/models/moe.TQ3_4S.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            expert_count=128,
+            tq3_status='native',
+            tq3_weight_format='TQ3_4S',
+            threads=12,
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='tq3',
+            name='n_cpu_moe_32',
+            ctx_size=8192,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            batch_size=512,
+            ubatch_size=512,
+            placement_strategy='n_cpu_moe_32',
+            n_cpu_moe=32,
+        )
+
+        def fake_raw_process(_cmd, _timeout, _cancel_token=None):
+            return {
+                'returncode': 0,
+                'stdout': '| 123.45 tok/s |',
+                'seconds': 0.1,
+                'timed_out': False,
+                'cancelled': False,
+            }
+
+        with patch('llama_tui.benchmark._command_exists_for_app', return_value=True), \
+            patch('llama_tui.benchmark._run_tq3_raw_process', side_effect=fake_raw_process):
+            records, promoted = run_tq3_raw_llama_bench_presearch(
+                FakeApp(),
+                model,
+                HardwareProfile(cpu_physical=12, cpu_logical=16, gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3),
+                [runtime_profile],
+                'fast',
+            )
+
+        self.assertTrue(records)
+        self.assertEqual(len(records), 3)
+        self.assertTrue(all(item['benchmark_kind'] == 'raw_engine_search' for item in records))
+        self.assertTrue(all(item['measurement_type'].startswith('raw_') for item in records))
+        self.assertTrue(all(item['prompt_tokens'] <= 1024 for item in records))
+        self.assertTrue(all(item['generated_tokens'] <= 64 for item in records))
+        self.assertEqual(promoted, [runtime_profile])
+        self.assertNotIn('measured_profiles', records[0])
+
+    def test_tq3_raw_profile_selection_is_bounded_and_q8_only(self):
+        def profile(name, n_cpu_moe=0, cpu_moe=False, kv='q8_0/q8_0', tensor_overrides=(), reasoning=''):
+            return RuntimeProfile(
+                engine_id='tq3',
+                name=name,
+                ctx_size=8192,
+                gpu_layers=999,
+                parallel=1,
+                kv_preset=kv,
+                placement_strategy=name,
+                cpu_moe=cpu_moe,
+                n_cpu_moe=n_cpu_moe,
+                tensor_overrides=tuple(tensor_overrides),
+                reasoning=reasoning,
+                reasoning_budget=0 if reasoning else -1,
+                reasoning_format='deepseek' if reasoning else '',
+            )
+
+        profiles = [
+            profile('n_cpu_moe_40', 40),
+            profile('n_cpu_moe_30', 30),
+            profile('n_cpu_moe_32', 32),
+            profile('q4_model_specific', 32, kv='q4_0/tq3_0'),
+            profile('tensor_override', 32, tensor_overrides=('.*exps.*=CPU',)),
+            profile('reasoning_off', 32, reasoning='off'),
+            profile('cpu_moe_all', cpu_moe=True),
+        ]
+
+        fast = _tq3_raw_runtime_profiles(profiles, 'fast')
+        full = _tq3_raw_runtime_profiles(profiles, 'full')
+
+        self.assertEqual([item.name for item in fast], ['n_cpu_moe_32'])
+        self.assertEqual([item.name for item in full], ['n_cpu_moe_32', 'n_cpu_moe_30'])
+        self.assertEqual(tq3_raw_presearch_case_total(profiles, 'fast'), 3)
+        self.assertEqual(tq3_raw_presearch_case_total(profiles, 'full'), 6)
+
+    def test_tq3_raw_timeout_persists_per_case_with_raw_failure_category(self):
+        class FakeApp:
+            runtime_profile = make_runtime_profile('tq3', 'llama-server')
+
+            def active_engine_key_for_model(self, _model):
+                return 'tq3'
+
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path='/models/moe.TQ3_4S.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            expert_count=128,
+            tq3_status='native',
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='tq3',
+            name='n_cpu_moe_32',
+            ctx_size=8192,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            placement_strategy='n_cpu_moe_32',
+            n_cpu_moe=32,
+        )
+        persisted = []
+
+        def timeout_process(_cmd, _timeout, _cancel_token=None):
+            return {
+                'returncode': -9,
+                'stdout': 'raw llama-bench timed out',
+                'seconds': 0.01,
+                'timed_out': True,
+                'cancelled': False,
+            }
+
+        with patch('llama_tui.benchmark._command_exists_for_app', return_value=True), \
+            patch('llama_tui.benchmark._run_tq3_raw_process', side_effect=timeout_process):
+            records, promoted = run_tq3_raw_llama_bench_presearch(
+                FakeApp(),
+                model,
+                HardwareProfile(cpu_physical=12, cpu_logical=16, gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3),
+                [runtime_profile],
+                'fast',
+                on_record=persisted.append,
+            )
+
+        self.assertEqual(len(persisted), 3)
+        self.assertEqual(len(records), 3)
+        self.assertFalse(promoted)
+        self.assertTrue(all(item['benchmark_kind'] == 'raw_engine_search' for item in persisted))
+        self.assertTrue(all(item['failure_category'] == 'RAW_ENGINE_TIMEOUT' for item in persisted))
+        self.assertTrue(all(item['timed_out'] for item in persisted))
+
+    def test_tq3_raw_cancel_records_aborted_row(self):
+        class FakeApp:
+            runtime_profile = make_runtime_profile('tq3', 'llama-server')
+
+            def active_engine_key_for_model(self, _model):
+                return 'tq3'
+
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path='/models/moe.TQ3_4S.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            expert_count=128,
+            tq3_status='native',
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='tq3',
+            name='n_cpu_moe_32',
+            ctx_size=8192,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            placement_strategy='n_cpu_moe_32',
+            n_cpu_moe=32,
+        )
+        persisted = []
+
+        def cancelled_process(_cmd, _timeout, _cancel_token=None):
+            return {
+                'returncode': -15,
+                'stdout': 'cancelled',
+                'seconds': 0.01,
+                'timed_out': False,
+                'cancelled': True,
+            }
+
+        with patch('llama_tui.benchmark._command_exists_for_app', return_value=True), \
+            patch('llama_tui.benchmark._run_tq3_raw_process', side_effect=cancelled_process):
+            with self.assertRaises(CancelledError):
+                run_tq3_raw_llama_bench_presearch(
+                    FakeApp(),
+                    model,
+                    HardwareProfile(cpu_physical=12, cpu_logical=16, gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3),
+                    [runtime_profile],
+                    'fast',
+                    on_record=persisted.append,
+                )
+
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]['status'], 'aborted')
+        self.assertTrue(persisted[0]['cancelled'])
+
+    def test_tq3_raw_process_runner_kills_cancelled_subprocess(self):
+        token = CancelToken()
+        token.cancel('unit test cancel')
+        result = _run_tq3_raw_process(
+            [sys.executable, '-c', 'import time; time.sleep(5)'],
+            timeout_seconds=10,
+            cancel_token=token,
+        )
+
+        self.assertTrue(result['cancelled'])
+        self.assertLess(float(result['seconds']), 2.5)
+
+    def test_stale_running_benchmark_runs_are_closed_before_new_run(self):
+        model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)
+        model.default_benchmark_status = 'running'
+        model.benchmark_runs = [
+            {
+                'id': 'server-older',
+                'kind': 'server',
+                'status': 'running',
+                'started_at': '2026-05-06T13:48:10',
+                'records': [],
+                'winners': {},
+                'summary': 'raw pre-search',
+            }
+        ]
+
+        changed = close_stale_running_benchmark_runs(model, '2026-05-06T14:10:00')
+
+        self.assertTrue(changed)
+        self.assertEqual(model.default_benchmark_status, 'aborted')
+        self.assertEqual(model.benchmark_runs[0]['status'], 'aborted')
+        self.assertEqual(model.benchmark_runs[0]['stale_reason'], 'aborted_stale_previous_run')
+        self.assertIn('aborted_stale_previous_run', model.benchmark_runs[0]['summary'])
+
     def test_runtime_profile_runners_use_expected_depth_and_attempts(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)
         hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
@@ -2991,6 +3299,55 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(any(item.kv_preset == 'q8_0/q8_0' for item in native_profiles))
         self.assertEqual(regular_profiles, [])
 
+    def test_missing_tq3_binary_blocks_before_candidate_generation(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'TQ3_LLAMA_SERVER_BIN': '/definitely/missing/tq3-llama-server'}):
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='native',
+                name='Native TQ3',
+                path='/models/native.TQ3_4S.gguf',
+                alias='native',
+                port=18080,
+                architecture_type='moe',
+                expert_count=128,
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+            )
+
+            with patch('llama_tui.benchmark.active_engine_runtime_profiles') as planner:
+                ok, msg = benchmark_fast_profiles(app, model)
+
+        self.assertFalse(ok)
+        self.assertIn('ENGINE_BINARY_MISSING', msg)
+        self.assertIn('/definitely/missing/tq3-llama-server', msg)
+        self.assertIn('Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server', msg)
+        planner.assert_not_called()
+
+    def test_tq3_native_gguf_is_blocked_under_turboquant_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='native',
+                name='Native TQ3',
+                path='/models/native.TQ3_4S.gguf',
+                alias='native',
+                port=18080,
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+            )
+
+            compatible, reason = app.active_engine_model_compatibility(model)
+
+        self.assertFalse(compatible)
+        self.assertIn('require the tq3 engine', reason)
+        self.assertIn('turboquant', reason)
+
     def test_tq3_compressed_kv_profiles_are_help_gated(self):
         help_caps = parse_engine_capabilities(
             'usage: llama-server --flash-attn on|off|auto -ctk TYPE -ctv TYPE -ngl N\n'
@@ -3036,6 +3393,49 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('q4_0/tq3_0', unsupported_presets)
         self.assertNotIn('tq3_0/tq3_0', unsupported_presets)
 
+    def test_tq3_q4_tq3_kv_is_only_model_specific(self):
+        caps = parse_engine_capabilities(
+            'usage: llama-server --flash-attn on|off|auto -ctk TYPE -ctv TYPE -ngl N\n'
+            'allowed values: q8_0 q4_0 tq3_0',
+            engine_id='tq3',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            generic = ModelConfig(
+                id='generic',
+                name='Native TQ3',
+                path='/models/native.TQ3_4S.gguf',
+                alias='generic',
+                port=18080,
+                architecture_type='dense',
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+                ctx_max=32768,
+            )
+            ytan = ModelConfig(
+                id='ytan',
+                name='YTan2000 Qwen3.6-35B-A3B-TQ3_4S',
+                path='/cache/models--YTan2000--Qwen3.6-35B-A3B-TQ3_4S/snapshots/model.gguf',
+                alias='ytan',
+                port=18081,
+                architecture_type='dense',
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=5 * 1024**3):
+                generic_profiles = active_engine_runtime_profiles(app, generic, hardware, depth='full')
+                ytan_profiles = active_engine_runtime_profiles(app, ytan, hardware, depth='full')
+
+        self.assertNotIn('q4_0/tq3_0', {item.kv_preset for item in generic_profiles})
+        self.assertIn('q4_0/tq3_0', {item.kv_preset for item in ytan_profiles})
+
     def test_tq3_launch_diagnostic_reports_partial_offload_and_speed(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
@@ -3074,6 +3474,7 @@ class RuntimeProfileTests(unittest.TestCase):
         caps = replace(
             default_engine_capabilities('tq3'),
             supports_n_cpu_moe=True,
+            supports_cpu_moe=True,
             supported_kv_modes=('q8_0', 'tq3_0'),
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -3106,6 +3507,58 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(placement_indices)
         self.assertTrue(growth_indices)
         self.assertLess(min(placement_indices), min(growth_indices))
+        seen = []
+        for item in profiles:
+            label = 'cmoe' if item.cpu_moe else f'ncmoe{item.n_cpu_moe}' if item.n_cpu_moe else 'partial' if item.gpu_layers and item.gpu_layers < 999 else ''
+            if label and label not in seen:
+                seen.append(label)
+        self.assertEqual(seen[:5], ['ncmoe32', 'ncmoe30', 'ncmoe36', 'ncmoe40', 'cmoe'])
+        self.assertGreater(seen.index('partial'), seen.index('cmoe'))
+
+    def test_tq3_moe_profiles_add_reasoning_off_only_when_supported(self):
+        supported = replace(
+            default_engine_capabilities('tq3'),
+            supports_n_cpu_moe=True,
+            supports_reasoning=True,
+            supports_reasoning_budget=True,
+            supports_reasoning_format=True,
+            supported_kv_modes=('q8_0', 'tq3_0'),
+        )
+        unsupported = replace(supported, supports_reasoning_format=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='moe',
+                name='Qwen MoE TQ3',
+                path='/models/moe.TQ3_4S.gguf',
+                alias='moe',
+                port=18080,
+                architecture_type='moe',
+                expert_count=128,
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+                ctx_min=4096,
+                ctx_max=65536,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=supported), \
+                patch('llama_tui.benchmark.model_file_size', return_value=18 * 1024**3), \
+                patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+                supported_profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+            with patch.object(app, 'engine_capabilities', return_value=unsupported), \
+                patch('llama_tui.benchmark.model_file_size', return_value=18 * 1024**3), \
+                patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+                unsupported_profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
+
+        reasoning_off = [item for item in supported_profiles if item.reasoning == 'off']
+        self.assertTrue(reasoning_off)
+        self.assertTrue(all(item.reasoning_budget == 0 for item in reasoning_off))
+        self.assertTrue(all(item.reasoning_format == 'deepseek' for item in reasoning_off))
+        self.assertFalse(any(item.reasoning == 'off' for item in unsupported_profiles))
 
     def test_moe_runtime_profiles_include_bounded_placement_candidates(self):
         caps = replace(

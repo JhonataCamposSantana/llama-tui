@@ -1598,6 +1598,18 @@ def benchmark_row_text(record: Dict[str, object]) -> str:
     benchmark_profile = str(record.get('benchmark_profile', '') or '')
     if benchmark_profile:
         suffix_parts.append(f'profile={benchmark_profile}')
+    benchmark_kind = str(record.get('benchmark_kind', '') or '')
+    if benchmark_kind:
+        suffix_parts.append(f'kind={benchmark_kind}')
+    if bool(record.get('cpu_moe', False)):
+        suffix_parts.append('placement=cmoe')
+    elif int(record.get('n_cpu_moe', 0) or 0) > 0:
+        suffix_parts.append(f'placement=ncmoe{int(record.get("n_cpu_moe", 0) or 0)}')
+    elif str(record.get('engine', '') or '').strip().lower() == 'tq3' and int(record.get('ngl', 0) or 0) > 0:
+        suffix_parts.append(f'placement=ngl{int(record.get("ngl", 0) or 0)}')
+    rejection = str(record.get('rejection_reason', '') or record.get('selection_rejection_reason', '') or '')
+    if rejection:
+        suffix_parts.append(f'reject={rejection}')
     suffix = (' ' + ' '.join(suffix_parts)) if suffix_parts else ''
     return (
         f'{label[:18]:18} {score:7.2f} {score_label:5} {seconds:6.1f}s '
@@ -1606,10 +1618,11 @@ def benchmark_row_text(record: Dict[str, object]) -> str:
 
 
 def benchmark_launch_profile_detail_lines(record: Dict[str, object]) -> List[str]:
-    profile = str(record.get('benchmark_profile', '') or '')
+    profile = str(record.get('benchmark_profile', '') or record.get('benchmark_kind', '') or '')
     if not profile:
         return []
     engine = str(record.get('engine', '') or '-')
+    binary = str(record.get('binary_path', '') or record.get('server_bin', '') or '-')
     ctx = int(record.get('ctx', 0) or 0)
     output = int(record.get('output', 0) or 0)
     measurement = int(record.get('measurement_output', 0) or 0)
@@ -1632,15 +1645,36 @@ def benchmark_launch_profile_detail_lines(record: Dict[str, object]) -> List[str
     kwargs = dict(record.get('chat_template_kwargs', {}) or {})
     kwargs_text = ','.join(f'{key}={format_value(value)}' for key, value in kwargs.items()) if kwargs else '-'
     unsupported = ','.join(str(item) for item in list(record.get('unsupported_launch_flags', []) or [])) or '-'
+    if bool(record.get('cpu_moe', False)):
+        placement = 'cmoe'
+    elif int(record.get('n_cpu_moe', 0) or 0) > 0:
+        placement = f'ncmoe={int(record.get("n_cpu_moe", 0) or 0)}'
+    elif int(record.get('ngl', 0) or 0) > 0:
+        placement = f'partial ngl={int(record.get("ngl", 0) or 0)}'
+    else:
+        placement = str(record.get('placement_strategy', '') or '-')
+    reasoning = str(record.get('reasoning_mode', '') or '')
+    if not reasoning:
+        reasoning = str(record.get('reasoning', '') or '-')
+        fmt = str(record.get('reasoning_format', '') or '')
+        budget = record.get('reasoning_budget', None)
+        if fmt and reasoning != '-':
+            reasoning = f'{reasoning}/{fmt}'
+        if budget is not None and reasoning != '-':
+            reasoning = f'{reasoning} budget={budget}'
+    rejection = str(record.get('rejection_reason', '') or record.get('selection_rejection_reason', '') or '')
     return [
         f'  profile: {profile} engine={engine} ctx={ctx} output={output} measure={measurement}',
+        f'  binary: {binary}',
         (
             f'  kv: key={kv_key} value={kv_value} flash={flash} fit={fit}'
             + (f' fit_ctx={fit_context}' if fit_context else '')
             + f' no_ctx_shift={no_shift}'
         ),
+        f'  placement: {placement} reasoning={reasoning or "-"}',
         f'  sampling: {sampling}',
         f'  template: {kwargs_text} unsupported={unsupported}',
+        *( [f'  rejected: {rejection}'] if rejection else [] ),
     ]
 
 

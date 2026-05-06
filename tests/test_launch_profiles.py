@@ -8,11 +8,12 @@ from llama_tui.launch_profiles import (
     TQ3_MOE_FAST_OUTPUT_CAP,
     TQ3_MOE_FULL_OUTPUT_CAP,
     benchmark_launch_metadata,
+    benchmark_profile_server_args,
     benchmark_profile_request_fields,
     build_benchmark_launch_profile,
 )
 from llama_tui.models import ModelConfig
-from llama_tui.runtime_profiles import RuntimeProfile
+from llama_tui.runtime_profiles import EngineCapabilities, RuntimeProfile
 
 
 class LaunchProfileTests(unittest.TestCase):
@@ -211,6 +212,37 @@ class LaunchProfileTests(unittest.TestCase):
 
         self.assertEqual(fast.measurement_output, SERVE_DEFAULT_FAST_OUTPUT_CAP)
         self.assertEqual(full.measurement_output, SERVE_DEFAULT_FULL_OUTPUT_CAP)
+
+    def test_runtime_profile_reasoning_off_emits_only_supported_flags(self):
+        model = ModelConfig(id='moe', name='MoE', path='moe.TQ3_4S.gguf', alias='moe', port=18080)
+        runtime = RuntimeProfile(
+            engine_id='tq3',
+            name='nc32_reasoning_off',
+            ctx_size=8192,
+            parallel=1,
+            gpu_layers=999,
+            kv_preset='q8_0/q8_0',
+            reasoning='off',
+            reasoning_budget=0,
+            reasoning_format='deepseek',
+        )
+        launch = build_benchmark_launch_profile(model, runtime, purpose='serve_default', depth='fast')
+        caps = EngineCapabilities(
+            supports_reasoning=True,
+            supports_reasoning_budget=True,
+            supports_reasoning_format=True,
+            supports_top_p=True,
+            supports_top_k=True,
+            supports_repeat_penalty=True,
+            supports_presence_penalty=True,
+        )
+
+        args, unsupported = benchmark_profile_server_args(launch, caps)
+
+        self.assertEqual(args[args.index('--reasoning') + 1], 'off')
+        self.assertEqual(args[args.index('--reasoning-budget') + 1], '0')
+        self.assertEqual(args[args.index('--reasoning-format') + 1], 'deepseek')
+        self.assertEqual(unsupported, [])
 
 
 if __name__ == '__main__':
