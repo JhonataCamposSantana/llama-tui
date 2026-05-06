@@ -30,11 +30,13 @@ from llama_tui.benchmark import (
     measured_profile_runtime_profile,
     memory_guardrail_admission,
     model_and_runtime_profile_from_measured_profile,
+    model_for_runtime_profile,
     runtime_record_context,
     runtime_profile_memory_disable_key,
     runtime_profile_memory_skip_reason,
     run_tq3_raw_llama_bench_presearch,
     select_measured_profiles,
+    tq3_moe_cpu_placement_threads,
     tq3_raw_presearch_case_total,
 )
 from llama_tui.control import CancelToken, CancelledError
@@ -2346,6 +2348,89 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(tq3_raw_presearch_case_total(profiles, 'fast'), 3)
         self.assertEqual(tq3_raw_presearch_case_total(profiles, 'full'), 6)
 
+    def test_tq3_moe_cpu_placement_uses_more_cpu_threads(self):
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path='/models/moe.TQ3_4S.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            expert_count=128,
+            threads=6,
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='tq3',
+            name='n_cpu_moe_32',
+            ctx_size=8192,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            placement_strategy='n_cpu_moe_32',
+            n_cpu_moe=32,
+        )
+
+        hardware = HardwareProfile(cpu_physical=8, cpu_logical=12)
+        self.assertEqual(tq3_moe_cpu_placement_threads(model, runtime_profile, hardware), 12)
+        with patch('llama_tui.benchmark.os.cpu_count', return_value=12):
+            candidate = model_for_runtime_profile(model, runtime_profile)
+
+        self.assertEqual(candidate.threads, 12)
+
+    def test_tq3_raw_presearch_uses_cpu_placement_thread_target(self):
+        class FakeApp:
+            runtime_profile = make_runtime_profile('tq3', 'llama-server')
+
+            def active_engine_key_for_model(self, _model):
+                return 'tq3'
+
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path='/models/moe.TQ3_4S.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            expert_count=128,
+            tq3_status='native',
+            threads=6,
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='tq3',
+            name='n_cpu_moe_32',
+            ctx_size=8192,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            placement_strategy='n_cpu_moe_32',
+            n_cpu_moe=32,
+        )
+        commands = []
+
+        def fake_raw_process(cmd, _timeout, _cancel_token=None):
+            commands.append(list(cmd))
+            return {
+                'returncode': 0,
+                'stdout': '| 123.45 tok/s |',
+                'seconds': 0.1,
+                'timed_out': False,
+                'cancelled': False,
+            }
+
+        with patch('llama_tui.benchmark._command_exists_for_app', return_value=True), \
+            patch('llama_tui.benchmark._run_tq3_raw_process', side_effect=fake_raw_process):
+            run_tq3_raw_llama_bench_presearch(
+                FakeApp(),
+                model,
+                HardwareProfile(cpu_physical=8, cpu_logical=12, gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3),
+                [runtime_profile],
+                'fast',
+            )
+
+        self.assertTrue(commands)
+        self.assertIn('-t', commands[0])
+        self.assertEqual(commands[0][commands[0].index('-t') + 1], '12')
+
     def test_tq3_raw_timeout_persists_per_case_with_raw_failure_category(self):
         class FakeApp:
             runtime_profile = make_runtime_profile('tq3', 'llama-server')
@@ -3558,6 +3643,8 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(reasoning_off)
         self.assertTrue(all(item.reasoning_budget == 0 for item in reasoning_off))
         self.assertTrue(all(item.reasoning_format == 'deepseek' for item in reasoning_off))
+        self.assertTrue(any(int(item.ctx_size or 0) >= 16384 for item in reasoning_off))
+        self.assertTrue(any(int(item.ctx_size or 0) >= 32768 for item in reasoning_off))
         self.assertFalse(any(item.reasoning == 'off' for item in unsupported_profiles))
 
     def test_moe_runtime_profiles_include_bounded_placement_candidates(self):

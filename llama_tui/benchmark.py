@@ -4503,6 +4503,30 @@ def _raw_bench_candidate_model(model: ModelConfig, runtime_profile: RuntimeProfi
     return candidate
 
 
+def tq3_moe_cpu_placement_threads(
+    model: ModelConfig,
+    runtime_profile: Optional[RuntimeProfile] = None,
+    hardware: Optional[HardwareProfile] = None,
+) -> int:
+    current = max(1, int(getattr(model, 'threads', 0) or 1))
+    if runtime_profile is not None and str(getattr(runtime_profile, 'engine_id', '') or '') != 'tq3':
+        return current
+    if not model_is_moe(model):
+        return current
+    cpu_placement = bool(getattr(model, 'cpu_moe', False)) or int(getattr(model, 'n_cpu_moe', 0) or 0) > 0
+    if runtime_profile is not None:
+        cpu_placement = (
+            cpu_placement
+            or bool(getattr(runtime_profile, 'cpu_moe', False))
+            or int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0) > 0
+        )
+    if not cpu_placement:
+        return current
+    logical = int(getattr(hardware, 'cpu_logical', 0) or 0) if hardware is not None else 0
+    logical = logical or (os.cpu_count() or current)
+    return max(current, min(max(1, logical), 12))
+
+
 def _terminate_process_group(process: subprocess.Popen):
     if process.poll() is not None:
         return
@@ -4657,7 +4681,6 @@ def run_tq3_raw_llama_bench_presearch(
             on_record(dict(record))
         return [record], []
 
-    threads = max(1, int(getattr(model, 'threads', 0) or getattr(hardware, 'cpu_physical', 0) or getattr(hardware, 'cpu_logical', 0) or 1))
     records: List[Dict[str, object]] = []
     scores: Dict[Tuple[object, ...], float] = {}
     profiles_by_key = {_tq3_raw_profile_key(item): item for item in raw_profiles}
@@ -4676,6 +4699,7 @@ def run_tq3_raw_llama_bench_presearch(
     for profile_index, runtime_profile in enumerate(raw_profiles, start=1):
         check_cancelled(cancel_token)
         candidate = _raw_bench_candidate_model(model, runtime_profile)
+        threads = tq3_moe_cpu_placement_threads(candidate, runtime_profile, hardware)
         key = _tq3_raw_profile_key(runtime_profile)
         for measurement_type, prompt_tokens, generated_tokens in TQ3_RAW_BENCH_CASES:
             check_cancelled(cancel_token)
@@ -4950,12 +4974,49 @@ def active_engine_runtime_profiles(
             and capabilities.supports_reasoning_format
         ):
             return items
-        selected = [
+        selected: List[RuntimeProfile] = []
+        seen_reasoning_shapes = set()
+
+        def add_reasoning_seed(item: RuntimeProfile):
+            key = (
+                int(item.ctx_size or 0),
+                item.gpu_layers,
+                item.kv_preset,
+                item.placement_strategy,
+                item.cpu_moe,
+                item.n_cpu_moe,
+            )
+            if key in seen_reasoning_shapes:
+                return
+            seen_reasoning_shapes.add(key)
+            selected.append(item)
+
+        placement_items = [
             item for item in items
-            if int(item.ctx_size or 0) == base_ctx
-            and not item.fit
-            and (bool(item.cpu_moe) or int(item.n_cpu_moe or 0) > 0)
-        ][:2]
+            if not item.fit and (bool(item.cpu_moe) or int(item.n_cpu_moe or 0) > 0)
+        ]
+        for item in placement_items:
+            if int(item.ctx_size or 0) == base_ctx:
+                add_reasoning_seed(item)
+                if len(selected) >= 2:
+                    break
+        target_contexts = [max(base_ctx, 16_384)]
+        tool_ctx = int(opencode_floor or 0) or 32_768
+        if benchmark_depth != 'fast':
+            target_contexts.append(max(base_ctx, tool_ctx))
+        for target in target_contexts:
+            match = next(
+                (
+                    item for item in placement_items
+                    if int(item.ctx_size or 0) >= target
+                    and str(item.kv_preset or '') == 'q8_0/q8_0'
+                ),
+                None,
+            )
+            if match is not None:
+                add_reasoning_seed(match)
+        limit = 2 if benchmark_depth == 'fast' else 4
+        selected = selected[:limit]
         if not selected:
             return items
         result: List[RuntimeProfile] = []
@@ -5469,6 +5530,7 @@ def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfil
     candidate.cpu_moe = bool(getattr(runtime_profile, 'cpu_moe', False))
     candidate.n_cpu_moe = max(0, int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0))
     candidate.tensor_overrides = [str(item) for item in tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ())]
+    candidate.threads = tq3_moe_cpu_placement_threads(candidate, runtime_profile)
     candidate.optimize_mode = 'manual'
     candidate.optimize_tier = 'measured'
     return candidate
