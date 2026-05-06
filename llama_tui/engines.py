@@ -106,7 +106,7 @@ def get_engine_definitions() -> Dict[str, EngineDefinition]:
             runtime_family='llama.cpp',
             default_binary_env='TQ3_LLAMA_SERVER_BIN',
             default_paths=[
-                str(Path.home() / 'llama.cpp-tq3' / 'build' / 'bin' / 'llama-server'),
+                str(Path.home() / 'src' / 'llama.cpp-tq3' / 'build' / 'bin' / 'llama-server'),
                 'tq3-llama-server',
             ],
             path_config_key=None,
