@@ -62,7 +62,21 @@ class TurboQuantInfo:
     reason: str = ''
 
 
+@dataclass
+class Tq3Info:
+    status: str = 'unknown'
+    weight_format: str = ''
+    source: str = ''
+    reason: str = ''
+
+
 TURBOQUANT_STATUSES = ('native', 'padded', 'incompatible', 'unknown', 'not_applicable')
+TQ3_STATUSES = ('native', 'not_native', 'unknown', 'not_applicable')
+TQ3_TENSOR_TYPES = {
+    44: 'TQ3_1S',
+    46: 'TQ3_4S',
+}
+TQ3_FILENAME_RE = re.compile(r'(?i)(?:^|[^a-z0-9])(?:TQ3[-_]?)(1S|4S)(?:[^a-z0-9]|$)')
 
 GGUF_EXPERT_SUFFIXES = (
     'expert_count',
@@ -116,6 +130,8 @@ GGML_TYPE_SIZE = {
     18: 0.25,     # I2
     19: 0.125,    # I1
     20: 2.0,      # BF16
+    44: 0.5,      # TQ3_1S
+    46: 0.5,      # TQ3_4S
 }
 
 def _read_exact(file_obj, size: int) -> bytes:
@@ -554,6 +570,75 @@ def detect_turboquant_info(model_or_path) -> TurboQuantInfo:
     )
 
 
+def _tq3_format_from_filename(name: str) -> str:
+    match = TQ3_FILENAME_RE.search(name or '')
+    if not match:
+        return ''
+    return f'TQ3_{match.group(1).upper()}'
+
+
+def detect_tq3_info(model_or_path) -> Tq3Info:
+    if isinstance(model_or_path, ModelConfig):
+        runtime = (getattr(model_or_path, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
+        if runtime != 'llama.cpp':
+            return Tq3Info(
+                status='not_applicable',
+                source='runtime',
+                reason=f'TQ3 applies to llama.cpp GGUF sessions, not {runtime}',
+            )
+
+    path = _target_path(model_or_path)
+    if not str(path):
+        return Tq3Info(status='not_applicable', source='path', reason='model path is empty')
+    filename_format = _tq3_format_from_filename(path.name)
+    if not path.exists():
+        return Tq3Info(status='not_applicable', source='path', reason='model path is missing')
+    if path.suffix.lower() != '.gguf':
+        return Tq3Info(status='not_applicable', source='path', reason='model is not a GGUF file')
+    if 'mmproj' in path.name.lower():
+        return Tq3Info(status='not_applicable', source='path', reason='projection files are not TQ3 targets')
+
+    descriptors = read_gguf_tensor_descriptors(path)
+    if descriptors:
+        counts: Dict[str, int] = {}
+        for descriptor in descriptors:
+            try:
+                tensor_type = int(descriptor.get('type', 0) or 0)
+            except Exception:
+                tensor_type = 0
+            weight_format = TQ3_TENSOR_TYPES.get(tensor_type, '')
+            if weight_format:
+                counts[weight_format] = counts.get(weight_format, 0) + 1
+        if counts:
+            ordered = sorted(counts, key=lambda item: (-counts[item], item))
+            weight_format = ordered[0] if len(ordered) == 1 else 'mixed'
+            detail = ', '.join(f'{name}={counts[name]}' for name in sorted(counts))
+            return Tq3Info(
+                status='native',
+                weight_format=weight_format,
+                source='tensor_types',
+                reason=f'GGUF tensor descriptors include {detail}',
+            )
+        return Tq3Info(
+            status='not_native',
+            source='tensor_types',
+            reason='GGUF tensor descriptors do not include TQ3_1S or TQ3_4S tensors',
+        )
+
+    if filename_format:
+        return Tq3Info(
+            status='native',
+            weight_format=filename_format,
+            source='filename',
+            reason=f'filename contains {filename_format}',
+        )
+    return Tq3Info(
+        status='unknown',
+        source='tensor_types',
+        reason='GGUF tensor descriptors were missing or unreadable',
+    )
+
+
 def architecture_label(model: ModelConfig) -> str:
     architecture_type = (getattr(model, 'architecture_type', '') or 'unknown').strip().lower()
     if architecture_type == 'moe':
@@ -636,6 +721,40 @@ def turboquant_detail(model: ModelConfig) -> str:
     return ' '.join(parts)
 
 
+def tq3_short(model: ModelConfig) -> str:
+    status = (getattr(model, 'tq3_status', '') or 'unknown').strip().lower()
+    if status == 'native':
+        weight_format = (getattr(model, 'tq3_weight_format', '') or '').upper()
+        if weight_format == 'TQ3_1S':
+            return '1S'
+        if weight_format == 'TQ3_4S':
+            return '4S'
+        return 'TQ3'
+    return {
+        'not_native': 'NO',
+        'unknown': 'UNK',
+        'not_applicable': 'N/A',
+    }.get(status, 'UNK')
+
+
+def tq3_detail(model: ModelConfig) -> str:
+    status = (getattr(model, 'tq3_status', '') or 'unknown').strip().lower()
+    if status not in TQ3_STATUSES:
+        status = 'unknown'
+    label = 'not applicable' if status == 'not_applicable' else status.replace('_', ' ')
+    parts = [label]
+    weight_format = getattr(model, 'tq3_weight_format', '') or ''
+    if weight_format:
+        parts.append(str(weight_format).upper())
+    source = getattr(model, 'tq3_source', '') or ''
+    if source:
+        parts.append(f'from {source}')
+    reason = getattr(model, 'tq3_reason', '') or ''
+    if reason:
+        parts.append(reason)
+    return ' '.join(parts)
+
+
 def apply_turboquant_info(model: ModelConfig, info: TurboQuantInfo) -> ModelConfig:
     status = (info.status or 'unknown').strip().lower()
     model.turboquant_status = status if status in TURBOQUANT_STATUSES else 'unknown'
@@ -644,6 +763,15 @@ def apply_turboquant_info(model: ModelConfig, info: TurboQuantInfo) -> ModelConf
     model.turboquant_value_dim = int(info.value_dim or 0)
     model.turboquant_source = info.source or ''
     model.turboquant_reason = info.reason or ''
+    return model
+
+
+def apply_tq3_info(model: ModelConfig, info: Tq3Info) -> ModelConfig:
+    status = (info.status or 'unknown').strip().lower()
+    model.tq3_status = status if status in TQ3_STATUSES else 'unknown'
+    model.tq3_weight_format = (info.weight_format or '').upper()
+    model.tq3_source = info.source or ''
+    model.tq3_reason = info.reason or ''
     return model
 
 

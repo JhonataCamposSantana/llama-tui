@@ -8,12 +8,16 @@ from llama_tui.benchmark import adaptive_record_from_candidate, architecture_pay
 from llama_tui.gguf import (
     ArchitectureInfo,
     GGUF_METADATA_CACHE,
+    apply_tq3_info,
     apply_turboquant_info,
     architecture_label,
     detect_architecture_info,
+    detect_tq3_info,
     detect_turboquant_info,
     estimate_layer_weight_bytes_from_tensor_descriptors,
     read_gguf_metadata,
+    tq3_detail,
+    tq3_short,
     turboquant_detail,
     turboquant_short,
 )
@@ -58,6 +62,14 @@ class ArchitectureDetectionTests(unittest.TestCase):
             model = ModelConfig(id='m', name='Model', path=str(path), alias='m', port=18080, runtime=runtime)
             with patch('llama_tui.gguf.read_gguf_metadata', return_value=metadata):
                 return detect_turboquant_info(model)
+
+    def detect_tq3_with_tensors(self, tensors, filename='model.gguf', runtime='llama.cpp'):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / filename
+            path.write_bytes(b'GGUF')
+            model = ModelConfig(id='m', name='Model', path=str(path), alias='m', port=18080, runtime=runtime)
+            with patch('llama_tui.gguf.read_gguf_tensor_descriptors', return_value=tensors):
+                return detect_tq3_info(model)
 
     def test_dense_metadata(self):
         info = self.detect_with_metadata({
@@ -115,6 +127,36 @@ class ArchitectureDetectionTests(unittest.TestCase):
         self.assertEqual(tq.status, 'native')
         self.assertEqual(tq.key_dim, 512)
         self.assertEqual(tq.value_dim, 512)
+
+    def test_tq3_detection_prefers_tensor_types(self):
+        info = self.detect_tq3_with_tensors([
+            {'name': 'blk.0.ffn_down.weight', 'type': 46},
+            {'name': 'blk.1.ffn_down.weight', 'type': 46},
+            {'name': 'output.weight', 'type': 6},
+        ])
+
+        self.assertEqual(info.status, 'native')
+        self.assertEqual(info.weight_format, 'TQ3_4S')
+        self.assertEqual(info.source, 'tensor_types')
+        model = apply_tq3_info(ModelConfig(id='m', name='Model', path='model.gguf', alias='m', port=18080), info)
+        self.assertEqual(tq3_short(model), '4S')
+        self.assertIn('TQ3_4S', tq3_detail(model))
+
+    def test_tq3_detection_uses_filename_fallback_when_descriptors_missing(self):
+        info = self.detect_tq3_with_tensors([], filename='Qwen3.5-27B-TQ3_1S.gguf')
+
+        self.assertEqual(info.status, 'native')
+        self.assertEqual(info.weight_format, 'TQ3_1S')
+        self.assertEqual(info.source, 'filename')
+
+    def test_tq3_detection_marks_regular_gguf_not_native_from_descriptors(self):
+        info = self.detect_tq3_with_tensors([
+            {'name': 'blk.0.attn_q.weight', 'type': 12},
+            {'name': 'blk.1.attn_q.weight', 'type': 12},
+        ], filename='model.Q3_K_S.gguf')
+
+        self.assertEqual(info.status, 'not_native')
+        self.assertEqual(info.weight_format, '')
 
     def test_qwen36_moe_metadata_and_benchmark_payload(self):
         info = self.detect_with_metadata({

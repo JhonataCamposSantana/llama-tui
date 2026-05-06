@@ -42,8 +42,13 @@ from .textutil import compact_message
 
 OPENCODE_PREFLIGHT_TIMEOUT = 20
 OPENCODE_TASK_TIMEOUT = 300
-OPENCODE_NO_OUTPUT_TIMEOUT = 45
-OPENCODE_IDLE_OUTPUT_TIMEOUT = 90
+WORKFLOW_NORMAL_NO_OUTPUT_TIMEOUT = 90
+WORKFLOW_NORMAL_IDLE_OUTPUT_TIMEOUT = 180
+WORKFLOW_SLOW_NO_OUTPUT_TIMEOUT = 180
+WORKFLOW_SLOW_IDLE_OUTPUT_TIMEOUT = 240
+
+OPENCODE_NO_OUTPUT_TIMEOUT = WORKFLOW_NORMAL_NO_OUTPUT_TIMEOUT
+OPENCODE_IDLE_OUTPUT_TIMEOUT = WORKFLOW_NORMAL_IDLE_OUTPUT_TIMEOUT
 OPENCODE_BENCHMARK_CANDIDATES = 4
 OPENCODE_LOG_LEVEL = 'WARN'
 OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE = 'opencode_ready'
@@ -54,6 +59,14 @@ class WorkflowTask:
     name: str
     prompt: str
     files: Dict[str, str]
+
+
+@dataclass(frozen=True)
+class WorkflowTimeoutPolicy:
+    no_output_timeout: int
+    idle_output_timeout: int
+    reason: str
+    pressure_level: str = ''
 
 
 OPENCODE_WORKFLOW_TASKS = [
@@ -138,6 +151,31 @@ def detect_vscode_pressure() -> Dict[str, object]:
         'processes': count,
         'rss_mib': round(rss_bytes / 1024**2, 1),
     }
+
+
+def workflow_timeout_policy(model: ModelConfig, pressure_payload: Optional[Dict[str, object]] = None) -> WorkflowTimeoutPolicy:
+    pressure_payload = pressure_payload or {}
+    pressure_level = str(pressure_payload.get('process_pressure_level', '') or '').strip().lower()
+    is_moe = str(getattr(model, 'architecture_type', '') or '').strip().lower() == 'moe'
+    pressure_slow = pressure_level in ('medium', 'high')
+    if is_moe or pressure_slow:
+        reasons = []
+        if is_moe:
+            reasons.append('moe')
+        if pressure_slow:
+            reasons.append(f'{pressure_level}_pressure')
+        return WorkflowTimeoutPolicy(
+            no_output_timeout=WORKFLOW_SLOW_NO_OUTPUT_TIMEOUT,
+            idle_output_timeout=WORKFLOW_SLOW_IDLE_OUTPUT_TIMEOUT,
+            reason='+'.join(reasons) or 'slow_path',
+            pressure_level=pressure_level,
+        )
+    return WorkflowTimeoutPolicy(
+        no_output_timeout=WORKFLOW_NORMAL_NO_OUTPUT_TIMEOUT,
+        idle_output_timeout=WORKFLOW_NORMAL_IDLE_OUTPUT_TIMEOUT,
+        reason='normal',
+        pressure_level=pressure_level,
+    )
 
 
 def write_fixture(root: Path, task: WorkflowTask):
@@ -408,6 +446,39 @@ def benchmark_record_context(model: ModelConfig) -> Dict[str, object]:
     return payload
 
 
+def is_startup_only_output(line: str) -> bool:
+    text = compact_message(str(line or '').strip())
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered.startswith('performing one time database migration'):
+        return True
+    if lowered.startswith('sqlite-migration:'):
+        return True
+    if lowered == 'database migration complete.':
+        return True
+    if 'preparing terminal' in lowered:
+        return True
+    if lowered.startswith('\u256d') and 'hermes' in lowered:
+        return True
+    return False
+
+
+def is_meaningful_process_output(line: str) -> bool:
+    text = str(line or '').strip()
+    if not text or is_startup_only_output(text):
+        return False
+    payload = text[5:].strip() if text.startswith('data:') else text
+    try:
+        event = json.loads(payload)
+    except Exception:
+        return True
+    event_type = str(event.get('type', '') or '').strip().lower()
+    if event_type in ('step_start', 'step_finish'):
+        return False
+    return True
+
+
 def run_process_with_metrics(
     command: List[str],
     cwd: Path,
@@ -422,9 +493,11 @@ def run_process_with_metrics(
     check_cancelled(cancel_token)
     started = time.monotonic()
     first_output: Optional[float] = None
-    last_output_at = started
+    first_process_output: Optional[float] = None
+    last_meaningful_output_at = started
     stdout_lines: List[str] = []
     stderr_lines: List[str] = []
+    startup_output_seen = False
     min_ram = 0
     min_vram = 0
     timed_out = False
@@ -492,7 +565,7 @@ def run_process_with_metrics(
             if (
                 first_output is not None
                 and idle_output_timeout > 0
-                and time.monotonic() - last_output_at > idle_output_timeout
+                and time.monotonic() - last_meaningful_output_at > idle_output_timeout
                 and proc.poll() is None
             ):
                 timed_out = True
@@ -508,9 +581,16 @@ def run_process_with_metrics(
                     except Exception:
                         pass
                     continue
-                if first_output is None:
-                    first_output = time.monotonic() - started
-                last_output_at = time.monotonic()
+                now = time.monotonic()
+                if first_process_output is None:
+                    first_process_output = now - started
+                meaningful = is_meaningful_process_output(line)
+                if meaningful:
+                    if first_output is None:
+                        first_output = now - started
+                    last_meaningful_output_at = now
+                else:
+                    startup_output_seen = True
                 if key.data == 'stdout':
                     stdout_lines.append(line.rstrip())
                 else:
@@ -568,6 +648,11 @@ def run_process_with_metrics(
         'memory_guardrail_stopped': memory_guardrail_stopped,
         'elapsed': elapsed,
         'first_output': first_output if first_output is not None else elapsed,
+        'first_meaningful_output': first_output if first_output is not None else 0.0,
+        'first_process_output': first_process_output if first_process_output is not None else 0.0,
+        'startup_output_seen': startup_output_seen,
+        'resolved_no_output_timeout': float(no_output_timeout or 0),
+        'resolved_idle_output_timeout': float(idle_output_timeout or 0),
         'stdout': stdout_lines[-40:],
         'stderr': stderr_lines[-40:],
         'json_event_tail': json_event_tail(stdout_lines + stderr_lines),
@@ -644,6 +729,8 @@ def run_opencode_task(
             env = isolated_opencode_env(home, config_path)
             command = build_opencode_run_command(app, model, workspace, task.prompt)
             preview = shlex.join(command)
+            pressure_payload = current_process_pressure_payload()
+            timeout_policy = workflow_timeout_policy(model, pressure_payload)
             app.append_log(model.id, f'OpenCode headless benchmark command: {preview}')
             if progress:
                 emit_benchmark_event(
@@ -656,9 +743,27 @@ def run_opencode_task(
                     candidate=task.name,
                     command=preview,
                 )
-            run = run_process_with_metrics(command, workspace, env, timeout, app, cancel_token=cancel_token)
+            run = run_process_with_metrics(
+                command,
+                workspace,
+                env,
+                timeout,
+                app,
+                cancel_token=cancel_token,
+                no_output_timeout=timeout_policy.no_output_timeout,
+                idle_output_timeout=timeout_policy.idle_output_timeout,
+            )
             all_output = list(run.get('stdout', []) or []) + list(run.get('stderr', []) or [])
             unittest_seen = detected_unittest_command(all_output)
+            timeout_fields = {
+                'resolved_no_output_timeout': int(run.get('resolved_no_output_timeout', timeout_policy.no_output_timeout) or 0),
+                'resolved_idle_output_timeout': int(run.get('resolved_idle_output_timeout', timeout_policy.idle_output_timeout) or 0),
+                'timeout_policy': timeout_policy.reason,
+                'timeout_pressure_level': timeout_policy.pressure_level,
+                'startup_output_seen': bool(run.get('startup_output_seen')),
+                'first_meaningful_output': float(run.get('first_meaningful_output', 0.0) or 0.0),
+                'first_process_output': float(run.get('first_process_output', 0.0) or 0.0),
+            }
             guardrail_fields = {
                 key: run.get(key)
                 for key in (
@@ -694,6 +799,7 @@ def run_opencode_task(
                     'raw_event_tail': list(run.get('raw_event_tail', []) or [])[-12:],
                     'unittest_command_seen': unittest_seen,
                     'detail': 'user requested abort',
+                    **timeout_fields,
                     **guardrail_fields,
                 }
             check_cancelled(cancel_token)
@@ -713,10 +819,10 @@ def run_opencode_task(
                 detail = f'candidate stopped to protect system memory: {run.get("memory_guardrail_reason", "")}'
             elif run.get('no_output_timeout'):
                 status = 'opencode no output timeout'
-                detail = f'no OpenCode output for {OPENCODE_NO_OUTPUT_TIMEOUT}s'
+                detail = f'no meaningful OpenCode output for {timeout_fields["resolved_no_output_timeout"]}s'
             elif run.get('idle_output_timeout'):
                 status = 'opencode idle timeout'
-                detail = f'no OpenCode output for {OPENCODE_IDLE_OUTPUT_TIMEOUT}s after initial output'
+                detail = f'no meaningful OpenCode output for {timeout_fields["resolved_idle_output_timeout"]}s after workflow output'
             elif run.get('timed_out'):
                 status = 'opencode timed out'
             elif int(run.get('returncode', -1)) != 0:
@@ -748,6 +854,7 @@ def run_opencode_task(
                 'unittest_command_seen': unittest_seen,
                 'context_required': context_required,
                 'detail': concise_failure(detail, limit=500),
+                **timeout_fields,
                 **guardrail_fields,
             }
 
@@ -816,6 +923,21 @@ def opencode_failure_summary(records: List[Dict[str, object]]) -> str:
     largest = max([int(row.get('ctx_per_slot', 0) or 0) for row in records if isinstance(row, dict)] or [0])
     if required:
         return f'no candidate completed; OpenCode requested about {required} tokens, largest tested ctx/slot was {largest}'
+    best_partial = max(
+        (
+            row for row in records
+            if isinstance(row, dict) and int(row.get('passed', 0) or 0) > 0
+        ),
+        key=lambda row: (int(row.get('passed', 0) or 0), float(row.get('score', 0.0) or 0.0)),
+        default=None,
+    )
+    if best_partial:
+        return concise_failure(
+            f'no candidate completed all tasks; best partial passed '
+            f'{int(best_partial.get("passed", 0) or 0)}/{int(best_partial.get("tasks", 0) or 0)} '
+            f'with status {best_partial.get("status", "failed")}: {best_partial.get("detail", "")}',
+            limit=500,
+        )
     first_detail = next((str(row.get('detail', '') or '') for row in records if isinstance(row, dict) and row.get('detail')), '')
     first_status = next((str(row.get('status', '') or '') for row in records if isinstance(row, dict) and row.get('status')), 'failed')
     return concise_failure(f'{first_status}: {first_detail}' if first_detail else first_status, limit=500)
@@ -851,6 +973,13 @@ def compact_sample_details(samples: List[Dict[str, object]]) -> List[Dict[str, o
             'context_overflow': bool(sample.get('context_overflow')),
             'unittest_command_seen': bool(sample.get('unittest_command_seen')),
             'context_required': int(sample.get('context_required', 0) or 0),
+            'resolved_no_output_timeout': int(sample.get('resolved_no_output_timeout', 0) or 0),
+            'resolved_idle_output_timeout': int(sample.get('resolved_idle_output_timeout', 0) or 0),
+            'timeout_policy': sample.get('timeout_policy', ''),
+            'timeout_pressure_level': sample.get('timeout_pressure_level', ''),
+            'startup_output_seen': bool(sample.get('startup_output_seen')),
+            'first_meaningful_output': float(sample.get('first_meaningful_output', 0.0) or 0.0),
+            'first_process_output': float(sample.get('first_process_output', 0.0) or 0.0),
             'memory_guardrail_status': sample.get('memory_guardrail_status', ''),
             'memory_guardrail_reason': sample.get('memory_guardrail_reason', ''),
             'detail': concise_failure(str(sample.get('detail', '')), limit=320),
@@ -1274,6 +1403,18 @@ def benchmark_opencode_workflow(
                 timeout_types = [sample_timeout_type(sample) for sample in samples if sample_timeout_type(sample)]
                 exit_codes = [int(sample.get('exit_code', -1) or -1) for sample in samples]
                 context_required = max([int(sample.get('context_required', 0) or 0) for sample in samples] or [0])
+                timeout_policies = [str(sample.get('timeout_policy', '') or '') for sample in samples if sample.get('timeout_policy')]
+                timeout_pressure_levels = [
+                    str(sample.get('timeout_pressure_level', '') or '') for sample in samples if sample.get('timeout_pressure_level')
+                ]
+                resolved_no_output_timeouts = [
+                    int(sample.get('resolved_no_output_timeout', 0) or 0) for sample in samples
+                    if int(sample.get('resolved_no_output_timeout', 0) or 0) > 0
+                ]
+                resolved_idle_timeouts = [
+                    int(sample.get('resolved_idle_output_timeout', 0) or 0) for sample in samples
+                    if int(sample.get('resolved_idle_output_timeout', 0) or 0) > 0
+                ]
                 record = {
                     'preset': preset,
                     'tier': tier,
@@ -1292,6 +1433,17 @@ def benchmark_opencode_workflow(
                     'vscode_rss_mib': vscode['rss_mib'],
                     'exit_code': next((code for code in exit_codes if code != 0), exit_codes[-1] if exit_codes else -1),
                     'timeout_type': timeout_types[0] if timeout_types else '',
+                    'timeout_policy': timeout_policies[0] if timeout_policies else '',
+                    'timeout_pressure_level': timeout_pressure_levels[0] if timeout_pressure_levels else '',
+                    'resolved_no_output_timeout': max(resolved_no_output_timeouts) if resolved_no_output_timeouts else 0,
+                    'resolved_idle_output_timeout': max(resolved_idle_timeouts) if resolved_idle_timeouts else 0,
+                    'startup_output_seen': any(bool(sample.get('startup_output_seen')) for sample in samples),
+                    'first_meaningful_output': round(statistics.median([
+                        float(sample.get('first_meaningful_output', 0.0) or 0.0) for sample in samples
+                    ]), 2),
+                    'first_process_output': round(statistics.median([
+                        float(sample.get('first_process_output', 0.0) or 0.0) for sample in samples
+                    ]), 2),
                     'unittest_command_seen': any(bool(sample.get('unittest_command_seen')) for sample in samples),
                     'context_required': context_required,
                     'stdout_tail': list(failing_sample.get('stdout_tail', []) or [])[-8:],
@@ -1308,7 +1460,7 @@ def benchmark_opencode_workflow(
                         if key.startswith('memory_guardrail_'):
                             record[key] = value
                 records.append(record)
-                if score > 0:
+                if passed == len(OPENCODE_WORKFLOW_TASKS) and len(samples) == len(OPENCODE_WORKFLOW_TASKS):
                     results.append({
                         'score': score,
                         'preset': preset,
@@ -1383,8 +1535,12 @@ def benchmark_opencode_workflow(
     recorded_model = clone_model_config(model)
     recorded_model.last_opencode_benchmark_results = records
     if not results:
+        summary = opencode_failure_summary(records)
+        recorded_model.last_opencode_benchmark_score = 0.0
+        recorded_model.last_opencode_benchmark_seconds = 0.0
+        recorded_model.last_opencode_benchmark_profile = f'failed: {summary}'
         app.add_or_update(recorded_model)
-        msg = f'❌ opencode workflow benchmark failed: {opencode_failure_summary(records)}'
+        msg = f'❌ opencode workflow benchmark failed: {summary}'
         if progress:
             progress(msg)
         emit_benchmark_event(

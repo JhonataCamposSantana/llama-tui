@@ -39,12 +39,14 @@ from llama_tui.main import (
     last_engine_session_stop_count,
     release_engine_session_lock,
     validate_buun_kv_args,
+    validate_tq3_kv_args,
     validate_turboquant_kv_args,
 )
 from llama_tui.models import ModelConfig
 from llama_tui.runtime_profiles import (
     EngineCapabilities,
     RuntimeProfile,
+    TQ3_KV_MODES,
     default_engine_capabilities,
     make_runtime_profile,
     parse_engine_capabilities,
@@ -117,6 +119,16 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.turboquant_kv_pair(), ('q8_0', 'turbo4'))
         self.assertIn('key=q8_0 value=turbo4', profile.header_indicator())
 
+    def test_tq3_profile_defaults_to_q8_and_respects_env_override(self):
+        with patch.dict(os.environ, {'TQ3_LLAMA_SERVER_BIN': '/opt/tq3/bin/llama-server'}):
+            profile = make_runtime_profile('tq3', 'llama-server')
+
+        self.assertEqual(profile.engine_id, 'tq3')
+        self.assertEqual(profile.server_command, '/opt/tq3/bin/llama-server')
+        self.assertEqual(profile.tq3_kv_pair(), ('q8_0', 'q8_0'))
+        self.assertEqual(profile.llama_extra_args(), ['--flash-attn', 'on', '-ctk', 'q8_0', '-ctv', 'q8_0'])
+        self.assertIn('llama.cpp-tq3', profile.header_indicator())
+
     def test_capability_parser_detects_buun_flash_value_and_ngl(self):
         caps = parse_engine_capabilities(
             'usage: llama-server --flash-attn on|off|auto -ctk MODE -ctv MODE --parallel N -ngl N -fit on -fitc N --no-warmup',
@@ -141,6 +153,18 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(caps.supports_ctk_ctv)
         self.assertIn('turbo4', caps.supported_kv_modes)
+        self.assertEqual(caps.gpu_layers_flag, '-ngl')
+
+    def test_capability_parser_detects_tq3_cache_type(self):
+        caps = parse_engine_capabilities(
+            'KV cache data type for K\nallowed values: q8_0 tq3_0\n'
+            'KV cache data type for V\nallowed values: q8_0 tq3_0\n'
+            '--flash-attn on|off|auto -ctk TYPE -ctv TYPE -ngl N --parallel N',
+            engine_id='tq3',
+        )
+
+        self.assertTrue(caps.supports_ctk_ctv)
+        self.assertEqual(caps.supported_kv_modes, TQ3_KV_MODES)
         self.assertEqual(caps.gpu_layers_flag, '-ngl')
 
     def test_capability_parser_detects_llama_cache_type_flags(self):
@@ -366,6 +390,30 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[0], app.runtime_profile.server_command)
         self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
         self.assertEqual(cmd[cmd.index('-ctv') + 1], 'turbo4')
+        self.assertNotIn('--cache-type-k', cmd)
+
+    def test_tq3_command_uses_short_cache_flags_and_q8_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='qwen-tq3',
+                name='Qwen TQ3_4S',
+                path='/models/qwen.TQ3_4S.gguf',
+                alias='qwen-tq3',
+                port=18080,
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('tq3')):
+                cmd = app.build_command(model)
+
+        self.assertEqual(cmd[0], app.runtime_profile.server_command)
+        self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('-ctv') + 1], 'q8_0')
         self.assertNotIn('--cache-type-k', cmd)
 
     def test_turboquant_head_dim_64_forces_q8_baseline_command(self):
@@ -2680,6 +2728,47 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(any(item.kv_preset == 'q8_0/q8_0' for item in profiles))
         self.assertFalse(any('turbo' in item.kv_preset for item in profiles))
 
+    def test_tq3_runtime_profiles_require_native_weight_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+            )
+            native = ModelConfig(
+                id='native',
+                name='Native TQ3',
+                path='/models/native.TQ3_4S.gguf',
+                alias='native',
+                port=18080,
+                architecture='llama',
+                architecture_type='dense',
+                tq3_status='native',
+                tq3_weight_format='TQ3_4S',
+                ctx_max=32768,
+            )
+            regular = ModelConfig(
+                id='regular',
+                name='Regular GGUF',
+                path='/models/regular.Q4_K_M.gguf',
+                alias='regular',
+                port=18081,
+                architecture='llama',
+                architecture_type='dense',
+                tq3_status='not_native',
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=16 * 1024**3, gpu_memory_free=12 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('tq3')):
+                with patch('llama_tui.benchmark.model_file_size', return_value=5 * 1024**3):
+                    native_profiles = active_engine_runtime_profiles(app, native, hardware)
+                    regular_profiles = active_engine_runtime_profiles(app, regular, hardware)
+
+        self.assertTrue(native_profiles)
+        self.assertTrue(all(item.engine_id == 'tq3' for item in native_profiles))
+        self.assertTrue(any(item.kv_preset == 'q8_0/q8_0' for item in native_profiles))
+        self.assertEqual(regular_profiles, [])
+
     def test_small_moe_gguf_can_plan_full_gpu_without_model_specific_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
@@ -2780,6 +2869,16 @@ class RuntimeProfileTests(unittest.TestCase):
 
                 self.assertIn(f'Unsupported {flag} "turbo3_tcq"', str(ctx.exception))
 
+    def test_invalid_tq3_kv_modes_fail_clearly(self):
+        for flag in ('--kv', '--kv-key', '--kv-value'):
+            with self.subTest(flag=flag):
+                args = build_cli_parser().parse_args(['--engine', 'tq3', flag, 'turbo4'])
+
+                with self.assertRaises(SystemExit) as ctx:
+                    validate_tq3_kv_args(args)
+
+                self.assertIn(f'Unsupported {flag} "turbo4"', str(ctx.exception))
+
     def test_cli_parser_accepts_kill_existing(self):
         args = build_cli_parser().parse_args(['--kill-existing'])
 
@@ -2790,10 +2889,12 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertIn('examples:', help_text)
         self.assertIn('llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4', help_text)
+        self.assertIn('llama-tui --engine tq3', help_text)
         self.assertIn('llama-tui --engine buun --kill-existing', help_text)
-        self.assertIn('supported runtimes: llama.cpp, turboquant, buun, vLLM saved model entries', help_text)
+        self.assertIn('supported runtimes: llama.cpp, turboquant, tq3, buun, vLLM saved model entries', help_text)
         self.assertIn('config path:', help_text)
         self.assertIn('TURBOQUANT_LLAMA_SERVER_BIN', help_text)
+        self.assertIn('TQ3_LLAMA_SERVER_BIN', help_text)
         self.assertIn('BUUN_LLAMA_SERVER_BIN', help_text)
         self.assertIn('VLLM_COMMAND', help_text)
         self.assertIn('--help exits before curses starts', help_text)

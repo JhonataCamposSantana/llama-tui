@@ -175,6 +175,44 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertTrue(sample['unittest_command_seen'])
         self.assertTrue(sample['config_path'].endswith('config.yaml'))
 
+    def test_run_hermes_task_uses_adaptive_timeout_policy(self):
+        task = WorkflowTask(
+            name='fake',
+            prompt='fix tests',
+            files={'thing.py': 'VALUE = 1\n', 'test_thing.py': 'import unittest\n'},
+        )
+        self.model.architecture_type = 'moe'
+        fake_run = {
+            'returncode': 0,
+            'timed_out': False,
+            'no_output_timeout': False,
+            'idle_output_timeout': False,
+            'aborted': False,
+            'elapsed': 1.25,
+            'first_output': 0.2,
+            'first_meaningful_output': 0.2,
+            'first_process_output': 0.1,
+            'startup_output_seen': False,
+            'resolved_no_output_timeout': 180,
+            'resolved_idle_output_timeout': 240,
+            'stdout': ['python -m unittest -q'],
+            'stderr': [],
+            'json_event_tail': [],
+            'raw_event_tail': ['python -m unittest -q'],
+            'min_ram_available': 2 * 1024**3,
+            'min_gpu_memory_free': 1024**3,
+        }
+        with patch.object(self.app, 'append_log'):
+            with patch('llama_tui.hermes_benchmark.current_process_pressure_payload', return_value={'process_pressure_level': 'high'}):
+                with patch('llama_tui.hermes_benchmark.run_process_with_metrics', return_value=fake_run) as run:
+                    with patch('llama_tui.hermes_benchmark.verify_fixture', return_value=(True, 'OK')):
+                        sample = run_hermes_task(self.app, self.model, task)
+
+        self.assertTrue(sample['ok'])
+        self.assertEqual(run.call_args.kwargs['no_output_timeout'], 180)
+        self.assertEqual(run.call_args.kwargs['idle_output_timeout'], 240)
+        self.assertEqual(sample['timeout_policy'], 'moe+high_pressure')
+
     def test_run_hermes_task_records_failure_tails_with_fake_process(self):
         task = WorkflowTask(
             name='fake',
@@ -412,6 +450,74 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(saved.last_hermes_benchmark_score, 0.0)
         self.assertEqual(saved.benchmark_runs[0]['kind'], 'hermes')
         self.assertEqual(saved.benchmark_runs[0]['status'], 'failed')
+
+    def test_hermes_partial_pass_does_not_become_winner(self):
+        self.model.measured_profiles = {
+            'hermes_floor': {
+                'status': 'ok',
+                'ctx': 65536,
+                'ctx_per_slot': 65536,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 12.0,
+                'extra_args': [],
+            },
+        }
+        ok_sample = {
+            'task': 'fix_calc',
+            'command_preview': 'hermes chat -q fix',
+            'ok': True,
+            'tests_ok': True,
+            'status': 'tests passed',
+            'exit_code': 0,
+            'timed_out': False,
+            'no_output_timeout': False,
+            'idle_output_timeout': False,
+            'aborted': False,
+            'elapsed': 1.0,
+            'first_output': 0.1,
+            'first_meaningful_output': 0.1,
+            'first_process_output': 0.05,
+            'min_ram_available': 2 * 1024**3,
+            'min_gpu_memory_free': 1024**3,
+            'stdout_tail': ['python -m unittest -q'],
+            'stderr_tail': [],
+            'json_event_tail': [],
+            'raw_event_tail': ['python -m unittest -q'],
+            'unittest_command_seen': True,
+            'context_required': 0,
+            'detail': 'OK',
+        }
+        timeout_sample = dict(ok_sample)
+        timeout_sample.update({
+            'task': 'add_slugify',
+            'ok': False,
+            'tests_ok': False,
+            'status': 'hermes no output timeout',
+            'timed_out': True,
+            'no_output_timeout': True,
+            'unittest_command_seen': False,
+            'detail': 'no meaningful Hermes output for 180s',
+        })
+        profile = SimpleNamespace(short_summary=lambda: 'fake hardware')
+        with patch('llama_tui.hermes_benchmark.hermes_cli_preflight', return_value=(True, 'Hermes CLI ready')):
+            with patch.object(self.app, 'health', return_value=('STOPPED', '')):
+                with patch.object(self.app, 'get_pid', return_value=None):
+                    with patch.object(self.app, 'hardware_profile', return_value=profile):
+                        with patch.object(self.app, 'start', return_value=(True, 'started')):
+                            with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
+                                with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
+                                    with patch('llama_tui.hermes_benchmark.run_hermes_task', side_effect=[ok_sample, timeout_sample]):
+                                        ok, msg = benchmark_hermes_workflow(self.app, self.model)
+
+        saved = self.app.get_model(self.model.id)
+        self.assertFalse(ok)
+        self.assertIn('no candidate completed all tasks', msg)
+        self.assertEqual(saved.last_hermes_benchmark_score, 0.0)
+        self.assertEqual(saved.last_hermes_benchmark_results[0]['passed'], 1)
+        self.assertEqual(saved.last_hermes_benchmark_results[0]['tasks'], 2)
 
     def test_hermes_candidates_skip_under_floor_and_run_all_viable(self):
         self.model.measured_profiles = {

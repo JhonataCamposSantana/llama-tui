@@ -62,6 +62,7 @@ from llama_tui.opencode_benchmark import (
     run_process_with_metrics,
     sample_timeout_type,
     score_opencode_samples,
+    workflow_timeout_policy,
     write_temp_opencode_config,
 )
 from llama_tui.runtime_profiles import make_runtime_profile
@@ -836,6 +837,20 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertEqual(candidates[0][0], 'opencode_ready')
         self.assertEqual(ctx_per_slot(candidates[0][2]), 20000)
 
+    def test_workflow_timeout_policy_extends_for_moe_and_pressure(self):
+        dense = ModelConfig(id='dense', name='Dense', path=__file__, alias='dense', architecture_type='dense')
+        moe = ModelConfig(id='moe', name='MoE', path=__file__, alias='moe', architecture_type='moe')
+
+        normal = workflow_timeout_policy(dense, {'process_pressure_level': 'low'})
+        pressure = workflow_timeout_policy(dense, {'process_pressure_level': 'medium'})
+        sparse = workflow_timeout_policy(moe, {'process_pressure_level': 'low'})
+
+        self.assertEqual((normal.no_output_timeout, normal.idle_output_timeout), (90, 180))
+        self.assertEqual((pressure.no_output_timeout, pressure.idle_output_timeout), (180, 240))
+        self.assertEqual((sparse.no_output_timeout, sparse.idle_output_timeout), (180, 240))
+        self.assertEqual(pressure.pressure_level, 'medium')
+        self.assertIn('moe', sparse.reason)
+
     def test_opencode_benchmark_replays_measured_runtime_profile(self):
         profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
         model = ModelConfig(
@@ -927,6 +942,88 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertTrue(runtime_profile.fit)
         self.assertIsNone(runtime_profile.gpu_layers)
         self.assertEqual(runtime_profile.fit_context, 4096)
+
+    def test_opencode_partial_pass_does_not_become_winner(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        app = AppConfig(Path(tmp.name) / 'models.json')
+        model = ModelConfig(
+            id='partial',
+            name='Partial',
+            path=__file__,
+            alias='partial',
+            port=18080,
+            runtime='vllm',
+        )
+        app.add_or_update(model)
+        model.measured_profiles = {
+            'opencode_ready': {
+                'status': 'ok',
+                'ctx': 32768,
+                'ctx_per_slot': 32768,
+                'parallel': 1,
+                'threads': 6,
+                'ngl': 0,
+                'output': 1024,
+                'tokens_per_sec': 12.0,
+                'extra_args': [],
+            },
+        }
+        app.add_or_update(model)
+        ok_sample = {
+            'task': 'fix_calc',
+            'ok': True,
+            'tests_ok': True,
+            'status': 'tests passed',
+            'elapsed': 5.0,
+            'first_output': 1.0,
+            'first_meaningful_output': 1.0,
+            'first_process_output': 0.5,
+            'exit_code': 0,
+            'timed_out': False,
+            'no_output_timeout': False,
+            'idle_output_timeout': False,
+            'unittest_command_seen': True,
+            'context_required': 0,
+            'min_ram_available': 8 * 1024**3,
+            'min_gpu_memory_free': 2 * 1024**3,
+            'stdout_tail': [],
+            'stderr_tail': [],
+            'detail': 'OK',
+        }
+        timeout_sample = dict(ok_sample)
+        timeout_sample.update({
+            'task': 'add_slugify',
+            'ok': False,
+            'tests_ok': False,
+            'status': 'opencode idle timeout',
+            'timed_out': True,
+            'idle_output_timeout': True,
+            'unittest_command_seen': False,
+            'detail': 'no meaningful OpenCode output for 240s after workflow output',
+        })
+        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=32 * 1024**3, memory_available=24 * 1024**3)
+        with patch.object(app, 'command_exists', return_value=True), \
+            patch('llama_tui.opencode_benchmark.opencode_cli_preflight', return_value=(True, 'cli ok')), \
+            patch('llama_tui.opencode_benchmark.benchmark_preflight_cleanup', return_value=(True, 'preflight ok')), \
+            patch.object(app, 'hardware_profile', return_value=profile), \
+            patch.object(app, 'start', return_value=(True, 'started')), \
+            patch.object(app, 'wait_until_ready', return_value=(True, 'ready')), \
+            patch.object(app, 'stop', return_value=(True, 'stopped')), \
+            patch('llama_tui.opencode_benchmark.opencode_candidate_models', return_value=[('opencode_ready', 'measured', model, 'measured')]), \
+            patch('llama_tui.opencode_benchmark.opencode_provider_preflight', return_value=(True, 'provider ok')), \
+            patch('llama_tui.opencode_benchmark.run_opencode_task', side_effect=[ok_sample, timeout_sample]), \
+            patch('llama_tui.opencode_benchmark.detect_vscode_pressure', return_value={'processes': 0, 'rss_mib': 0.0}), \
+            patch('llama_tui.opencode_benchmark.current_process_pressure_payload', return_value={'process_pressure_level': 'medium'}), \
+            patch('llama_tui.opencode_benchmark.sleep_with_cancel', return_value=None):
+            ok, msg = benchmark_opencode_workflow(app, model)
+
+        saved = app.get_model(model.id)
+        self.assertFalse(ok)
+        self.assertIn('no candidate completed all tasks', msg)
+        self.assertEqual(saved.last_opencode_benchmark_score, 0.0)
+        self.assertEqual(saved.last_opencode_benchmark_results[0]['passed'], 1)
+        self.assertEqual(saved.last_opencode_benchmark_results[0]['tasks'], 2)
 
     def test_opencode_candidates_are_dynamic_for_tiny_context(self):
         profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=64 * 1024**3, memory_available=48 * 1024**3)
@@ -1697,6 +1794,32 @@ class ProcessLifecycleTests(unittest.TestCase):
         self.assertTrue(result['no_output_timeout'])
         self.assertEqual(result['stdout'], [])
         self.assertEqual(result['stderr'], [])
+
+    def test_startup_only_output_does_not_start_idle_timer(self):
+        code = (
+            'import sys, time\n'
+            'print("Performing one time database migration, may take a few minutes...", file=sys.stderr, flush=True)\n'
+            'print("sqlite-migration:done", file=sys.stderr, flush=True)\n'
+            'time.sleep(60)\n'
+        )
+        result = run_process_with_metrics(
+            [sys.executable, '-c', code],
+            Path(self.tmp.name),
+            os.environ.copy(),
+            timeout=5,
+            app=self.app,
+            no_output_timeout=0.5,
+            idle_output_timeout=0.1,
+        )
+
+        self.assertTrue(result['timed_out'])
+        self.assertTrue(result['no_output_timeout'])
+        self.assertFalse(result['idle_output_timeout'])
+        self.assertTrue(result['startup_output_seen'])
+        self.assertGreater(result['first_process_output'], 0.0)
+        self.assertEqual(result['first_meaningful_output'], 0.0)
+        self.assertEqual(result['resolved_no_output_timeout'], 0.5)
+        self.assertEqual(result['resolved_idle_output_timeout'], 0.1)
 
     def test_memory_guardrail_kills_opencode_process(self):
         class FakeApp:

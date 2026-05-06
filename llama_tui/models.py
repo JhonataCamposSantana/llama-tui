@@ -79,6 +79,10 @@ class ModelConfig:
     turboquant_value_dim: int = 0
     turboquant_source: str = ''
     turboquant_reason: str = ''
+    tq3_status: str = 'unknown'
+    tq3_weight_format: str = ''
+    tq3_source: str = ''
+    tq3_reason: str = ''
     extra_args: List[str] = field(default_factory=list)
     launch_overrides: Dict[str, object] = field(default_factory=dict)
     favorite: bool = False

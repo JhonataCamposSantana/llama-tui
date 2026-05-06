@@ -492,6 +492,13 @@ def benchmark_preflight_cleanup(
     cancel_token: Optional[CancelToken] = None,
 ) -> Tuple[bool, str]:
     check_cancelled(cancel_token)
+    if hasattr(app, 'active_engine_model_compatibility'):
+        try:
+            compatible, compatibility_msg = app.active_engine_model_compatibility(model)
+        except Exception:
+            compatible, compatibility_msg = True, ''
+        if not compatible:
+            return False, f'❌ benchmark preflight blocked: {compatibility_msg}'
     stopped: List[str] = []
     models = list(getattr(app, 'models', []) or [])
     if model.id not in {getattr(item, 'id', '') for item in models}:
@@ -3071,6 +3078,8 @@ def adaptive_record_from_candidate(
     detected_head_dim: int = 0,
     model_quant: str = '',
     model_family: str = '',
+    tq3_status: str = '',
+    tq3_weight_format: str = '',
     binary_path: str = '',
     help_supported_cache_types: Optional[List[str]] = None,
     runtime_log_path: str = '',
@@ -3179,6 +3188,8 @@ def adaptive_record_from_candidate(
         'detected_head_dim': int(detected_head_dim or 0),
         'model_quant': model_quant,
         'model_family': model_family,
+        'tq3_status': tq3_status,
+        'tq3_weight_format': tq3_weight_format,
         'binary_path': binary_path,
         'help_supported_cache_types': list(help_supported_cache_types or []),
         'runtime_log_path': runtime_log_path,
@@ -3292,6 +3303,8 @@ def runtime_record_context(
         'detected_head_dim': turboquant_head_dim(candidate),
         'model_quant': extract_quant(candidate),
         'model_family': getattr(candidate, 'model_family', '') or getattr(candidate, 'architecture', '') or '',
+        'tq3_status': getattr(candidate, 'tq3_status', 'unknown'),
+        'tq3_weight_format': getattr(candidate, 'tq3_weight_format', ''),
         'help_supported_cache_types': supported_cache_types,
         'flash_attn_mode': getattr(profile, 'flash_attn', '') if profile is not None else '',
         'kv_family': kv_family,
@@ -3939,6 +3952,8 @@ def active_engine_runtime_profiles(
     if getattr(model, 'runtime', 'llama.cpp') != 'llama.cpp':
         return []
     if not str(getattr(model, 'path', '') or '').lower().endswith('.gguf'):
+        return []
+    if engine == 'tq3' and (getattr(model, 'tq3_status', '') or 'unknown').strip().lower() != 'native':
         return []
     try:
         capabilities = app.engine_capabilities()

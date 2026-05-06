@@ -4,9 +4,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from llama_tui.app import AppConfig
-from llama_tui.gguf import TurboQuantInfo
+from llama_tui.benchmark import benchmark_preflight_cleanup
+from llama_tui.gguf import Tq3Info, TurboQuantInfo
 from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
+from llama_tui.runtime_profiles import make_runtime_profile
 
 
 def large_profile() -> HardwareProfile:
@@ -115,6 +117,58 @@ class ModelVerificationTests(unittest.TestCase):
         self.assertEqual(reloaded.turboquant_key_dim, 128)
         self.assertEqual(reloaded.turboquant_value_dim, 128)
         self.assertEqual(reloaded.turboquant_source, 'gguf_metadata')
+
+    def test_tq3_metadata_is_enriched_and_persisted(self):
+        model_path = self.root / 'model.TQ3_4S.gguf'
+        model_path.write_bytes(b'GGUF')
+        model = ModelConfig(
+            id='tq3',
+            name='TQ3',
+            path=str(model_path),
+            alias='tq3',
+            port=18080,
+        )
+        detected = Tq3Info(
+            status='native',
+            weight_format='TQ3_4S',
+            source='tensor_types',
+            reason='GGUF tensor descriptors include TQ3_4S=42',
+        )
+
+        with patch('llama_tui.app.detect_tq3_info', return_value=detected):
+            self.app.add_or_update(model)
+            reloaded = AppConfig(self.root / 'models.json').get_model('tq3')
+
+        self.assertIsNotNone(reloaded)
+        self.assertEqual(reloaded.tq3_status, 'native')
+        self.assertEqual(reloaded.tq3_weight_format, 'TQ3_4S')
+        self.assertEqual(reloaded.tq3_source, 'tensor_types')
+
+    def test_tq3_launch_and_benchmark_preflight_block_non_native_models(self):
+        model_path = self.root / 'regular.Q4_K_M.gguf'
+        model_path.write_bytes(b'GGUF' + (b'\0' * 64))
+        app = AppConfig(
+            self.root / 'tq3.json',
+            runtime_profile=make_runtime_profile('tq3', 'llama-server'),
+        )
+        model = ModelConfig(
+            id='regular',
+            name='Regular',
+            path=str(model_path),
+            alias='regular',
+            port=18080,
+            tq3_status='not_native',
+            tq3_source='tensor_types',
+            tq3_reason='GGUF tensor descriptors do not include TQ3_1S or TQ3_4S tensors',
+        )
+
+        ok, msg = app.start(model)
+        preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'server')
+
+        self.assertFalse(ok)
+        self.assertIn('TQ3-native GGUFs', msg)
+        self.assertFalse(preflight_ok)
+        self.assertIn('benchmark preflight blocked', preflight_msg)
 
     def test_fresh_benchmark_fingerprint_passes_verification(self):
         model = self.model()

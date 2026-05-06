@@ -38,14 +38,15 @@ from .opencode_benchmark import (
     sample_timeout_type,
     score_opencode_samples,
     verify_fixture,
+    workflow_timeout_policy,
     write_fixture,
 )
 from .runtime_profiles import RuntimeProfile
 
 HERMES_PREFLIGHT_TIMEOUT = 20
 HERMES_TASK_TIMEOUT = 300
-HERMES_NO_OUTPUT_TIMEOUT = 45
-HERMES_IDLE_OUTPUT_TIMEOUT = 90
+HERMES_NO_OUTPUT_TIMEOUT = 90
+HERMES_IDLE_OUTPUT_TIMEOUT = 180
 HERMES_WORKFLOW_TASKS = OPENCODE_WORKFLOW_TASKS
 HermesCandidate = Tuple[str, str, ModelConfig, str, Optional[RuntimeProfile]]
 
@@ -504,6 +505,8 @@ def run_hermes_task(
             env = isolated_hermes_env(app, model, home)
             command = build_hermes_run_command(app, model, workspace, task.prompt)
             preview = shlex.join(command)
+            pressure_payload = current_process_pressure_payload()
+            timeout_policy = workflow_timeout_policy(model, pressure_payload)
             app.append_log(model.id, f'Hermes headless benchmark command: {preview}')
             app.append_log(model.id, f'Hermes benchmark config: {config_path}')
             if progress:
@@ -524,11 +527,20 @@ def run_hermes_task(
                 timeout,
                 app,
                 cancel_token=cancel_token,
-                no_output_timeout=HERMES_NO_OUTPUT_TIMEOUT,
-                idle_output_timeout=HERMES_IDLE_OUTPUT_TIMEOUT,
+                no_output_timeout=timeout_policy.no_output_timeout,
+                idle_output_timeout=timeout_policy.idle_output_timeout,
             )
             all_output = list(run.get('stdout', []) or []) + list(run.get('stderr', []) or [])
             unittest_seen = detected_unittest_command(all_output)
+            timeout_fields = {
+                'resolved_no_output_timeout': int(run.get('resolved_no_output_timeout', timeout_policy.no_output_timeout) or 0),
+                'resolved_idle_output_timeout': int(run.get('resolved_idle_output_timeout', timeout_policy.idle_output_timeout) or 0),
+                'timeout_policy': timeout_policy.reason,
+                'timeout_pressure_level': timeout_policy.pressure_level,
+                'startup_output_seen': bool(run.get('startup_output_seen')),
+                'first_meaningful_output': float(run.get('first_meaningful_output', 0.0) or 0.0),
+                'first_process_output': float(run.get('first_process_output', 0.0) or 0.0),
+            }
             if run.get('aborted'):
                 return {
                     'task': task.name,
@@ -552,6 +564,7 @@ def run_hermes_task(
                     'unittest_command_seen': unittest_seen,
                     'config_path': str(config_path),
                     'detail': 'user requested abort',
+                    **timeout_fields,
                     **context_fields,
                 }
             check_cancelled(cancel_token)
@@ -567,10 +580,10 @@ def run_hermes_task(
                 detail = f'Hermes requested about {context_required} tokens; {detail}'
             elif run.get('no_output_timeout'):
                 status = 'hermes no output timeout'
-                detail = f'no Hermes output for {HERMES_NO_OUTPUT_TIMEOUT}s'
+                detail = f'no meaningful Hermes output for {timeout_fields["resolved_no_output_timeout"]}s'
             elif run.get('idle_output_timeout'):
                 status = 'hermes idle timeout'
-                detail = f'no Hermes output for {HERMES_IDLE_OUTPUT_TIMEOUT}s after initial output'
+                detail = f'no meaningful Hermes output for {timeout_fields["resolved_idle_output_timeout"]}s after workflow output'
             elif run.get('timed_out'):
                 status = 'hermes timed out'
             elif int(run.get('returncode', -1)) != 0:
@@ -602,6 +615,7 @@ def run_hermes_task(
                 'unittest_command_seen': unittest_seen,
                 'context_required': context_required,
                 'detail': concise_failure(detail, limit=500),
+                **timeout_fields,
                 **context_fields,
             }
             if not sample['ok']:
@@ -663,6 +677,28 @@ def summarize_hermes_sample_status(samples: List[Dict[str, object]]) -> str:
         if candidate in statuses:
             return candidate
     return 'tests failed' if samples else 'failed'
+
+
+def hermes_failure_summary(records: List[Dict[str, object]]) -> str:
+    best_partial = max(
+        (
+            row for row in records
+            if isinstance(row, dict) and int(row.get('passed', 0) or 0) > 0
+        ),
+        key=lambda row: (int(row.get('passed', 0) or 0), float(row.get('score', 0.0) or 0.0)),
+        default=None,
+    )
+    if best_partial:
+        return concise_failure(
+            f'no candidate completed all tasks; best partial passed '
+            f'{int(best_partial.get("passed", 0) or 0)}/{int(best_partial.get("tasks", 0) or 0)} '
+            f'with status {best_partial.get("status", "failed")}: {best_partial.get("detail", "")}',
+            limit=500,
+        )
+    first_detail = next((str(row.get('detail', '') or '') for row in records if isinstance(row, dict) and row.get('detail')), '')
+    first_status = next((str(row.get('status', '') or '') for row in records if isinstance(row, dict) and row.get('status')), 'failed')
+    detail = f'{first_status}: {first_detail}' if first_detail else first_status
+    return concise_failure(f'no candidate passed a task; {detail}', limit=500)
 
 
 def benchmark_hermes_workflow(
@@ -862,6 +898,18 @@ def benchmark_hermes_workflow(
                 detail_parts = [str(sample.get('detail', '')) for sample in samples if sample.get('detail')]
                 if context_fields.get('context_detail'):
                     detail_parts.append(str(context_fields.get('context_detail')))
+                timeout_policies = [str(sample.get('timeout_policy', '') or '') for sample in samples if sample.get('timeout_policy')]
+                timeout_pressure_levels = [
+                    str(sample.get('timeout_pressure_level', '') or '') for sample in samples if sample.get('timeout_pressure_level')
+                ]
+                resolved_no_output_timeouts = [
+                    int(sample.get('resolved_no_output_timeout', 0) or 0) for sample in samples
+                    if int(sample.get('resolved_no_output_timeout', 0) or 0) > 0
+                ]
+                resolved_idle_timeouts = [
+                    int(sample.get('resolved_idle_output_timeout', 0) or 0) for sample in samples
+                    if int(sample.get('resolved_idle_output_timeout', 0) or 0) > 0
+                ]
                 record = {
                     'runtime': 'hermes',
                     'preset': preset,
@@ -880,13 +928,24 @@ def benchmark_hermes_workflow(
                     'vscode_pressure': vscode,
                     'samples': compact_sample_details(samples),
                     'timeout_type': sample_timeout_type(samples[-1]) if samples else '',
+                    'timeout_policy': timeout_policies[0] if timeout_policies else '',
+                    'timeout_pressure_level': timeout_pressure_levels[0] if timeout_pressure_levels else '',
+                    'resolved_no_output_timeout': max(resolved_no_output_timeouts) if resolved_no_output_timeouts else 0,
+                    'resolved_idle_output_timeout': max(resolved_idle_timeouts) if resolved_idle_timeouts else 0,
+                    'startup_output_seen': any(bool(sample.get('startup_output_seen')) for sample in samples),
+                    'first_meaningful_output': round(sum(
+                        float(sample.get('first_meaningful_output', 0.0) or 0.0) for sample in samples
+                    ) / max(1, len(samples)), 2),
+                    'first_process_output': round(sum(
+                        float(sample.get('first_process_output', 0.0) or 0.0) for sample in samples
+                    ) / max(1, len(samples)), 2),
                     'context_required': max([int(sample.get('context_required', 0) or 0) for sample in samples] or [0]),
                     'detail': concise_failure(' | '.join(detail_parts), limit=600),
                     **context_fields,
                 }
                 record.update(hermes_benchmark_record_context(candidate))
                 records.append(record)
-                if passed > 0:
+                if passed == len(HERMES_WORKFLOW_TASKS) and len(samples) == len(HERMES_WORKFLOW_TASKS):
                     results.append({
                         'score': score,
                         'preset': preset,
@@ -951,12 +1010,13 @@ def benchmark_hermes_workflow(
     if not results:
         recorded_model.last_hermes_benchmark_score = 0.0
         recorded_model.last_hermes_benchmark_seconds = 0.0
-        recorded_model.last_hermes_benchmark_profile = 'failed: no candidate passed a task'
+        summary = hermes_failure_summary(records)
+        recorded_model.last_hermes_benchmark_profile = f'failed: {summary}'
         run = build_benchmark_run(run_id, 'hermes', 'failed', records, {}, started_at, datetime.now().isoformat(timespec='seconds'), profile.short_summary())
-        run['summary'] = 'Hermes benchmark failed'
+        run['summary'] = f'Hermes benchmark failed: {summary}'
         upsert_benchmark_run(recorded_model, run)
         app.add_or_update(recorded_model)
-        msg = '❌ Hermes workflow benchmark failed: no candidate passed a task'
+        msg = f'❌ Hermes workflow benchmark failed: {summary}'
         emit_benchmark_event(progress, 'benchmark_error', model, 'hermes', message=msg, phase='failed', records=records)
         return False, msg
 

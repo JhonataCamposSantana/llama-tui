@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from .constants import DEFAULT_LLAMA_SERVER, DEFAULT_VLLM_COMMAND
 from .runtime_profiles import (
     DEFAULT_BUUN_LLAMA_SERVER,
+    DEFAULT_TQ3_LLAMA_SERVER,
     DEFAULT_TURBOQUANT_LLAMA_SERVER,
     EngineCapabilities,
     default_engine_capabilities,
@@ -17,6 +18,7 @@ from .runtime_profiles import (
 
 ENGINE_LLAMA_CPP = 'llama.cpp'
 ENGINE_TURBOQUANT = 'turboquant'
+ENGINE_TQ3 = 'tq3'
 ENGINE_BUUN = 'buun'
 ENGINE_VLLM = 'vllm'
 
@@ -98,6 +100,21 @@ def get_engine_definitions() -> Dict[str, EngineDefinition]:
             supports_openai_api=True,
             notes='Buun-compatible llama-server command.',
         ),
+        ENGINE_TQ3: EngineDefinition(
+            id=ENGINE_TQ3,
+            display_name='llama.cpp-tq3',
+            runtime_family='llama.cpp',
+            default_binary_env='TQ3_LLAMA_SERVER_BIN',
+            default_paths=[
+                str(Path.home() / 'llama.cpp-tq3' / 'build' / 'bin' / 'llama-server'),
+                'tq3-llama-server',
+            ],
+            path_config_key=None,
+            supports_gguf=True,
+            supports_hf_ref=False,
+            supports_openai_api=True,
+            notes='Experimental TQ3-native llama.cpp fork.',
+        ),
         ENGINE_VLLM: EngineDefinition(
             id=ENGINE_VLLM,
             display_name='vLLM',
@@ -124,6 +141,8 @@ def normalize_engine_id(engine_id: str) -> str:
         return ENGINE_LLAMA_CPP
     if normalized in ('tq', 'turboquant+', 'turboquant'):
         return ENGINE_TURBOQUANT
+    if normalized in ('tq3', 'llama.cpp-tq3', 'llama-cpp-tq3', 'llamacpp-tq3'):
+        return ENGINE_TQ3
     if normalized == 'buun':
         return ENGINE_BUUN
     if normalized == 'vllm':
@@ -152,7 +171,7 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
     runtime_profile = getattr(config, 'runtime_profile', None)
     profile_engine = normalize_engine_id(str(getattr(runtime_profile, 'engine_id', '') or getattr(runtime_profile, 'engine', '') or ''))
     profile_command = str(getattr(runtime_profile, 'server_command', '') or getattr(runtime_profile, 'server_bin', '') or '')
-    if profile_engine == engine and profile_command and engine in (ENGINE_BUUN, ENGINE_TURBOQUANT, ENGINE_LLAMA_CPP):
+    if profile_engine == engine and profile_command and engine in (ENGINE_BUUN, ENGINE_TURBOQUANT, ENGINE_TQ3, ENGINE_LLAMA_CPP):
         command = profile_command
         source = 'runtime_profile'
     elif env_value:
@@ -163,6 +182,9 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
         source = 'default'
     elif engine == ENGINE_TURBOQUANT:
         command = DEFAULT_TURBOQUANT_LLAMA_SERVER
+        source = 'default'
+    elif engine == ENGINE_TQ3:
+        command = DEFAULT_TQ3_LLAMA_SERVER
         source = 'default'
     elif engine == ENGINE_VLLM:
         command = str(getattr(config, 'vllm_command', '') or DEFAULT_VLLM_COMMAND)
@@ -205,6 +227,24 @@ def turboquant_binary_warning(command: str, capabilities: EngineCapabilities) ->
     )
 
 
+def tq3_binary_warning(command: str, capabilities: EngineCapabilities) -> str:
+    help_text = str(getattr(capabilities, 'help_text', '') or '')
+    if not help_text:
+        return ''
+    if re.search(r'\btq3_0\b', help_text.lower()):
+        return ''
+    path_hint = ''
+    parts = shlex.split(command or '')
+    if parts:
+        low = parts[0].lower()
+        if 'llama.cpp' in low and 'llama.cpp-tq3' not in low and 'llama-cpp-tq3' not in low:
+            path_hint = ' The path looks like a vanilla llama.cpp checkout.'
+    return (
+        f'llama.cpp-tq3 binary warning: {command} does not advertise tq3_0 cache type in --help.'
+        f'{path_hint}'
+    )
+
+
 def get_engine_health(config, engine_id: str) -> EngineHealth:
     install = resolve_engine_install(config, engine_id)
     if not install.exists:
@@ -223,6 +263,10 @@ def get_engine_health(config, engine_id: str) -> EngineHealth:
             str(install.resolved_command or ''),
             capabilities,
         )
+        if warning:
+            warnings.append(warning)
+    if install.id == ENGINE_TQ3:
+        warning = tq3_binary_warning(str(install.resolved_command or ''), capabilities)
         if warning:
             warnings.append(warning)
     if warnings:

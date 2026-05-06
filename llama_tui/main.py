@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .app import AppConfig
 from .constants import CONFIG_DIR, DATA_DIR, CACHE_DIR, DEFAULT_CONFIG_PATH, SCRIPT_DIR, DEFAULT_LLAMA_SERVER
-from .runtime_profiles import BUUN_KV_MODES, TURBOQUANT_KV_MODES, make_runtime_profile
+from .runtime_profiles import BUUN_KV_MODES, TQ3_KV_MODES, TURBOQUANT_KV_MODES, make_runtime_profile
 from .ui import tui
 
 
@@ -37,19 +37,21 @@ def ensure_bootstrap_files(config_path: Path) -> Path:
 
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='llama-tui: local LLM control plane for llama.cpp, TurboQuant+, Buun, and vLLM models.',
+        description='llama-tui: local LLM control plane for llama.cpp, TurboQuant+, llama.cpp-tq3, Buun, and vLLM models.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f'''examples:
   llama-tui
   llama-tui {DEFAULT_CONFIG_PATH}
   llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4
+  llama-tui --engine tq3
   llama-tui --engine buun --kill-existing
 
 defaults:
-  supported runtimes: llama.cpp, turboquant, buun, vLLM saved model entries
+  supported runtimes: llama.cpp, turboquant, tq3, buun, vLLM saved model entries
   config path: {DEFAULT_CONFIG_PATH}
   llama.cpp binary: LLAMA_SERVER or config llama_server
   TurboQuant+ binary: TURBOQUANT_LLAMA_SERVER_BIN
+  llama.cpp-tq3 binary: TQ3_LLAMA_SERVER_BIN
   Buun binary: BUUN_LLAMA_SERVER_BIN
   vLLM command: VLLM_COMMAND or config vllm_command
 
@@ -60,11 +62,11 @@ notes:
 ''',
     )
     parser.add_argument('config_path', nargs='?', default=str(DEFAULT_CONFIG_PATH), help='models.json config path (default: %(default)s)')
-    parser.add_argument('--engine', choices=('llama.cpp', 'buun', 'turboquant'), default='llama.cpp', help='active GGUF engine for this session (default: %(default)s)')
+    parser.add_argument('--engine', choices=('llama.cpp', 'buun', 'turboquant', 'tq3'), default='llama.cpp', help='active GGUF engine for this session (default: %(default)s)')
     parser.add_argument('--ctx', type=int, default=None, help='optional session context override for the active GGUF engine')
-    parser.add_argument('--kv', default='', help='KV cache mode shorthand for Buun/TurboQuant+ sessions')
-    parser.add_argument('--kv-key', default='', help='key-cache mode for Buun/TurboQuant+ sessions')
-    parser.add_argument('--kv-value', default='', help='value-cache mode for Buun/TurboQuant+ sessions')
+    parser.add_argument('--kv', default='', help='KV cache mode shorthand for Buun/TurboQuant+/TQ3 sessions')
+    parser.add_argument('--kv-key', default='', help='key-cache mode for Buun/TurboQuant+/TQ3 sessions')
+    parser.add_argument('--kv-value', default='', help='value-cache mode for Buun/TurboQuant+/TQ3 sessions')
     parser.add_argument(
         '--kill-existing',
         action='store_true',
@@ -456,10 +458,25 @@ def validate_turboquant_kv_args(args):
             )
 
 
+def validate_tq3_kv_args(args):
+    if args.engine != 'tq3':
+        return
+    for flag, value in (
+        ('--kv', args.kv),
+        ('--kv-key', args.kv_key),
+        ('--kv-value', args.kv_value),
+    ):
+        if value and value not in TQ3_KV_MODES:
+            raise SystemExit(
+                f'Unsupported {flag} "{value}". Supported llama.cpp-tq3 modes: {", ".join(TQ3_KV_MODES)}'
+            )
+
+
 def main():
     args = build_cli_parser().parse_args()
     validate_buun_kv_args(args)
     validate_turboquant_kv_args(args)
+    validate_tq3_kv_args(args)
     config_path = Path(args.config_path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_bootstrap_files(config_path)

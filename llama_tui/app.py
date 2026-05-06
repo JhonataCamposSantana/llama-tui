@@ -32,19 +32,25 @@ from .discovery import (
     looks_like_model_reference,
 )
 from .engines import (
+    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
     resolve_engine_install,
+    tq3_binary_warning as engine_tq3_binary_warning,
     turboquant_binary_warning as engine_turboquant_binary_warning,
 )
 from .control import CancelToken, check_cancelled, sleep_with_cancel
 from .gguf import estimate_kv_bytes_per_token, extra_arg_value, read_gguf_metadata
 from .gguf import (
+    TQ3_STATUSES,
     TURBOQUANT_STATUSES,
     apply_architecture_info,
+    apply_tq3_info,
     apply_turboquant_info,
     detect_architecture_info,
+    detect_tq3_info,
     detect_turboquant_info,
+    tq3_detail,
     turboquant_detail,
 )
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
@@ -400,6 +406,8 @@ class AppConfig:
                 roots_changed = True
             if self.enrich_model_turboquant(m):
                 roots_changed = True
+            if self.enrich_model_tq3(m):
+                roots_changed = True
             inferred = self.infer_model_source(m)
             if m.source != inferred:
                 m.source = inferred
@@ -453,13 +461,13 @@ class AppConfig:
         runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
         if runtime == ENGINE_VLLM:
             return ENGINE_VLLM
-        if self.runtime_profile.engine in ('buun', 'turboquant'):
+        if self.runtime_profile.engine in ('buun', 'turboquant', ENGINE_TQ3):
             return self.runtime_profile.engine
         return 'llama.cpp'
 
     def active_engine_label_for_model(self, model: ModelConfig) -> str:
         engine = self.active_engine_key_for_model(model)
-        if engine in ('buun', 'turboquant'):
+        if engine in ('buun', 'turboquant', ENGINE_TQ3):
             return self.runtime_profile.display_name
         if engine == 'vllm':
             return 'vLLM'
@@ -614,6 +622,12 @@ class AppConfig:
             payload[key] = int(payload.get(key, 0) or 0)
         payload['turboquant_source'] = str(payload.get('turboquant_source', '') or '')
         payload['turboquant_reason'] = str(payload.get('turboquant_reason', '') or '')
+        payload['tq3_status'] = str(payload.get('tq3_status', 'unknown') or 'unknown').strip().lower()
+        if payload['tq3_status'] not in TQ3_STATUSES:
+            payload['tq3_status'] = 'unknown'
+        payload['tq3_weight_format'] = str(payload.get('tq3_weight_format', '') or '').strip().upper()
+        payload['tq3_source'] = str(payload.get('tq3_source', '') or '')
+        payload['tq3_reason'] = str(payload.get('tq3_reason', '') or '')
         payload['favorite'] = bool(payload.get('favorite', False))
         payload['last_used_at'] = str(payload.get('last_used_at', '') or '')
         payload['sort_rank'] = int(payload.get('sort_rank', index + 1) or (index + 1))
@@ -680,6 +694,28 @@ class AppConfig:
         if not should_update:
             return False
         apply_turboquant_info(model, detected)
+        return asdict(model) != before
+
+    def enrich_model_tq3(self, model: ModelConfig) -> bool:
+        if (getattr(model, 'tq3_source', '') or '') == 'manual':
+            return False
+        try:
+            detected = detect_tq3_info(model)
+        except Exception:
+            return False
+        before = asdict(model)
+        current_status = (getattr(model, 'tq3_status', '') or 'unknown').strip().lower()
+        if current_status not in TQ3_STATUSES:
+            current_status = 'unknown'
+        should_update = (
+            current_status != detected.status
+            or not getattr(model, 'tq3_source', '')
+            or (getattr(model, 'tq3_weight_format', '') or '').upper() != (detected.weight_format or '').upper()
+            or (getattr(model, 'tq3_reason', '') or '') != (detected.reason or '')
+        )
+        if not should_update:
+            return False
+        apply_tq3_info(model, detected)
         return asdict(model) != before
 
     def _normalize_model_ranks(self) -> bool:
@@ -828,6 +864,9 @@ class AppConfig:
                 kv_preset = 'q8_0/q8_0'
             else:
                 kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
+        elif engine_id == ENGINE_TQ3:
+            key_mode, value_mode = self.runtime_profile.tq3_kv_pair()
+            kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
         else:
             key_mode = (
                 extra_arg_value(args, '--cache-type-k')
@@ -897,6 +936,37 @@ class AppConfig:
             return ''
         return f'TurboQuant advisory: {turboquant_detail(model)}'
 
+    def model_tq3_native(self, model: ModelConfig) -> bool:
+        return (getattr(model, 'tq3_status', '') or 'unknown').strip().lower() == 'native'
+
+    def tq3_compatibility_reason(self, model: ModelConfig) -> str:
+        status = (getattr(model, 'tq3_status', '') or 'unknown').strip().lower()
+        if status == 'native':
+            weight_format = getattr(model, 'tq3_weight_format', '') or 'TQ3'
+            return f'TQ3-native {weight_format}'
+        detail = tq3_detail(model)
+        if detail:
+            return detail
+        return f'TQ3 status {status or "unknown"}'
+
+    def active_engine_model_compatibility(self, model: ModelConfig) -> Tuple[bool, str]:
+        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
+            return True, ''
+        if self.model_tq3_native(model):
+            return True, self.tq3_compatibility_reason(model)
+        return False, (
+            'llama.cpp-tq3 only accepts TQ3-native GGUFs in llama-tui '
+            f'(TQ3_1S/TQ3_4S). Selected model is {self.tq3_compatibility_reason(model)}.'
+        )
+
+    def tq3_session_advisory(self, model: ModelConfig) -> str:
+        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
+            return ''
+        ok, reason = self.active_engine_model_compatibility(model)
+        if ok:
+            return ''
+        return f'TQ3 engine advisory: {reason}'
+
     def turboquant_binary_warning(self, model: ModelConfig) -> str:
         if self.active_engine_key_for_model(model) != ENGINE_TURBOQUANT:
             return ''
@@ -906,6 +976,16 @@ class AppConfig:
         except Exception:
             return ''
         return engine_turboquant_binary_warning(command, capabilities)
+
+    def tq3_binary_warning(self, model: ModelConfig) -> str:
+        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
+            return ''
+        command = self.runtime_server_command('llama.cpp')
+        try:
+            capabilities = self.engine_capabilities()
+        except Exception:
+            return ''
+        return engine_tq3_binary_warning(command, capabilities)
 
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
@@ -964,11 +1044,17 @@ class AppConfig:
             'runtime_config': {
                 'extra_args': list(getattr(model, 'extra_args', []) or []),
                 'engine_key': self.active_engine_key_for_model(model),
-                'kv_key_mode': self.runtime_profile.kv_key_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant') else '',
-                'kv_value_mode': self.runtime_profile.kv_value_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant') else '',
+                'kv_key_mode': self.runtime_profile.kv_key_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant', ENGINE_TQ3) else '',
+                'kv_value_mode': self.runtime_profile.kv_value_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant', ENGINE_TQ3) else '',
                 'llama_server': self.runtime_server_command('llama.cpp') if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' else '',
                 'vllm_command': self.vllm_command if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else '',
                 'binary_version': self.runtime_binary_version(model),
+            },
+            'tq3': {
+                'status': getattr(model, 'tq3_status', 'unknown'),
+                'weight_format': getattr(model, 'tq3_weight_format', ''),
+                'source': getattr(model, 'tq3_source', ''),
+                'reason': getattr(model, 'tq3_reason', ''),
             },
         }
         encoded = json.dumps(payload, sort_keys=True, default=str).encode('utf-8')
@@ -1025,6 +1111,9 @@ class AppConfig:
             'classification_confidence': float(getattr(model, 'classification_confidence', 0.0) or 0.0),
             'turboquant_status': getattr(model, 'turboquant_status', 'unknown'),
             'turboquant_detail': turboquant_detail(model),
+            'tq3_status': getattr(model, 'tq3_status', 'unknown'),
+            'tq3_weight_format': getattr(model, 'tq3_weight_format', ''),
+            'tq3_detail': tq3_detail(model),
         }
         if not target:
             result.update({'status': 'failed', 'reason': 'model target is empty'})
@@ -1291,7 +1380,7 @@ class AppConfig:
             return False
         if not getattr(self.continue_settings, 'path', ''):
             return False
-        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant')
+        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant', ENGINE_TQ3)
 
     def hermes_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
@@ -2292,19 +2381,26 @@ class AppConfig:
             label = 'buun server'
         elif engine_key == 'turboquant':
             label = 'TurboQuant+ server'
+        elif engine_key == ENGINE_TQ3:
+            label = 'llama.cpp-tq3 server'
         else:
             label = 'llama-server'
+        valid, reason = self.validate_model_target(model)
+        if not valid:
+            return False, reason
+        compatible, compatibility_msg = self.active_engine_model_compatibility(model)
+        if not compatible:
+            return False, compatibility_msg
         if not self.command_exists(command):
             return False, f'{label} not found: {command}'
         runtime_ok, runtime_msg = self.runtime_command_ready(runtime, command)
         if not runtime_ok:
             self.append_log(model.id, f'{label} runtime check failed: {runtime_msg}')
             return False, f'{label} cannot run: {runtime_msg}'
-        valid, reason = self.validate_model_target(model)
-        if not valid:
-            return False, reason
         tq_advisory = self.turboquant_session_advisory(model)
+        tq3_advisory = self.tq3_session_advisory(model)
         tq_binary_warning = self.turboquant_binary_warning(model)
+        tq3_binary_warning = self.tq3_binary_warning(model)
         if runtime_profile is not None:
             profile = {
                 'ctx': int(runtime_profile.ctx_size or getattr(model, 'ctx', 0) or 0),
@@ -2351,8 +2447,12 @@ class AppConfig:
         self.append_log(model.id, f'launch profile: {profile_msg}')
         if tq_advisory:
             self.append_log(model.id, tq_advisory)
+        if tq3_advisory:
+            self.append_log(model.id, tq3_advisory)
         if tq_binary_warning:
             self.append_log(model.id, tq_binary_warning)
+        if tq3_binary_warning:
+            self.append_log(model.id, tq3_binary_warning)
         self.append_log(model.id, f'launch command: {shlex.join(command)}')
         try:
             with open(log_path, 'ab') as log_file:
@@ -2373,8 +2473,12 @@ class AppConfig:
         detail = f'started PID {proc.pid} ({profile_msg})'
         if tq_advisory:
             detail += f' | {tq_advisory}'
+        if tq3_advisory:
+            detail += f' | {tq3_advisory}'
         if tq_binary_warning:
             detail += f' | {tq_binary_warning}'
+        if tq3_binary_warning:
+            detail += f' | {tq3_binary_warning}'
         return True, detail
 
     def _runtime_log_after_last_launch(self, model: ModelConfig, max_lines: int = 400) -> List[str]:
@@ -2501,6 +2605,7 @@ class AppConfig:
     def add_or_update(self, model: ModelConfig, sync_exports: bool = False):
         self.enrich_model_architecture(model)
         self.enrich_model_turboquant(model)
+        self.enrich_model_tq3(model)
         for idx, existing in enumerate(self.models):
             if existing.id == model.id:
                 if not getattr(model, 'sort_rank', 0):

@@ -5,12 +5,14 @@ from unittest.mock import patch
 from llama_tui.engines import (
     ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
+    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
     command_exists,
     get_engine_definitions,
     get_engine_health,
     resolve_engine_install,
+    tq3_binary_warning,
     turboquant_binary_warning,
 )
 from llama_tui.runtime_profiles import EngineCapabilities
@@ -22,6 +24,7 @@ class EngineRegistryTests(unittest.TestCase):
 
         self.assertIn(ENGINE_LLAMA_CPP, definitions)
         self.assertIn(ENGINE_TURBOQUANT, definitions)
+        self.assertIn(ENGINE_TQ3, definitions)
         self.assertIn(ENGINE_BUUN, definitions)
         self.assertIn(ENGINE_VLLM, definitions)
         self.assertTrue(definitions[ENGINE_LLAMA_CPP].supports_gguf)
@@ -32,8 +35,12 @@ class EngineRegistryTests(unittest.TestCase):
 
         llama_install = resolve_engine_install(config, ENGINE_LLAMA_CPP)
         vllm_install = resolve_engine_install(config, ENGINE_VLLM)
-        with patch.dict('os.environ', {'TURBOQUANT_LLAMA_SERVER_BIN': '/opt/tq/llama-server'}):
+        with patch.dict('os.environ', {
+            'TURBOQUANT_LLAMA_SERVER_BIN': '/opt/tq/llama-server',
+            'TQ3_LLAMA_SERVER_BIN': '/opt/tq3/llama-server',
+        }):
             turbo_install = resolve_engine_install(config, ENGINE_TURBOQUANT)
+            tq3_install = resolve_engine_install(config, ENGINE_TQ3)
 
         self.assertEqual(llama_install.resolved_command, '/opt/llama-server')
         self.assertEqual(llama_install.source, 'config:llama_server')
@@ -41,6 +48,8 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertEqual(vllm_install.source, 'config:vllm_command')
         self.assertEqual(turbo_install.resolved_command, '/opt/tq/llama-server')
         self.assertEqual(turbo_install.source, 'env:TURBOQUANT_LLAMA_SERVER_BIN')
+        self.assertEqual(tq3_install.resolved_command, '/opt/tq3/llama-server')
+        self.assertEqual(tq3_install.source, 'env:TQ3_LLAMA_SERVER_BIN')
 
     def test_missing_binary_health_is_fail_not_exception(self):
         config = SimpleNamespace(llama_server='/definitely/missing/llama-server', vllm_command='vllm')
@@ -78,6 +87,18 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertIn('vanilla llama.cpp', warning)
         self.assertEqual(
             turboquant_binary_warning('/work/llama-cpp-turboquant/build/bin/llama-server', EngineCapabilities(help_text='allowed values: q8_0 turbo4')),
+            '',
+        )
+
+    def test_tq3_binary_warning_requires_tq3_cache_type(self):
+        caps = EngineCapabilities(help_text='--cache-type-k allowed values: f16 q8_0 q4_0')
+
+        warning = tq3_binary_warning('/work/llama.cpp/build/bin/llama-server', caps)
+
+        self.assertIn('does not advertise tq3_0 cache type', warning)
+        self.assertIn('vanilla llama.cpp', warning)
+        self.assertEqual(
+            tq3_binary_warning('/work/llama.cpp-tq3/build/bin/llama-server', EngineCapabilities(help_text='allowed values: q8_0 tq3_0')),
             '',
         )
 

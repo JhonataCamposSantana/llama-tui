@@ -30,7 +30,7 @@ from .chat import stream_chat_events
 from .constants import DEFAULT_HOST, DEFAULT_MODEL_PORT, LOGO, REFRESH_SECONDS
 from .control import CancelToken, CancelledError
 from .discovery import classify_model_type, display_offload, display_runtime, extract_quant
-from .gguf import architecture_detail, turboquant_detail, turboquant_short
+from .gguf import architecture_detail, tq3_detail, tq3_short, turboquant_detail, turboquant_short
 from .hermes_benchmark import benchmark_hermes_workflow
 from .hardware import HardwareProfile
 from .models import ModelConfig
@@ -241,6 +241,11 @@ FILTER_STATUS_OPTIONS = [
     ('pending', 'Pending benchmark'),
     ('running', 'Running benchmark'),
 ]
+FILTER_COMPATIBILITY_OPTIONS = [
+    ('all', 'All models'),
+    ('active', 'Active engine compatible'),
+    ('tq3_native', 'TQ3 native'),
+]
 BENCHMARK_FRESHNESS_LABELS = {
     'fresh': 'Fresh',
     'stale': 'Stale',
@@ -347,6 +352,8 @@ def format_engine_badge(engine_id: str, narrow: bool = False) -> str:
     normalized = str(engine_id or '').strip().lower()
     if normalized == 'turboquant':
         return 'TQ' if narrow else 'TurboQuant+'
+    if normalized == 'tq3':
+        return 'TQ3'
     if normalized == 'buun':
         return 'Buun'
     if normalized == 'vllm':
@@ -528,7 +535,7 @@ def browser_model_line(
     roles = app.role_badges(model.id)
     engine = active_engine_short(app, model)[:10]
     quant = extract_quant(model)[:8]
-    tq = turboquant_short(model)[:3]
+    tq = (tq3_short(model) if active_engine_key(app, model) == 'tq3' else turboquant_short(model))[:3]
     model_type = classify_model_type(model)[:6]
     freshness = benchmark_freshness_short(app, model)
     name_col_width = max(10, left_w - 79)
@@ -555,6 +562,8 @@ def active_engine_short(app: AppConfig, model: ModelConfig) -> str:
         return 'buun'
     if engine == 'turboquant':
         return 'turboquant'
+    if engine == 'tq3':
+        return 'tq3'
     if engine == 'vllm':
         return 'vLLM'
     return engine or display_runtime(model)
@@ -575,7 +584,7 @@ def active_engine_binary(app: AppConfig, model: ModelConfig) -> str:
 
 def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
     engine = active_engine_key(app, model)
-    if engine not in ('buun', 'turboquant'):
+    if engine not in ('buun', 'turboquant', 'tq3'):
         return '-'
     tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
     if engine == 'buun' and tq_status not in ('native', 'padded'):
@@ -648,7 +657,7 @@ def active_engine_badge_kind(app: AppConfig, model: Optional[ModelConfig] = None
 
 def active_engine_warning_line(app: AppConfig, model: ModelConfig) -> str:
     messages = []
-    for name in ('turboquant_session_advisory', 'turboquant_binary_warning'):
+    for name in ('turboquant_session_advisory', 'turboquant_binary_warning', 'tq3_session_advisory', 'tq3_binary_warning'):
         try:
             value = str(getattr(app, name)(model) or '')
         except Exception:
@@ -689,6 +698,10 @@ def turboquant_status_kind(model: ModelConfig, buun_session: bool = False, turbo
 
 def turboquant_detail_line(model: ModelConfig) -> str:
     return f'turboquant: {turboquant_detail(model)}'
+
+
+def tq3_detail_line(model: ModelConfig) -> str:
+    return f'tq3: {tq3_detail(model)}'
 
 
 def filter_option_label(options: List[Tuple[str, str]], value: str) -> str:
@@ -732,11 +745,13 @@ def model_matches_browser_filters(
     source_filter: str = 'all',
     status_filter: str = 'all',
     tag_filter: str = 'all',
+    compatibility_filter: str = 'all',
 ) -> bool:
     runtime_filter = str(runtime_filter or 'all').strip().lower() or 'all'
     source_filter = str(source_filter or 'all').strip().lower() or 'all'
     status_filter = str(status_filter or 'all').strip() or 'all'
     tag_filter = str(tag_filter or 'all').strip().lower() or 'all'
+    compatibility_filter = str(compatibility_filter or 'all').strip().lower() or 'all'
     if runtime_filter != 'all' and str(getattr(model, 'runtime', 'llama.cpp') or '').strip().lower() != runtime_filter:
         return False
     if source_filter != 'all' and str(getattr(model, 'source', 'manual') or '').strip().lower() != source_filter:
@@ -751,6 +766,16 @@ def model_matches_browser_filters(
     if tag_filter != 'all':
         tags = {str(tag).strip().lower() for tag in list(getattr(model, 'tags', []) or []) if str(tag).strip()}
         if tag_filter not in tags:
+            return False
+    if compatibility_filter == 'active':
+        try:
+            compatible, _reason = app.active_engine_model_compatibility(model)
+        except Exception:
+            compatible = True
+        if not compatible:
+            return False
+    elif compatibility_filter == 'tq3_native':
+        if (getattr(model, 'tq3_status', '') or 'unknown').strip().lower() != 'native':
             return False
     return model_matches_search(model, status, search)
 
@@ -784,6 +809,7 @@ def browser_models(
     source_filter: str = 'all',
     status_filter: str = 'all',
     tag_filter: str = 'all',
+    compatibility_filter: str = 'all',
     sort_mode: str = 'port',
 ) -> List[ModelConfig]:
     filtered: List[ModelConfig] = []
@@ -798,6 +824,7 @@ def browser_models(
             source_filter=source_filter,
             status_filter=status_filter,
             tag_filter=tag_filter,
+            compatibility_filter=compatibility_filter,
         ):
             filtered.append(model)
     return sorted(filtered, key=lambda item: model_sort_key(item, sort_mode))
@@ -2827,21 +2854,29 @@ def prompt_search_query(stdscr, colors, current: str) -> Optional[str]:
     )
 
 
-def browser_filter_fields(runtime_filter: str, source_filter: str, status_filter: str, tag_filter: str = 'all') -> List[Dict[str, str]]:
+def browser_filter_fields(
+    runtime_filter: str,
+    source_filter: str,
+    status_filter: str,
+    tag_filter: str = 'all',
+    compatibility_filter: str = 'all',
+) -> List[Dict[str, str]]:
     return [
         form_field('runtime_filter', 'runtime_filter', runtime_filter, 'all/llama.cpp/vllm'),
         form_field('source_filter', 'source_filter', source_filter, 'all/manual/huggingface/llmfit/llm-models/lm-studio'),
         form_field('status_filter', 'status_filter', status_filter, 'all/READY/LOADING/STARTING/STOPPED/ERROR/fresh/stale/missing/failed/pending/running'),
         form_field('tag_filter', 'tag_filter', tag_filter, 'all/coding/autocomplete/long-context/fast-chat/custom tag'),
+        form_field('compatibility_filter', 'compatibility_filter', compatibility_filter, 'all/active/tq3_native'),
     ]
 
 
-def parse_browser_filter_answers(answers: Dict[str, str]) -> Tuple[Optional[Tuple[str, str, str, str]], Dict[str, str]]:
+def parse_browser_filter_answers(answers: Dict[str, str]) -> Tuple[Optional[Tuple[str, str, str, str, str]], Dict[str, str]]:
     cleaned = {key: str(value or '').strip() for key, value in answers.items()}
     runtime = cleaned.get('runtime_filter', '').lower() or 'all'
     source = cleaned.get('source_filter', '').lower() or 'all'
     status = cleaned.get('status_filter', '') or 'all'
     tag = cleaned.get('tag_filter', '').lower() or 'all'
+    compatibility = cleaned.get('compatibility_filter', '').lower() or 'all'
     errors: Dict[str, str] = {}
     if runtime not in dict(FILTER_RUNTIME_OPTIONS):
         errors['runtime_filter'] = 'unsupported runtime filter'
@@ -2849,9 +2884,11 @@ def parse_browser_filter_answers(answers: Dict[str, str]) -> Tuple[Optional[Tupl
         errors['source_filter'] = 'unsupported source filter'
     if status not in dict(FILTER_STATUS_OPTIONS):
         errors['status_filter'] = 'unsupported status filter'
+    if compatibility not in dict(FILTER_COMPATIBILITY_OPTIONS):
+        errors['compatibility_filter'] = 'unsupported compatibility filter'
     if errors:
         return None, errors
-    return (runtime, source, status, tag), {}
+    return (runtime, source, status, tag, compatibility), {}
 
 
 def prompt_browser_filters(
@@ -2861,12 +2898,13 @@ def prompt_browser_filters(
     source_filter: str,
     status_filter: str,
     tag_filter: str = 'all',
-) -> Optional[Tuple[str, str, str, str]]:
+    compatibility_filter: str = 'all',
+) -> Optional[Tuple[str, str, str, str, str]]:
     return prompt_form(
         stdscr,
         colors,
         'Model Filters',
-        browser_filter_fields(runtime_filter, source_filter, status_filter, tag_filter),
+        browser_filter_fields(runtime_filter, source_filter, status_filter, tag_filter, compatibility_filter),
         parse_browser_filter_answers,
         footer_hint='Use "all" to clear an individual filter.',
     )
@@ -2990,7 +3028,7 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
         f'Continue Agent tools: tool_use exported for {len(enabled_continue_models)} model(s); MCP requires Agent Mode',
         'success' if enabled_continue_models else 'muted',
     ))
-    if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'buun', 'turboquant'):
+    if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'buun', 'turboquant', 'tq3'):
         try:
             tool_jinja_ready = bool(app.continue_tool_use_launch_required(active_model)) or bool(getattr(active_model, 'jinja', True))
         except Exception:
@@ -3052,6 +3090,10 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
             (
                 turboquant_detail_line(active_model),
                 turboquant_status_kind(active_model, active_engine == 'buun', active_engine == 'turboquant'),
+            ),
+            (
+                tq3_detail_line(active_model),
+                'success' if getattr(active_model, 'tq3_status', '') == 'native' else 'muted',
             ),
         ])
     return items
@@ -3593,6 +3635,7 @@ def tui(stdscr, app: AppConfig):
     filter_source = 'all'
     filter_status = 'all'
     filter_tag = 'all'
+    filter_compatibility = 'tq3_native' if str(getattr(getattr(app, 'runtime_profile', None), 'engine', '') or '') == 'tq3' else 'all'
     sort_mode = normalize_choice(getattr(app.ui, 'preferred_sort', 'port'), tuple(key for key, _label in SORT_OPTIONS), 'port')
     view_mode = 'list'
     detail_model_id = ''
@@ -3693,6 +3736,7 @@ def tui(stdscr, app: AppConfig):
             source_filter=filter_source,
             status_filter=filter_status,
             tag_filter=filter_tag,
+            compatibility_filter=filter_compatibility,
             sort_mode=sort_mode,
         )
 
@@ -4563,6 +4607,7 @@ def tui(stdscr, app: AppConfig):
                 (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
                 (f'architecture detail: {architecture_detail(model)}', curses.A_NORMAL),
                 (turboquant_detail_line(model), tq_attr),
+                (tq3_detail_line(model), colors['success'] | curses.A_BOLD if getattr(model, 'tq3_status', '') == 'native' else colors['muted']),
                 (f'quant/source: {extract_quant(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
                 (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {freshness}', curses.A_NORMAL),
                 (f'tags: {tags_text}', curses.A_NORMAL),
@@ -4619,7 +4664,8 @@ def tui(stdscr, app: AppConfig):
                     f'search={list_search or "-"}  runtime={filter_option_label(FILTER_RUNTIME_OPTIONS, filter_runtime)}  '
                     f'source={filter_option_label(FILTER_SOURCE_OPTIONS, filter_source)}  '
                     f'status={filter_option_label(FILTER_STATUS_OPTIONS, filter_status)}  '
-                    f'tag={filter_tag}  sort={sort_mode_label(sort_mode)}  view={browser_view_label(browser_view)}'
+                    f'tag={filter_tag}  compat={filter_option_label(FILTER_COMPATIBILITY_OPTIONS, filter_compatibility)}  '
+                    f'sort={sort_mode_label(sort_mode)}  view={browser_view_label(browser_view)}'
                 )
                 safe_addstr(stdscr, box_top + 2, 3, ellipsize(summary, left_w - 4), colors['muted'])
             if content_rows > 1:
@@ -5016,7 +5062,7 @@ def tui(stdscr, app: AppConfig):
                 (f'status: {status} ({detail})', status_attr(colors, status)),
                 (f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
                 (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
-                (f'browser: search={list_search or "-"} runtime={filter_runtime} source={filter_source} status={filter_status} tag={filter_tag} sort={sort_mode}', colors['muted']),
+                (f'browser: search={list_search or "-"} runtime={filter_runtime} source={filter_source} status={filter_status} tag={filter_tag} compat={filter_compatibility} sort={sort_mode}', colors['muted']),
                 ('', curses.A_NORMAL),
                 ('last log lines:', colors['accent'] | curses.A_BOLD),
             ]
@@ -5226,14 +5272,23 @@ def tui(stdscr, app: AppConfig):
                 message = 'Search cancelled.'
             continue
         if view_mode == 'list' and key == ord('f'):
-            filters = prompt_browser_filters(stdscr, colors, filter_runtime, filter_source, filter_status, filter_tag)
+            filters = prompt_browser_filters(
+                stdscr,
+                colors,
+                filter_runtime,
+                filter_source,
+                filter_status,
+                filter_tag,
+                filter_compatibility,
+            )
             if filters is not None:
-                filter_runtime, filter_source, filter_status, filter_tag = filters
+                filter_runtime, filter_source, filter_status, filter_tag, filter_compatibility = filters
                 selected = 0
                 message = (
                     f'Filters set: {filter_option_label(FILTER_RUNTIME_OPTIONS, filter_runtime)}, '
                     f'{filter_option_label(FILTER_SOURCE_OPTIONS, filter_source)}, '
-                    f'{filter_option_label(FILTER_STATUS_OPTIONS, filter_status)}, tag={filter_tag}.'
+                    f'{filter_option_label(FILTER_STATUS_OPTIONS, filter_status)}, tag={filter_tag}, '
+                    f'compat={filter_option_label(FILTER_COMPATIBILITY_OPTIONS, filter_compatibility)}.'
                 )
             else:
                 message = 'Filter changes cancelled.'
@@ -5244,6 +5299,7 @@ def tui(stdscr, app: AppConfig):
             filter_source = 'all'
             filter_status = 'all'
             filter_tag = 'all'
+            filter_compatibility = 'all'
             selected = 0
             message = 'Browser search and filters cleared.'
             continue

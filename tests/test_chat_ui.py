@@ -94,6 +94,7 @@ from llama_tui.ui import (
     try_input_view,
     try_transcript_scroll_action,
     try_input_wrapped_lines,
+    tq3_detail_line,
     turboquant_detail_line,
     turboquant_status_kind,
     runtime_engine_source_line,
@@ -400,12 +401,37 @@ class BrowserAndFormTests(unittest.TestCase):
         filtered = browser_models(FakeApp(), statuses, tag_filter='coding')
         self.assertEqual([model.id for model in filtered], ['alpha'])
 
+    def test_browser_models_filters_tq3_native_compatibility(self):
+        native = ModelConfig(id='native', name='Native', path='native.TQ3_4S.gguf', alias='native', port=18080)
+        regular = ModelConfig(id='regular', name='Regular', path='regular.Q4_K_M.gguf', alias='regular', port=18081)
+        native.tq3_status = 'native'
+        native.tq3_weight_format = 'TQ3_4S'
+        regular.tq3_status = 'not_native'
+
+        class FakeApp:
+            models = [native, regular]
+
+            def model_fingerprint(self, model):
+                return f'fp-{model.id}'
+
+            def active_engine_model_compatibility(self, model):
+                return (getattr(model, 'tq3_status', '') == 'native', '')
+
+        statuses = {'native': ('STOPPED', ''), 'regular': ('STOPPED', '')}
+
+        filtered = browser_models(FakeApp(), statuses, compatibility_filter='tq3_native')
+        all_models = browser_models(FakeApp(), statuses, compatibility_filter='all')
+
+        self.assertEqual([model.id for model in filtered], ['native'])
+        self.assertEqual([model.id for model in all_models], ['native', 'regular'])
+
     def test_parse_browser_filter_answers_rejects_unknown_values(self):
         parsed, errors = parse_browser_filter_answers({
             'runtime_filter': 'weird',
             'source_filter': 'manual',
             'status_filter': 'READY',
             'tag_filter': 'coding',
+            'compatibility_filter': 'all',
         })
 
         self.assertIsNone(parsed)
@@ -417,10 +443,11 @@ class BrowserAndFormTests(unittest.TestCase):
             'source_filter': 'manual',
             'status_filter': 'READY',
             'tag_filter': 'coding',
+            'compatibility_filter': 'tq3_native',
         })
 
         self.assertFalse(errors)
-        self.assertEqual(parsed, ('all', 'manual', 'READY', 'coding'))
+        self.assertEqual(parsed, ('all', 'manual', 'READY', 'coding', 'tq3_native'))
 
     def test_config_doctor_items_reports_verification_counts(self):
         passed = ModelConfig(id='passed', name='Passed', path='org/model', alias='passed', port=18080, runtime='vllm')
@@ -497,6 +524,24 @@ class BrowserAndFormTests(unittest.TestCase):
         line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
         self.assertIn(' NAT ', line)
         self.assertEqual(turboquant_status_kind(model, buun_session=True), 'success')
+
+    def test_tq3_browser_detail_uses_tq3_short_when_tq3_engine_active(self):
+        model = ModelConfig(id='tq3', name='TQ3 Model', path='model.TQ3_4S.gguf', alias='tq3', port=18080)
+        model.tq3_status = 'native'
+        model.tq3_weight_format = 'TQ3_4S'
+        model.tq3_source = 'tensor_types'
+
+        class FakeApp:
+            def role_badges(self, _model_id):
+                return '-'
+
+            def active_engine_key_for_model(self, _model):
+                return 'tq3'
+
+        line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
+
+        self.assertIn(' 4S ', line)
+        self.assertIn('tq3: native TQ3_4S from tensor_types', tq3_detail_line(model))
 
     def test_active_engine_labels_distinguish_buun_from_model_runtime(self):
         model = ModelConfig(id='gemma', name='Gemma', path='gemma.gguf', alias='gemma', port=18080)
