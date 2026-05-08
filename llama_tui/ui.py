@@ -10,9 +10,11 @@ from .app import AppConfig, CONTINUE_MERGE_MODES, context_per_slot
 from .benchmark import (
     append_model_log,
     apply_measured_profile,
+    apply_moe_recommendation,
     benchmark_all_models_deep,
     benchmark_best_optimization,
     benchmark_fast_profiles,
+    benchmark_moe_placement_tuning,
     benchmark_profile_is_fresh,
     benchmark_raw_speed_profile,
     deep_benchmark_model_decision,
@@ -130,6 +132,7 @@ SERVER_WINNER_LABELS = {
     'long_context': ('Winner', 'Highest Context'),
     'opencode_ready': ('Winner', 'OpenCode-ready'),
     'auto': ('Winner', 'Ideal'),
+    'moe_placement': ('Winner', 'MoE placement'),
 }
 RANK_ROLE_PRIORITY = {
     'Winner': 0,
@@ -1758,6 +1761,105 @@ def benchmark_runs_for_model(model: ModelConfig) -> List[Dict[str, object]]:
     }]
 
 
+def latest_benchmark_run(model: ModelConfig, kind: str) -> Dict[str, object]:
+    target = str(kind or '').strip()
+    for run in benchmark_runs_for_model(model):
+        if str(run.get('kind', '') or '') == target:
+            return run if isinstance(run, dict) else {}
+    return {}
+
+
+def compact_bytes(value: object) -> str:
+    try:
+        raw = int(value or 0)
+    except Exception:
+        raw = 0
+    if raw <= 0:
+        return '-'
+    if raw >= 1024 ** 3:
+        return f'{raw / (1024 ** 3):.1f} GiB'
+    if raw >= 1024 ** 2:
+        return f'{raw / (1024 ** 2):.0f} MiB'
+    return f'{raw} B'
+
+
+def moe_tuning_items(
+    model: ModelConfig,
+    width: int = 120,
+    success_attr: int = 0,
+    warning_attr: int = 0,
+    error_attr: int = 0,
+    heading_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    profile = get_measured_profile(model, 'moe_placement')
+    run = latest_benchmark_run(model, 'moe_tuning')
+    items: List[Tuple[str, int]] = [('MoE Placement Recommendation', heading_attr)]
+    if not profile:
+        if run:
+            items.append((f'latest run: {run.get("status", "-")} {run.get("summary", "")}', warning_attr))
+        else:
+            items.append(('No measured MoE placement recommendation yet. Press N to tune.', warning_attr))
+        return items
+
+    winner = str(profile.get('measured_candidate_name', '') or profile.get('runtime_profile', '') or '-')
+    speed = float(profile.get('tokens_per_sec', 0.0) or 0.0)
+    headroom = profile.get('vram_headroom_bytes', 0)
+    peak_vram = profile.get('peak_vram_used', profile.get('peak_vram_bytes', 0))
+    peak_ram = profile.get('peak_ram_bytes', 0)
+    ctx = int(profile.get('ctx', 0) or 0)
+    reason = compact_message(str(profile.get('tuning_summary', '') or profile.get('selection_reason', '') or 'measured winner'))
+    items.extend([
+        (f'Winner: {winner}', success_attr | curses.A_BOLD if success_attr else normal_attr),
+        (f'Speed: {speed:.2f} tok/s', success_attr if speed > 0 else warning_attr),
+        (f'VRAM peak/headroom: {compact_bytes(peak_vram)} / {compact_bytes(headroom)}', normal_attr),
+        (f'RAM peak: {compact_bytes(peak_ram)}', normal_attr),
+        (f'Context: {ctx or "-"}', normal_attr),
+        (f'Reason: {reason}', normal_attr),
+    ])
+    early_stop = str(profile.get('early_stop_reason', '') or (run.get('early_stop_reason', '') if run else ''))
+    if early_stop:
+        items.append((f'Early stop: {compact_message(early_stop)}', warning_attr))
+    warnings = list(profile.get('warnings', []) or [])
+    warnings.extend(list(run.get('warnings', []) or []) if run else [])
+    deduped_warnings: List[str] = []
+    for item in warnings:
+        text = compact_message(str(item or ''))
+        if text and text not in deduped_warnings:
+            deduped_warnings.append(text)
+    if deduped_warnings:
+        items.append(('', normal_attr))
+        items.append(('Warnings', heading_attr))
+        items.extend((f'- {item}', warning_attr) for item in deduped_warnings[:5])
+    applied_at = str(profile.get('applied_at', '') or '')
+    if applied_at:
+        items.append(('', normal_attr))
+        items.append(('Traceability', heading_attr))
+        items.append((f'applied_from: {profile.get("applied_from", "-")}', normal_attr))
+        items.append((f'applied_at: {applied_at}', normal_attr))
+        items.append((f'tuning_run_id: {profile.get("tuning_run_id", "-")}', normal_attr))
+        items.append((f'measured candidate: {profile.get("measured_candidate_name", "-")}', normal_attr))
+    log_path = str(profile.get('tuning_log_json', '') or (run.get('tuning_log_json', '') if run else ''))
+    if log_path:
+        items.append((f'log: {log_path}', normal_attr))
+    args_preview = str(profile.get('effective_server_args_preview', '') or '')
+    if args_preview:
+        items.append((f'winner args: {ellipsize(args_preview, max(40, width - 13))}', normal_attr))
+    if run:
+        items.append(('', normal_attr))
+        items.append(('Candidate Rows', heading_attr))
+        items.extend(benchmark_ranking_items(
+            run,
+            width=width,
+            success_attr=success_attr,
+            warning_attr=warning_attr,
+            error_attr=error_attr,
+            heading_attr=heading_attr,
+            normal_attr=normal_attr,
+        ))
+    return items
+
+
 def benchmark_run_line(run: Dict[str, object], index: int, selected: bool = False) -> str:
     marker = '>' if selected else ' '
     status = str(run.get('status', '-') or '-')[:8]
@@ -2981,7 +3083,7 @@ def help_overlay_lines() -> List[str]:
         '',
         'Detail view',
         'Enter or l opens launch actions. T opens Try It Out. v toggles Simple/Advanced detail density.',
-        'B runs deep benchmark, F runs fast benchmark, O runs OpenCode workflow, H runs Hermes workflow.',
+        'B runs deep benchmark, F runs fast benchmark, N tunes MoE placement, O/H run workflow benchmarks.',
         '',
         'Power tools',
         ': opens a compact command palette. g/c/G export OpenCode, Continue, and Hermes configs.',
@@ -3270,6 +3372,9 @@ def command_palette_options(app: Optional[AppConfig] = None) -> List[Tuple[str, 
         ('8', 'Settings...', 'settings'),
         ('9', 'Detect models', 'detect'),
         ('p', 'Raw Speed Benchmark...', 'raw_speed_benchmark'),
+        ('n', 'Tune MoE Placement (fast)', 'moe_tuning_fast'),
+        ('u', 'Tune MoE Placement (full)', 'moe_tuning_full'),
+        ('r', 'Apply MoE Recommendation', 'apply_moe_recommendation'),
         ('m', 'Compare with machine pick', 'compare'),
         ('o', 'Export OpenCode config', 'export_opencode'),
         ('c', 'Export Continue config', 'export_continue'),
@@ -4846,6 +4951,22 @@ def tui(stdscr, app: AppConfig):
                         (f'kv: {active_engine_kv(app, model)}', curses.A_NORMAL),
                         (f'extra args: {" ".join(getattr(model, "extra_args", []) or []) or "-"}', curses.A_NORMAL),
                     ]
+                    right_items.extend([
+                        ('', curses.A_NORMAL),
+                        ('actions:', colors['accent'] | curses.A_BOLD),
+                        ('N tunes MoE placement (fast)', curses.A_NORMAL),
+                        (': palette offers full MoE tuning and Apply MoE Recommendation', curses.A_NORMAL),
+                        ('', curses.A_NORMAL),
+                    ])
+                    right_items.extend(moe_tuning_items(
+                        model,
+                        width=right_content_w,
+                        success_attr=colors['success'],
+                        warning_attr=colors['warning'],
+                        error_attr=colors['error'],
+                        heading_attr=colors['accent'] | curses.A_BOLD,
+                        normal_attr=curses.A_NORMAL,
+                    ))
                 elif right_active_tab == 'logs':
                     right_items = [(f'log: {app.logfile(model.id)}', colors['accent'] | curses.A_BOLD)]
                     right_items.extend(build_log_items(log_lines, curses.A_NORMAL, colors['muted']))
@@ -5132,7 +5253,7 @@ def tui(stdscr, app: AppConfig):
             footer = '[Esc] models  [D] deep all  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab  [M] refresh rankings.'
         elif view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] actions  [T] try  [B/F/O/H] bench  [R] results'
+            footer = '[Esc] models  [Enter/l] actions  [T] try  [B/F/N/O/H] bench  [R] results'
             footer2 = 'Tab/] next  Shift-Tab/[ prev  [v] density  [g/c/G] exports  [Y/y] verify  [:] actions'
         else:
             footer = '[Enter] details  [/] search  [f] filter  [T] sort  [C] clear browser  [*] favorite'
@@ -5238,6 +5359,40 @@ def tui(stdscr, app: AppConfig):
                     done_event='benchmark_done',
                     run_kind='raw_speed',
                 )
+                continue
+            elif action in ('moe_tuning_fast', 'moe_tuning_full'):
+                model = active_detail_model() or selected_model()
+                if model is None:
+                    message = 'No model selected for MoE placement tuning.'
+                    continue
+                depth = 'full' if action == 'moe_tuning_full' else 'fast'
+                start_background_action(
+                    model,
+                    f'MoE placement tuning ({depth})',
+                    lambda progress, token, model=model, depth=depth: benchmark_moe_placement_tuning(
+                        app,
+                        model,
+                        progress=progress,
+                        cancel_token=token,
+                        depth=depth,
+                    ),
+                    done_event='benchmark_done',
+                    run_kind='moe_tuning',
+                )
+                continue
+            elif action == 'apply_moe_recommendation':
+                model = active_detail_model() or selected_model()
+                if model is None:
+                    message = 'No model selected for MoE recommendation.'
+                    continue
+                ok, apply_msg = apply_moe_recommendation(model)
+                if ok:
+                    app.add_or_update(model, sync_exports=False)
+                    sync_msg = sync_opencode_after_tuning(app)
+                    invalidate_machine_summary()
+                    message = f'{apply_msg} | {sync_msg}'
+                else:
+                    message = apply_msg
                 continue
             else:
                 message = 'Command palette cancelled.'
@@ -5554,6 +5709,23 @@ def tui(stdscr, app: AppConfig):
                 ),
                 done_event='benchmark_done',
                 run_kind='server_fast',
+            )
+        elif key == ord('N') and app.models and view_mode in ('detail', 'benchmark', 'results'):
+            model = active_detail_model() or selected_model()
+            if not model:
+                continue
+            start_background_action(
+                model,
+                'MoE placement tuning (fast)',
+                lambda progress, token, model=model: benchmark_moe_placement_tuning(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                    depth='fast',
+                ),
+                done_event='benchmark_done',
+                run_kind='moe_tuning',
             )
         elif key == ord('O') and app.models and view_mode == 'detail':
             model = active_detail_model()

@@ -9,13 +9,14 @@ import time
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib import request
 
+from .constants import CACHE_DIR
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .discovery import extract_quant
 from .engines import ENGINE_TQ3, resolve_engine_install
-from .gguf import architecture_label, extra_arg_value, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
+from .gguf import architecture_label, extra_arg_value, gguf_layer_count, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
 from .launch_profiles import (
     BenchmarkLaunchProfile,
@@ -50,6 +51,16 @@ from .runtime_profiles import (
     turbo_kv_profile_for_preset,
 )
 from .textutil import compact_message
+from .tuning import (
+    TuningCandidate,
+    early_stop_reason,
+    generate_moe_tuning_candidates,
+    generate_refinement_candidates,
+    moe_tuning_eligibility_reason,
+    score_tuning_record,
+    select_measured_tuning_winner,
+    tuning_objective_for_model,
+)
 
 BENCHMARK_MAX_CANDIDATES = 6
 BENCHMARK_WARMUP_TOKENS = 16
@@ -156,6 +167,25 @@ def benchmark_command_preview(
         )])
     except Exception:
         return ''
+
+
+def benchmark_effective_server_args(
+    app: AppConfig,
+    model: ModelConfig,
+    runtime_profile: Optional[RuntimeProfile] = None,
+    benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
+) -> List[str]:
+    try:
+        return [
+            str(item)
+            for item in app.build_command(
+                model,
+                runtime_profile=runtime_profile,
+                benchmark_profile=benchmark_profile,
+            )
+        ]
+    except Exception:
+        return []
 
 
 FAILURE_CATEGORIES = (
@@ -1513,6 +1543,45 @@ def apply_measured_profile(model: ModelConfig, key: str) -> Tuple[bool, str]:
         f'measured {key}: ctx={model.ctx} parallel={model.parallel} '
         f'threads={model.threads} ngl={model.ngl} '
         f'{float(profile.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s'
+    )
+
+
+def apply_moe_recommendation(model: ModelConfig) -> Tuple[bool, str]:
+    profile = get_measured_profile(model, 'moe_placement')
+    if not profile:
+        return False, 'no measured MoE placement recommendation'
+    if str(profile.get('status', '') or '').lower() != 'ok':
+        return False, 'measured MoE placement recommendation is not successful'
+
+    candidate_name = str(profile.get('measured_candidate_name') or profile.get('runtime_profile') or 'unknown').strip()
+    model.moe_placement_strategy = f'measured:moe_tuning:{candidate_name or "unknown"}'
+    model.cpu_moe = bool(profile.get('cpu_moe', False))
+    model.n_cpu_moe = max(0, int(profile.get('n_cpu_moe', 0) or 0))
+    tensor_overrides = profile.get('tensor_overrides', [])
+    if isinstance(tensor_overrides, (list, tuple)):
+        model.tensor_overrides = [str(item).strip() for item in tensor_overrides if str(item).strip()]
+    elif str(tensor_overrides or '').strip():
+        model.tensor_overrides = [str(tensor_overrides).strip()]
+    else:
+        model.tensor_overrides = []
+    if bool(profile.get('ngl_required_for_moe_tuning', False)) and 'ngl' in profile:
+        try:
+            model.ngl = int(profile.get('ngl') or model.ngl)
+        except Exception:
+            pass
+
+    measured_profiles = dict(getattr(model, 'measured_profiles', {}) or {})
+    updated = dict(profile)
+    updated['applied_from'] = 'moe_placement'
+    updated['applied_at'] = datetime.now().isoformat(timespec='seconds')
+    updated['tuning_run_id'] = str(profile.get('tuning_run_id', '') or '')
+    updated['measured_candidate_name'] = candidate_name
+    updated['placement_strategy'] = model.moe_placement_strategy
+    measured_profiles['moe_placement'] = updated
+    model.measured_profiles = measured_profiles
+    return True, (
+        f'MoE recommendation applied: {model.moe_placement_strategy} '
+        f'ngl={model.ngl} {float(profile.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s'
     )
 
 
@@ -3254,6 +3323,10 @@ def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Option
         parts.append(f'long={int(long.get("ctx_per_slot", 0) or 0)} ctx/slot')
     if auto:
         parts.append(f'auto={int(auto.get("ctx", 0) or 0)} ctx')
+    moe = winners.get('moe_placement') or {}
+    if moe:
+        candidate = str(moe.get('measured_candidate_name', '') or moe.get('runtime_profile', '') or 'moe')
+        parts.append(f'moe={candidate} {float(moe.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s')
     if winners.get('opencode_ready'):
         parts.append(opencode_profile_status_text(winners))
     if any(
@@ -6605,6 +6678,552 @@ def benchmark_exhaustive_profiles(
         'benchmark_done',
         saved,
         'server',
+        message=msg,
+        phase='complete',
+        completed=completed,
+        total=completed,
+        records=records,
+    )
+    return True, msg
+
+
+def _safe_tuning_path_part(value: object) -> str:
+    text = str(value or '').strip()
+    clean = re.sub(r'[^A-Za-z0-9_.-]+', '_', text).strip('._')
+    return clean or 'unknown'
+
+
+def _moe_tuning_layer_count(model: ModelConfig) -> int:
+    try:
+        return max(0, int(gguf_layer_count(model) or 0))
+    except Exception:
+        return 0
+
+
+def _moe_tuning_capabilities(app, runtime_profile: RuntimeProfile):
+    try:
+        return app.engine_capabilities()
+    except Exception:
+        return default_engine_capabilities(str(getattr(runtime_profile, 'engine_id', '') or 'llama.cpp'))
+
+
+def _moe_tuning_baseline_profile(app, model: ModelConfig, depth: str) -> RuntimeProfile:
+    profile = app.runtime_profile_from_model(
+        model,
+        int(getattr(model, 'ctx', 0) or 0),
+        int(getattr(model, 'parallel', 1) or 1),
+        int(getattr(model, 'ngl', 0) or 0),
+    )
+    return replace(profile, name='baseline_current', benchmark_depth=depth)
+
+
+def _moe_tuning_effective_args(
+    app,
+    model: ModelConfig,
+    runtime_profile: RuntimeProfile,
+    depth: str,
+) -> List[str]:
+    candidate_model = model_for_runtime_profile(model, runtime_profile)
+    capabilities = _moe_tuning_capabilities(app, runtime_profile)
+    launch_profile = build_benchmark_launch_profile(
+        candidate_model,
+        runtime_profile,
+        capabilities,
+        purpose='moe_tuning',
+        depth=depth,
+    )
+    return benchmark_effective_server_args(app, candidate_model, runtime_profile, launch_profile)
+
+
+def _record_vram_headroom(record: Dict[str, object]) -> int:
+    values: List[int] = []
+    for key in ('memory_guardrail_min_gpu_memory_free', 'gpu_memory_free', 'vram_headroom_bytes'):
+        try:
+            value = int(record.get(key, 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            values.append(value)
+    return min(values) if values else 0
+
+
+def _record_peak_ram(record: Dict[str, object]) -> int:
+    for key in ('process_rss', 'memory_used', 'ram_used', 'peak_ram_bytes'):
+        try:
+            value = int(record.get(key, 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _enrich_moe_tuning_records(
+    records: Sequence[Dict[str, object]],
+    candidate: TuningCandidate,
+    baseline_profile: RuntimeProfile,
+    run_id: str,
+    objective,
+    effective_args: Sequence[str],
+    early_stop_text: str = '',
+) -> List[Dict[str, object]]:
+    enriched: List[Dict[str, object]] = []
+    profile = candidate.runtime_profile
+    args = [str(item) for item in list(effective_args or [])]
+    args_preview = shlex.join(args) if args else ''
+    for record in records:
+        row = dict(record)
+        row['benchmark_kind'] = 'moe_tuning'
+        row['benchmark_purpose'] = 'moe_tuning'
+        row['objective'] = 'moe_placement'
+        row['measured_profile_key'] = 'moe_placement'
+        row['tuning_run_id'] = run_id
+        row['measured_candidate_name'] = candidate.name
+        row['tuning_phase'] = candidate.phase
+        row['tuning_source'] = candidate.source
+        row['tuning_risk'] = candidate.risk
+        row['tuning_expected_effect'] = candidate.expected_effect
+        row['target_vram_headroom_bytes'] = int(objective.target_vram_headroom_bytes)
+        row['vram_headroom_bytes'] = _record_vram_headroom(row)
+        row['peak_ram_bytes'] = _record_peak_ram(row)
+        row['effective_server_args'] = args
+        row['effective_server_args_preview'] = args_preview
+        row['ngl_required_for_moe_tuning'] = bool(
+            profile.gpu_layers is not None
+            and profile.gpu_layers != baseline_profile.gpu_layers
+        )
+        if early_stop_text:
+            row['early_stop_reason'] = early_stop_text
+        row['tuning_score'] = score_tuning_record(row, objective, candidate.risk)
+        if str(row.get('status', '') or '').lower() == 'ok':
+            row['selection_reason'] = 'measured successful MoE placement candidate'
+        else:
+            row['selection_reason'] = str(row.get('failure_category', '') or row.get('status', '') or 'failed')
+        enriched.append(row)
+    return enriched
+
+
+def _tuning_candidate_payload(candidate: TuningCandidate) -> Dict[str, object]:
+    profile = candidate.runtime_profile
+    return {
+        'name': candidate.name,
+        'source': candidate.source,
+        'risk': candidate.risk,
+        'phase': candidate.phase,
+        'expected_effect': candidate.expected_effect,
+        'runtime_profile': profile.name,
+        'ctx': profile.ctx_size,
+        'ngl': profile.gpu_layers,
+        'parallel': profile.parallel,
+        'kv_preset': profile.kv_preset,
+        'cpu_moe': profile.cpu_moe,
+        'n_cpu_moe': profile.n_cpu_moe,
+        'tensor_overrides': list(profile.tensor_overrides),
+    }
+
+
+def _write_moe_tuning_logs(
+    app,
+    model: ModelConfig,
+    run_id: str,
+    engine: str,
+    capabilities,
+    objective,
+    candidates: Sequence[TuningCandidate],
+    records: Sequence[Dict[str, object]],
+    winner: Dict[str, object],
+    warnings: Sequence[str],
+    early_stop_text: str,
+    layer_count: int,
+    profile: HardwareProfile,
+) -> Tuple[str, str]:
+    root = (
+        CACHE_DIR
+        / 'tuning'
+        / _safe_tuning_path_part(getattr(model, 'id', 'model'))
+        / _safe_tuning_path_part(engine or 'engine')
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    json_path = root / f'{stamp}-{_safe_tuning_path_part(run_id)}.json'
+    log_path = root / f'{stamp}-{_safe_tuning_path_part(run_id)}.log'
+    try:
+        fingerprint = app.model_fingerprint(model)
+    except Exception:
+        fingerprint = benchmark_config_fingerprint(model)
+    payload = {
+        'run_id': run_id,
+        'model_id': getattr(model, 'id', ''),
+        'model_path': getattr(model, 'path', ''),
+        'model_fingerprint': fingerprint,
+        'engine_id': engine,
+        'runtime_capabilities': asdict(capabilities) if hasattr(capabilities, '__dataclass_fields__') else {},
+        'runtime_binary': (
+            app.runtime_server_command(getattr(model, 'runtime', 'llama.cpp'))
+            if hasattr(app, 'runtime_server_command')
+            else getattr(model, 'runtime', 'llama.cpp')
+        ),
+        'runtime_version': app.runtime_binary_version(model) if hasattr(app, 'runtime_binary_version') else '',
+        'hardware_profile': asdict(profile) if hasattr(profile, '__dataclass_fields__') else {},
+        'objective': asdict(objective),
+        'layer_count': int(layer_count or 0),
+        'candidates': [_tuning_candidate_payload(candidate) for candidate in candidates],
+        'results': [dict(row) for row in records],
+        'winner': dict(winner),
+        'warnings': list(warnings or []),
+        'early_stop_reason': early_stop_text,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding='utf-8')
+    lines = [
+        f'MoE tuning run {run_id}',
+        f'model={getattr(model, "id", "")} engine={engine} layer_count={layer_count or "unknown"}',
+        f'winner={winner.get("measured_candidate_name", "-") if winner else "-"}',
+    ]
+    if early_stop_text:
+        lines.append(f'early_stop={early_stop_text}')
+    for warning in warnings:
+        lines.append(f'warning={warning}')
+    for row in records:
+        lines.append(
+            'candidate={candidate} status={status} tps={tps:.2f} headroom={headroom} failure={failure}'.format(
+                candidate=row.get('measured_candidate_name', row.get('runtime_profile', '-')),
+                status=row.get('status', '-'),
+                tps=float(row.get('tokens_per_sec', 0.0) or 0.0),
+                headroom=int(row.get('vram_headroom_bytes', 0) or 0),
+                failure=row.get('failure_category', '') or row.get('detail', ''),
+            )
+        )
+    log_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return str(json_path), str(log_path)
+
+
+def _moe_tuning_warnings(records: Sequence[Dict[str, object]], layer_count: int, early_stop_text: str) -> List[str]:
+    warnings: List[str] = []
+    if layer_count <= 0:
+        warnings.append('layer count unavailable; n_cpu_moe ladder was skipped')
+    failed = [
+        row for row in records
+        if str(row.get('status', '') or '').lower() not in ('ok', 'probe ok', 'skipped')
+    ]
+    oom_failures = [
+        row for row in failed
+        if str(row.get('failure_category', '') or '') in ('CUDA_OOM_WEIGHTS', 'CUDA_OOM_KV', 'MEMORY_GUARDRAIL')
+    ]
+    if oom_failures:
+        names = ', '.join(str(row.get('measured_candidate_name', '') or row.get('runtime_profile', 'candidate')) for row in oom_failures[:3])
+        warnings.append(f'unsafe/OOM candidate(s): {names}')
+    experimental = [
+        row for row in records
+        if str(row.get('tuning_risk', '') or '').lower() == 'experimental'
+    ]
+    if experimental:
+        warnings.append('tensor override mode is experimental')
+    if early_stop_text:
+        warnings.append(early_stop_text)
+    deduped: List[str] = []
+    for item in warnings:
+        clean = compact_message(item)
+        if clean and clean not in deduped:
+            deduped.append(clean)
+    return deduped
+
+
+def benchmark_moe_placement_tuning(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+    depth: str = 'fast',
+) -> Tuple[bool, str]:
+    depth_key = 'full' if str(depth or '').strip().lower() == 'full' else 'fast'
+    profile = app.hardware_profile(refresh=True)
+    baseline_profile = _moe_tuning_baseline_profile(app, model, depth_key)
+    capabilities = _moe_tuning_capabilities(app, baseline_profile)
+    try:
+        engine = app.active_engine_key_for_model(model)
+    except Exception:
+        engine = baseline_profile.engine_id
+    eligibility = moe_tuning_eligibility_reason(model, profile, capabilities, engine)
+    if eligibility:
+        msg = f'MoE tuning skipped: {eligibility}'
+        if progress:
+            progress(msg)
+        return False, msg
+
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'moe_tuning', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
+
+    profile = app.hardware_profile(refresh=True)
+    started_at = datetime.now().isoformat(timespec='seconds')
+    run_id = f'moe-tuning-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    layer_count = _moe_tuning_layer_count(model)
+    objective = tuning_objective_for_model(model, profile, depth_key)
+    coarse_candidates = generate_moe_tuning_candidates(
+        baseline_profile,
+        capabilities,
+        profile,
+        layer_count,
+        depth=depth_key,
+    )
+    total = max(1, objective.max_trials)
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    completed = 0
+    early_stop_text = ''
+    extra_probe_used = False
+    probe_after_unsafe_pending = False
+    all_candidates: List[TuningCandidate] = list(coarse_candidates)
+    current_candidate_model: Optional[ModelConfig] = None
+
+    running_model = ModelConfig(**asdict(model))
+    if close_stale_running_benchmark_runs(running_model, started_at):
+        model.benchmark_runs = list(running_model.benchmark_runs)
+    running_run = build_benchmark_run(run_id, 'moe_tuning', 'running', [], {}, started_at, hardware=profile.short_summary())
+    running_run['depth'] = depth_key
+    upsert_benchmark_run(running_model, running_run)
+    app.add_or_update(running_model)
+
+    start_msg = (
+        f'MoE placement tuning started: depth={depth_key}, candidates={len(coarse_candidates)}, '
+        f'layer_count={layer_count or "unknown"}, engine={engine}, {profile.short_summary()}'
+    )
+    if progress:
+        progress(start_msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_started',
+        model,
+        'moe_tuning',
+        message=start_msg,
+        phase='moe tuning',
+        completed=0,
+        total=total,
+    )
+
+    def measured_candidate_names() -> set[str]:
+        return {
+            str(row.get('measured_candidate_name', '') or '')
+            for row in records
+            if str(row.get('measured_candidate_name', '') or '')
+        }
+
+    def persist_progress():
+        running = ModelConfig(**asdict(model))
+        running_run_local = build_benchmark_run(
+            run_id,
+            'moe_tuning',
+            'running',
+            records,
+            {},
+            started_at,
+            hardware=profile.short_summary(),
+        )
+        running_run_local['depth'] = depth_key
+        if early_stop_text:
+            running_run_local['early_stop_reason'] = early_stop_text
+        upsert_benchmark_run(running, running_run_local)
+        app.add_or_update(running)
+
+    def run_candidate(candidate: TuningCandidate) -> bool:
+        nonlocal completed, early_stop_text, extra_probe_used, probe_after_unsafe_pending, current_candidate_model
+        check_cancelled(cancel_token)
+        if len(measured_candidate_names()) >= objective.max_trials:
+            return False
+        was_probe_after_unsafe = probe_after_unsafe_pending
+        probe_after_unsafe_pending = False
+        runtime_profile = candidate.runtime_profile
+        current_candidate_model = model_for_runtime_profile(model, runtime_profile)
+        effective_args = _moe_tuning_effective_args(app, model, runtime_profile, depth_key)
+        if progress:
+            progress(f'MoE tuning candidate {candidate.name} ({candidate.phase})')
+        ok, _broke, new_records, new_measured, completed = benchmark_runtime_profile_with_retry(
+            app,
+            model,
+            runtime_profile,
+            'moe_placement',
+            progress,
+            cancel_token,
+            completed,
+            total,
+            run_kind='moe_tuning',
+            max_attempts=1,
+            benchmark_depth=depth_key,
+            benchmark_purpose='moe_tuning',
+        )
+        enriched = _enrich_moe_tuning_records(
+            new_records,
+            candidate,
+            baseline_profile,
+            run_id,
+            objective,
+            effective_args,
+            early_stop_text,
+        )
+        records.extend(enriched)
+        measured.extend(new_measured)
+        persist_progress()
+        if was_probe_after_unsafe:
+            if not early_stop_text:
+                early_stop_text = 'full stopped after one nearby probe following unsafe n_cpu_moe value'
+            if records:
+                records[-1]['early_stop_reason'] = early_stop_text
+            return False
+        if not ok and enriched:
+            stop_now, next_extra_probe_used, reason = early_stop_reason(enriched[-1], depth_key, extra_probe_used)
+            if reason:
+                early_stop_text = reason
+                records[-1]['early_stop_reason'] = early_stop_text
+            extra_probe_used = next_extra_probe_used
+            if stop_now:
+                return False
+            if next_extra_probe_used:
+                probe_after_unsafe_pending = True
+        return True
+
+    try:
+        for candidate in coarse_candidates:
+            if not run_candidate(candidate):
+                break
+
+        coarse_winner = select_measured_tuning_winner(records, objective)
+        refinements: List[TuningCandidate] = []
+        if coarse_winner and not early_stop_text and layer_count > 0 and int(coarse_winner.get('n_cpu_moe', 0) or 0) > 0:
+            refinements = [
+                candidate for candidate in generate_refinement_candidates(baseline_profile, coarse_winner, layer_count)
+                if candidate.name not in measured_candidate_names()
+            ]
+            remaining = max(0, objective.max_trials - len(measured_candidate_names()))
+            refinements = refinements[:remaining]
+        if refinements and progress:
+            progress(f'MoE tuning refinement around {coarse_winner.get("measured_candidate_name")}: {len(refinements)} candidate(s)')
+        all_candidates.extend(refinements)
+        for candidate in refinements:
+            if not run_candidate(candidate):
+                break
+    except CancelledError:
+        if current_candidate_model is not None:
+            app.stop(current_candidate_model, managed_only=True)
+            records.append(adaptive_record_from_candidate(
+                current_candidate_model,
+                'moe_placement',
+                'aborted',
+                detail='user requested abort',
+            ))
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        aborted_model = ModelConfig(**asdict(model))
+        run = build_benchmark_run(run_id, 'moe_tuning', 'aborted', records, {}, started_at, ended_at, profile.short_summary())
+        if early_stop_text:
+            run['early_stop_reason'] = early_stop_text
+        upsert_benchmark_run(aborted_model, run)
+        app.add_or_update(aborted_model)
+        msg = 'MoE tuning aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_aborted',
+            model,
+            'moe_tuning',
+            message=msg,
+            phase='aborted',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    winner = select_measured_tuning_winner(records, objective)
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    warnings = _moe_tuning_warnings(records, layer_count, early_stop_text)
+    status = 'done' if winner else 'failed'
+    log_json = ''
+    log_text = ''
+    try:
+        log_json, log_text = _write_moe_tuning_logs(
+            app,
+            model,
+            run_id,
+            engine,
+            capabilities,
+            objective,
+            all_candidates,
+            records,
+            winner,
+            warnings,
+            early_stop_text,
+            layer_count,
+            profile,
+        )
+    except Exception as exc:
+        warnings.append(f'tuning log write failed: {compact_message(str(exc))}')
+
+    saved = ModelConfig(**asdict(model))
+    measured_profiles = dict(getattr(saved, 'measured_profiles', {}) or {})
+    winners: Dict[str, Dict[str, object]] = {}
+    if winner:
+        winner_profile = dict(winner)
+        winner_profile['status'] = 'ok'
+        winner_profile['tuning_run_id'] = run_id
+        winner_profile['benchmark_depth'] = depth_key
+        winner_profile['measured_profile_key'] = 'moe_placement'
+        winner_profile['tuning_summary'] = 'fastest measured MoE placement candidate above safety scoring gates'
+        if log_json:
+            winner_profile['tuning_log_json'] = log_json
+        if log_text:
+            winner_profile['tuning_log_path'] = log_text
+        if early_stop_text:
+            winner_profile['early_stop_reason'] = early_stop_text
+        if warnings:
+            winner_profile['warnings'] = list(warnings)
+        measured_profiles['moe_placement'] = winner_profile
+        winners['moe_placement'] = winner_profile
+    saved.measured_profiles = measured_profiles
+    run = build_benchmark_run(run_id, 'moe_tuning', status, records, winners, started_at, ended_at, profile.short_summary())
+    run['depth'] = depth_key
+    run['warnings'] = list(warnings)
+    if early_stop_text:
+        run['early_stop_reason'] = early_stop_text
+    if log_json:
+        run['tuning_log_json'] = log_json
+    if log_text:
+        run['tuning_log_path'] = log_text
+    upsert_benchmark_run(saved, run)
+    app.add_or_update(saved)
+
+    if not winner:
+        summary = benchmark_failure_summary(records, 'no measured MoE placement candidates completed')
+        msg = f'MoE placement tuning failed: {summary}'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_error',
+            model,
+            'moe_tuning',
+            message=msg,
+            phase='failed',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    candidate_name = str(winner.get('measured_candidate_name', '') or winner.get('runtime_profile', '') or 'candidate')
+    msg = (
+        f'MoE placement recommendation saved: {candidate_name} '
+        f'{float(winner.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s '
+        f'headroom={int(winner.get("vram_headroom_bytes", 0) or 0) // (1024 ** 2)} MiB'
+    )
+    if warnings:
+        msg = f'{msg}; warnings={len(warnings)}'
+    if progress:
+        progress(msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_done',
+        saved,
+        'moe_tuning',
         message=msg,
         phase='complete',
         completed=completed,

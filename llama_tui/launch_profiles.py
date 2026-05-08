@@ -7,9 +7,11 @@ from .models import ModelConfig
 from .runtime_profiles import EngineCapabilities, RuntimeProfile, kv_modes_from_preset, strip_runtime_tuning_args
 
 
-BENCHMARK_PURPOSES = ('raw_speed', 'serve_default')
+BENCHMARK_PURPOSES = ('raw_speed', 'serve_default', 'moe_tuning')
 SERVE_DEFAULT_FAST_OUTPUT_CAP = 512
 SERVE_DEFAULT_FULL_OUTPUT_CAP = 1024
+MOE_TUNING_FAST_OUTPUT_CAP = 128
+MOE_TUNING_FULL_OUTPUT_CAP = 256
 TQ3_MOE_FAST_OUTPUT_CAP = 128
 TQ3_MOE_FULL_OUTPUT_CAP = 256
 RAW_SPEED_OUTPUT = 512
@@ -172,6 +174,17 @@ def build_benchmark_launch_profile(
         presence_penalty = 0.0
         no_context_shift = False
         cache_prompt: Optional[bool] = False
+    elif purpose_key == 'moe_tuning':
+        output = max(1, int(getattr(model, 'output', 4096) or 4096))
+        cap = MOE_TUNING_FAST_OUTPUT_CAP if depth_key == 'fast' else MOE_TUNING_FULL_OUTPUT_CAP
+        measurement_output = max(1, min(output, cap))
+        temp = 0.0
+        top_p = None
+        top_k = None
+        repeat_penalty = 1.0
+        presence_penalty = 0.0
+        no_context_shift = bool(getattr(model, 'no_context_shift', False))
+        cache_prompt = None
     else:
         output = max(1, int(getattr(model, 'output', 4096) or 4096))
         cap = SERVE_DEFAULT_FAST_OUTPUT_CAP if depth_key == 'fast' else SERVE_DEFAULT_FULL_OUTPUT_CAP
@@ -211,6 +224,13 @@ def build_benchmark_launch_profile(
         overrides.get('reasoning_format', getattr(runtime_profile, 'reasoning_format', '') if runtime_profile is not None else '') or ''
     ).strip().lower()
     fit_target = str(overrides.get('fit_target', '') or '').strip()
+    if purpose_key == 'moe_tuning':
+        temp = 0.0
+        top_p = None
+        top_k = None
+        min_p = None
+        seed = None
+        samplers = ''
 
     preserve_thinking, preserve_source = resolve_preserve_thinking(model)
     chat_kwargs_raw = overrides.get('chat_template_kwargs', {})

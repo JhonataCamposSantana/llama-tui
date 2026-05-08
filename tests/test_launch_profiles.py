@@ -2,6 +2,8 @@ import unittest
 from unittest.mock import patch
 
 from llama_tui.launch_profiles import (
+    MOE_TUNING_FAST_OUTPUT_CAP,
+    MOE_TUNING_FULL_OUTPUT_CAP,
     RAW_SPEED_OUTPUT,
     SERVE_DEFAULT_FAST_OUTPUT_CAP,
     SERVE_DEFAULT_FULL_OUTPUT_CAP,
@@ -60,6 +62,31 @@ class LaunchProfileTests(unittest.TestCase):
         self.assertEqual(full.repeat_penalty, 1.07)
         self.assertEqual(full.presence_penalty, 0.2)
         self.assertTrue(full.no_context_shift)
+
+    def test_moe_tuning_profiles_are_deterministic_and_short(self):
+        model = ModelConfig(
+            id='moe',
+            name='MoE',
+            path='moe.gguf',
+            alias='moe',
+            port=18080,
+            output=4096,
+            temp=0.8,
+            top_p=0.9,
+            top_k=20,
+        )
+
+        fast = build_benchmark_launch_profile(model, purpose='moe_tuning', depth='fast')
+        full = build_benchmark_launch_profile(model, purpose='moe_tuning', depth='full')
+
+        self.assertEqual(fast.name, 'moe_tuning')
+        self.assertEqual(fast.measurement_output, MOE_TUNING_FAST_OUTPUT_CAP)
+        self.assertEqual(full.measurement_output, MOE_TUNING_FULL_OUTPUT_CAP)
+        self.assertEqual(fast.temp, 0.0)
+        self.assertIsNone(fast.top_p)
+        self.assertIsNone(fast.top_k)
+        self.assertEqual(fast.repeat_penalty, 1.0)
+        self.assertEqual(fast.presence_penalty, 0.0)
 
     def test_config_overrides_adjust_sampling_output_and_extra_args(self):
         model = ModelConfig(

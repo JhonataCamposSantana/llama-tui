@@ -922,20 +922,30 @@ class AppConfig:
                 idx += 1
             return values
 
-        cpu_moe = bool(getattr(model, 'cpu_moe', False)) or has_extra_flag(args, '--cpu-moe', '-cmoe')
-        n_cpu_moe = max(
-            0,
-            int(getattr(model, 'n_cpu_moe', 0) or 0) or int_extra('--n-cpu-moe', '-ncmoe'),
-        )
         tensor_overrides = [
             str(item).strip()
             for item in list(getattr(model, 'tensor_overrides', []) or [])
             if str(item).strip()
         ]
-        for value in extra_arg_values('--override-tensor', '--override-tensors', '-ot'):
-            if value not in tensor_overrides:
-                tensor_overrides.append(value)
         placement_strategy = str(getattr(model, 'moe_placement_strategy', '') or '').strip()
+        explicit_moe_placement = bool(
+            placement_strategy
+            or bool(getattr(model, 'cpu_moe', False))
+            or int(getattr(model, 'n_cpu_moe', 0) or 0) > 0
+            or tensor_overrides
+        )
+        if explicit_moe_placement:
+            cpu_moe = bool(getattr(model, 'cpu_moe', False))
+            n_cpu_moe = max(0, int(getattr(model, 'n_cpu_moe', 0) or 0))
+        else:
+            cpu_moe = bool(getattr(model, 'cpu_moe', False)) or has_extra_flag(args, '--cpu-moe', '-cmoe')
+            n_cpu_moe = max(
+                0,
+                int(getattr(model, 'n_cpu_moe', 0) or 0) or int_extra('--n-cpu-moe', '-ncmoe'),
+            )
+            for value in extra_arg_values('--override-tensor', '--override-tensors', '-ot'):
+                if value not in tensor_overrides:
+                    tensor_overrides.append(value)
         if not placement_strategy:
             if cpu_moe:
                 placement_strategy = 'cpu_moe_all'
