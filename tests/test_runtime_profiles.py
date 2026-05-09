@@ -20,24 +20,31 @@ from llama_tui.benchmark import (
     benchmark_completion,
     benchmark_exhaustive_profiles,
     benchmark_fast_profiles,
+    benchmark_max_context_probe,
     benchmark_preflight_cleanup,
+    build_profile_frontier,
     benchmark_raw_speed_profile,
     benchmark_run_summary,
     benchmark_runtime_profile_with_retry,
     close_stale_running_benchmark_runs,
     classify_benchmark_failure,
+    expand_workflow_cache_ram_candidates,
     launch_with_failsafe,
     measured_profile_runtime_profile,
     memory_guardrail_admission,
     model_and_runtime_profile_from_measured_profile,
     model_for_runtime_profile,
+    max_context_probe_runtime_profiles,
     runtime_record_context,
     runtime_profile_memory_disable_key,
     runtime_profile_memory_skip_reason,
     run_tq3_raw_llama_bench_presearch,
     select_measured_profiles,
+    select_max_context_probe_profiles,
     tq3_moe_cpu_placement_threads,
     tq3_raw_presearch_case_total,
+    workflow_cache_ram_profile_from_record,
+    workflow_cache_ram_selection_key,
 )
 from llama_tui.control import CancelToken, CancelledError
 from llama_tui.hardware import HardwareProfile
@@ -2252,6 +2259,399 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(measured[0]['rejection_reason'], 'rejected_slow_partial_offload')
         self.assertIn('slow partial-offload profile(s) rejected', benchmark_run_summary(winners, measured))
 
+    def test_profile_frontier_keeps_distinct_usage_winners(self):
+        profile = HardwareProfile(
+            cpu_logical=8,
+            cpu_physical=4,
+            memory_total=64 * 1024**3,
+            memory_available=48 * 1024**3,
+            gpu_memory_total=8 * 1024**3,
+            gpu_memory_free=6 * 1024**3,
+        )
+        model = ModelConfig(
+            id='m',
+            name='MoE',
+            path='/models/moe.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            ctx_max=131072,
+        )
+
+        def measured_row(ctx, objective, tps, runtime_profile, *, gpu_free=2 * 1024**3, n_cpu_moe=0, cpu_moe=False, fit=False):
+            candidate = ModelConfig(
+                id='m',
+                name='MoE',
+                path='/models/moe.gguf',
+                alias='m',
+                port=18200,
+                architecture_type='moe',
+                ctx=ctx,
+                parallel=1,
+                n_cpu_moe=n_cpu_moe,
+                cpu_moe=cpu_moe,
+            )
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=tps,
+                seconds=1.0,
+                ram_available=32 * 1024**3,
+                gpu_memory_free=gpu_free,
+                engine='llama.cpp',
+                runtime_profile=runtime_profile,
+                kv_preset='q8_0/q8_0',
+                runtime_fit=fit,
+                fit_context=4096 if fit else 0,
+                placement_strategy='cpu_moe_all' if cpu_moe else f'n_cpu_moe_{n_cpu_moe}' if n_cpu_moe else '',
+                cpu_moe=cpu_moe,
+                n_cpu_moe=n_cpu_moe,
+            )
+            record['model'] = candidate
+            record['measurement_type'] = 'full'
+            return record
+
+        measured = [
+            measured_row(8192, 'fast_chat', 60.0, 'fast_chat_ncpu30', n_cpu_moe=30),
+            measured_row(32768, 'long_context', 36.0, 'balanced_ncpu34', n_cpu_moe=34),
+            measured_row(65536, 'long_context', 22.0, 'hermes_ncpu38', n_cpu_moe=38),
+            measured_row(131072, 'long_context', 9.0, 'max_fit_cpu', gpu_free=256 * 1024**2, cpu_moe=True, fit=True),
+        ]
+        winners = select_measured_profiles(model, measured, profile)
+
+        frontier = build_profile_frontier(model, measured, winners, profile, generated_at='2026-05-09T00:00:00')
+
+        categories = frontier['categories']
+        self.assertEqual(categories['fastest_usable']['tokens_per_sec'], 60.0)
+        self.assertEqual(categories['best_balanced']['source_profile_key'], 'auto')
+        self.assertEqual(categories['hermes_ready']['ctx_per_slot'], 65536)
+        self.assertEqual(categories['highest_stable_context']['ctx_per_slot'], 65536)
+        self.assertEqual(categories['max_context_experimental']['ctx_per_slot'], 131072)
+        self.assertEqual(categories['max_context_experimental']['status'], 'experimental')
+        self.assertFalse(categories['max_context_experimental']['default_eligible'])
+        self.assertEqual(categories['max_context_experimental']['fit_mode'], 'fit_assisted')
+        self.assertEqual(categories['max_context_experimental']['moe_placement']['strategy'], 'cpu_moe_all')
+        self.assertIn('profile_classes', frontier)
+        self.assertEqual(frontier['stable_profile'], frontier['profile_classes']['stable_profile']['profile_id'])
+        self.assertEqual(frontier['adaptive_profile'], 'long_context_fit_assisted_moe_cpu')
+        self.assertEqual(frontier['profile_classes']['adaptive_profile']['profile_class'], 'adaptive')
+        self.assertTrue(frontier['pareto'])
+        self.assertTrue(all('stability_rating' in item for item in frontier['pareto']))
+
+    def test_profile_frontier_stores_stable_and_fit_assisted_profile_classes(self):
+        profile = HardwareProfile(
+            cpu_logical=8,
+            cpu_physical=4,
+            memory_total=64 * 1024**3,
+            memory_available=48 * 1024**3,
+            gpu_memory_total=8 * 1024**3,
+            gpu_memory_free=6 * 1024**3,
+        )
+        model = ModelConfig(
+            id='m',
+            name='MoE',
+            path='/models/moe.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            ctx_max=65536,
+        )
+
+        def measured_row(ctx, tps, runtime_profile, fit=False):
+            candidate = ModelConfig(
+                id='m',
+                name='MoE',
+                path='/models/moe.gguf',
+                alias='m',
+                port=18200,
+                architecture_type='moe',
+                ctx=ctx,
+                parallel=1,
+                n_cpu_moe=34,
+            )
+            record = adaptive_record_from_candidate(
+                candidate,
+                'long_context',
+                'ok',
+                tokens_per_sec=tps,
+                seconds=1.0,
+                ram_available=32 * 1024**3,
+                gpu_memory_free=2 * 1024**3,
+                engine='llama.cpp',
+                runtime_profile=runtime_profile,
+                kv_preset='q8_0/q8_0',
+                runtime_fit=fit,
+                fit_context=4096 if fit else 0,
+                placement_strategy='n_cpu_moe_34',
+                n_cpu_moe=34,
+            )
+            record['model'] = candidate
+            record['measurement_type'] = 'full'
+            return record
+
+        measured = [
+            measured_row(32768, 31.0, 'long_context_locked_moe_ncpu34'),
+            measured_row(65536, 23.0, 'long_context_fit_assisted_moe_ncpu34', fit=True),
+        ]
+
+        frontier = build_profile_frontier(model, measured, {}, profile, generated_at='2026-05-09T00:00:00')
+
+        stable = frontier['profile_classes']['stable_profile']
+        adaptive = frontier['profile_classes']['adaptive_profile']
+        self.assertEqual(frontier['stable_profile'], 'long_context_locked_moe_ncpu34')
+        self.assertEqual(frontier['adaptive_profile'], 'long_context_fit_assisted_moe_ncpu34')
+        self.assertEqual(stable['profile_class'], 'stable')
+        self.assertEqual(stable['fit_mode'], 'locked_moe')
+        self.assertTrue(stable['default_eligible'])
+        self.assertEqual(adaptive['profile_class'], 'adaptive')
+        self.assertEqual(adaptive['fit_mode'], 'fit_assisted')
+        self.assertFalse(adaptive['default_eligible'])
+        self.assertIn('Fit-assisted', frontier['mode_explanations']['adaptive'])
+
+    def test_max_context_probe_generates_bounded_turboquant_targets(self):
+        model = ModelConfig(
+            id='m',
+            name='TurboQuant',
+            path='/models/model-Q8_0.gguf',
+            alias='m',
+            port=18200,
+            runtime='llama.cpp',
+            ctx=8192,
+            ctx_min=8192,
+            ctx_max=262144,
+            ngl=999,
+            turboquant_head_dim=128,
+            turboquant_key_dim=128,
+            turboquant_value_dim=128,
+        )
+        hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+
+        class FakeApp:
+            def active_engine_key_for_model(self, _model):
+                return 'turboquant'
+
+            def engine_capabilities(self):
+                return default_engine_capabilities('turboquant')
+
+            def runtime_profile_from_model(self, _model, ctx, parallel, ngl):
+                return RuntimeProfile(
+                    engine_id='turboquant',
+                    name='base',
+                    ctx_size=ctx,
+                    gpu_layers=ngl,
+                    parallel=parallel,
+                    kv_preset='q8_0/q8_0',
+                )
+
+        profiles = max_context_probe_runtime_profiles(FakeApp(), model, hardware)
+
+        self.assertLessEqual(len(profiles), 15)
+        self.assertEqual(profiles[0].ctx_size, 131072)
+        self.assertEqual(
+            [item.kv_preset for item in profiles[:3]],
+            ['q8_0/turbo4', 'q8_0/turbo3', 'q8_0/turbo2'],
+        )
+        self.assertTrue(all(item.name.startswith('max_context_probe_') for item in profiles))
+        self.assertTrue(all(item.benchmark_depth == 'full' for item in profiles))
+
+    def test_max_context_probe_selection_separates_safe_from_experimental(self):
+        hardware = HardwareProfile(
+            gpu_memory_total=8 * 1024**3,
+            gpu_memory_free=7 * 1024**3,
+            memory_total=64 * 1024**3,
+            memory_available=48 * 1024**3,
+        )
+        model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200, ctx_max=262144)
+
+        def measured_row(ctx, headroom, tps):
+            candidate = ModelConfig(
+                id='m',
+                name='M',
+                path='/models/model.gguf',
+                alias='m',
+                port=18200,
+                ctx=ctx,
+                parallel=1,
+                ngl=999,
+            )
+            record = adaptive_record_from_candidate(
+                candidate,
+                'max_context_probe',
+                'ok',
+                tokens_per_sec=tps,
+                seconds=1.0,
+                ram_available=32 * 1024**3,
+                gpu_memory_free=headroom,
+                engine='turboquant',
+                runtime_profile=f'max_context_probe_{ctx}_q8_0_turbo4',
+                benchmark_purpose='max_context_probe',
+                kv_preset='q8_0/turbo4',
+            )
+            record['model'] = candidate
+            record['measurement_type'] = 'full'
+            return record
+
+        measured = [
+            measured_row(131072, 2 * 1024**3, 20.0),
+            measured_row(196608, 256 * 1024**2, 12.0),
+        ]
+
+        winners = select_max_context_probe_profiles(model, measured, hardware)
+
+        self.assertEqual(winners['max_context_safe']['ctx_per_slot'], 131072)
+        self.assertEqual(winners['max_context_safe']['safety_class'], 'safe')
+        self.assertTrue(winners['max_context_safe']['default_eligible'])
+        self.assertEqual(winners['max_context_experimental']['ctx_per_slot'], 196608)
+        self.assertEqual(winners['max_context_experimental']['safety_class'], 'experimental')
+        self.assertFalse(winners['max_context_experimental']['default_eligible'])
+
+    def test_max_context_probe_persists_winners_without_applying_config(self):
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path='/models/model.gguf',
+            alias='m',
+            port=18200,
+            ctx=8192,
+            ctx_max=196608,
+            ngl=999,
+        )
+        hardware = HardwareProfile(
+            gpu_memory_total=8 * 1024**3,
+            gpu_memory_free=7 * 1024**3,
+            memory_total=64 * 1024**3,
+            memory_available=48 * 1024**3,
+        )
+        profiles = [
+            RuntimeProfile(
+                engine_id='turboquant',
+                name='max_context_probe_131072_q8_0_turbo4',
+                ctx_size=131072,
+                gpu_layers=999,
+                parallel=1,
+                kv_preset='q8_0/turbo4',
+                benchmark_depth='full',
+            ),
+            RuntimeProfile(
+                engine_id='turboquant',
+                name='max_context_probe_196608_q8_0_turbo3',
+                ctx_size=196608,
+                gpu_layers=999,
+                parallel=1,
+                kv_preset='q8_0/turbo3',
+                benchmark_depth='full',
+            ),
+        ]
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self):
+                self.models = [model]
+                self.saved = []
+
+            def active_engine_key_for_model(self, _model):
+                return 'turboquant'
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model, discover=True, managed_only=False):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return hardware
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, saved):
+                self.saved.append(saved)
+
+        def fake_runtime_benchmark(_app, base_model, profile, objective, _progress, _cancel_token, completed, total, **kwargs):
+            candidate = model_for_runtime_profile(base_model, profile)
+            headroom = 2 * 1024**3 if profile.ctx_size == 131072 else 256 * 1024**2
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=18.0 if profile.ctx_size == 131072 else 10.0,
+                seconds=1.0,
+                ram_available=32 * 1024**3,
+                gpu_memory_free=headroom,
+                engine=profile.engine_id,
+                runtime_profile=profile.name,
+                benchmark_purpose=kwargs.get('benchmark_purpose', ''),
+                kv_preset=profile.kv_preset,
+                benchmark_depth=kwargs.get('benchmark_depth', ''),
+            )
+            measured = dict(record)
+            measured['model'] = candidate
+            measured['measurement_type'] = 'full'
+            return True, False, [record], [measured], completed + 1
+
+        app = FakeApp()
+        with patch('llama_tui.benchmark.max_context_probe_runtime_profiles', return_value=profiles), \
+             patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
+            ok, msg = benchmark_max_context_probe(app, model)
+
+        self.assertTrue(ok, msg)
+        saved = app.saved[-1]
+        self.assertEqual(saved.ctx, 8192)
+        self.assertIn('max_context_safe', saved.measured_profiles)
+        self.assertIn('max_context_experimental', saved.measured_profiles)
+        self.assertEqual(saved.measured_profiles['max_context_safe']['ctx_per_slot'], 131072)
+        self.assertEqual(saved.measured_profiles['max_context_experimental']['ctx_per_slot'], 196608)
+        self.assertFalse(saved.measured_profiles['max_context_experimental']['default_eligible'])
+        self.assertEqual(saved.benchmark_runs[0]['kind'], 'max_context_probe')
+        self.assertIn('max_context_experimental', saved.benchmark_runs[0]['winners'])
+
+    def test_workflow_cache_ram_candidate_expansion_is_bounded_and_non_destructive(self):
+        model = ModelConfig(
+            id='m',
+            name='M',
+            path='/models/model.gguf',
+            alias='m',
+            port=18200,
+            ctx=32768,
+            parallel=1,
+            cache_ram=0,
+        )
+        hardware = HardwareProfile(memory_total=32 * 1024**3, memory_available=16 * 1024**3)
+        candidates = [('opencode_ready', 'measured', model, 'measured opencode_ready')]
+
+        expanded = expand_workflow_cache_ram_candidates(candidates, hardware)
+
+        self.assertEqual([item[2].cache_ram for item in expanded], [0, 512, 1024, 2048])
+        self.assertEqual(model.cache_ram, 0)
+        self.assertEqual(expanded[0][0], 'opencode_ready')
+        self.assertIn('cache_ram_512', expanded[1][0])
+        self.assertIn('cache_ram=2048 MiB', expanded[-1][3])
+
+    def test_workflow_cache_ram_selection_uses_time_stability_and_overhead(self):
+        base = {
+            'score': 1.0,
+            'passed': 2,
+            'tasks': 2,
+            'status': 'ok',
+            'ctx': 32768,
+            'ctx_per_slot': 32768,
+        }
+        faster = dict(base, seconds=90.0, cache_ram=512, cache_ram_mib=512, preset='auto', tier='cache_ram_512')
+        slower = dict(base, seconds=140.0, cache_ram=0, cache_ram_mib=0, preset='auto', tier='cache_ram_0')
+        unstable = dict(base, seconds=20.0, cache_ram=0, cache_ram_mib=0, timeout_type='idle', preset='auto', tier='timeout')
+
+        winner = max([slower, faster, unstable], key=workflow_cache_ram_selection_key)
+        profile = workflow_cache_ram_profile_from_record('opencode', winner)
+
+        self.assertIs(winner, faster)
+        self.assertEqual(profile['kind'], 'workflow_cache_ram')
+        self.assertEqual(profile['workflow'], 'opencode')
+        self.assertEqual(profile['cache_ram_mib'], 512)
+        self.assertEqual(profile['status'], 'ok')
+        self.assertIn('completion time', profile['selection_reason'])
+
     def test_tq3_raw_llama_bench_records_are_separate_and_promote_only_for_validation(self):
         class FakeApp:
             runtime_profile = make_runtime_profile('tq3', 'llama-server')
@@ -2653,6 +3053,91 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(ok, msg)
         self.assertEqual(runner.call_args.kwargs['max_attempts'], 2)
         self.assertEqual(runner.call_args.kwargs['benchmark_depth'], 'full')
+
+    def test_fast_benchmark_persists_profile_frontier(self):
+        model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200, ctx_max=65536)
+        hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+        fast_profile = RuntimeProfile(
+            engine_id='llama.cpp',
+            name='fast_chat_probe',
+            ctx_size=8192,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            benchmark_depth='fast',
+        )
+        long_profile = RuntimeProfile(
+            engine_id='llama.cpp',
+            name='long_context_probe',
+            ctx_size=65536,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            benchmark_depth='fast',
+        )
+
+        class FakeApp:
+            opencode = type('OpenCode', (), {'path': ''})()
+
+            def __init__(self):
+                self.saved = []
+
+            def health(self, _model):
+                return 'STOPPED', ''
+
+            def get_pid(self, _model, discover=True, managed_only=False):
+                return None
+
+            def hardware_profile(self, refresh=False):
+                return hardware
+
+            def model_fingerprint(self, _model):
+                return 'fingerprint'
+
+            def add_or_update(self, saved):
+                self.saved.append(saved)
+
+        def fake_runtime_benchmark(_app, base_model, profile, objective, _progress, _cancel_token, completed, _total, **kwargs):
+            candidate = ModelConfig(
+                id=base_model.id,
+                name=base_model.name,
+                path=base_model.path,
+                alias=base_model.alias,
+                port=base_model.port,
+                ctx=profile.ctx_size,
+                parallel=profile.parallel,
+                ngl=profile.gpu_layers or 0,
+            )
+            tps = 50.0 if profile.ctx_size <= 8192 else 20.0
+            record = adaptive_record_from_candidate(
+                candidate,
+                objective,
+                'ok',
+                tokens_per_sec=tps,
+                seconds=1.0,
+                ram_available=24 * 1024**3,
+                gpu_memory_free=4 * 1024**3,
+                engine=profile.engine_id,
+                runtime_profile=profile.name,
+                kv_preset=profile.kv_preset,
+                benchmark_depth=kwargs.get('benchmark_depth', ''),
+            )
+            measured = dict(record)
+            measured['model'] = candidate
+            return True, False, [record], [measured], completed + 1
+
+        app = FakeApp()
+        with patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=[fast_profile, long_profile]), \
+             patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_benchmark):
+            ok, msg = benchmark_fast_profiles(app, model)
+
+        self.assertTrue(ok, msg)
+        saved = app.saved[-1]
+        self.assertIn('profile_frontier', saved.measured_profiles)
+        self.assertIn('profile_frontier', saved.benchmark_runs[0]['winners'])
+        frontier = saved.measured_profiles['profile_frontier']
+        self.assertEqual(frontier['categories']['fastest_usable']['runtime_profile'], 'fast_chat_probe')
+        self.assertEqual(frontier['categories']['highest_stable_context']['ctx_per_slot'], 65536)
 
     def test_runtime_profile_retry_does_not_repeat_buun_fit_failures(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200)

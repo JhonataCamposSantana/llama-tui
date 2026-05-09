@@ -7,8 +7,10 @@ from unittest.mock import patch
 from llama_tui.app import AppConfig
 from llama_tui.benchmark import (
     adaptive_record_from_candidate,
+    apply_measured_profile,
     apply_moe_recommendation,
     benchmark_moe_placement_tuning,
+    measured_profile_runtime_profile,
     model_for_runtime_profile,
 )
 from llama_tui.hardware import HardwareProfile
@@ -223,14 +225,14 @@ class MoeTuningRunnerTests(unittest.TestCase):
 
         return fake
 
-    def run_tuning(self, fake_benchmark):
+    def run_tuning(self, fake_benchmark, depth='fast', layer_count=32):
         with patch.object(self.app, 'hardware_profile', return_value=tuning_hardware()), \
              patch.object(self.app, 'engine_capabilities', return_value=tuning_caps()), \
              patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'ok')), \
-             patch('llama_tui.benchmark._moe_tuning_layer_count', return_value=32), \
+             patch('llama_tui.benchmark._moe_tuning_layer_count', return_value=layer_count), \
              patch('llama_tui.benchmark.CACHE_DIR', self.root / 'cache'), \
              patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_benchmark):
-            return benchmark_moe_placement_tuning(self.app, self.model, depth='fast')
+            return benchmark_moe_placement_tuning(self.app, self.model, depth=depth)
 
     def test_refinement_candidates_are_benchmarked_before_selection(self):
         calls = []
@@ -284,6 +286,41 @@ class MoeTuningRunnerTests(unittest.TestCase):
         self.assertIn('unsafe', profile['early_stop_reason'])
         self.assertEqual(profile['early_stop_reason'], latest_run['early_stop_reason'])
         self.assertNotIn('n_cpu_moe_24', calls)
+
+    def test_full_tuning_validates_moe_placement_across_context_buckets(self):
+        calls = []
+        self.model.ctx_max = 131072
+
+        ok, msg = self.run_tuning(self.fake_runtime_benchmark(
+            calls,
+            {
+                'n_cpu_moe_34': 30.0,
+                'n_cpu_moe_36': 35.0,
+                'fast_chat_n_cpu_moe_34': 55.0,
+                'auto_n_cpu_moe_38': 50.0,
+                'hermes_ready_cpu_moe_all': 45.0,
+                'long_context_cpu_moe_all': 44.0,
+            },
+        ), depth='full', layer_count=40)
+
+        saved = self.app.get_model('moe')
+        profile = saved.measured_profiles['moe_placement']
+        placements = profile['profile_moe_placements']
+        latest_run = saved.benchmark_runs[0]
+        context_rows = [row for row in latest_run['records'] if row.get('context_validation')]
+
+        self.assertTrue(ok, msg)
+        self.assertIn('fast_chat', placements)
+        self.assertIn('auto', placements)
+        self.assertIn('hermes_ready', placements)
+        self.assertIn('long_context', placements)
+        self.assertEqual(placements['fast_chat']['strategy'], 'n_cpu_moe_34')
+        self.assertEqual(placements['auto']['strategy'], 'n_cpu_moe_38')
+        self.assertEqual(placements['hermes_ready']['strategy'], 'cpu_moe_all')
+        self.assertEqual(placements['long_context']['strategy'], 'cpu_moe_all')
+        self.assertIn('auto_n_cpu_moe_38', calls)
+        self.assertTrue(any(row.get('context_validation_winner') for row in context_rows))
+        self.assertEqual(latest_run['profile_moe_placements']['auto']['n_cpu_moe'], 38)
 
 
 class ApplyMoeRecommendationTests(unittest.TestCase):
@@ -387,6 +424,68 @@ class ApplyMoeRecommendationTests(unittest.TestCase):
             self.assertIn('new=CPU', cmd)
             self.assertNotIn('old=CPU', cmd)
             self.assertEqual(cmd.count('-ncmoe'), 1)
+
+    def test_profile_level_moe_placement_takes_precedence_over_flat_fields(self):
+        model = moe_model(
+            measured_profiles={
+                'long_context': {
+                    'status': 'ok',
+                    'ctx': 65536,
+                    'ctx_per_slot': 65536,
+                    'parallel': 1,
+                    'threads': 8,
+                    'ngl': 33,
+                    'tokens_per_sec': 20.0,
+                    'placement_strategy': 'n_cpu_moe_30',
+                    'n_cpu_moe': 30,
+                    'cpu_moe': False,
+                    'tensor_overrides': [],
+                    'moe_placement': {
+                        'strategy': 'n_cpu_moe_38',
+                        'n_cpu_moe': 38,
+                        'cpu_moe': False,
+                        'tensor_overrides': [],
+                    },
+                }
+            },
+        )
+
+        runtime_profile = measured_profile_runtime_profile(model, 'long_context')
+        ok, msg = apply_measured_profile(model, 'long_context')
+
+        self.assertIsNotNone(runtime_profile)
+        self.assertEqual(runtime_profile.n_cpu_moe, 38)
+        self.assertTrue(ok, msg)
+        self.assertEqual(model.n_cpu_moe, 38)
+        self.assertEqual(model.moe_placement_strategy, 'n_cpu_moe_38')
+
+    def test_flat_moe_fields_remain_backward_compatible_when_profile_level_missing(self):
+        model = moe_model(
+            measured_profiles={
+                'fast_chat': {
+                    'status': 'ok',
+                    'ctx': 8192,
+                    'ctx_per_slot': 8192,
+                    'parallel': 1,
+                    'threads': 8,
+                    'ngl': 33,
+                    'tokens_per_sec': 40.0,
+                    'placement_strategy': 'n_cpu_moe_30',
+                    'n_cpu_moe': 30,
+                    'cpu_moe': False,
+                    'tensor_overrides': [],
+                }
+            },
+        )
+
+        runtime_profile = measured_profile_runtime_profile(model, 'fast_chat')
+        ok, msg = apply_measured_profile(model, 'fast_chat')
+
+        self.assertIsNotNone(runtime_profile)
+        self.assertEqual(runtime_profile.n_cpu_moe, 30)
+        self.assertTrue(ok, msg)
+        self.assertEqual(model.n_cpu_moe, 30)
+        self.assertEqual(model.moe_placement_strategy, 'n_cpu_moe_30')
 
 
 if __name__ == '__main__':

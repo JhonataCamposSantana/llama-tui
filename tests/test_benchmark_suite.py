@@ -518,6 +518,54 @@ class FullSuiteBackendTests(unittest.TestCase):
         self.assertIn('-ncmoe', smart_command)
         self.assertEqual(smart_command[smart_command.index('-ncmoe') + 1], '30')
 
+    def test_profile_level_moe_placement_overrides_global_for_matching_context(self):
+        model = suite_model(
+            ctx_max=65536,
+            n_cpu_moe=30,
+            moe_placement_strategy='measured:moe_tuning:n_cpu_moe_30',
+            measured_profiles={
+                'moe_placement': {
+                    'status': 'ok',
+                    'measured_candidate_name': 'n_cpu_moe_30',
+                    'cpu_moe': False,
+                    'n_cpu_moe': 30,
+                    'tensor_overrides': [],
+                    'profile_moe_placements': {
+                        'fast_chat': {
+                            'strategy': 'n_cpu_moe_30',
+                            'cpu_moe': False,
+                            'n_cpu_moe': 30,
+                            'tensor_overrides': [],
+                        },
+                        'auto': {
+                            'strategy': 'n_cpu_moe_38',
+                            'cpu_moe': False,
+                            'n_cpu_moe': 38,
+                            'tensor_overrides': [],
+                        },
+                    },
+                }
+            },
+        )
+        app = SuiteFakeApp(model)
+
+        runtime_profiles = active_engine_runtime_profiles(
+            app,
+            model,
+            app.hardware_profile(refresh=True),
+            depth='fast',
+        )
+        auto_context = next(item for item in runtime_profiles if int(item.ctx_size or 0) > 32768)
+        command = app.build_command(
+            model_for_runtime_profile(model, auto_context),
+            runtime_profile=auto_context,
+        )
+
+        self.assertEqual(auto_context.n_cpu_moe, 38)
+        self.assertIn('+moe_ncpu38', auto_context.name)
+        self.assertIn('-ncmoe', command)
+        self.assertEqual(command[command.index('-ncmoe') + 1], '38')
+
     def test_fit_assisted_moe_candidates_are_labeled_separately_after_locked_probe(self):
         model = suite_model(
             runtime='llama.cpp',

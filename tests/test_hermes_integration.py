@@ -312,6 +312,10 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(saved.benchmark_runs[0]['kind'], 'hermes')
         self.assertIn('auto', saved.measured_profiles)
         self.assertIn('hermes_floor', saved.measured_profiles)
+        self.assertIn('hermes_cache_ram', saved.measured_profiles)
+        self.assertEqual(saved.measured_profiles['hermes_cache_ram']['cache_ram_mib'], 0)
+        self.assertIn('hermes_cache_ram', saved.benchmark_runs[0]['winners'])
+        self.assertEqual(saved.cache_ram, self.model.cache_ram)
         self.assertNotIn('hermes_measured_hermes_floor_0', saved.measured_profiles)
 
     def test_hermes_benchmark_skips_candidates_below_context_floor(self):
@@ -404,7 +408,8 @@ class HermesIntegrationTests(unittest.TestCase):
         saved = self.app.get_model(self.model.id)
         self.assertTrue(ok)
         self.assertIn('Hermes workflow winner', msg)
-        start.assert_called_once()
+        self.assertEqual(start.call_count, 4)
+        self.assertEqual([call.args[0].cache_ram for call in start.call_args_list], [0, 512, 1024, 2048])
         row = saved.last_hermes_benchmark_results[0]
         self.assertTrue(row['experimental_context_override'])
         self.assertEqual(row['configured_context_length'], 70000)
@@ -523,7 +528,7 @@ class HermesIntegrationTests(unittest.TestCase):
                         with patch.object(self.app, 'start', return_value=(True, 'started')):
                             with patch.object(self.app, 'wait_until_ready', return_value=(True, 'ready')):
                                 with patch.object(self.app, 'stop', return_value=(True, 'stopped')):
-                                    with patch('llama_tui.hermes_benchmark.run_hermes_task', side_effect=[ok_sample, timeout_sample]):
+                                    with patch('llama_tui.hermes_benchmark.run_hermes_task', side_effect=[ok_sample, timeout_sample] * 4):
                                         ok, msg = benchmark_hermes_workflow(self.app, self.model)
 
         saved = self.app.get_model(self.model.id)
@@ -661,9 +666,10 @@ class HermesIntegrationTests(unittest.TestCase):
 
         self.assertTrue(ok, msg)
         probe.assert_called_once()
-        self.assertEqual(start.call_count, 2)
+        self.assertEqual(start.call_count, 5)
         started_ctxs = [call.args[0].ctx for call in start.call_args_list]
-        self.assertEqual(started_ctxs, [65536, 98304])
+        self.assertEqual(started_ctxs, [65536, 65536, 65536, 65536, 98304])
+        self.assertEqual([call.args[0].cache_ram for call in start.call_args_list[:4]], [0, 512, 1024, 2048])
 
     def test_hermes_floor_probe_persists_reusable_floor_profile(self):
         runtime_profile = RuntimeProfile(

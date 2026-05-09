@@ -18,6 +18,7 @@ from .benchmark import (
     ctx_per_slot,
     current_process_pressure_payload,
     emit_benchmark_event,
+    expand_workflow_cache_ram_candidates,
     fit_ceiling_from_records,
     model_and_runtime_profile_from_measured_profile,
     parse_context_requirement,
@@ -25,6 +26,9 @@ from .benchmark import (
     runtime_profile_uses_fit,
     runtime_profile_with_fit_ceiling,
     upsert_benchmark_run,
+    workflow_cache_ram_profile_from_record,
+    workflow_cache_ram_record_fields,
+    workflow_cache_ram_selection_key,
 )
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .models import HERMES_DEFAULT_MIN_CONTEXT_TOKENS, ModelConfig
@@ -99,6 +103,7 @@ def hermes_context_record_fields(app, model: ModelConfig) -> Dict[str, object]:
 def hermes_benchmark_record_context(model: ModelConfig) -> Dict[str, object]:
     payload = architecture_payload(model)
     payload.update(current_process_pressure_payload())
+    payload.update(workflow_cache_ram_record_fields(model))
     return payload
 
 
@@ -738,6 +743,7 @@ def benchmark_hermes_workflow(
         if probe_ok:
             model = app.get_model(model.id) or model
             candidates = hermes_candidate_models(app, model, required_context)
+    candidates = expand_workflow_cache_ram_candidates(candidates, profile)
     vscode = detect_vscode_pressure()
     records: List[Dict[str, object]] = []
     results: List[Dict[str, object]] = []
@@ -1028,8 +1034,12 @@ def benchmark_hermes_workflow(
         emit_benchmark_event(progress, 'benchmark_error', model, 'hermes', message=msg, phase='failed', records=records)
         return False, msg
 
-    best = max(results, key=lambda item: float(item['score']))
-    best_model = best['model']
+    best = max(results, key=lambda item: workflow_cache_ram_selection_key(item['record']))
+    cache_ram_profile = workflow_cache_ram_profile_from_record('hermes', best['record'])
+    best_model = clone_model_config(best['model'])
+    best_model.cache_ram = int(getattr(model, 'cache_ram', 0) or 0)
+    best_model.measured_profiles = dict(getattr(model, 'measured_profiles', {}) or {})
+    best_model.measured_profiles['hermes_cache_ram'] = cache_ram_profile
     best_model.last_hermes_benchmark_score = round(float(best['score']), 2)
     best_model.last_hermes_benchmark_seconds = round(float(best['elapsed']), 2)
     best_model.last_hermes_benchmark_profile = (
@@ -1038,7 +1048,7 @@ def benchmark_hermes_workflow(
         f'{profile.short_summary()}'
     )
     best_model.last_hermes_benchmark_results = records
-    winners = {'hermes': dict(best['record'])}
+    winners = {'hermes': dict(best['record']), 'hermes_cache_ram': dict(cache_ram_profile)}
     run = build_benchmark_run(run_id, 'hermes', 'done', records, winners, started_at, datetime.now().isoformat(timespec='seconds'), profile.short_summary())
     run['summary'] = f'Hermes {float(best["score"]):.2f} score ctx={best_model.ctx} par={best_model.parallel}'
     upsert_benchmark_run(best_model, run)
@@ -1047,7 +1057,8 @@ def benchmark_hermes_workflow(
     msg = (
         f'✅ Hermes workflow winner: {best_model.id} {best["preset"]}/{best["tier"]} '
         f'score={float(best["score"]):.2f} ctx={best_model.ctx} parallel={best_model.parallel} '
-        f'threads={best_model.threads} ngl={best_model.ngl} | {sync_msg}'
+        f'threads={best_model.threads} ngl={best_model.ngl} '
+        f'cache_ram_rec={int(cache_ram_profile.get("cache_ram_mib", 0) or 0)} MiB | {sync_msg}'
     )
     emit_benchmark_event(
         progress,

@@ -53,12 +53,14 @@ from .runtime_profiles import (
 from .textutil import compact_message
 from .tuning import (
     TuningCandidate,
+    TuningObjective,
     early_stop_reason,
     generate_moe_tuning_candidates,
     generate_refinement_candidates,
     moe_tuning_eligibility_reason,
     score_tuning_record,
     select_measured_tuning_winner,
+    target_vram_headroom_bytes,
     tuning_objective_for_model,
 )
 
@@ -101,6 +103,11 @@ SMART_FRONTIER_MAX_PROBES = 10
 SMART_PARALLEL_IMPROVEMENT_THRESHOLD = 0.08
 SMART_PARALLEL_NON_IMPROVING_LIMIT = 2
 SMART_Q8_CONTEXT_GAIN_THRESHOLD = 0.15
+MAX_CONTEXT_PROBE_TARGETS = (131_072, 160_000, 196_608, 224_000, 262_144)
+MAX_CONTEXT_PROBE_MAX_CANDIDATES = 15
+WORKFLOW_CACHE_RAM_VARIANTS = (0, 512, 1024, 2048)
+WORKFLOW_CACHE_RAM_BASE_CANDIDATES = 1
+WORKFLOW_CACHE_RAM_RESERVE_MIB = 1024
 TURBOQUANT_VALIDATED_SYMMETRIC_FAMILIES = (
     ('llama', 'q4_k_m'),
     ('mistral', 'q4_k_m'),
@@ -1237,6 +1244,91 @@ def _normalized_tensor_overrides(value: object) -> List[str]:
     return []
 
 
+def infer_moe_placement_strategy(cpu_moe: bool, n_cpu_moe: int, tensor_overrides: Sequence[str] = ()) -> str:
+    if bool(cpu_moe):
+        return 'cpu_moe_all'
+    value = max(0, int(n_cpu_moe or 0))
+    if value > 0:
+        return f'n_cpu_moe_{value}'
+    if tuple(tensor_overrides or ()):
+        return 'tensor_override'
+    return ''
+
+
+def moe_placement_payload(
+    source: Dict[str, object],
+    strategy: str = '',
+    source_name: str = '',
+) -> Dict[str, object]:
+    tensor_overrides = _normalized_tensor_overrides(source.get('tensor_overrides', []))
+    cpu_moe = _profile_bool(source, 'cpu_moe')
+    n_cpu_moe = max(0, _profile_int(source, 'n_cpu_moe', 0))
+    strategy = str(
+        strategy
+        or source.get('strategy')
+        or source.get('placement_strategy')
+        or source.get('moe_placement_strategy')
+        or infer_moe_placement_strategy(cpu_moe, n_cpu_moe, tensor_overrides)
+    ).strip()
+    payload = {
+        'strategy': strategy,
+        'cpu_moe': bool(cpu_moe),
+        'n_cpu_moe': int(n_cpu_moe),
+        'tensor_overrides': tensor_overrides,
+    }
+    if source_name:
+        payload['source'] = source_name
+    for key in (
+        'measured_candidate_name',
+        'tokens_per_sec',
+        'ctx',
+        'ctx_per_slot',
+        'runtime_profile',
+        'moe_placement_mode',
+        'fit_assisted_moe_placement',
+        'benchmark_depth',
+    ):
+        if key in source:
+            payload[key] = source.get(key)
+    return payload
+
+
+def profile_moe_placement(profile: Dict[str, object]) -> Dict[str, object]:
+    nested = profile.get('moe_placement') if isinstance(profile, dict) else {}
+    if isinstance(nested, dict) and (
+        nested.get('strategy')
+        or nested.get('placement_strategy')
+        or nested.get('cpu_moe')
+        or _profile_int(nested, 'n_cpu_moe', 0) > 0
+        or _normalized_tensor_overrides(nested.get('tensor_overrides', []))
+    ):
+        return moe_placement_payload(nested, source_name=str(nested.get('source', '') or 'profile'))
+    return moe_placement_payload(profile, source_name='flat_profile')
+
+
+def moe_profile_key_for_context(ctx: int) -> str:
+    ctx = max(0, int(ctx or 0))
+    if ctx <= 16_384:
+        return 'fast_chat'
+    if ctx <= 49_152:
+        return 'auto'
+    if ctx <= 98_304:
+        return 'hermes_ready'
+    return 'long_context'
+
+
+def profile_moe_placements_from_model(model: ModelConfig) -> Dict[str, Dict[str, object]]:
+    moe_profile = get_moe_recommendation(model)
+    source = moe_profile.get('profile_moe_placements') if moe_profile else {}
+    if not isinstance(source, dict):
+        return {}
+    result: Dict[str, Dict[str, object]] = {}
+    for key, value in source.items():
+        if isinstance(value, dict):
+            result[str(key)] = moe_placement_payload(value, source_name=str(value.get('source', '') or 'context_validation'))
+    return result
+
+
 def moe_recommendation_applied(model: ModelConfig) -> bool:
     profile = get_moe_recommendation(model)
     if not profile:
@@ -1494,6 +1586,17 @@ def measured_profile_runtime_profile(
             placement_strategy = f'n_cpu_moe_{n_cpu_moe}'
         elif tensor_values:
             placement_strategy = 'tensor_override'
+    placement_payload = profile_moe_placement(profile)
+    if (
+        placement_payload.get('strategy')
+        or placement_payload.get('cpu_moe')
+        or int(placement_payload.get('n_cpu_moe', 0) or 0) > 0
+        or placement_payload.get('tensor_overrides')
+    ):
+        placement_strategy = str(placement_payload.get('strategy') or '')
+        cpu_moe = bool(placement_payload.get('cpu_moe', False))
+        n_cpu_moe = max(0, int(placement_payload.get('n_cpu_moe', 0) or 0))
+        tensor_values = _normalized_tensor_overrides(placement_payload.get('tensor_overrides', []))
     reasoning = str(profile.get('reasoning') or fingerprint.get('reasoning') or '').strip().lower()
     if not reasoning:
         reasoning = _command_flag_value(command_tokens, '--reasoning', '-rea').strip().lower()
@@ -1563,14 +1666,17 @@ def apply_measured_profile(model: ModelConfig, key: str) -> Tuple[bool, str]:
         model.jinja = bool(profile['jinja'])
     if isinstance(profile.get('extra_args'), list):
         model.extra_args = [str(item) for item in profile.get('extra_args', [])]
-    if 'placement_strategy' in profile:
-        model.moe_placement_strategy = str(profile.get('placement_strategy') or '')
-    if 'cpu_moe' in profile:
-        model.cpu_moe = bool(profile.get('cpu_moe'))
-    if 'n_cpu_moe' in profile:
-        model.n_cpu_moe = max(0, int(profile.get('n_cpu_moe') or 0))
-    if isinstance(profile.get('tensor_overrides'), list):
-        model.tensor_overrides = [str(item).strip() for item in profile.get('tensor_overrides', []) if str(item).strip()]
+    placement = profile_moe_placement(profile)
+    if (
+        placement.get('strategy')
+        or placement.get('cpu_moe')
+        or int(placement.get('n_cpu_moe', 0) or 0) > 0
+        or placement.get('tensor_overrides')
+    ):
+        model.moe_placement_strategy = str(placement.get('strategy') or '')
+        model.cpu_moe = bool(placement.get('cpu_moe', False))
+        model.n_cpu_moe = max(0, int(placement.get('n_cpu_moe', 0) or 0))
+        model.tensor_overrides = _normalized_tensor_overrides(placement.get('tensor_overrides', []))
     model.optimize_mode = f'measured_{key}'
     model.optimize_tier = 'measured'
     return True, (
@@ -3483,6 +3589,14 @@ def adaptive_profile_dict(
     ):
         if key in record:
             profile_dict[key] = record.get(key)
+    placement = moe_placement_payload(profile_dict, source_name='measured_profile')
+    if (
+        placement.get('strategy')
+        or placement.get('cpu_moe')
+        or int(placement.get('n_cpu_moe', 0) or 0) > 0
+        or placement.get('tensor_overrides')
+    ):
+        profile_dict['moe_placement'] = placement
     return profile_dict
 
 
@@ -3635,6 +3749,825 @@ def select_measured_profiles(
             profile_dict['opencode_floor'] = int(opencode_floor or 0)
             profiles['opencode_ready'] = profile_dict
     return profiles
+
+
+def profile_frontier_fit_mode(record: Dict[str, object]) -> str:
+    if bool(record.get('runtime_fit', False) or record.get('fit', False) or record.get('fit_assisted_moe_placement', False)):
+        return 'fit_assisted'
+    placement = profile_moe_placement(record)
+    if (
+        placement.get('strategy')
+        or placement.get('cpu_moe')
+        or int(placement.get('n_cpu_moe', 0) or 0) > 0
+        or placement.get('tensor_overrides')
+    ):
+        return 'locked_moe'
+    return 'standard'
+
+
+def _profile_frontier_slug(value: str) -> str:
+    slug = re.sub(r'[^a-z0-9]+', '_', str(value or '').strip().lower()).strip('_')
+    return slug or 'profile'
+
+
+def _profile_frontier_moe_slug(record: Dict[str, object]) -> str:
+    placement = profile_moe_placement(record)
+    if bool(placement.get('cpu_moe', False)):
+        return 'moe_cpu'
+    n_cpu_moe = max(0, int(placement.get('n_cpu_moe', 0) or 0))
+    if n_cpu_moe > 0:
+        return f'moe_ncpu{n_cpu_moe}'
+    if placement.get('tensor_overrides'):
+        return 'moe_ot'
+    return 'no_moe'
+
+
+def profile_frontier_profile_id(
+    category: str,
+    record: Dict[str, object],
+    source_profile_key: str = '',
+) -> str:
+    base = (
+        source_profile_key
+        or str(record.get('objective', '') or '')
+        or category
+    )
+    fit_mode = profile_frontier_fit_mode(record)
+    placement_slug = _profile_frontier_moe_slug(record)
+    if fit_mode == 'locked_moe' and placement_slug.startswith('moe_'):
+        placement_slug = placement_slug[len('moe_'):]
+    return '_'.join(
+        item for item in (
+            _profile_frontier_slug(base),
+            fit_mode,
+            placement_slug,
+        )
+        if item
+    )
+
+
+def profile_frontier_stability_rating(record: Dict[str, object]) -> str:
+    status = str(record.get('status', '') or '').lower()
+    if status not in ('ok', 'probe ok', 'tests passed'):
+        return 'failed'
+    if low_speed_guardrail_reason(record):
+        return 'fragile'
+    score = _record_stability_score(record)
+    vram_headroom = _record_vram_headroom(record)
+    if 0 < vram_headroom < 512 * 1024**2:
+        return 'experimental'
+    if score >= 0.85:
+        return 'stable'
+    if score >= 0.65:
+        return 'usable'
+    return 'fragile'
+
+
+def profile_frontier_entry(
+    category: str,
+    label: str,
+    record: Dict[str, object],
+    reason: str,
+    source_profile_key: str = '',
+    status: str = '',
+    default_eligible: bool = True,
+) -> Dict[str, object]:
+    placement = profile_moe_placement(record)
+    placement_payload: Dict[str, object] = {}
+    if (
+        placement.get('strategy')
+        or placement.get('cpu_moe')
+        or int(placement.get('n_cpu_moe', 0) or 0) > 0
+        or placement.get('tensor_overrides')
+    ):
+        placement_payload = dict(placement)
+    vram_headroom = _record_vram_headroom(record)
+    entry_status = status or str(record.get('status', 'ok') or 'ok')
+    fit_mode = profile_frontier_fit_mode(record)
+    entry = {
+        'category': category,
+        'label': label,
+        'profile_id': profile_frontier_profile_id(category, record, source_profile_key=source_profile_key),
+        'profile_class': 'adaptive' if fit_mode == 'fit_assisted' else 'stable',
+        'status': entry_status,
+        'source_profile_key': source_profile_key,
+        'source_objective': str(record.get('objective', '') or ''),
+        'runtime_profile': str(record.get('runtime_profile', '') or ''),
+        'tokens_per_sec': round(float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0), 2),
+        'ctx': int(record.get('ctx', 0) or 0),
+        'ctx_per_slot': int(record.get('ctx_per_slot', record.get('ctx', 0)) or 0),
+        'parallel': int(record.get('parallel', 1) or 1),
+        'kv_preset': str(record.get('kv_preset', '') or ''),
+        'ctk': str(record.get('ctk', '') or ''),
+        'ctv': str(record.get('ctv', '') or ''),
+        'fit_mode': fit_mode,
+        'runtime_fit': bool(record.get('runtime_fit', False) or record.get('fit', False)),
+        'fit_context': int(record.get('fit_context', 0) or 0),
+        'vram_headroom_bytes': int(vram_headroom or 0),
+        'ram_available_bytes': int(record.get('ram_available', 0) or 0),
+        'ram_pressure_level': str(record.get('process_pressure_level', '') or ''),
+        'ram_pressure_score': round(float(record.get('process_pressure_score', 0.0) or 0.0), 4),
+        'stability_score': round(float(_record_stability_score(record)), 4),
+        'stability_rating': profile_frontier_stability_rating(record),
+        'default_eligible': bool(default_eligible),
+        'selection_reason': reason,
+        'workflow_result': str(record.get('workflow_result', '') or record.get('objective', '') or category),
+    }
+    if placement_payload:
+        entry['moe_placement'] = placement_payload
+    if record.get('reused_from'):
+        entry['reused_from'] = record.get('reused_from')
+    if record.get('context_required') or record.get('opencode_floor'):
+        entry['context_required'] = int(record.get('context_required', record.get('opencode_floor', 0)) or 0)
+    if record.get('failure_category'):
+        entry['failure_category'] = str(record.get('failure_category') or '')
+    if record.get('failure_reason'):
+        entry['failure_reason'] = str(record.get('failure_reason') or '')
+    if record.get('selection_rejection_reason') or record.get('rejection_reason'):
+        entry['selection_rejection_reason'] = str(record.get('selection_rejection_reason') or record.get('rejection_reason') or '')
+    return entry
+
+
+def _frontier_pick_stable_profile(
+    records: Sequence[Dict[str, object]],
+    model: ModelConfig,
+) -> Dict[str, object]:
+    pool = [
+        item for item in records
+        if profile_frontier_fit_mode(item) != 'fit_assisted'
+        and profile_frontier_stability_rating(item) in ('stable', 'usable')
+    ]
+    if not pool:
+        return {}
+    return max(
+        pool,
+        key=lambda item: (
+            score_auto(item, model),
+            profile_frontier_fit_mode(item) == 'locked_moe',
+            int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0),
+            float(item.get('decode_tokens_per_sec', item.get('tokens_per_sec', 0.0)) or 0.0),
+        ),
+    )
+
+
+def _frontier_pick_adaptive_profile(
+    records: Sequence[Dict[str, object]],
+    model: ModelConfig,
+) -> Dict[str, object]:
+    pool = [
+        item for item in records
+        if profile_frontier_fit_mode(item) == 'fit_assisted'
+        and str(item.get('status', '') or '').lower() == 'ok'
+    ]
+    if not pool:
+        return {}
+    return max(
+        pool,
+        key=lambda item: (
+            int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0),
+            score_auto(item, model),
+            float(item.get('decode_tokens_per_sec', item.get('tokens_per_sec', 0.0)) or 0.0),
+        ),
+    )
+
+
+def _frontier_metric_tuple(record: Dict[str, object]) -> Tuple[float, int, float, float]:
+    return (
+        float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0),
+        int(record.get('ctx_per_slot', record.get('ctx', 0)) or 0),
+        float(_record_headroom_score(record)),
+        float(_record_stability_score(record)),
+    )
+
+
+def _frontier_dominates(left: Dict[str, object], right: Dict[str, object]) -> bool:
+    left_metrics = _frontier_metric_tuple(left)
+    right_metrics = _frontier_metric_tuple(right)
+    return all(a >= b for a, b in zip(left_metrics, right_metrics)) and any(a > b for a, b in zip(left_metrics, right_metrics))
+
+
+def pareto_frontier_records(records: Sequence[Dict[str, object]], limit: int = 8) -> List[Dict[str, object]]:
+    unique: List[Dict[str, object]] = []
+    seen = set()
+    for record in records:
+        key = (
+            int(record.get('ctx_per_slot', record.get('ctx', 0)) or 0),
+            int(record.get('parallel', 1) or 1),
+            str(record.get('runtime_profile', '') or ''),
+            str(record.get('kv_preset', '') or ''),
+            str(record.get('placement_strategy', '') or ''),
+            bool(record.get('cpu_moe', False)),
+            int(record.get('n_cpu_moe', 0) or 0),
+            bool(record.get('runtime_fit', False) or record.get('fit', False)),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    frontier = [
+        record for record in unique
+        if not any(other is not record and _frontier_dominates(other, record) for other in unique)
+    ]
+    frontier.sort(
+        key=lambda item: (
+            -int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0),
+            -float(item.get('decode_tokens_per_sec', item.get('tokens_per_sec', 0.0)) or 0.0),
+            str(item.get('runtime_profile', '') or ''),
+        )
+    )
+    return frontier[: max(1, int(limit or 1))]
+
+
+def _matching_frontier_source(
+    records: Sequence[Dict[str, object]],
+    profile: Dict[str, object],
+) -> Dict[str, object]:
+    for record in records:
+        if record_matches_profile(record, profile):
+            merged = dict(record)
+            for key, value in profile.items():
+                if key not in merged or merged.get(key) in ('', 0, None, [], {}):
+                    merged[key] = value
+            return merged
+    return dict(profile)
+
+
+def build_profile_frontier(
+    model: ModelConfig,
+    measured: Sequence[Dict[str, object]],
+    winners: Dict[str, Dict[str, object]],
+    profile: HardwareProfile,
+    generated_at: str = '',
+) -> Dict[str, object]:
+    successful = [
+        dict(item) for item in list(measured or [])
+        if item.get('status') == 'ok' and str(item.get('measurement_type', 'full') or 'full') == 'full'
+    ]
+    if not successful and not winners:
+        return {}
+    usable = [
+        item for item in successful
+        if not low_speed_guardrail_reason(item)
+        and not str(item.get('selection_rejection_reason', '') or item.get('rejection_reason', '') or '')
+    ] or successful
+    single_slot = [item for item in usable if int(item.get('parallel', 1) or 1) == 1] or usable
+    stable_single_slot = [
+        item for item in single_slot
+        if profile_frontier_stability_rating(item) in ('stable', 'usable')
+    ] or single_slot
+    categories: Dict[str, Dict[str, object]] = {}
+    profile_classes: Dict[str, Dict[str, object]] = {}
+
+    stable_profile = _frontier_pick_stable_profile(usable, model)
+    if stable_profile:
+        profile_classes['stable_profile'] = profile_frontier_entry(
+            'stable_profile',
+            'Stable Profile',
+            stable_profile,
+            'predictable measured profile without fit-assisted placement',
+            source_profile_key=str(stable_profile.get('objective', '') or 'stable_profile'),
+            default_eligible=True,
+        )
+    adaptive_profile = _frontier_pick_adaptive_profile(usable, model)
+    if adaptive_profile:
+        profile_classes['adaptive_profile'] = profile_frontier_entry(
+            'adaptive_profile',
+            'Adaptive Profile',
+            adaptive_profile,
+            'fit-assisted measured profile; useful when current free memory can change placement',
+            source_profile_key=str(adaptive_profile.get('objective', '') or 'adaptive_profile'),
+            default_eligible=False,
+        )
+
+    if usable:
+        fastest = max(usable, key=lambda item: (float(item.get('decode_tokens_per_sec', item.get('tokens_per_sec', 0.0)) or 0.0), int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0)))
+        categories['fastest_usable'] = profile_frontier_entry(
+            'fastest_usable',
+            'Fastest Usable',
+            fastest,
+            'highest measured decode throughput among usable profiles',
+        )
+
+    auto_profile = winners.get('auto') or {}
+    if auto_profile:
+        auto_source = _matching_frontier_source(successful, auto_profile)
+        categories['best_balanced'] = profile_frontier_entry(
+            'best_balanced',
+            'Best Balanced',
+            auto_source,
+            str(auto_profile.get('selection_reason') or 'selected auto profile'),
+            source_profile_key='auto',
+        )
+    elif usable:
+        balanced = max(usable, key=lambda item: score_auto(item, model))
+        categories['best_balanced'] = profile_frontier_entry(
+            'best_balanced',
+            'Best Balanced',
+            balanced,
+            'highest balanced score among usable profiles',
+        )
+
+    if stable_single_slot:
+        highest = max(
+            stable_single_slot,
+            key=lambda item: (
+                int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0),
+                float(item.get('decode_tokens_per_sec', item.get('tokens_per_sec', 0.0)) or 0.0),
+            ),
+        )
+        categories['highest_stable_context'] = profile_frontier_entry(
+            'highest_stable_context',
+            'Highest Stable Context',
+            highest,
+            'largest single-slot context with stable or usable rating',
+        )
+
+    opencode_profile = winners.get('opencode_ready') or {}
+    if opencode_profile:
+        opencode_source = _matching_frontier_source(successful, opencode_profile)
+        categories['opencode_ready'] = profile_frontier_entry(
+            'opencode_ready',
+            'OpenCode Ready',
+            opencode_source,
+            str(opencode_profile.get('selection_reason') or 'selected OpenCode-ready profile'),
+            source_profile_key='opencode_ready',
+            status=str(opencode_profile.get('status', opencode_source.get('status', 'ok')) or 'ok'),
+            default_eligible=str(opencode_profile.get('status', 'ok') or 'ok') == 'ok',
+        )
+
+    hermes_target = 65_536
+    hermes_pool = [
+        item for item in single_slot
+        if int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0) >= hermes_target
+        and profile_frontier_stability_rating(item) in ('stable', 'usable')
+    ]
+    if hermes_pool:
+        hermes = max(hermes_pool, key=lambda item: (score_long_context(item, model), float(item.get('decode_tokens_per_sec', item.get('tokens_per_sec', 0.0)) or 0.0)))
+        categories['hermes_ready'] = profile_frontier_entry(
+            'hermes_ready',
+            'Hermes Ready',
+            hermes,
+            f'single-slot context meets Hermes floor {hermes_target}',
+            source_profile_key='hermes_ready',
+        )
+    elif stable_single_slot:
+        fallback = max(stable_single_slot, key=lambda item: int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0))
+        not_ready = dict(fallback)
+        not_ready['context_required'] = hermes_target
+        categories['hermes_ready'] = profile_frontier_entry(
+            'hermes_ready',
+            'Hermes Ready',
+            not_ready,
+            f'not Hermes-ready: no stable single-slot profile met floor {hermes_target}',
+            source_profile_key='hermes_ready',
+            status='not_ready',
+            default_eligible=False,
+        )
+
+    if single_slot:
+        max_context = max(
+            single_slot,
+            key=lambda item: (
+                int(item.get('ctx_per_slot', item.get('ctx', 0)) or 0),
+                float(item.get('decode_tokens_per_sec', item.get('tokens_per_sec', 0.0)) or 0.0),
+            ),
+        )
+        categories['max_context_experimental'] = profile_frontier_entry(
+            'max_context_experimental',
+            'Max Context Experimental',
+            max_context,
+            'largest measured single-slot context; stored separately from defaults',
+            source_profile_key='max_context_experimental',
+            status='experimental',
+            default_eligible=False,
+        )
+
+    pareto = [
+        profile_frontier_entry(
+            f'pareto_{index + 1}',
+            f'Pareto {index + 1}',
+            record,
+            'non-dominated by measured throughput, context, headroom, and stability',
+            default_eligible=profile_frontier_stability_rating(record) in ('stable', 'usable'),
+        )
+        for index, record in enumerate(pareto_frontier_records(usable))
+    ]
+    if not categories and not pareto:
+        return {}
+    result = {
+        'status': 'ok',
+        'kind': 'profile_frontier',
+        'schema_version': 1,
+        'generated_at': generated_at or datetime.now().isoformat(timespec='seconds'),
+        'hardware': profile.short_summary() if hasattr(profile, 'short_summary') else '',
+        'categories': categories,
+        'mode_explanations': {
+            'stable': 'Predictable repeatable launch profile; does not rely on fit-assisted runtime placement.',
+            'adaptive': 'Fit-assisted launch profile; may fit larger contexts but can vary with currently free memory.',
+            'locked_moe': 'Measured manual MoE placement flags are fixed in the launch command.',
+            'fit_assisted': 'Measured run used fit-assisted launch behavior in addition to any explicit placement flags.',
+        },
+        'pareto': pareto,
+    }
+    if profile_classes:
+        result['profile_classes'] = profile_classes
+        stable_entry = profile_classes.get('stable_profile') or {}
+        adaptive_entry = profile_classes.get('adaptive_profile') or {}
+        if stable_entry:
+            result['stable_profile'] = str(stable_entry.get('profile_id', '') or '')
+        if adaptive_entry:
+            result['adaptive_profile'] = str(adaptive_entry.get('profile_id', '') or '')
+    return result
+
+
+def attach_profile_frontier(
+    model: ModelConfig,
+    measured: Sequence[Dict[str, object]],
+    winners: Dict[str, Dict[str, object]],
+    profile: HardwareProfile,
+    generated_at: str = '',
+) -> Dict[str, Dict[str, object]]:
+    updated = dict(winners or {})
+    frontier = build_profile_frontier(model, measured, updated, profile, generated_at=generated_at)
+    if frontier:
+        updated['profile_frontier'] = frontier
+    return updated
+
+
+def max_context_probe_targets(model: ModelConfig) -> List[int]:
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', getattr(model, 'ctx', 0) or ctx_min) or ctx_min))
+    targets = [value for value in MAX_CONTEXT_PROBE_TARGETS if ctx_min <= value <= ctx_max]
+    if ctx_max >= ctx_min and ctx_max not in targets:
+        targets.append(ctx_max)
+    return sorted(set(max(ctx_min, min(ctx_max, int(value))) for value in targets))
+
+
+def _kv_profile_sort_key(profile: TurboKvProfile, preferred: Sequence[str]) -> Tuple[int, str]:
+    try:
+        index = tuple(preferred).index(profile.kv_preset)
+    except ValueError:
+        index = len(tuple(preferred))
+    return index, profile.kv_preset
+
+
+def max_context_probe_kv_profiles(
+    model: ModelConfig,
+    capabilities,
+    engine: str,
+) -> List[TurboKvProfile]:
+    engine_key = str(engine or '').strip().lower()
+    if engine_key == 'turboquant':
+        preferred = ('q8_0/turbo4', 'q8_0/turbo3', 'q8_0/turbo2', 'q8_0/q8_0')
+        profiles = [
+            item for item in turboquant_auto_profiles(model, capabilities, 'full')
+            if item.kv_preset in preferred
+        ]
+        return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
+    if engine_key == 'tq3':
+        profiles = tq3_kv_profiles_for_model(model, capabilities, 'full')
+        preferred = ('q8_0/q8_0', 'tq3_0/tq3_0', 'q4_0/tq3_0')
+        return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
+    if engine_key == 'buun':
+        preferred = ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq', 'turbo2_tcq/turbo2_tcq')
+        profiles = [
+            item for item in supported_turbo_kv_profiles(capabilities, 'full', engine_id='buun')
+            if item.kv_preset in preferred
+        ]
+        return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
+    allowed = {str(item).strip().lower() for item in tuple(getattr(capabilities, 'supported_kv_modes', ()) or ())}
+    if bool(getattr(capabilities, 'supports_cache_type_kv', False)) and {'q8_0'} <= allowed:
+        return [TurboKvProfile('q8_0/q8_0', 'q8 baseline', 'baseline', '8.5bpv', 'fast', 0.0, False, 'baseline')]
+    return [TurboKvProfile('default', 'default KV', 'baseline', 'default', 'fast', 0.0, False, 'baseline')]
+
+
+def _max_context_probe_moe_overlay(model: ModelConfig) -> Dict[str, object]:
+    saved_placement = current_model_moe_placement(model)
+    if saved_placement is None:
+        return {}
+    payload = (
+        profile_moe_placements_from_model(model).get('long_context')
+        or profile_moe_placements_from_model(model).get('hermes_ready')
+        or profile_moe_placements_from_model(model).get('auto')
+        or {}
+    )
+    placement = moe_placement_candidate_from_payload(payload) or saved_placement
+    return {
+        'source': str(payload.get('source') or 'current_model_moe_placement'),
+        'candidate_name': placement.name,
+        'moe_placement_strategy': placement.name,
+        'cpu_moe': bool(placement.cpu_moe),
+        'n_cpu_moe': max(0, int(placement.n_cpu_moe or 0)),
+        'tensor_overrides': list(placement.tensor_overrides or ()),
+    }
+
+
+def max_context_probe_runtime_profiles(
+    app: AppConfig,
+    model: ModelConfig,
+    profile: HardwareProfile,
+) -> List[RuntimeProfile]:
+    try:
+        engine = app.active_engine_key_for_model(model)
+    except Exception:
+        engine = str(getattr(model, 'runtime', '') or 'llama.cpp')
+    try:
+        capabilities = app.engine_capabilities()
+    except Exception:
+        capabilities = default_engine_capabilities(engine)
+    targets = max_context_probe_targets(model)
+    kv_profiles = max_context_probe_kv_profiles(model, capabilities, engine)
+    if not targets or not kv_profiles:
+        return []
+    try:
+        base = app.runtime_profile_from_model(
+            model,
+            int(getattr(model, 'ctx', 0) or targets[0]),
+            1,
+            int(getattr(model, 'ngl', 0) or 0),
+        )
+    except Exception:
+        base = RuntimeProfile(
+            engine_id=engine,
+            ctx_size=int(getattr(model, 'ctx', 0) or targets[0]),
+            gpu_layers=int(getattr(model, 'ngl', 0) or 0),
+            parallel=1,
+            kv_preset='default',
+            name='max_context_probe_base',
+        )
+    overlay = _max_context_probe_moe_overlay(model)
+    profiles: List[RuntimeProfile] = []
+    for ctx in targets:
+        for kv_profile in kv_profiles:
+            name = f'max_context_probe_{ctx}_{kv_profile.name_slug}'
+            candidate = replace(
+                base,
+                name=name,
+                ctx_size=int(ctx),
+                parallel=1,
+                kv_preset=kv_profile.kv_preset,
+                batch_size=128,
+                ubatch_size=64,
+                fit=False,
+                fit_context=0,
+                no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
+                kv_family='turbo' if any(mode.startswith('turbo') for mode in kv_modes_from_preset(kv_profile.kv_preset)) else 'cache' if kv_profile.kv_preset != 'default' else 'default',
+                kv_quality_tier=kv_profile.quality_tier,
+                kv_compression_tier=kv_profile.compression_tier,
+                kv_score_penalty=float(kv_profile.score_penalty or 0.0),
+                benchmark_depth='full',
+                fit_discovery_phase='max_context_probe',
+            )
+            profiles.append(runtime_profile_with_overlay(candidate, overlay))
+            if len(profiles) >= MAX_CONTEXT_PROBE_MAX_CANDIDATES:
+                return profiles
+    return profiles
+
+
+def max_context_record_is_safe(record: Dict[str, object], profile: HardwareProfile, target_headroom: int) -> bool:
+    if int(getattr(profile, 'gpu_memory_total', 0) or 0) <= 0:
+        return True
+    headroom = _record_vram_headroom(record)
+    return bool(headroom and headroom >= int(target_headroom or 0))
+
+
+def _max_context_record_sort_key(record: Dict[str, object]) -> Tuple[int, float, float, str]:
+    return (
+        int(record.get('ctx_per_slot', record.get('ctx', 0)) or 0),
+        -float(record.get('kv_score_penalty', 0.0) or 0.0),
+        float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0),
+        str(record.get('runtime_profile', '') or ''),
+    )
+
+
+def max_context_profile_from_record(
+    key: str,
+    record: Dict[str, object],
+    profile: HardwareProfile,
+    target_headroom: int,
+    safety_class: str,
+    default_eligible: bool,
+    selection_reason: str,
+    status: str = 'ok',
+) -> Dict[str, object]:
+    candidate = record.get('model') if isinstance(record.get('model'), ModelConfig) else None
+    if candidate is None:
+        candidate = ModelConfig(
+            id=str(record.get('model_id', '') or 'max-context'),
+            name=str(record.get('model_name', '') or record.get('model_id', '') or 'Max Context'),
+            path=str(record.get('path', '') or ''),
+            alias=str(record.get('alias', '') or 'max-context'),
+            port=int(record.get('port', 0) or 0),
+            ctx=int(record.get('ctx', 0) or 0),
+            parallel=int(record.get('parallel', 1) or 1),
+            ngl=int(record.get('ngl', 0) or 0),
+        )
+    selected = dict(record)
+    selected['selection_score'] = int(record.get('ctx_per_slot', record.get('ctx', 0)) or 0)
+    selected['selection_reason'] = selection_reason
+    profile_dict = adaptive_profile_dict(key, candidate, selected, profile)
+    profile_dict['status'] = status
+    profile_dict['kind'] = 'max_context_probe'
+    profile_dict['safety_class'] = safety_class
+    profile_dict['default_eligible'] = bool(default_eligible)
+    profile_dict['target_vram_headroom_bytes'] = int(target_headroom or 0)
+    profile_dict['vram_headroom_bytes'] = _record_vram_headroom(record)
+    profile_dict['profile_class'] = 'adaptive' if profile_frontier_fit_mode(record) == 'fit_assisted' else 'stable'
+    profile_dict['fit_mode'] = profile_frontier_fit_mode(record)
+    profile_dict['selection_reason'] = selection_reason
+    return profile_dict
+
+
+def select_max_context_probe_profiles(
+    model: ModelConfig,
+    measured: Sequence[Dict[str, object]],
+    profile: HardwareProfile,
+) -> Dict[str, Dict[str, object]]:
+    successful = [
+        dict(item) for item in list(measured or [])
+        if str(item.get('status', '') or '').lower() == 'ok'
+        and str(item.get('measurement_type', 'full') or 'full') == 'full'
+    ]
+    if not successful:
+        return {}
+    target_headroom = target_vram_headroom_bytes(profile)
+    safe_pool = [
+        item for item in successful
+        if max_context_record_is_safe(item, profile, target_headroom)
+    ]
+    largest_success = max(successful, key=_max_context_record_sort_key)
+    winners: Dict[str, Dict[str, object]] = {}
+    if safe_pool:
+        safe = max(safe_pool, key=_max_context_record_sort_key)
+        winners['max_context_safe'] = max_context_profile_from_record(
+            'max_context_safe',
+            safe,
+            profile,
+            target_headroom,
+            'safe',
+            True,
+            f'largest measured context with VRAM headroom >= {target_headroom // (1024 ** 2)} MiB',
+        )
+    else:
+        winners['max_context_safe'] = max_context_profile_from_record(
+            'max_context_safe',
+            largest_success,
+            profile,
+            target_headroom,
+            'unsafe',
+            False,
+            f'not safe: no measured max-context row kept VRAM headroom >= {target_headroom // (1024 ** 2)} MiB',
+            status='not_ready',
+        )
+    experimental_safe = max_context_record_is_safe(largest_success, profile, target_headroom)
+    winners['max_context_experimental'] = max_context_profile_from_record(
+        'max_context_experimental',
+        largest_success,
+        profile,
+        target_headroom,
+        'safe' if experimental_safe else 'experimental',
+        False,
+        'largest measured successful max-context row; stored separately from defaults',
+    )
+    return winners
+
+
+def _cache_ram_mib(model: ModelConfig) -> int:
+    return max(0, int(getattr(model, 'cache_ram', 0) or 0))
+
+
+def workflow_cache_ram_values(model: ModelConfig, profile: Optional[HardwareProfile] = None) -> List[int]:
+    current = _cache_ram_mib(model)
+    values: List[int] = [current]
+    values.extend(int(item) for item in WORKFLOW_CACHE_RAM_VARIANTS)
+    available_mib = 0
+    if profile is not None:
+        try:
+            available_mib = max(0, int(getattr(profile, 'memory_available', 0) or 0) // (1024 ** 2))
+        except (TypeError, ValueError):
+            available_mib = 0
+    soft_limit = max(0, available_mib - WORKFLOW_CACHE_RAM_RESERVE_MIB) if available_mib else 0
+    unique: List[int] = []
+    for value in values:
+        cache_ram = max(0, int(value or 0))
+        if cache_ram in unique:
+            continue
+        if soft_limit and cache_ram > soft_limit and cache_ram not in (0, current):
+            continue
+        unique.append(cache_ram)
+    return unique
+
+
+def model_with_cache_ram_variant(model: ModelConfig, cache_ram_mib: int) -> ModelConfig:
+    candidate = ModelConfig(**asdict(model))
+    candidate.cache_ram = max(0, int(cache_ram_mib or 0))
+    return candidate
+
+
+def _cache_ram_variant_name(value: int) -> str:
+    return f'cache_ram_{max(0, int(value or 0))}'
+
+
+def expand_workflow_cache_ram_candidates(
+    candidates: Sequence[Tuple[object, ...]],
+    profile: Optional[HardwareProfile] = None,
+    *,
+    max_base_candidates: int = WORKFLOW_CACHE_RAM_BASE_CANDIDATES,
+) -> List[Tuple[object, ...]]:
+    expanded: List[Tuple[object, ...]] = []
+    seen = set()
+    for index, item in enumerate(list(candidates or [])):
+        if len(item) < 4 or not isinstance(item[2], ModelConfig):
+            if item not in expanded:
+                expanded.append(item)
+            continue
+        label, tier, model, detail, *rest = item
+        values = workflow_cache_ram_values(model, profile) if index < max_base_candidates else [_cache_ram_mib(model)]
+        current = _cache_ram_mib(model)
+        for value in values:
+            variant_model = model_with_cache_ram_variant(model, value)
+            if value == current:
+                variant_label = str(label)
+                variant_tier = str(tier)
+            else:
+                suffix = _cache_ram_variant_name(value)
+                variant_label = f'{label}_{suffix}'
+                variant_tier = f'{tier}+{suffix}'
+            variant_detail = f'{detail} cache_ram={value} MiB'
+            key = (
+                variant_label,
+                variant_tier,
+                int(getattr(variant_model, 'ctx', 0) or 0),
+                int(getattr(variant_model, 'parallel', 1) or 1),
+                int(getattr(variant_model, 'cache_ram', 0) or 0),
+                tuple(getattr(variant_model, 'extra_args', []) or []),
+                tuple(str(part) for part in rest),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append((variant_label, variant_tier, variant_model, variant_detail, *rest))
+    return expanded
+
+
+def workflow_cache_ram_record_fields(model: ModelConfig) -> Dict[str, object]:
+    cache_ram = _cache_ram_mib(model)
+    return {
+        'cache_ram': cache_ram,
+        'cache_ram_mib': cache_ram,
+        'cache_ram_variant': _cache_ram_variant_name(cache_ram),
+    }
+
+
+def workflow_cache_ram_selection_key(record: Dict[str, object]) -> Tuple[float, float, int, float, float, float]:
+    score = float(record.get('score', 0.0) or 0.0)
+    tasks = max(1, int(record.get('tasks', 0) or 0))
+    passed = max(0, int(record.get('passed', 0) or 0))
+    pass_ratio = min(1.0, passed / tasks)
+    status = str(record.get('status', '') or '').lower()
+    timeout_type = str(record.get('timeout_type', '') or '').strip().lower()
+    stable = 0 if 'timeout' in status or timeout_type else 1
+    seconds = max(0.0, float(record.get('seconds', 0.0) or 0.0))
+    cache_ram = float(record.get('cache_ram_mib', record.get('cache_ram', 0)) or 0.0)
+    pressure = float(record.get('process_pressure_score', 0.0) or 0.0)
+    return (score, pass_ratio, stable, -seconds, -cache_ram, -pressure)
+
+
+def workflow_cache_ram_score(record: Dict[str, object]) -> float:
+    score, pass_ratio, stable, neg_seconds, neg_cache_ram, neg_pressure = workflow_cache_ram_selection_key(record)
+    return (
+        score * 100.0
+        + pass_ratio * 20.0
+        + float(stable) * 5.0
+        + neg_seconds * 0.05
+        + neg_cache_ram * 0.001
+        + neg_pressure
+    )
+
+
+def workflow_cache_ram_profile_from_record(workflow: str, record: Dict[str, object]) -> Dict[str, object]:
+    cache_ram = int(record.get('cache_ram_mib', record.get('cache_ram', 0)) or 0)
+    passed = int(record.get('passed', 0) or 0)
+    tasks = int(record.get('tasks', 0) or 0)
+    return {
+        'status': 'ok' if tasks > 0 and passed >= tasks else 'not_ready',
+        'kind': 'workflow_cache_ram',
+        'workflow': str(workflow or ''),
+        'cache_ram': cache_ram,
+        'cache_ram_mib': cache_ram,
+        'cache_ram_variant': _cache_ram_variant_name(cache_ram),
+        'workflow_cache_ram_score': round(workflow_cache_ram_score(record), 4),
+        'score': float(record.get('score', 0.0) or 0.0),
+        'seconds': float(record.get('seconds', 0.0) or 0.0),
+        'passed': passed,
+        'tasks': tasks,
+        'ctx': int(record.get('ctx', 0) or 0),
+        'ctx_per_slot': int(record.get('ctx_per_slot', 0) or 0),
+        'preset': str(record.get('preset', '') or ''),
+        'tier': str(record.get('tier', '') or ''),
+        'selection_reason': 'best workflow result by task score, completion time, stability, and cache-RAM overhead',
+        'benchmarked_at': str(record.get('benchmarked_at', '') or datetime.now().isoformat(timespec='seconds')),
+    }
 
 
 def benchmark_profile_is_fresh(app: AppConfig, model: ModelConfig) -> bool:
@@ -3978,6 +4911,16 @@ def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Option
     if moe:
         candidate = str(moe.get('measured_candidate_name', '') or moe.get('runtime_profile', '') or 'moe')
         parts.append(f'moe={candidate} {float(moe.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s')
+    max_safe = winners.get('max_context_safe') or {}
+    max_experimental = winners.get('max_context_experimental') or {}
+    if max_safe or max_experimental:
+        safe_ctx = int(max_safe.get('ctx_per_slot', max_safe.get('ctx', 0)) or 0)
+        exp_ctx = int(max_experimental.get('ctx_per_slot', max_experimental.get('ctx', 0)) or 0)
+        safe_status = str(max_safe.get('status', '') or '')
+        if safe_ctx and safe_status == 'ok':
+            parts.append(f'maxctx safe={safe_ctx}')
+        if exp_ctx:
+            parts.append(f'maxctx experimental={exp_ctx}')
     if winners.get('opencode_ready'):
         parts.append(opencode_profile_status_text(winners))
     if any(
@@ -5633,6 +6576,30 @@ def current_model_moe_placement(model: ModelConfig) -> Optional[MoePlacementCand
     )
 
 
+def moe_placement_candidate_from_payload(payload: Dict[str, object]) -> Optional[MoePlacementCandidate]:
+    normalized = moe_placement_payload(payload)
+    if not (
+        normalized.get('strategy')
+        or normalized.get('cpu_moe')
+        or int(normalized.get('n_cpu_moe', 0) or 0) > 0
+        or normalized.get('tensor_overrides')
+    ):
+        return None
+    return MoePlacementCandidate(
+        name=str(normalized.get('strategy') or infer_moe_placement_strategy(
+            bool(normalized.get('cpu_moe', False)),
+            int(normalized.get('n_cpu_moe', 0) or 0),
+            normalized.get('tensor_overrides', []),
+        ) or 'profile_moe_placement'),
+        gpu_layers=None,
+        cpu_moe=bool(normalized.get('cpu_moe', False)),
+        n_cpu_moe=max(0, int(normalized.get('n_cpu_moe', 0) or 0)),
+        tensor_overrides=tuple(_normalized_tensor_overrides(normalized.get('tensor_overrides', []))),
+        expected_vram_saving_hint='profile-level measured MoE placement',
+        risk='baseline',
+    )
+
+
 def _moe_placement_signature(placement: MoePlacementCandidate) -> Tuple[bool, int, Tuple[str, ...]]:
     return (
         bool(getattr(placement, 'cpu_moe', False)),
@@ -5739,6 +6706,7 @@ def active_engine_runtime_profiles(
     profiles: List[RuntimeProfile] = []
     seen = set()
     moe_placements = generate_moe_placement_candidates(model, profile, capabilities, engine, benchmark_depth)
+    context_profile_placements = profile_moe_placements_from_model(model)
     saved_placement = current_model_moe_placement(model)
     if saved_placement is not None:
         saved_signature = _moe_placement_signature(saved_placement)
@@ -5862,7 +6830,15 @@ def active_engine_runtime_profiles(
     def finalized_profiles() -> List[RuntimeProfile]:
         if not moe_placements:
             return with_tq3_reasoning_off_candidates(profiles)
-        updated: List[RuntimeProfile] = [apply_placement(item, baseline_placement) for item in profiles]
+        updated: List[RuntimeProfile] = [
+            item if (
+                bool(getattr(item, 'cpu_moe', False))
+                or int(getattr(item, 'n_cpu_moe', 0) or 0) > 0
+                or tuple(getattr(item, 'tensor_overrides', ()) or ())
+                or str(getattr(item, 'placement_strategy', '') or '').strip()
+            ) else apply_placement(item, baseline_placement)
+            for item in profiles
+        ]
         profile_keys = {
             (
                 item.name,
@@ -6000,7 +6976,17 @@ def active_engine_runtime_profiles(
     ):
         ctx = max(ctx_min, min(ctx_max, int(ctx or base_ctx)))
         ngl_key = 'fit' if ngl is None else int(ngl)
-        effective_placement = placement or baseline_placement
+        effective_placement = placement
+        if effective_placement is None and saved_placement is not None and context_profile_placements:
+            profile_key = moe_profile_key_for_context(ctx)
+            payload = context_profile_placements.get(profile_key)
+            if payload is None and profile_key == 'hermes_ready':
+                payload = context_profile_placements.get('long_context')
+            if payload is None:
+                payload = context_profile_placements.get('auto')
+            effective_placement = moe_placement_candidate_from_payload(payload or {})
+        if effective_placement is None:
+            effective_placement = baseline_placement
         key = (
             name,
             ctx,
@@ -7405,7 +8391,6 @@ def benchmark_exhaustive_profiles(
 
     winners = select_measured_profiles(model, measured, profile)
     propagate_rejection_reasons(records, measured)
-    annotate_spectrum_records(records, winners)
     ended_at = datetime.now().isoformat(timespec='seconds')
     if not winners:
         saved, preserved = failed_benchmark_model_state(app, model, records, ended_at)
@@ -7433,6 +8418,8 @@ def benchmark_exhaustive_profiles(
         )
         return False, msg
 
+    winners = attach_profile_frontier(model, measured, winners, profile, generated_at=ended_at)
+    annotate_spectrum_records(records, winners)
     saved = ModelConfig(**asdict(model))
     saved.last_benchmark_results = records
     saved.measured_profiles = winners
@@ -7523,6 +8510,128 @@ def _moe_tuning_effective_args(
     return benchmark_effective_server_args(app, candidate_model, runtime_profile, launch_profile)
 
 
+def moe_context_bucket_specs(model: ModelConfig, depth: str = 'full') -> List[Dict[str, object]]:
+    ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
+    ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', getattr(model, 'ctx', 32768)) or 32768))
+    raw = [
+        ('fast_chat', '8k', 8192),
+        ('auto', '32k', 32768),
+        ('hermes_ready', '64k', 65536),
+        ('long_context', '131k', 131072),
+    ]
+    if str(depth or '').strip().lower() != 'full':
+        raw = raw[:2]
+    specs: List[Dict[str, object]] = []
+    seen_ctx = set()
+    for profile_key, label, target in raw:
+        ctx = max(ctx_min, min(ctx_max, int(target)))
+        if ctx in seen_ctx:
+            continue
+        seen_ctx.add(ctx)
+        specs.append({'profile_key': profile_key, 'label': label, 'ctx': ctx})
+    return specs
+
+
+def _context_validation_n_cpu_moe_values(winner_n_cpu_moe: int, layer_count: int, depth: str) -> List[int]:
+    center = max(0, int(winner_n_cpu_moe or 0))
+    layers = max(0, int(layer_count or 0))
+    if center <= 0 or layers <= 0:
+        return []
+    deltas = (-4, -2, 0, 2, 4) if str(depth or '').strip().lower() == 'full' else (0, 2, 4)
+    values = {
+        max(1, min(layers, center + delta))
+        for delta in deltas
+    }
+    return sorted(values, key=lambda value: (abs(value - center), value))
+
+
+def generate_context_moe_validation_candidates(
+    baseline: RuntimeProfile,
+    winner: Dict[str, object],
+    capabilities,
+    layer_count: int,
+    bucket_ctx: int,
+    bucket_key: str,
+    depth: str,
+) -> List[TuningCandidate]:
+    baseline = replace(baseline, ctx_size=max(1, int(bucket_ctx or baseline.ctx_size or 1)))
+    candidates: List[TuningCandidate] = []
+    winner_payload = profile_moe_placement(winner)
+    winner_candidate = moe_placement_candidate_from_payload(winner_payload)
+    if winner_candidate is not None:
+        candidates.append(TuningCandidate(
+            name=f'{bucket_key}_{winner_candidate.name}',
+            runtime_profile=replace(
+                baseline,
+                name=f'{bucket_key}_{winner_candidate.name}',
+                gpu_layers=baseline.gpu_layers,
+                placement_strategy=winner_candidate.name,
+                cpu_moe=winner_candidate.cpu_moe,
+                n_cpu_moe=winner_candidate.n_cpu_moe,
+                tensor_overrides=winner_candidate.tensor_overrides,
+            ),
+            source='context_validation',
+            risk='baseline',
+            expected_effect=f'validate current MoE placement at {bucket_ctx} ctx',
+            phase='context_validation',
+        ))
+    if bool(getattr(capabilities, 'supports_n_cpu_moe', False)):
+        for value in _context_validation_n_cpu_moe_values(
+            int(winner_payload.get('n_cpu_moe', 0) or 0),
+            layer_count,
+            depth,
+        ):
+            name = f'{bucket_key}_n_cpu_moe_{value}'
+            candidates.append(TuningCandidate(
+                name=name,
+                runtime_profile=replace(
+                    baseline,
+                    name=name,
+                    gpu_layers=999,
+                    placement_strategy=f'n_cpu_moe_{value}',
+                    n_cpu_moe=value,
+                    cpu_moe=False,
+                    tensor_overrides=(),
+                ),
+                source='context_validation',
+                risk='normal',
+                expected_effect=f'validate n_cpu_moe={value} at {bucket_ctx} ctx',
+                phase='context_validation',
+            ))
+    if bool(getattr(capabilities, 'supports_cpu_moe', False)):
+        name = f'{bucket_key}_cpu_moe_all'
+        candidates.append(TuningCandidate(
+            name=name,
+            runtime_profile=replace(
+                baseline,
+                name=name,
+                gpu_layers=999,
+                placement_strategy='cpu_moe_all',
+                cpu_moe=True,
+                n_cpu_moe=0,
+                tensor_overrides=(),
+            ),
+            source='context_validation',
+            risk='safe',
+            expected_effect=f'validate all experts on CPU at {bucket_ctx} ctx',
+            phase='context_validation',
+        ))
+
+    deduped: List[TuningCandidate] = []
+    seen = set()
+    limit = 6 if str(depth or '').strip().lower() == 'full' else 4
+    for candidate in candidates:
+        profile = candidate.runtime_profile
+        key = (profile.cpu_moe, profile.n_cpu_moe, tuple(profile.tensor_overrides or ()), profile.ctx_size)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
 def _record_vram_headroom(record: Dict[str, object]) -> int:
     values: List[int] = []
     for key in ('memory_guardrail_min_gpu_memory_free', 'gpu_memory_free', 'vram_headroom_bytes'):
@@ -7589,6 +8698,115 @@ def _enrich_moe_tuning_records(
             row['selection_reason'] = str(row.get('failure_category', '') or row.get('status', '') or 'failed')
         enriched.append(row)
     return enriched
+
+
+def _run_context_aware_moe_validation(
+    app,
+    model: ModelConfig,
+    baseline_profile: RuntimeProfile,
+    capabilities,
+    layer_count: int,
+    depth_key: str,
+    primary_winner: Dict[str, object],
+    base_objective,
+    run_id: str,
+    progress: Optional[Callable[[object], None]],
+    cancel_token: Optional[CancelToken],
+    completed: int,
+    total: int,
+) -> Tuple[List[Dict[str, object]], Dict[str, Dict[str, object]], int]:
+    if not primary_winner or str(depth_key or '').strip().lower() != 'full':
+        return [], {}, completed
+    records: List[Dict[str, object]] = []
+    placements: Dict[str, Dict[str, object]] = {}
+    for bucket in moe_context_bucket_specs(model, depth_key):
+        check_cancelled(cancel_token)
+        profile_key = str(bucket.get('profile_key') or '')
+        label = str(bucket.get('label') or profile_key)
+        ctx = max(1, int(bucket.get('ctx', 0) or 0))
+        bucket_objective = TuningObjective(
+            purpose='moe_placement_context',
+            target_context=ctx,
+            min_context=ctx,
+            target_vram_headroom_bytes=int(base_objective.target_vram_headroom_bytes),
+            max_trials=6,
+            depth=depth_key,
+        )
+        candidates = generate_context_moe_validation_candidates(
+            baseline_profile,
+            primary_winner,
+            capabilities,
+            layer_count,
+            ctx,
+            profile_key,
+            depth_key,
+        )
+        if not candidates:
+            continue
+        if progress:
+            progress(f'MoE context validation {profile_key} ctx={ctx}: {len(candidates)} candidate(s)')
+        bucket_records: List[Dict[str, object]] = []
+        for candidate in candidates:
+            check_cancelled(cancel_token)
+            runtime_profile = candidate.runtime_profile
+            effective_args = _moe_tuning_effective_args(app, model, runtime_profile, depth_key)
+            ok, _broke, new_records, _new_measured, completed = benchmark_runtime_profile_with_retry(
+                app,
+                model,
+                runtime_profile,
+                'moe_placement_context',
+                progress,
+                cancel_token,
+                completed,
+                total,
+                run_kind='moe_tuning',
+                max_attempts=1,
+                benchmark_depth=depth_key,
+                benchmark_purpose='moe_context_validation',
+            )
+            enriched = _enrich_moe_tuning_records(
+                new_records,
+                candidate,
+                baseline_profile,
+                run_id,
+                bucket_objective,
+                effective_args,
+            )
+            for row in enriched:
+                row['objective'] = 'moe_placement_context'
+                row['benchmark_purpose'] = 'moe_context_validation'
+                row['measured_profile_key'] = f'moe_placement:{profile_key}'
+                row['profile_key'] = profile_key
+                row['context_bucket'] = label
+                row['target_context'] = ctx
+                row['context_validation'] = True
+                row['context_validation_winner'] = False
+                row['tuning_score'] = score_tuning_record(row, bucket_objective, candidate.risk)
+            records.extend(enriched)
+            bucket_records.extend(enriched)
+            if progress:
+                suffix = 'ok' if ok else (enriched[-1].get('failure_category') if enriched else 'failed')
+                progress(f'MoE context validation {profile_key}/{candidate.name}: {suffix}')
+        bucket_winner = select_measured_tuning_winner(bucket_records, bucket_objective)
+        if bucket_winner:
+            for row in records:
+                if (
+                    row.get('profile_key') == profile_key
+                    and row.get('measured_candidate_name') == bucket_winner.get('measured_candidate_name')
+                ):
+                    row['context_validation_winner'] = True
+            payload = moe_placement_payload(bucket_winner, source_name='context_validation')
+            payload.update({
+                'profile_key': profile_key,
+                'context_bucket': label,
+                'target_context': ctx,
+                'ctx': int(bucket_winner.get('ctx', ctx) or ctx),
+                'tokens_per_sec': float(bucket_winner.get('tokens_per_sec', 0.0) or 0.0),
+                'measured_candidate_name': str(bucket_winner.get('measured_candidate_name', '') or ''),
+                'tuning_run_id': run_id,
+            })
+            placements[profile_key] = payload
+    return records, placements, completed
 
 
 def _tuning_candidate_payload(candidate: TuningCandidate) -> Dict[str, object]:
@@ -7763,6 +8981,8 @@ def benchmark_moe_placement_tuning(
     probe_after_unsafe_pending = False
     all_candidates: List[TuningCandidate] = list(coarse_candidates)
     current_candidate_model: Optional[ModelConfig] = None
+    primary_winner: Dict[str, object] = {}
+    profile_moe_placements: Dict[str, Dict[str, object]] = {}
 
     running_model = ModelConfig(**asdict(model))
     if close_stale_running_benchmark_runs(running_model, started_at):
@@ -7889,6 +9109,25 @@ def benchmark_moe_placement_tuning(
         for candidate in refinements:
             if not run_candidate(candidate):
                 break
+
+        primary_winner = select_measured_tuning_winner(records, objective)
+        if primary_winner:
+            context_records, profile_moe_placements, completed = _run_context_aware_moe_validation(
+                app,
+                model,
+                baseline_profile,
+                capabilities,
+                layer_count,
+                depth_key,
+                primary_winner,
+                objective,
+                run_id,
+                progress,
+                cancel_token,
+                completed,
+                total,
+            )
+            records.extend(context_records)
     except CancelledError:
         if current_candidate_model is not None:
             app.stop(current_candidate_model, managed_only=True)
@@ -7921,7 +9160,7 @@ def benchmark_moe_placement_tuning(
         )
         return False, msg
 
-    winner = select_measured_tuning_winner(records, objective)
+    winner = primary_winner or select_measured_tuning_winner(records, objective)
     ended_at = datetime.now().isoformat(timespec='seconds')
     warnings = _moe_tuning_warnings(records, layer_count, early_stop_text)
     status = 'done' if winner else 'failed'
@@ -7956,6 +9195,14 @@ def benchmark_moe_placement_tuning(
         winner_profile['benchmark_depth'] = depth_key
         winner_profile['measured_profile_key'] = 'moe_placement'
         winner_profile['tuning_summary'] = 'fastest measured MoE placement candidate above safety scoring gates'
+        if profile_moe_placements:
+            winner_profile['profile_moe_placements'] = {
+                key: dict(value)
+                for key, value in profile_moe_placements.items()
+            }
+            winner_profile['context_validation_summary'] = (
+                f'{len(profile_moe_placements)} context bucket placement(s) validated'
+            )
         if log_json:
             winner_profile['tuning_log_json'] = log_json
         if log_text:
@@ -7970,6 +9217,11 @@ def benchmark_moe_placement_tuning(
     run = build_benchmark_run(run_id, 'moe_tuning', status, records, winners, started_at, ended_at, profile.short_summary())
     run['depth'] = depth_key
     run['warnings'] = list(warnings)
+    if profile_moe_placements:
+        run['profile_moe_placements'] = {
+            key: dict(value)
+            for key, value in profile_moe_placements.items()
+        }
     if early_stop_text:
         run['early_stop_reason'] = early_stop_text
     if log_json:
@@ -8012,6 +9264,169 @@ def benchmark_moe_placement_tuning(
         'benchmark_done',
         saved,
         'moe_tuning',
+        message=msg,
+        phase='complete',
+        completed=completed,
+        total=completed,
+        records=records,
+    )
+    return True, msg
+
+
+def benchmark_max_context_probe(
+    app: AppConfig,
+    model: ModelConfig,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+) -> Tuple[bool, str]:
+    preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'max_context_probe', progress, cancel_token)
+    if not preflight_ok:
+        return False, preflight_msg
+
+    profile = app.hardware_profile(refresh=True)
+    started_at = datetime.now().isoformat(timespec='seconds')
+    run_id = f'max-context-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    runtime_profiles = max_context_probe_runtime_profiles(app, model, profile)
+    if not runtime_profiles:
+        msg = 'max context probe skipped: no supported context/KV candidates'
+        if progress:
+            progress(msg)
+        return False, msg
+
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    completed = 0
+    total = max(1, len(runtime_profiles))
+    current_profile: Optional[RuntimeProfile] = None
+
+    running_model = ModelConfig(**asdict(model))
+    if close_stale_running_benchmark_runs(running_model, started_at):
+        model.benchmark_runs = list(running_model.benchmark_runs)
+    running_run = build_benchmark_run(run_id, 'max_context_probe', 'running', [], {}, started_at, hardware=profile.short_summary())
+    upsert_benchmark_run(running_model, running_run)
+    app.add_or_update(running_model)
+
+    start_msg = (
+        f'max context probe started: {len(runtime_profiles)} candidate(s), '
+        f'targets={",".join(str(item) for item in max_context_probe_targets(model))}, '
+        f'target_headroom={target_vram_headroom_bytes(profile) // (1024 ** 2)} MiB, '
+        f'{profile.short_summary()}'
+    )
+    if progress:
+        progress(start_msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_started',
+        model,
+        'max_context_probe',
+        message=start_msg,
+        phase='max context probe',
+        completed=0,
+        total=total,
+    )
+
+    try:
+        for runtime_profile in runtime_profiles:
+            check_cancelled(cancel_token)
+            current_profile = runtime_profile
+            ok, _broke, new_records, new_measured, completed = benchmark_runtime_profile_with_retry(
+                app,
+                model,
+                runtime_profile,
+                'max_context_probe',
+                progress,
+                cancel_token,
+                completed,
+                total,
+                run_kind='max_context_probe',
+                max_attempts=1,
+                benchmark_depth='full',
+                benchmark_purpose='max_context_probe',
+            )
+            records.extend(new_records)
+            measured.extend(new_measured)
+            running = ModelConfig(**asdict(model))
+            run = build_benchmark_run(run_id, 'max_context_probe', 'running', records, {}, started_at, hardware=profile.short_summary())
+            upsert_benchmark_run(running, run)
+            app.add_or_update(running)
+            if progress:
+                status = 'ok' if ok else (new_records[-1].get('failure_category') if new_records else 'failed')
+                progress(f'max context probe {runtime_profile.name}: {status}')
+    except CancelledError:
+        if current_profile is not None:
+            app.stop(model_for_runtime_profile(model, current_profile), managed_only=True)
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        aborted_model = ModelConfig(**asdict(model))
+        aborted_model.last_benchmark_results = records
+        run = build_benchmark_run(run_id, 'max_context_probe', 'aborted', records, {}, started_at, ended_at, profile.short_summary())
+        upsert_benchmark_run(aborted_model, run)
+        app.add_or_update(aborted_model)
+        msg = 'max context probe aborted; managed processes stopped'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_aborted',
+            model,
+            'max_context_probe',
+            message=msg,
+            phase='aborted',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    winners = select_max_context_probe_profiles(model, measured, profile)
+    if not winners:
+        saved = ModelConfig(**asdict(model))
+        saved.last_benchmark_results = records
+        run = build_benchmark_run(run_id, 'max_context_probe', 'failed', records, {}, started_at, ended_at, profile.short_summary())
+        upsert_benchmark_run(saved, run)
+        app.add_or_update(saved)
+        msg = f'❌ max context probe failed: {benchmark_failure_summary(records, "no measured max-context candidates completed")}'
+        if progress:
+            progress(msg)
+        emit_benchmark_event(
+            progress,
+            'benchmark_error',
+            model,
+            'max_context_probe',
+            message=msg,
+            phase='failed',
+            completed=completed,
+            total=completed,
+            records=records,
+        )
+        return False, msg
+
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    measured_profiles = dict(getattr(saved, 'measured_profiles', {}) or {})
+    measured_profiles.update(winners)
+    saved.measured_profiles = measured_profiles
+    run = build_benchmark_run(run_id, 'max_context_probe', 'done', records, winners, started_at, ended_at, profile.short_summary())
+    run['target_vram_headroom_bytes'] = target_vram_headroom_bytes(profile)
+    upsert_benchmark_run(saved, run)
+    app.add_or_update(saved)
+
+    safe = winners.get('max_context_safe') or {}
+    experimental = winners.get('max_context_experimental') or {}
+    safe_ctx = int(safe.get('ctx_per_slot', safe.get('ctx', 0)) or 0)
+    experimental_ctx = int(experimental.get('ctx_per_slot', experimental.get('ctx', 0)) or 0)
+    safe_status = str(safe.get('status', '') or 'unknown')
+    msg = (
+        f'✅ max context probe saved: safe={safe_ctx if safe_status == "ok" else "not_ready"} '
+        f'experimental={experimental_ctx} ctx/slot'
+    )
+    if progress:
+        progress(msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_done',
+        saved,
+        'max_context_probe',
         message=msg,
         phase='complete',
         completed=completed,
@@ -8292,7 +9707,6 @@ def benchmark_fast_profiles(
 
     winners = select_measured_profiles(model, measured, profile)
     propagate_rejection_reasons(records, measured)
-    annotate_spectrum_records(records, winners)
     ended_at = datetime.now().isoformat(timespec='seconds')
     if not winners:
         saved, preserved = failed_benchmark_model_state(app, model, records, ended_at)
@@ -8320,6 +9734,8 @@ def benchmark_fast_profiles(
         )
         return False, msg
 
+    winners = attach_profile_frontier(model, measured, winners, profile, generated_at=ended_at)
+    annotate_spectrum_records(records, winners)
     saved = ModelConfig(**asdict(model))
     saved.last_benchmark_results = records
     saved.measured_profiles = winners
@@ -8506,7 +9922,6 @@ def benchmark_adaptive_profiles(
 
     winners = select_measured_profiles(model, measured, profile)
     propagate_rejection_reasons(records, measured)
-    annotate_spectrum_records(records, winners)
     if not winners:
         ended_at = datetime.now().isoformat(timespec='seconds')
         saved, preserved = failed_benchmark_model_state(app, model, records, ended_at)
@@ -8530,11 +9945,14 @@ def benchmark_adaptive_profiles(
         )
         return False, msg
 
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    winners = attach_profile_frontier(model, measured, winners, profile, generated_at=ended_at)
+    annotate_spectrum_records(records, winners)
     saved = ModelConfig(**asdict(model))
     saved.last_benchmark_results = records
     saved.measured_profiles = winners
     saved.benchmark_fingerprint = app.model_fingerprint(saved)
-    saved.default_benchmark_at = datetime.now().isoformat(timespec='seconds')
+    saved.default_benchmark_at = ended_at
 
     auto_profile = winners['auto']
     apply_measured_profile(saved, 'auto')

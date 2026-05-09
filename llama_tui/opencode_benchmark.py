@@ -25,10 +25,14 @@ from .benchmark import (
     current_process_pressure_payload,
     dynamic_context_growth_targets,
     emit_benchmark_event,
+    expand_workflow_cache_ram_candidates,
     model_and_runtime_profile_from_measured_profile,
     observed_opencode_context_floor,
     parse_context_requirement,
     sync_opencode_after_tuning,
+    workflow_cache_ram_profile_from_record,
+    workflow_cache_ram_record_fields,
+    workflow_cache_ram_selection_key,
 )
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .hardware import HardwareProfile, read_meminfo_bytes
@@ -443,6 +447,7 @@ def sample_memory(app) -> Dict[str, int]:
 def benchmark_record_context(model: ModelConfig) -> Dict[str, object]:
     payload = architecture_payload(model)
     payload.update(current_process_pressure_payload())
+    payload.update(workflow_cache_ram_record_fields(model))
     return payload
 
 
@@ -1010,7 +1015,7 @@ def benchmark_opencode_workflow(
         return False, preflight_msg
 
     profile = app.hardware_profile(refresh=True)
-    candidates = opencode_candidate_models(model, profile)
+    candidates = expand_workflow_cache_ram_candidates(opencode_candidate_models(model, profile), profile)
     vscode = detect_vscode_pressure()
     pressure_payload = current_process_pressure_payload()
     records: List[Dict[str, object]] = []
@@ -1554,8 +1559,12 @@ def benchmark_opencode_workflow(
         )
         return False, msg
 
-    best = max(results, key=lambda item: float(item['score']))
-    best_model = best['model']
+    best = max(results, key=lambda item: workflow_cache_ram_selection_key(item['record']))
+    cache_ram_profile = workflow_cache_ram_profile_from_record('opencode', best['record'])
+    best_model = clone_model_config(best['model'])
+    best_model.cache_ram = int(getattr(model, 'cache_ram', 0) or 0)
+    best_model.measured_profiles = dict(getattr(model, 'measured_profiles', {}) or {})
+    best_model.measured_profiles['opencode_cache_ram'] = cache_ram_profile
     best_model.last_opencode_benchmark_score = round(float(best['score']), 2)
     best_model.last_opencode_benchmark_seconds = round(float(best['elapsed']), 2)
     best_model.last_opencode_benchmark_profile = (
@@ -1569,7 +1578,8 @@ def benchmark_opencode_workflow(
     msg = (
         f'✅ opencode workflow winner: {best_model.id} {best["preset"]}/{best["tier"]} '
         f'score={float(best["score"]):.2f} ctx={best_model.ctx} parallel={best_model.parallel} '
-        f'threads={best_model.threads} ngl={best_model.ngl} | {sync_msg}'
+        f'threads={best_model.threads} ngl={best_model.ngl} '
+        f'cache_ram_rec={int(cache_ram_profile.get("cache_ram_mib", 0) or 0)} MiB | {sync_msg}'
     )
     if progress:
         progress(msg)

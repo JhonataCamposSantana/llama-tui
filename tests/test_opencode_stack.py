@@ -942,6 +942,10 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertTrue(runtime_profile.fit)
         self.assertIsNone(runtime_profile.gpu_layers)
         self.assertEqual(runtime_profile.fit_context, 4096)
+        saved = app.saved[-1]
+        self.assertEqual(saved.cache_ram, model.cache_ram)
+        self.assertIn('opencode_cache_ram', saved.measured_profiles)
+        self.assertEqual(saved.measured_profiles['opencode_cache_ram']['cache_ram_mib'], 0)
 
     def test_opencode_partial_pass_does_not_become_winner(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1012,7 +1016,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             patch.object(app, 'stop', return_value=(True, 'stopped')), \
             patch('llama_tui.opencode_benchmark.opencode_candidate_models', return_value=[('opencode_ready', 'measured', model, 'measured')]), \
             patch('llama_tui.opencode_benchmark.opencode_provider_preflight', return_value=(True, 'provider ok')), \
-            patch('llama_tui.opencode_benchmark.run_opencode_task', side_effect=[ok_sample, timeout_sample]), \
+            patch('llama_tui.opencode_benchmark.run_opencode_task', side_effect=[ok_sample, timeout_sample] * 4), \
             patch('llama_tui.opencode_benchmark.detect_vscode_pressure', return_value={'processes': 0, 'rss_mib': 0.0}), \
             patch('llama_tui.opencode_benchmark.current_process_pressure_payload', return_value={'process_pressure_level': 'medium'}), \
             patch('llama_tui.opencode_benchmark.sleep_with_cancel', return_value=None):
