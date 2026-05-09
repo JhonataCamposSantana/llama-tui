@@ -5530,6 +5530,58 @@ def dedupe_runtime_profiles(runtime_profiles: List[RuntimeProfile]) -> List[Runt
     return selected
 
 
+def current_model_moe_placement(model: ModelConfig) -> Optional[MoePlacementCandidate]:
+    tensor_overrides = tuple(
+        str(item).strip()
+        for item in list(getattr(model, 'tensor_overrides', []) or [])
+        if str(item).strip()
+    )
+    cpu_moe = bool(getattr(model, 'cpu_moe', False))
+    n_cpu_moe = max(0, int(getattr(model, 'n_cpu_moe', 0) or 0))
+    placement = str(getattr(model, 'moe_placement_strategy', '') or '').strip()
+    if not (placement or cpu_moe or n_cpu_moe > 0 or tensor_overrides):
+        return None
+    if placement.startswith('measured:moe_tuning:'):
+        placement = placement.rsplit(':', 1)[-1]
+    if not placement:
+        if cpu_moe:
+            placement = 'cpu_moe_all'
+        elif n_cpu_moe > 0:
+            placement = f'n_cpu_moe_{n_cpu_moe}'
+        else:
+            placement = 'tensor_override'
+    return MoePlacementCandidate(
+        name=placement,
+        gpu_layers=None,
+        cpu_moe=cpu_moe,
+        n_cpu_moe=n_cpu_moe,
+        tensor_overrides=tensor_overrides,
+        expected_vram_saving_hint='current saved MoE placement',
+        risk='baseline',
+    )
+
+
+def _moe_placement_signature(placement: MoePlacementCandidate) -> Tuple[bool, int, Tuple[str, ...]]:
+    return (
+        bool(getattr(placement, 'cpu_moe', False)),
+        max(0, int(getattr(placement, 'n_cpu_moe', 0) or 0)),
+        tuple(getattr(placement, 'tensor_overrides', ()) or ()),
+    )
+
+
+def _runtime_moe_label_suffix(placement: Optional[MoePlacementCandidate]) -> str:
+    if placement is None:
+        return ''
+    if bool(getattr(placement, 'cpu_moe', False)):
+        return '+moe_cpu'
+    n_cpu_moe = max(0, int(getattr(placement, 'n_cpu_moe', 0) or 0))
+    if n_cpu_moe > 0:
+        return f'+moe_ncpu{n_cpu_moe}'
+    if tuple(getattr(placement, 'tensor_overrides', ()) or ()):
+        return '+moe_ot'
+    return ''
+
+
 def active_engine_runtime_profiles(
     app: AppConfig,
     model: ModelConfig,
@@ -5598,6 +5650,13 @@ def active_engine_runtime_profiles(
     profiles: List[RuntimeProfile] = []
     seen = set()
     moe_placements = generate_moe_placement_candidates(model, profile, capabilities, engine, benchmark_depth)
+    saved_placement = current_model_moe_placement(model)
+    if saved_placement is not None:
+        saved_signature = _moe_placement_signature(saved_placement)
+        moe_placements = [saved_placement] + [
+            item for item in moe_placements
+            if _moe_placement_signature(item) != saved_signature
+        ]
     baseline_placement = moe_placements[0] if moe_placements else None
 
     def placement_key(placement: Optional[MoePlacementCandidate]) -> Tuple[str, bool, int, Tuple[str, ...]]:
@@ -5620,9 +5679,14 @@ def active_engine_runtime_profiles(
         gpu_layers = runtime_profile.gpu_layers
         if placement.gpu_layers is not None:
             gpu_layers = int(placement.gpu_layers)
+        profile_name = name or runtime_profile.name
+        if name is None:
+            suffix = _runtime_moe_label_suffix(placement)
+            if suffix and suffix not in profile_name:
+                profile_name = f'{profile_name}{suffix}'
         return replace(
             runtime_profile,
-            name=name or runtime_profile.name,
+            name=profile_name,
             gpu_layers=gpu_layers,
             placement_strategy=placement.name,
             cpu_moe=bool(placement.cpu_moe),

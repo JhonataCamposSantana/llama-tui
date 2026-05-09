@@ -8,15 +8,17 @@ from llama_tui.benchmark import (
     adaptive_record_from_candidate,
     apply_full_suite_profile_recommendation,
     apply_full_suite_recommendations,
+    active_engine_runtime_profiles,
     benchmark_full_suite,
     build_runtime_overlay_from_moe_recommendation,
     full_suite_recommended_profile_key,
+    model_for_runtime_profile,
     runtime_profile_with_overlay,
     suite_run_recommended_profile_key,
 )
 from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
-from llama_tui.runtime_profiles import EngineCapabilities, RuntimeProfile
+from llama_tui.runtime_profiles import EngineCapabilities, RuntimeProfile, make_runtime_profile, runtime_profile_extra_args
 
 
 GIB = 1024 ** 3
@@ -63,6 +65,7 @@ class SuiteFakeApp:
         )
         self.opencode = type('OpenCode', (), {'path': ''})()
         self.continue_settings = type('Continue', (), {'path': ''})()
+        self.runtime_profile = make_runtime_profile(engine, 'llama-server')
 
     def get_model(self, model_id):
         return next((model for model in self.models if model.id == model_id), None)
@@ -105,6 +108,36 @@ class SuiteFakeApp:
             override_tensor_flag='-ot',
             gpu_layers_flag='-ngl',
         )
+
+    def build_command(
+        self,
+        model,
+        ctx_override=None,
+        parallel_override=None,
+        ngl_override=None,
+        runtime_profile=None,
+        benchmark_profile=None,
+    ):
+        ctx_value = int(ctx_override if ctx_override is not None else getattr(model, 'ctx', 0) or 0)
+        parallel_value = int(parallel_override if parallel_override is not None else getattr(model, 'parallel', 1) or 1)
+        ngl_value = int(ngl_override if ngl_override is not None else getattr(model, 'ngl', 0) or 0)
+        profile = self.runtime_profile_from_model(
+            model,
+            ctx_value,
+            parallel_value,
+            ngl_value,
+            runtime_profile=runtime_profile,
+        )
+        cmd = ['llama-server', '-m', str(getattr(model, 'path', '') or '')]
+        if profile.gpu_layers is not None:
+            cmd += ['-ngl', str(int(profile.gpu_layers))]
+        cmd += runtime_profile_extra_args(
+            self.runtime_profile,
+            profile,
+            self.engine_capabilities(),
+            existing_args=list(getattr(model, 'extra_args', []) or []),
+        )
+        return cmd
 
     def hardware_profile(self, refresh=False):
         return self.hardware
@@ -218,6 +251,67 @@ def suite_stage_runners(order, seen, fail_moe=False):
 
 
 class FullSuiteBackendTests(unittest.TestCase):
+    def run_suite_with_measured_moe_profile(self, moe_profile):
+        model = suite_model()
+        app = SuiteFakeApp(model)
+        order = []
+        seen = {}
+
+        def moe_runner(app, model, progress=None, cancel_token=None, depth='full'):
+            order.append('moe')
+            saved = ModelConfig(**asdict(model))
+            saved.measured_profiles = dict(getattr(saved, 'measured_profiles', {}) or {})
+            saved.measured_profiles['moe_placement'] = dict(moe_profile)
+            append_run(saved, 'moe_tuning', 'done', winners={'moe_placement': moe_profile})
+            app.add_or_update(saved)
+            return True, f'MoE placement winner {moe_profile["measured_candidate_name"]}'
+
+        def smart_runner(app, model, progress=None, cancel_token=None):
+            order.append('smart')
+            runtime_profiles = active_engine_runtime_profiles(
+                app,
+                model,
+                app.hardware_profile(refresh=True),
+                depth='fast',
+            )
+            self.assertTrue(runtime_profiles)
+            runtime_profile = runtime_profiles[0]
+            candidate = model_for_runtime_profile(model, runtime_profile)
+            command = app.build_command(candidate, runtime_profile=runtime_profile)
+            seen['smart_runtime_profile'] = runtime_profile
+            seen['smart_command'] = command
+            saved = ModelConfig(**asdict(model))
+            record = adaptive_record_from_candidate(
+                candidate,
+                'opencode_ready',
+                'ok',
+                tokens_per_sec=22.0,
+                seconds=1.0,
+                runtime_profile=runtime_profile.name,
+                command=' '.join(command),
+                effective_server_args=command,
+                effective_server_command=' '.join(command),
+            )
+            auto = dict(record, status='ok', ctx=candidate.ctx, ctx_per_slot=candidate.ctx, parallel=candidate.parallel)
+            opencode = dict(auto, objective='opencode_ready')
+            saved.measured_profiles = dict(getattr(saved, 'measured_profiles', {}) or {})
+            saved.measured_profiles.update({'auto': auto, 'fast_chat': auto, 'opencode_ready': opencode})
+            append_run(saved, 'server', 'done', record=record, winners={'auto': auto, 'opencode_ready': opencode})
+            app.add_or_update(saved)
+            return True, 'smart benchmark saved opencode_ready'
+
+        runners = suite_stage_runners(order, seen)
+        with tempfile.TemporaryDirectory() as tmp, patch('llama_tui.benchmark.CACHE_DIR', Path(tmp)):
+            ok, msg = benchmark_full_suite(
+                app,
+                model,
+                moe_runner=moe_runner,
+                smart_runner=smart_runner,
+                hermes_runner=runners[2],
+                opencode_runner=runners[3],
+            )
+        return ok, msg, app, seen
+
     def test_full_suite_orders_stages_uses_overlay_and_restores_config(self):
         model = suite_model()
         app = SuiteFakeApp(model)
@@ -258,6 +352,117 @@ class FullSuiteBackendTests(unittest.TestCase):
         self.assertTrue(server_run['uses_suite_overlay'])
         self.assertEqual(server_run['records'][0]['moe_overlay_source'], 'measured_profiles.moe_placement')
         self.assertEqual(server_run['records'][0]['effective_server_args'], ['llama-server', '-ncmoe', '30'])
+
+    def test_full_suite_smart_candidates_include_ncmoe_overlay(self):
+        ok, msg, app, seen = self.run_suite_with_measured_moe_profile({
+            'status': 'ok',
+            'kind': 'moe_tuning',
+            'measured_candidate_name': 'n_cpu_moe_40',
+            'placement_strategy': 'measured:moe_tuning:n_cpu_moe_40',
+            'cpu_moe': False,
+            'n_cpu_moe': 40,
+            'tensor_overrides': [],
+            'tokens_per_sec': 25.0,
+            'tuning_run_id': 'moe-run',
+            'ngl_required_for_moe_tuning': False,
+        })
+
+        saved = app.get_model('suite-moe')
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(saved.n_cpu_moe, 0)
+        self.assertEqual(seen['smart_runtime_profile'].n_cpu_moe, 40)
+        self.assertIn('+moe_ncpu40', seen['smart_runtime_profile'].name)
+        self.assertIn('-ncmoe', seen['smart_command'])
+        self.assertEqual(seen['smart_command'][seen['smart_command'].index('-ncmoe') + 1], '40')
+
+    def test_full_suite_smart_candidates_include_cpu_moe_overlay(self):
+        ok, msg, app, seen = self.run_suite_with_measured_moe_profile({
+            'status': 'ok',
+            'kind': 'moe_tuning',
+            'measured_candidate_name': 'cpu_moe_all',
+            'placement_strategy': 'measured:moe_tuning:cpu_moe_all',
+            'cpu_moe': True,
+            'n_cpu_moe': 0,
+            'tensor_overrides': [],
+            'tokens_per_sec': 18.0,
+            'tuning_run_id': 'moe-run',
+            'ngl_required_for_moe_tuning': False,
+        })
+
+        saved = app.get_model('suite-moe')
+
+        self.assertTrue(ok, msg)
+        self.assertFalse(saved.cpu_moe)
+        self.assertTrue(seen['smart_runtime_profile'].cpu_moe)
+        self.assertIn('+moe_cpu', seen['smart_runtime_profile'].name)
+        self.assertIn('-cmoe', seen['smart_command'])
+        self.assertNotIn('-ncmoe', seen['smart_command'])
+
+    def test_standalone_smart_does_not_use_unapplied_moe_recommendation(self):
+        model = suite_model(
+            measured_profiles={
+                'moe_placement': {
+                    'status': 'ok',
+                    'measured_candidate_name': 'n_cpu_moe_37',
+                    'placement_strategy': 'measured:moe_tuning:n_cpu_moe_37',
+                    'cpu_moe': False,
+                    'n_cpu_moe': 37,
+                    'tensor_overrides': [],
+                }
+            },
+            cpu_moe=False,
+            n_cpu_moe=0,
+            moe_placement_strategy='',
+            tensor_overrides=[],
+        )
+        app = SuiteFakeApp(model)
+
+        with patch('llama_tui.moe_placement.gguf_layer_count', return_value=0):
+            runtime_profiles = active_engine_runtime_profiles(
+                app,
+                model,
+                app.hardware_profile(refresh=True),
+                depth='fast',
+            )
+
+        self.assertTrue(runtime_profiles)
+        self.assertEqual(runtime_profiles[0].n_cpu_moe, 0)
+        self.assertNotIn('+moe_ncpu37', runtime_profiles[0].name)
+        self.assertFalse(any(profile.n_cpu_moe == 37 for profile in runtime_profiles))
+        command = app.build_command(
+            model_for_runtime_profile(model, runtime_profiles[0]),
+            runtime_profile=runtime_profiles[0],
+        )
+        self.assertNotIn('-ncmoe', command)
+        self.assertNotIn('--n-cpu-moe', command)
+
+    def test_applied_moe_recommendation_is_used_by_normal_launch_and_smart_profiles(self):
+        model = suite_model(
+            n_cpu_moe=30,
+            moe_placement_strategy='measured:moe_tuning:n_cpu_moe_30',
+            tensor_overrides=[],
+        )
+        app = SuiteFakeApp(model)
+
+        launch_command = app.build_command(model)
+        runtime_profiles = active_engine_runtime_profiles(
+            app,
+            model,
+            app.hardware_profile(refresh=True),
+            depth='fast',
+        )
+        smart_command = app.build_command(
+            model_for_runtime_profile(model, runtime_profiles[0]),
+            runtime_profile=runtime_profiles[0],
+        )
+
+        self.assertIn('-ncmoe', launch_command)
+        self.assertEqual(launch_command[launch_command.index('-ncmoe') + 1], '30')
+        self.assertEqual(runtime_profiles[0].n_cpu_moe, 30)
+        self.assertIn('+moe_ncpu30', runtime_profiles[0].name)
+        self.assertIn('-ncmoe', smart_command)
+        self.assertEqual(smart_command[smart_command.index('-ncmoe') + 1], '30')
 
     def test_dense_model_skips_moe_stage(self):
         model = suite_model(architecture_type='dense', expert_count=0, expert_used_count=0)
