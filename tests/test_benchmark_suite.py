@@ -13,6 +13,8 @@ from llama_tui.benchmark import (
     build_runtime_overlay_from_moe_recommendation,
     full_suite_recommended_profile_key,
     model_for_runtime_profile,
+    runtime_record_context,
+    runtime_profile_moe_placement_mode,
     runtime_profile_with_overlay,
     suite_run_recommended_profile_key,
 )
@@ -49,9 +51,10 @@ def suite_model(**overrides) -> ModelConfig:
 
 
 class SuiteFakeApp:
-    def __init__(self, model: ModelConfig, engine: str = 'llama.cpp'):
+    def __init__(self, model: ModelConfig, engine: str = 'llama.cpp', supports_fit: bool = False):
         self.models = [ModelConfig(**asdict(model))]
         self.engine = engine
+        self.supports_fit = supports_fit
         self.saved = []
         self.logs = []
         self.hardware = HardwareProfile(
@@ -103,10 +106,15 @@ class SuiteFakeApp:
             supports_cpu_moe=True,
             supports_n_cpu_moe=True,
             supports_override_tensor=True,
+            supports_ctk_ctv=True,
+            supports_fit=self.supports_fit,
+            supports_fit_ctx=self.supports_fit,
+            supports_no_warmup=self.supports_fit,
             cpu_moe_flag='-cmoe',
             n_cpu_moe_flag='-ncmoe',
             override_tensor_flag='-ot',
             gpu_layers_flag='-ngl',
+            supported_kv_modes=('q8_0', 'turbo4', 'turbo3', 'turbo2'),
         )
 
     def build_command(
@@ -251,11 +259,11 @@ def suite_stage_runners(order, seen, fail_moe=False):
 
 
 class FullSuiteBackendTests(unittest.TestCase):
-    def run_suite_with_measured_moe_profile(self, moe_profile):
-        model = suite_model()
+    def run_suite_with_measured_moe_profile(self, moe_profile, initial_model=None):
+        model = initial_model or suite_model()
         app = SuiteFakeApp(model)
         order = []
-        seen = {}
+        seen = {'progress': []}
 
         def moe_runner(app, model, progress=None, cancel_token=None, depth='full'):
             order.append('moe')
@@ -305,6 +313,7 @@ class FullSuiteBackendTests(unittest.TestCase):
             ok, msg = benchmark_full_suite(
                 app,
                 model,
+                progress=seen['progress'].append,
                 moe_runner=moe_runner,
                 smart_runner=smart_runner,
                 hermes_runner=runners[2],
@@ -350,7 +359,8 @@ class FullSuiteBackendTests(unittest.TestCase):
         self.assertTrue(suite_run['uses_suite_overlay'])
         self.assertEqual(server_run['suite_run_id'], suite_run['suite_run_id'])
         self.assertTrue(server_run['uses_suite_overlay'])
-        self.assertEqual(server_run['records'][0]['moe_overlay_source'], 'measured_profiles.moe_placement')
+        self.assertEqual(server_run['records'][0]['moe_overlay_source'], 'current_suite')
+        self.assertEqual(server_run['records'][0]['moe_overlay_flags'], '-ncmoe 30')
         self.assertEqual(server_run['records'][0]['effective_server_args'], ['llama-server', '-ncmoe', '30'])
 
     def test_full_suite_smart_candidates_include_ncmoe_overlay(self):
@@ -375,6 +385,10 @@ class FullSuiteBackendTests(unittest.TestCase):
         self.assertIn('+moe_ncpu40', seen['smart_runtime_profile'].name)
         self.assertIn('-ncmoe', seen['smart_command'])
         self.assertEqual(seen['smart_command'][seen['smart_command'].index('-ncmoe') + 1], '40')
+        progress_text = '\n'.join(str(item) for item in seen['progress'])
+        self.assertIn('Full Suite MoE winner: source=current_suite winner=n_cpu_moe_40', progress_text)
+        self.assertIn('Full Suite MoE overlay: source=current_suite winner=n_cpu_moe_40', progress_text)
+        self.assertIn('flags="-ncmoe 40"', progress_text)
 
     def test_full_suite_smart_candidates_include_cpu_moe_overlay(self):
         ok, msg, app, seen = self.run_suite_with_measured_moe_profile({
@@ -398,6 +412,46 @@ class FullSuiteBackendTests(unittest.TestCase):
         self.assertIn('+moe_cpu', seen['smart_runtime_profile'].name)
         self.assertIn('-cmoe', seen['smart_command'])
         self.assertNotIn('-ncmoe', seen['smart_command'])
+
+    def test_current_suite_moe_winner_takes_precedence_over_stored_recommendation(self):
+        initial = suite_model(
+            measured_profiles={
+                'moe_placement': {
+                    'status': 'ok',
+                    'kind': 'moe_tuning',
+                    'measured_candidate_name': 'n_cpu_moe_12',
+                    'placement_strategy': 'measured:moe_tuning:n_cpu_moe_12',
+                    'cpu_moe': False,
+                    'n_cpu_moe': 12,
+                    'tensor_overrides': [],
+                }
+            }
+        )
+
+        ok, msg, _app, seen = self.run_suite_with_measured_moe_profile(
+            {
+                'status': 'ok',
+                'kind': 'moe_tuning',
+                'measured_candidate_name': 'cpu_moe_all',
+                'placement_strategy': 'measured:moe_tuning:cpu_moe_all',
+                'cpu_moe': True,
+                'n_cpu_moe': 0,
+                'tensor_overrides': [],
+                'tokens_per_sec': 18.0,
+                'tuning_run_id': 'current-suite-moe',
+                'ngl_required_for_moe_tuning': False,
+            },
+            initial_model=initial,
+        )
+
+        self.assertTrue(ok, msg)
+        self.assertTrue(seen['smart_runtime_profile'].cpu_moe)
+        self.assertEqual(seen['smart_runtime_profile'].n_cpu_moe, 0)
+        self.assertIn('-cmoe', seen['smart_command'])
+        self.assertNotIn('-ncmoe', seen['smart_command'])
+        progress_text = '\n'.join(str(item) for item in seen['progress'])
+        self.assertIn('source=current_suite winner=cpu_moe_all', progress_text)
+        self.assertNotIn('winner=n_cpu_moe_12', progress_text)
 
     def test_standalone_smart_does_not_use_unapplied_moe_recommendation(self):
         model = suite_model(
@@ -463,6 +517,55 @@ class FullSuiteBackendTests(unittest.TestCase):
         self.assertIn('+moe_ncpu30', runtime_profiles[0].name)
         self.assertIn('-ncmoe', smart_command)
         self.assertEqual(smart_command[smart_command.index('-ncmoe') + 1], '30')
+
+    def test_fit_assisted_moe_candidates_are_labeled_separately_after_locked_probe(self):
+        model = suite_model(
+            runtime='llama.cpp',
+            n_cpu_moe=40,
+            moe_placement_strategy='measured:moe_tuning:n_cpu_moe_40',
+            turboquant_status='native',
+            turboquant_head_dim=128,
+            turboquant_key_dim=128,
+            turboquant_value_dim=128,
+        )
+        app = SuiteFakeApp(model, engine='turboquant', supports_fit=True)
+
+        runtime_profiles = active_engine_runtime_profiles(
+            app,
+            model,
+            app.hardware_profile(refresh=True),
+            depth='fast',
+        )
+
+        locked = next(item for item in runtime_profiles if item.name.startswith('moe_locked_probe'))
+        fit_assisted = next(item for item in runtime_profiles if item.fit and '+fit_assisted' in item.name)
+        locked_command = app.build_command(model_for_runtime_profile(model, locked), runtime_profile=locked)
+        fit_command = app.build_command(model_for_runtime_profile(model, fit_assisted), runtime_profile=fit_assisted)
+        locked_context = runtime_record_context(
+            app,
+            model_for_runtime_profile(model, locked),
+            runtime_profile=locked,
+        )
+        fit_context = runtime_record_context(
+            app,
+            model_for_runtime_profile(model, fit_assisted),
+            runtime_profile=fit_assisted,
+        )
+
+        self.assertLess(runtime_profiles.index(locked), runtime_profiles.index(fit_assisted))
+        self.assertFalse(locked.fit)
+        self.assertTrue(fit_assisted.fit)
+        self.assertIn('+moe_ncpu40', locked.name)
+        self.assertIn('+moe_ncpu40+fit_assisted', fit_assisted.name)
+        self.assertEqual(runtime_profile_moe_placement_mode(locked), 'locked')
+        self.assertEqual(runtime_profile_moe_placement_mode(fit_assisted), 'fit_assisted')
+        self.assertIn('-ncmoe', locked_command)
+        self.assertIn('-ncmoe', fit_command)
+        self.assertIn('-fit', fit_command)
+        self.assertEqual(locked_context['moe_placement_mode'], 'locked')
+        self.assertFalse(locked_context['fit_assisted_moe_placement'])
+        self.assertEqual(fit_context['moe_placement_mode'], 'fit_assisted')
+        self.assertTrue(fit_context['fit_assisted_moe_placement'])
 
     def test_dense_model_skips_moe_stage(self):
         model = suite_model(architecture_type='dense', expert_count=0, expert_used_count=0)

@@ -1619,13 +1619,45 @@ def apply_moe_recommendation(model: ModelConfig) -> Tuple[bool, str]:
     )
 
 
-def build_runtime_overlay_from_moe_recommendation(model: ModelConfig) -> Dict[str, object]:
+def moe_overlay_expected_flags(overlay: Dict[str, object]) -> List[str]:
+    flags: List[str] = []
+    if bool(overlay.get('cpu_moe', False)):
+        flags.append('-cmoe')
+    else:
+        n_cpu_moe = max(0, int(overlay.get('n_cpu_moe', 0) or 0))
+        if n_cpu_moe > 0:
+            flags += ['-ncmoe', str(n_cpu_moe)]
+    for override in _normalized_tensor_overrides(overlay.get('tensor_overrides', [])):
+        flags += ['-ot', override]
+    return flags
+
+
+def moe_overlay_flags_preview(overlay: Dict[str, object]) -> str:
+    return shlex.join(moe_overlay_expected_flags(overlay))
+
+
+def moe_overlay_log_text(overlay: Dict[str, object], prefix: str = 'Full Suite MoE overlay') -> str:
+    flags = moe_overlay_flags_preview(overlay)
+    tensor_overrides = _normalized_tensor_overrides(overlay.get('tensor_overrides', []))
+    return (
+        f'{prefix}: source={overlay.get("source") or "unknown"} '
+        f'winner={overlay.get("candidate_name") or overlay.get("moe_placement_strategy") or "unknown"} '
+        f'cpu_moe={bool(overlay.get("cpu_moe", False))} '
+        f'n_cpu_moe={max(0, int(overlay.get("n_cpu_moe", 0) or 0))} '
+        f'tensor_overrides={tensor_overrides} flags="{flags}"'
+    )
+
+
+def build_runtime_overlay_from_moe_recommendation(
+    model: ModelConfig,
+    source: str = 'measured_profiles.moe_placement',
+) -> Dict[str, object]:
     profile = get_moe_recommendation(model)
     if not profile:
         return {}
     candidate_name = str(profile.get('measured_candidate_name') or profile.get('runtime_profile') or '').strip()
     overlay: Dict[str, object] = {
-        'source': 'measured_profiles.moe_placement',
+        'source': source or 'measured_profiles.moe_placement',
         'candidate_name': candidate_name,
         'moe_placement_strategy': str(
             profile.get('placement_strategy')
@@ -1643,6 +1675,8 @@ def build_runtime_overlay_from_moe_recommendation(model: ModelConfig) -> Dict[st
             overlay['ngl'] = int(profile.get('ngl') or 0)
         except Exception:
             pass
+    overlay['expected_flags'] = moe_overlay_expected_flags(overlay)
+    overlay['expected_flags_preview'] = moe_overlay_flags_preview(overlay)
     return overlay
 
 
@@ -1748,7 +1782,6 @@ def _suite_restore_config_fields(
         restored.measured_profiles = merged
     return restored
 
-
 def _annotate_latest_stage_run(
     model: ModelConfig,
     kind: str,
@@ -1770,6 +1803,11 @@ def _annotate_latest_stage_run(
             run['uses_suite_overlay'] = True
             run['moe_overlay_source'] = str(overlay.get('source') or 'measured_profiles.moe_placement')
             run['moe_overlay_candidate'] = str(overlay.get('candidate_name') or '')
+            run['moe_overlay_cpu_moe'] = bool(overlay.get('cpu_moe', False))
+            run['moe_overlay_n_cpu_moe'] = max(0, int(overlay.get('n_cpu_moe', 0) or 0))
+            run['moe_overlay_tensor_overrides'] = _normalized_tensor_overrides(overlay.get('tensor_overrides', []))
+            run['moe_overlay_expected_flags'] = list(overlay.get('expected_flags') or moe_overlay_expected_flags(overlay))
+            run['moe_overlay_flags'] = str(overlay.get('expected_flags_preview') or moe_overlay_flags_preview(overlay))
         if profile_used:
             run['profile_used'] = profile_used
         for record in list(run.get('records', []) or []):
@@ -1779,6 +1817,9 @@ def _annotate_latest_stage_run(
                 if overlay:
                     record['uses_suite_overlay'] = True
                     record['moe_overlay_source'] = str(overlay.get('source') or 'measured_profiles.moe_placement')
+                    record['moe_overlay_candidate'] = str(overlay.get('candidate_name') or '')
+                    record['moe_overlay_expected_flags'] = list(overlay.get('expected_flags') or moe_overlay_expected_flags(overlay))
+                    record['moe_overlay_flags'] = str(overlay.get('expected_flags_preview') or moe_overlay_flags_preview(overlay))
         for winner in (run.get('winners', {}) or {}).values():
             if isinstance(winner, dict):
                 winner['suite_run_id'] = suite_run_id
@@ -1786,6 +1827,9 @@ def _annotate_latest_stage_run(
                 if overlay:
                     winner['uses_suite_overlay'] = True
                     winner['moe_overlay_source'] = str(overlay.get('source') or 'measured_profiles.moe_placement')
+                    winner['moe_overlay_candidate'] = str(overlay.get('candidate_name') or '')
+                    winner['moe_overlay_expected_flags'] = list(overlay.get('expected_flags') or moe_overlay_expected_flags(overlay))
+                    winner['moe_overlay_flags'] = str(overlay.get('expected_flags_preview') or moe_overlay_flags_preview(overlay))
         changed = True
         break
     return changed
@@ -1877,6 +1921,7 @@ def benchmark_full_suite(
     warnings: List[str] = []
     recommendations: Dict[str, object] = {}
     overlay: Dict[str, object] = {}
+    current_suite_moe_winner = False
 
     def emit(message: str, event: str = 'benchmark_phase', stage: str = ''):
         if progress:
@@ -1982,16 +2027,27 @@ def benchmark_full_suite(
             app.add_or_update(current)
             add_stage('moe_placement', 'done' if ok else 'failed', msg)
             if ok:
-                overlay = build_runtime_overlay_from_moe_recommendation(current)
+                overlay = build_runtime_overlay_from_moe_recommendation(current, source='current_suite')
                 if overlay:
+                    overlay['suite_run_id'] = suite_run_id
+                    current_suite_moe_winner = True
                     recommendations['moe_placement'] = overlay.get('candidate_name') or overlay.get('moe_placement_strategy')
+                    emit(moe_overlay_log_text(overlay, prefix='Full Suite MoE winner'), stage='moe placement')
+                    if stage_records and stage_records[-1].get('stage') == 'moe_placement':
+                        stage_records[-1]['moe_overlay'] = dict(overlay)
+                        stage_records[-1]['moe_overlay_source'] = overlay.get('source')
+                        stage_records[-1]['moe_overlay_candidate'] = overlay.get('candidate_name')
+                        stage_records[-1]['moe_overlay_expected_flags'] = list(overlay.get('expected_flags') or [])
+                        stage_records[-1]['moe_overlay_flags'] = overlay.get('expected_flags_preview', '')
             else:
                 warnings.append(f'MoE placement failed: {compact_message(msg)}')
         persist_suite('running')
 
         current = _current_model_for_suite(app, model)
-        if not overlay:
-            overlay = build_runtime_overlay_from_moe_recommendation(current)
+        if not overlay and not current_suite_moe_winner:
+            overlay = build_runtime_overlay_from_moe_recommendation(current, source='stored_recommendation')
+        if overlay:
+            emit(moe_overlay_log_text(overlay, prefix='Full Suite MoE overlay'), stage='smart benchmark')
         smart_model = model_with_moe_overlay(current, overlay) if overlay else _clone_model(current)
         prior_profiles = dict(getattr(current, 'measured_profiles', {}) or {})
         emit('Full Suite stage: smart benchmark', stage='smart benchmark')
@@ -2003,7 +2059,17 @@ def benchmark_full_suite(
         if profile_key:
             recommendations['default_profile'] = profile_key
         app.add_or_update(current)
-        add_stage('model_benchmark', 'done' if ok else 'failed', msg, uses_suite_overlay=bool(overlay), profile_used=profile_key)
+        add_stage(
+            'model_benchmark',
+            'done' if ok else 'failed',
+            msg,
+            uses_suite_overlay=bool(overlay),
+            profile_used=profile_key,
+            moe_overlay_source=str(overlay.get('source', '') or '') if overlay else '',
+            moe_overlay_candidate=str(overlay.get('candidate_name', '') or '') if overlay else '',
+            moe_overlay_expected_flags=list(overlay.get('expected_flags') or []) if overlay else [],
+            moe_overlay_flags=str(overlay.get('expected_flags_preview', '') or '') if overlay else '',
+        )
         if not ok:
             warnings.append(f'Smart benchmark failed: {compact_message(msg)}')
         persist_suite('running')
@@ -4095,6 +4161,8 @@ def adaptive_record_from_candidate(
     cpu_moe: bool = False,
     n_cpu_moe: int = 0,
     tensor_overrides: Optional[List[str]] = None,
+    moe_placement_mode: str = '',
+    fit_assisted_moe_placement: bool = False,
     startup_result: str = '',
     failure_category: str = '',
     failure_reason: str = '',
@@ -4229,6 +4297,8 @@ def adaptive_record_from_candidate(
         'cpu_moe': bool(cpu_moe),
         'n_cpu_moe': int(n_cpu_moe or 0),
         'tensor_overrides': tensor_override_values,
+        'moe_placement_mode': moe_placement_mode,
+        'fit_assisted_moe_placement': bool(fit_assisted_moe_placement),
         'startup_result': startup_result,
         'failure_category': failure_category,
         'failure_reason': concise_failure(failure_reason, limit=500),
@@ -4373,6 +4443,8 @@ def runtime_record_context(
         'cpu_moe': bool(getattr(profile, 'cpu_moe', False)) if profile is not None else False,
         'n_cpu_moe': int(getattr(profile, 'n_cpu_moe', 0) or 0) if profile is not None else 0,
         'tensor_overrides': list(getattr(profile, 'tensor_overrides', ()) or ()) if profile is not None else [],
+        'moe_placement_mode': runtime_profile_moe_placement_mode(profile),
+        'fit_assisted_moe_placement': runtime_profile_moe_placement_mode(profile) == 'fit_assisted',
         'gpu_layers_mode': (
             'fit' if profile is not None and getattr(profile, 'gpu_layers', None) is None and getattr(profile, 'fit', False)
             else 'fixed' if profile is not None and getattr(profile, 'gpu_layers', None) is not None
@@ -5582,6 +5654,23 @@ def _runtime_moe_label_suffix(placement: Optional[MoePlacementCandidate]) -> str
     return ''
 
 
+def runtime_profile_moe_placement_mode(runtime_profile: Optional[RuntimeProfile]) -> str:
+    if runtime_profile is None:
+        return ''
+    placement = str(getattr(runtime_profile, 'placement_strategy', '') or '').strip()
+    has_placement = bool(
+        bool(getattr(runtime_profile, 'cpu_moe', False))
+        or max(0, int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0)) > 0
+        or tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ())
+        or placement == 'cpu_moe_all'
+        or placement.startswith('n_cpu_moe_')
+        or placement in ('tensor_override', 'experts_cpu_override')
+    )
+    if not has_placement:
+        return 'fit_only' if bool(getattr(runtime_profile, 'fit', False)) else ''
+    return 'fit_assisted' if bool(getattr(runtime_profile, 'fit', False)) else 'locked'
+
+
 def active_engine_runtime_profiles(
     app: AppConfig,
     model: ModelConfig,
@@ -5684,6 +5773,8 @@ def active_engine_runtime_profiles(
             suffix = _runtime_moe_label_suffix(placement)
             if suffix and suffix not in profile_name:
                 profile_name = f'{profile_name}{suffix}'
+            if suffix and runtime_profile.fit and '+fit_assisted' not in profile_name:
+                profile_name = f'{profile_name}+fit_assisted'
         return replace(
             runtime_profile,
             name=profile_name,
@@ -5881,6 +5972,16 @@ def active_engine_runtime_profiles(
     if heavy_for_gpu and partial_ngl > 0:
         partial_ngl = min(partial_ngl, 64)
 
+    def has_locked_moe_placement() -> bool:
+        return bool(baseline_placement is not None and _runtime_moe_label_suffix(baseline_placement))
+
+    def locked_moe_ngl() -> int:
+        try:
+            current_ngl = int(getattr(model, 'ngl', 0) or 0)
+        except Exception:
+            current_ngl = 0
+        return current_ngl if current_ngl > 0 else int(partial_ngl or 0)
+
     def add(
         name: str,
         ctx: int,
@@ -6065,6 +6166,16 @@ def active_engine_runtime_profiles(
             discovery_ctx = max(ctx_min, min(ctx_max, max(8192, chat_min_ctx_per_slot(model))))
             discovery_profile = preferred_profile or baseline_profile
             discovery_kv = discovery_profile.kv_preset if discovery_profile is not None else baseline_kv
+            if has_locked_moe_placement():
+                add(
+                    'moe_locked_probe',
+                    discovery_ctx,
+                    locked_moe_ngl(),
+                    discovery_kv,
+                    batch=128,
+                    ubatch=64,
+                    kv_profile=discovery_profile,
+                )
             add(
                 f'fit_weight_discovery_{(discovery_profile.name_slug if discovery_profile is not None else "q8_0_q8_0")}',
                 discovery_ctx,
@@ -6145,6 +6256,17 @@ def active_engine_runtime_profiles(
             if supports_turbo:
                 turbo4_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), turbo_profiles[0])
                 initial_fit_kv = turbo4_profile.kv_preset
+                if has_locked_moe_placement():
+                    add(
+                        'moe_locked_probe',
+                        base_ctx,
+                        locked_moe_ngl(),
+                        turbo4_profile.kv_preset,
+                        batch=128,
+                        ubatch=64,
+                        kv_profile=turbo4_profile,
+                        no_warmup=capabilities.supports_no_warmup,
+                    )
                 add(
                     'fit_turbokv_probe',
                     base_ctx,
@@ -6170,6 +6292,16 @@ def active_engine_runtime_profiles(
                 )
             else:
                 initial_fit_kv = 'default'
+                if has_locked_moe_placement():
+                    add(
+                        'moe_locked_probe',
+                        base_ctx,
+                        locked_moe_ngl(),
+                        'default',
+                        batch=128,
+                        ubatch=64,
+                        no_warmup=capabilities.supports_no_warmup,
+                    )
                 add(
                     'fit_default_probe',
                     base_ctx,
