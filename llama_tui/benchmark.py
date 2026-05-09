@@ -1221,6 +1221,40 @@ def get_measured_profile(model: ModelConfig, key: str) -> Dict[str, object]:
     return profile if isinstance(profile, dict) and profile.get('status', 'ok') == 'ok' else {}
 
 
+def get_moe_recommendation(model: ModelConfig) -> Dict[str, object]:
+    return get_measured_profile(model, 'moe_placement')
+
+
+def has_moe_recommendation(model: ModelConfig) -> bool:
+    return bool(get_moe_recommendation(model))
+
+
+def _normalized_tensor_overrides(value: object) -> List[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def moe_recommendation_applied(model: ModelConfig) -> bool:
+    profile = get_moe_recommendation(model)
+    if not profile:
+        return False
+    if bool(getattr(model, 'cpu_moe', False)) != bool(profile.get('cpu_moe', False)):
+        return False
+    if max(0, int(getattr(model, 'n_cpu_moe', 0) or 0)) != max(0, int(profile.get('n_cpu_moe', 0) or 0)):
+        return False
+    if _normalized_tensor_overrides(getattr(model, 'tensor_overrides', [])) != _normalized_tensor_overrides(profile.get('tensor_overrides', [])):
+        return False
+    if bool(profile.get('ngl_required_for_moe_tuning', False)):
+        try:
+            return int(getattr(model, 'ngl', 0) or 0) == int(profile.get('ngl', 0) or 0)
+        except Exception:
+            return False
+    return True
+
+
 def _profile_int(profile: Dict[str, object], key: str, default: int = 0) -> int:
     try:
         return int(profile.get(key, default) or default)
@@ -1583,6 +1617,557 @@ def apply_moe_recommendation(model: ModelConfig) -> Tuple[bool, str]:
         f'MoE recommendation applied: {model.moe_placement_strategy} '
         f'ngl={model.ngl} {float(profile.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s'
     )
+
+
+def build_runtime_overlay_from_moe_recommendation(model: ModelConfig) -> Dict[str, object]:
+    profile = get_moe_recommendation(model)
+    if not profile:
+        return {}
+    candidate_name = str(profile.get('measured_candidate_name') or profile.get('runtime_profile') or '').strip()
+    overlay: Dict[str, object] = {
+        'source': 'measured_profiles.moe_placement',
+        'candidate_name': candidate_name,
+        'moe_placement_strategy': str(
+            profile.get('placement_strategy')
+            or f'measured:moe_tuning:{candidate_name or "unknown"}'
+        ),
+        'cpu_moe': bool(profile.get('cpu_moe', False)),
+        'n_cpu_moe': max(0, int(profile.get('n_cpu_moe', 0) or 0)),
+        'tensor_overrides': _normalized_tensor_overrides(profile.get('tensor_overrides', [])),
+        'ngl_required_for_moe_tuning': bool(profile.get('ngl_required_for_moe_tuning', False)),
+        'tuning_run_id': str(profile.get('tuning_run_id', '') or ''),
+        'tokens_per_sec': float(profile.get('tokens_per_sec', 0.0) or 0.0),
+    }
+    if overlay['ngl_required_for_moe_tuning'] and 'ngl' in profile:
+        try:
+            overlay['ngl'] = int(profile.get('ngl') or 0)
+        except Exception:
+            pass
+    return overlay
+
+
+def model_with_moe_overlay(model: ModelConfig, overlay: Dict[str, object]) -> ModelConfig:
+    candidate = ModelConfig(**asdict(model))
+    if not overlay:
+        return candidate
+    candidate.moe_placement_strategy = str(overlay.get('moe_placement_strategy') or '')
+    candidate.cpu_moe = bool(overlay.get('cpu_moe', False))
+    candidate.n_cpu_moe = max(0, int(overlay.get('n_cpu_moe', 0) or 0))
+    candidate.tensor_overrides = _normalized_tensor_overrides(overlay.get('tensor_overrides', []))
+    if bool(overlay.get('ngl_required_for_moe_tuning', False)) and 'ngl' in overlay:
+        try:
+            candidate.ngl = int(overlay.get('ngl') or candidate.ngl)
+        except Exception:
+            pass
+    return candidate
+
+
+def runtime_profile_with_overlay(runtime_profile: RuntimeProfile, overlay: Dict[str, object]) -> RuntimeProfile:
+    if not overlay:
+        return runtime_profile
+    gpu_layers = runtime_profile.gpu_layers
+    if bool(overlay.get('ngl_required_for_moe_tuning', False)) and 'ngl' in overlay:
+        try:
+            gpu_layers = int(overlay.get('ngl') or 0)
+        except Exception:
+            gpu_layers = runtime_profile.gpu_layers
+    placement = str(overlay.get('moe_placement_strategy') or '')
+    if placement.startswith('measured:moe_tuning:'):
+        placement = placement.rsplit(':', 1)[-1]
+    return replace(
+        runtime_profile,
+        gpu_layers=gpu_layers,
+        placement_strategy=placement,
+        cpu_moe=bool(overlay.get('cpu_moe', False)),
+        n_cpu_moe=max(0, int(overlay.get('n_cpu_moe', 0) or 0)),
+        tensor_overrides=tuple(_normalized_tensor_overrides(overlay.get('tensor_overrides', []))),
+    )
+
+
+def full_suite_recommended_profile_key(model: ModelConfig) -> str:
+    for key in ('opencode_ready', 'auto', 'fast_chat'):
+        if get_measured_profile(model, key):
+            return key
+    return ''
+
+
+SUITE_BENCHMARK_STATE_FIELDS = {
+    'last_benchmark_tokens_per_sec',
+    'last_benchmark_seconds',
+    'last_benchmark_profile',
+    'last_benchmark_results',
+    'measured_profiles',
+    'benchmark_runs',
+    'benchmark_fingerprint',
+    'default_benchmark_status',
+    'default_benchmark_at',
+    'engine_benchmark_store',
+    'last_opencode_benchmark_score',
+    'last_opencode_benchmark_seconds',
+    'last_opencode_benchmark_profile',
+    'last_opencode_benchmark_results',
+    'last_hermes_benchmark_score',
+    'last_hermes_benchmark_seconds',
+    'last_hermes_benchmark_profile',
+    'last_hermes_benchmark_results',
+}
+
+
+def _clone_model(model: ModelConfig) -> ModelConfig:
+    return ModelConfig(**asdict(model))
+
+
+def _current_model_for_suite(app, fallback: ModelConfig) -> ModelConfig:
+    if hasattr(app, 'get_model'):
+        try:
+            current = app.get_model(fallback.id)
+            if current is not None:
+                return current
+        except Exception:
+            pass
+    return fallback
+
+
+def _suite_restore_config_fields(
+    current: ModelConfig,
+    original: ModelConfig,
+    prior_profiles: Optional[Dict[str, Dict[str, object]]] = None,
+) -> ModelConfig:
+    restored = _clone_model(current)
+    for field in getattr(ModelConfig, '__dataclass_fields__', {}):
+        if field in SUITE_BENCHMARK_STATE_FIELDS:
+            continue
+        setattr(restored, field, getattr(original, field))
+    if prior_profiles:
+        merged = {
+            str(key): (dict(value) if isinstance(value, dict) else value)
+            for key, value in prior_profiles.items()
+        }
+        for key, value in (getattr(current, 'measured_profiles', {}) or {}).items():
+            merged[str(key)] = dict(value) if isinstance(value, dict) else value
+        restored.measured_profiles = merged
+    return restored
+
+
+def _annotate_latest_stage_run(
+    model: ModelConfig,
+    kind: str,
+    suite_run_id: str,
+    stage: str,
+    overlay: Optional[Dict[str, object]] = None,
+    profile_used: str = '',
+) -> bool:
+    overlay = dict(overlay or {})
+    changed = False
+    for run in list(getattr(model, 'benchmark_runs', []) or []):
+        if str(run.get('kind', '') or '') != kind:
+            continue
+        if str(run.get('suite_run_id', '') or '') and str(run.get('suite_run_id')) != suite_run_id:
+            continue
+        run['suite_run_id'] = suite_run_id
+        run['suite_stage'] = stage
+        if overlay:
+            run['uses_suite_overlay'] = True
+            run['moe_overlay_source'] = str(overlay.get('source') or 'measured_profiles.moe_placement')
+            run['moe_overlay_candidate'] = str(overlay.get('candidate_name') or '')
+        if profile_used:
+            run['profile_used'] = profile_used
+        for record in list(run.get('records', []) or []):
+            if isinstance(record, dict):
+                record['suite_run_id'] = suite_run_id
+                record['suite_stage'] = stage
+                if overlay:
+                    record['uses_suite_overlay'] = True
+                    record['moe_overlay_source'] = str(overlay.get('source') or 'measured_profiles.moe_placement')
+        for winner in (run.get('winners', {}) or {}).values():
+            if isinstance(winner, dict):
+                winner['suite_run_id'] = suite_run_id
+                winner['suite_stage'] = stage
+                if overlay:
+                    winner['uses_suite_overlay'] = True
+                    winner['moe_overlay_source'] = str(overlay.get('source') or 'measured_profiles.moe_placement')
+        changed = True
+        break
+    return changed
+
+
+def _write_full_suite_log(
+    app,
+    model: ModelConfig,
+    suite_run_id: str,
+    engine: str,
+    run: Dict[str, object],
+    stage_records: Sequence[Dict[str, object]],
+    overlay: Dict[str, object],
+) -> str:
+    root = (
+        CACHE_DIR
+        / 'suites'
+        / _safe_tuning_path_part(getattr(model, 'id', 'model'))
+        / _safe_tuning_path_part(engine or 'engine')
+        / _safe_tuning_path_part(suite_run_id)
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / 'suite.json'
+    try:
+        fingerprint = app.model_fingerprint(model)
+    except Exception:
+        fingerprint = benchmark_config_fingerprint(model)
+    payload = {
+        'suite_run_id': suite_run_id,
+        'model_id': getattr(model, 'id', ''),
+        'model_path': getattr(model, 'path', ''),
+        'model_fingerprint': fingerprint,
+        'engine_id': engine,
+        'run': dict(run),
+        'stages': [dict(item) for item in stage_records],
+        'moe_overlay': dict(overlay or {}),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding='utf-8')
+    return str(path)
+
+
+def _moe_tuning_skip_reason_for_app(app, model: ModelConfig, depth: str = 'full') -> str:
+    try:
+        hardware = app.hardware_profile(refresh=True)
+    except Exception:
+        hardware = HardwareProfile()
+    try:
+        baseline = _moe_tuning_baseline_profile(app, model, depth)
+    except Exception:
+        baseline = RuntimeProfile(
+            engine_id=getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp',
+            name='baseline_current',
+            ctx_size=max(1, int(getattr(model, 'ctx', 1) or 1)),
+            gpu_layers=int(getattr(model, 'ngl', 0) or 0),
+            parallel=max(1, int(getattr(model, 'parallel', 1) or 1)),
+        )
+    capabilities = _moe_tuning_capabilities(app, baseline)
+    try:
+        engine = app.active_engine_key_for_model(model)
+    except Exception:
+        engine = baseline.engine_id
+    return moe_tuning_eligibility_reason(model, hardware, capabilities, engine)
+
+
+def benchmark_full_suite(
+    app,
+    model: ModelConfig,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+    depth: str = 'full',
+    moe_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
+    smart_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
+    hermes_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
+    opencode_runner: Optional[Callable[..., Tuple[bool, str]]] = None,
+) -> Tuple[bool, str]:
+    depth_key = 'fast' if str(depth or '').strip().lower() == 'fast' else 'full'
+    original = _clone_model(model)
+    started_at = datetime.now().isoformat(timespec='seconds')
+    suite_run_id = f'full-suite-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    try:
+        engine = app.active_engine_key_for_model(model)
+    except Exception:
+        engine = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
+    try:
+        hardware = app.hardware_profile(refresh=True).short_summary()
+    except Exception:
+        hardware = ''
+    stage_records: List[Dict[str, object]] = []
+    warnings: List[str] = []
+    recommendations: Dict[str, object] = {}
+    overlay: Dict[str, object] = {}
+
+    def emit(message: str, event: str = 'benchmark_phase', stage: str = ''):
+        if progress:
+            progress(message)
+        emit_benchmark_event(
+            progress,
+            event,
+            model,
+            'full_suite',
+            message=message,
+            phase=stage or compact_message(message),
+            completed=len(stage_records),
+            total=5,
+            records=stage_records,
+        )
+
+    def add_stage(stage: str, status: str, detail: str = '', **extra: object):
+        row = {
+            'objective': 'full_suite',
+            'stage': stage,
+            'status': status,
+            'detail': concise_failure(detail, limit=500),
+            'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
+        }
+        row.update(extra)
+        stage_records.append(row)
+        return row
+
+    def persist_suite(status: str, ended_at: str = ''):
+        current = _current_model_for_suite(app, model)
+        saved = _suite_restore_config_fields(current, original)
+        winners: Dict[str, Dict[str, object]] = {}
+        moe = get_moe_recommendation(saved)
+        if moe:
+            winners['moe_placement'] = dict(moe)
+        profile_key = str(recommendations.get('default_profile', '') or '')
+        if profile_key and get_measured_profile(saved, profile_key):
+            winners[profile_key] = get_measured_profile(saved, profile_key)
+        run = build_benchmark_run(
+            suite_run_id,
+            'full_suite',
+            status,
+            stage_records,
+            winners,
+            started_at,
+            ended_at,
+            hardware,
+        )
+        run['suite_run_id'] = suite_run_id
+        run['depth'] = depth_key
+        run['stages'] = {
+            str(row.get('stage', '')): {
+                key: value
+                for key, value in row.items()
+                if key not in ('objective', 'benchmarked_at')
+            }
+            for row in stage_records
+        }
+        run['warnings'] = list(warnings)
+        run['recommendations'] = dict(recommendations)
+        if overlay:
+            run['uses_suite_overlay'] = True
+            run['moe_overlay'] = dict(overlay)
+        try:
+            run['suite_log_json'] = _write_full_suite_log(app, saved, suite_run_id, engine, run, stage_records, overlay)
+        except Exception as exc:
+            warnings.append(f'full suite log write failed: {compact_message(str(exc))}')
+            run['warnings'] = list(warnings)
+        run['summary'] = full_suite_summary_text(stage_records, recommendations, warnings)
+        upsert_benchmark_run(saved, run)
+        app.add_or_update(saved)
+        return saved, run
+
+    moe_runner = moe_runner or benchmark_moe_placement_tuning
+    smart_runner = smart_runner or benchmark_best_optimization
+    if hermes_runner is None:
+        from .hermes_benchmark import benchmark_hermes_workflow as hermes_runner
+    if opencode_runner is None:
+        from .opencode_benchmark import benchmark_opencode_workflow as opencode_runner
+
+    try:
+        emit(f'Full Suite Benchmark started: model={model.name or model.id} engine={engine}', 'benchmark_started', 'preflight')
+        preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'full_suite', progress, cancel_token)
+        add_stage('preflight', 'ok' if preflight_ok else 'failed', preflight_msg)
+        if not preflight_ok:
+            ended_at = datetime.now().isoformat(timespec='seconds')
+            persist_suite('failed', ended_at)
+            return False, preflight_msg
+        persist_suite('running')
+
+        current = _current_model_for_suite(app, model)
+        skip_reason = _moe_tuning_skip_reason_for_app(app, current, depth_key)
+        if skip_reason:
+            add_stage('moe_placement', 'skipped', skip_reason)
+            warnings.append(f'MoE placement skipped: {skip_reason}')
+        else:
+            prior_profiles = dict(getattr(current, 'measured_profiles', {}) or {})
+            emit('Full Suite stage: MoE placement tuning', stage='moe placement')
+            ok, msg = moe_runner(app, current, progress=progress, cancel_token=cancel_token, depth=depth_key)
+            current = _current_model_for_suite(app, current)
+            current = _suite_restore_config_fields(current, original, prior_profiles)
+            _annotate_latest_stage_run(current, 'moe_tuning', suite_run_id, 'moe_placement')
+            app.add_or_update(current)
+            add_stage('moe_placement', 'done' if ok else 'failed', msg)
+            if ok:
+                overlay = build_runtime_overlay_from_moe_recommendation(current)
+                if overlay:
+                    recommendations['moe_placement'] = overlay.get('candidate_name') or overlay.get('moe_placement_strategy')
+            else:
+                warnings.append(f'MoE placement failed: {compact_message(msg)}')
+        persist_suite('running')
+
+        current = _current_model_for_suite(app, model)
+        if not overlay:
+            overlay = build_runtime_overlay_from_moe_recommendation(current)
+        smart_model = model_with_moe_overlay(current, overlay) if overlay else _clone_model(current)
+        prior_profiles = dict(getattr(current, 'measured_profiles', {}) or {})
+        emit('Full Suite stage: smart benchmark', stage='smart benchmark')
+        ok, msg = smart_runner(app, smart_model, progress=progress, cancel_token=cancel_token)
+        current = _current_model_for_suite(app, smart_model)
+        current = _suite_restore_config_fields(current, original, prior_profiles)
+        _annotate_latest_stage_run(current, 'server', suite_run_id, 'model_benchmark', overlay)
+        profile_key = full_suite_recommended_profile_key(current)
+        if profile_key:
+            recommendations['default_profile'] = profile_key
+        app.add_or_update(current)
+        add_stage('model_benchmark', 'done' if ok else 'failed', msg, uses_suite_overlay=bool(overlay), profile_used=profile_key)
+        if not ok:
+            warnings.append(f'Smart benchmark failed: {compact_message(msg)}')
+        persist_suite('running')
+
+        current = _current_model_for_suite(app, model)
+        workflow_profile = full_suite_recommended_profile_key(current)
+        workflow_overlay = overlay or build_runtime_overlay_from_moe_recommendation(current)
+        workflow_model = model_with_moe_overlay(current, workflow_overlay) if workflow_overlay else _clone_model(current)
+        prior_profiles = dict(getattr(current, 'measured_profiles', {}) or {})
+        emit('Full Suite stage: Hermes workflow benchmark', stage='hermes benchmark')
+        ok, msg = hermes_runner(app, workflow_model, progress=progress, cancel_token=cancel_token)
+        current = _current_model_for_suite(app, workflow_model)
+        current = _suite_restore_config_fields(current, original, prior_profiles)
+        _annotate_latest_stage_run(current, 'hermes', suite_run_id, 'hermes', workflow_overlay, workflow_profile)
+        app.add_or_update(current)
+        add_stage('hermes', 'passed' if ok else 'failed', msg, uses_suite_overlay=bool(workflow_overlay), profile_used=workflow_profile)
+        if not ok:
+            warnings.append(f'Hermes benchmark failed: {compact_message(msg)}')
+        persist_suite('running')
+
+        current = _current_model_for_suite(app, model)
+        workflow_profile = full_suite_recommended_profile_key(current)
+        workflow_overlay = overlay or build_runtime_overlay_from_moe_recommendation(current)
+        workflow_model = model_with_moe_overlay(current, workflow_overlay) if workflow_overlay else _clone_model(current)
+        prior_profiles = dict(getattr(current, 'measured_profiles', {}) or {})
+        emit('Full Suite stage: OpenCode workflow benchmark', stage='opencode benchmark')
+        ok, msg = opencode_runner(app, workflow_model, progress=progress, cancel_token=cancel_token)
+        current = _current_model_for_suite(app, workflow_model)
+        current = _suite_restore_config_fields(current, original, prior_profiles)
+        _annotate_latest_stage_run(current, 'opencode', suite_run_id, 'opencode', workflow_overlay, workflow_profile)
+        app.add_or_update(current)
+        add_stage('opencode', 'passed' if ok else 'failed', msg, uses_suite_overlay=bool(workflow_overlay), profile_used=workflow_profile)
+        if not ok:
+            warnings.append(f'OpenCode benchmark failed: {compact_message(msg)}')
+
+    except CancelledError:
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        add_stage('aborted', 'aborted', 'user requested abort')
+        saved, _run = persist_suite('aborted', ended_at)
+        msg = 'Full Suite Benchmark aborted; managed processes stopped'
+        emit(msg, 'benchmark_aborted', 'aborted')
+        return False, msg
+
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    failed_stages = [
+        row for row in stage_records
+        if str(row.get('status', '') or '').lower() in ('failed', 'aborted')
+        and str(row.get('stage', '') or '') not in ('moe_placement',)
+    ]
+    status = 'done' if not failed_stages else 'failed'
+    saved, run = persist_suite(status, ended_at)
+    msg = run.get('summary', '') or full_suite_summary_text(stage_records, recommendations, warnings)
+    if progress:
+        progress(msg)
+    emit_benchmark_event(
+        progress,
+        'benchmark_done' if status == 'done' else 'benchmark_error',
+        saved,
+        'full_suite',
+        message=msg,
+        phase='summary',
+        completed=len(stage_records),
+        total=len(stage_records),
+        records=stage_records,
+    )
+    return status == 'done', msg
+
+
+def full_suite_summary_text(
+    stage_records: Sequence[Dict[str, object]],
+    recommendations: Optional[Dict[str, object]] = None,
+    warnings: Optional[Sequence[str]] = None,
+) -> str:
+    recommendations = dict(recommendations or {})
+    warnings = list(warnings or [])
+    parts = []
+    for name in ('moe_placement', 'model_benchmark', 'hermes', 'opencode'):
+        row = next((item for item in stage_records if str(item.get('stage', '') or '') == name), None)
+        if not row:
+            continue
+        status = str(row.get('status', '') or '')
+        if name == 'moe_placement' and recommendations.get('moe_placement'):
+            parts.append(f'moe={recommendations["moe_placement"]}')
+        elif name == 'model_benchmark' and recommendations.get('default_profile'):
+            parts.append(f'profile={recommendations["default_profile"]}')
+        else:
+            parts.append(f'{name}={status}')
+    if warnings:
+        parts.append(f'{len(warnings)} warning(s)')
+    return 'Full Suite Benchmark complete: ' + ', '.join(parts) if parts else 'Full Suite Benchmark complete'
+
+
+def suite_run_recommended_profile_key(model: ModelConfig, run: Optional[Dict[str, object]] = None) -> str:
+    recommendations = (run or {}).get('recommendations') if isinstance(run, dict) else {}
+    if isinstance(recommendations, dict):
+        key = str(recommendations.get('default_profile', '') or '').strip()
+        if key and get_measured_profile(model, key):
+            return key
+    return full_suite_recommended_profile_key(model)
+
+
+def apply_full_suite_profile_recommendation(
+    model: ModelConfig,
+    run: Optional[Dict[str, object]] = None,
+) -> Tuple[bool, str]:
+    key = suite_run_recommended_profile_key(model, run)
+    if not key:
+        return False, 'no measured model profile recommendation to apply'
+    moe_snapshot = {
+        'moe_placement_strategy': getattr(model, 'moe_placement_strategy', ''),
+        'cpu_moe': bool(getattr(model, 'cpu_moe', False)),
+        'n_cpu_moe': max(0, int(getattr(model, 'n_cpu_moe', 0) or 0)),
+        'tensor_overrides': list(getattr(model, 'tensor_overrides', []) or []),
+    }
+    ok, msg = apply_measured_profile(model, key)
+    model.moe_placement_strategy = str(moe_snapshot['moe_placement_strategy'])
+    model.cpu_moe = bool(moe_snapshot['cpu_moe'])
+    model.n_cpu_moe = int(moe_snapshot['n_cpu_moe'])
+    model.tensor_overrides = list(moe_snapshot['tensor_overrides'])
+    if not ok:
+        return False, msg
+    return True, f'Full Suite profile applied ({key}): {msg}'
+
+
+def _add_or_update_without_export(app, model: ModelConfig):
+    try:
+        app.add_or_update(model, sync_exports=False)
+    except TypeError:
+        app.add_or_update(model)
+
+
+def apply_full_suite_recommendations(
+    app,
+    model: ModelConfig,
+    run: Optional[Dict[str, object]] = None,
+) -> Tuple[bool, str]:
+    messages: List[str] = []
+    profile_ok, profile_msg = apply_full_suite_profile_recommendation(model, run)
+    if profile_ok:
+        messages.append(profile_msg)
+
+    moe_ok = False
+    moe_msg = ''
+    if has_moe_recommendation(model):
+        moe_ok, moe_msg = apply_moe_recommendation(model)
+        if moe_ok:
+            messages.append(moe_msg)
+
+    if not messages:
+        return False, profile_msg or moe_msg or 'no Full Suite recommendations to apply'
+
+    _add_or_update_without_export(app, model)
+    sync_msg = sync_opencode_after_tuning(app)
+    profile_key = suite_run_recommended_profile_key(model, run)
+    moe_name = str(get_moe_recommendation(model).get('measured_candidate_name', '') or '')
+    if hasattr(app, 'append_log'):
+        try:
+            app.append_log(
+                model.id,
+                f'Applied full suite recommendations: moe={moe_name or "-"} profile={profile_key or "-"}',
+            )
+        except Exception:
+            pass
+    return True, f'Applied Full Suite recommendations: {" | ".join(messages)} | {sync_msg}'
 
 
 def model_from_measured_profile(model: ModelConfig, key: str) -> Optional[ModelConfig]:
@@ -3542,6 +4127,8 @@ def adaptive_record_from_candidate(
     preserve_thinking_source: str = '',
     chat_template_kwargs: Optional[Dict[str, object]] = None,
     unsupported_launch_flags: Optional[List[str]] = None,
+    effective_server_args: Optional[List[str]] = None,
+    effective_server_command: str = '',
 ) -> Dict[str, object]:
     if not startup_result:
         startup_result = 'READY' if status == 'ok' else 'FAILED' if status in ('start failed', 'not ready') else ''
@@ -3662,6 +4249,8 @@ def adaptive_record_from_candidate(
         'preserve_thinking_source': preserve_thinking_source,
         'chat_template_kwargs': dict(chat_template_kwargs or {}),
         'unsupported_launch_flags': list(unsupported_launch_flags or []),
+        'effective_server_args': [str(item) for item in list(effective_server_args or [])],
+        'effective_server_command': effective_server_command or command,
         'detail': concise_failure(detail, limit=500),
         'benchmarked_at': datetime.now().isoformat(timespec='seconds'),
     }
@@ -3695,8 +4284,9 @@ def runtime_record_context(
         )
     except Exception:
         profile = runtime_profile
+    effective_args = benchmark_effective_server_args(app, candidate, profile, benchmark_profile)
     if not command:
-        command = benchmark_command_preview(app, candidate, profile, benchmark_profile)
+        command = shlex.join(effective_args) if effective_args else benchmark_command_preview(app, candidate, profile, benchmark_profile)
     engine = ''
     server_bin = ''
     if hasattr(app, 'active_engine_key_for_model'):
@@ -3789,6 +4379,8 @@ def runtime_record_context(
             else ''
         ),
         'command': command,
+        'effective_server_args': effective_args,
+        'effective_server_command': command,
     }
     if benchmark_profile is not None:
         context.update(benchmark_launch_metadata(benchmark_profile, unsupported_launch_flags))

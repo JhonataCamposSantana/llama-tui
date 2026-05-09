@@ -12,6 +12,9 @@ from llama_tui.ui import (
     apply_quit_policy,
     adjust_scroll_offset,
     benchmark_freshness_label,
+    benchmark_menu_intro_lines,
+    benchmark_menu_options,
+    benchmark_menu_recommendation,
     benchmark_ranking_items,
     body_content_bottom,
     body_content_rows,
@@ -23,6 +26,7 @@ from llama_tui.ui import (
     browser_models,
     build_error_source_lines,
     build_benchmark_progress_items,
+    build_full_suite_progress_items,
     build_error_items,
     build_header_config_items,
     build_header_dashboard_items,
@@ -57,9 +61,13 @@ from llama_tui.ui import (
     form_key_advances,
     form_key_submits,
     form_status_text,
+    full_suite_results_items,
+    full_suite_stage_lines,
     machine_category_items,
     machine_gap_items,
     machine_ranking_items,
+    moe_recommendation_state_text,
+    moe_tuning_items,
     model_sort_key,
     new_try_live_metrics,
     new_benchmark_run_state,
@@ -74,6 +82,8 @@ from llama_tui.ui import (
     reset_try_live_metrics,
     cycle_right_tab,
     sort_mode_label,
+    suggested_next_action,
+    overview_items,
     default_right_tab,
     normalize_right_tab,
     right_scroll_action_for_view,
@@ -696,6 +706,98 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn('MODEL', browser_header_for_view('compact', 100))
         self.assertEqual(browser_view_label('advanced'), 'Advanced')
 
+    def test_suggested_next_action_guides_moe_and_apply_paths(self):
+        class FakeApp:
+            def model_fingerprint(self, _model):
+                return 'fp'
+
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp'
+
+            def active_runtime_binary_for_model(self, _model):
+                return '/bin/llama-server'
+
+            def command_exists(self, _command):
+                return True
+
+            def validate_model_target(self, _model):
+                return True, ''
+
+            def turboquant_session_advisory(self, _model):
+                return ''
+
+            def turboquant_binary_warning(self, _model):
+                return ''
+
+        model = ModelConfig(
+            id='moe',
+            name='MoE',
+            path='moe.gguf',
+            alias='moe',
+            port=18080,
+            architecture_type='moe',
+            expert_count=64,
+            expert_used_count=8,
+        )
+
+        action = suggested_next_action(FakeApp(), model)
+        self.assertEqual(action.label, 'Run Full Suite Benchmark')
+        self.assertEqual(action.key, 'B')
+
+        model.measured_profiles = {
+            'moe_placement': {
+                'status': 'ok',
+                'measured_candidate_name': 'n_cpu_moe_24',
+                'n_cpu_moe': 24,
+                'tensor_overrides': [],
+            }
+        }
+
+        action = suggested_next_action(FakeApp(), model)
+        self.assertEqual(action.label, 'Apply MoE Recommendation')
+        self.assertEqual(action.key, 'A')
+
+    def test_overview_items_are_summary_first_and_hide_paths(self):
+        class FakeApp:
+            def model_fingerprint(self, _model):
+                return 'fp'
+
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp'
+
+            def active_runtime_binary_for_model(self, _model):
+                return '/bin/llama-server'
+
+            def command_exists(self, _command):
+                return True
+
+            def validate_model_target(self, _model):
+                return True, ''
+
+            def turboquant_session_advisory(self, _model):
+                return ''
+
+            def turboquant_binary_warning(self, _model):
+                return ''
+
+        model = ModelConfig(
+            id='tiny',
+            name='Tiny',
+            path='/very/long/tiny.gguf',
+            alias='tiny',
+            port=18080,
+        )
+
+        text = '\n'.join(line for line, _attr in overview_items(FakeApp(), model, 'STOPPED', width=80))
+
+        self.assertIn('Model', text)
+        self.assertIn('Health', text)
+        self.assertIn('Recommendation', text)
+        self.assertIn('Suggested next step:', text)
+        self.assertIn('[B] Benchmark Menu', text)
+        self.assertNotIn('/very/long/tiny.gguf', text)
+        self.assertNotIn('command preview', text.lower())
+
     def test_advanced_browser_view_preserves_dense_line(self):
         model = ModelConfig(id='dense', name='Dense', path='dense.gguf', alias='dense', port=18080)
 
@@ -1189,7 +1291,107 @@ class ProfileUiTests(unittest.TestCase):
         self.assertIn('Raw Speed Benchmark...', text)
         self.assertIn('Settings...', text)
         self.assertIn('Config Doctor...', text)
+        self.assertIn('Apply MoE Recommendation - run MoE tuning first', text)
         self.assertTrue(all(len(f'[{key}] {label}') <= 68 for key, label, _value in options))
+
+    def test_command_palette_enables_apply_moe_when_recommendation_exists(self):
+        app = SimpleNamespace(ui=SimpleNamespace(detail_density='simple', browser_view='compact'))
+        model = ModelConfig(
+            id='moe',
+            name='MoE',
+            path='moe.gguf',
+            alias='moe',
+            port=18080,
+            architecture_type='moe',
+            expert_count=64,
+            measured_profiles={
+                'moe_placement': {
+                    'status': 'ok',
+                    'measured_candidate_name': 'n_cpu_moe_24',
+                    'n_cpu_moe': 24,
+                    'tensor_overrides': [],
+                }
+            },
+        )
+
+        options = command_palette_options(app, model)
+
+        self.assertIn(('r', 'Apply MoE Recommendation', 'apply_moe_recommendation'), options)
+
+    def test_moe_recommendation_state_and_tuning_items_show_apply_hint(self):
+        model = ModelConfig(
+            id='moe',
+            name='MoE',
+            path='moe.gguf',
+            alias='moe',
+            port=18080,
+            architecture_type='moe',
+            expert_count=64,
+            measured_profiles={
+                'moe_placement': {
+                    'status': 'ok',
+                    'measured_candidate_name': 'n_cpu_moe_24',
+                    'n_cpu_moe': 24,
+                    'tensor_overrides': [],
+                    'tokens_per_sec': 18.5,
+                }
+            },
+        )
+
+        self.assertEqual(moe_recommendation_state_text(model), 'available, not applied')
+        text = '\n'.join(line for line, _attr in moe_tuning_items(model))
+        self.assertIn('Applied: No', text)
+        self.assertIn('[A] Apply MoE Recommendation', text)
+
+        model.n_cpu_moe = 24
+        self.assertEqual(moe_recommendation_state_text(model), 'applied')
+        applied_text = '\n'.join(line for line, _attr in moe_tuning_items(model))
+        self.assertIn('Applied: Yes', applied_text)
+
+    def test_benchmark_menu_options_and_recommendation_for_moe_model(self):
+        class FakeApp:
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp'
+
+        model = ModelConfig(
+            id='moe',
+            name='MoE',
+            path='moe.gguf',
+            alias='moe',
+            port=18080,
+            architecture_type='moe',
+            expert_count=64,
+        )
+
+        options = benchmark_menu_options(FakeApp(), model)
+        labels = '\n'.join(label for _key, label, _value in options)
+        values = {value for _key, _label, value in options}
+        recommended, reason = benchmark_menu_recommendation(FakeApp(), model)
+        intro = '\n'.join(benchmark_menu_intro_lines(FakeApp(), model))
+
+        self.assertIn('Quick Benchmark', labels)
+        self.assertIn('Smart Benchmark', labels)
+        self.assertIn('MoE Placement Tuning', labels)
+        self.assertIn('Hermes Benchmark', labels)
+        self.assertIn('OpenCode Benchmark', labels)
+        self.assertIn('Full Suite Benchmark', labels)
+        self.assertIn('full_suite', values)
+        self.assertEqual(recommended, 'full_suite')
+        self.assertIn('MoE placement has not been measured', reason)
+        self.assertIn('Recommended: Full Suite Benchmark', intro)
+
+    def test_benchmark_menu_disables_moe_for_dense_model(self):
+        class FakeApp:
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp'
+
+        model = ModelConfig(id='dense', name='Dense', path='dense.gguf', alias='dense', port=18080, architecture_type='dense')
+
+        options = benchmark_menu_options(FakeApp(), model)
+        moe_entry = next(item for item in options if item[0] == '3')
+
+        self.assertIn('unavailable', moe_entry[1])
+        self.assertTrue(moe_entry[2].startswith('disabled:moe:'))
 
     def test_log_and_error_tab_builders_are_separate(self):
         logs = build_log_items(['server line'], log_attr=2, muted_attr=4)
@@ -1259,6 +1461,62 @@ class ProfileUiTests(unittest.TestCase):
         self.assertIn('runtime:', text)
         self.assertIn('latest result:', text)
         self.assertIn('Hermes readiness: needs 65536', text)
+
+    def test_full_suite_progress_and_results_show_stages_and_actions(self):
+        model = ModelConfig(
+            id='moe',
+            name='MoE Model',
+            path='moe.gguf',
+            alias='moe',
+            port=18080,
+            measured_profiles={
+                'moe_placement': {
+                    'status': 'ok',
+                    'measured_candidate_name': 'n_cpu_moe_30',
+                    'n_cpu_moe': 30,
+                    'tensor_overrides': [],
+                },
+                'opencode_ready': {
+                    'status': 'ok',
+                    'ctx': 32768,
+                    'ctx_per_slot': 32768,
+                    'parallel': 1,
+                    'tokens_per_sec': 18.0,
+                },
+            },
+        )
+        records = [
+            {'stage': 'preflight', 'status': 'ok', 'detail': 'ready'},
+            {'stage': 'moe_placement', 'status': 'done', 'detail': 'winner n_cpu_moe_30'},
+            {'stage': 'model_benchmark', 'status': 'done', 'profile_used': 'opencode_ready'},
+            {'stage': 'hermes', 'status': 'passed', 'profile_used': 'opencode_ready'},
+            {'stage': 'opencode', 'status': 'passed', 'profile_used': 'opencode_ready'},
+        ]
+        state = new_benchmark_run_state(model.id, 'full_suite', 'suite', now=10.0)
+        state.update({'status': 'running', 'phase': 'hermes benchmark', 'completed': 4, 'total': 5, 'records': records})
+        run = {
+            'id': 'full-suite-1',
+            'kind': 'full_suite',
+            'status': 'done',
+            'records': records,
+            'recommendations': {'moe_placement': 'n_cpu_moe_30', 'default_profile': 'opencode_ready'},
+            'warnings': ['lower n_cpu_moe failed'],
+            'summary': 'Full Suite Benchmark complete',
+        }
+
+        progress_text = '\n'.join(line for line, _attr in build_full_suite_progress_items(model, state, width=80))
+        results_text = '\n'.join(line for line, _attr in full_suite_results_items(model, run, width=80))
+        stage_text = '\n'.join(full_suite_stage_lines(records))
+
+        self.assertIn('Full Suite Benchmark', progress_text)
+        self.assertIn('MoE Placement', progress_text)
+        self.assertIn('Hermes Benchmark', progress_text)
+        self.assertIn('[x] Smart Benchmark', stage_text)
+        self.assertIn('MoE Placement: n_cpu_moe_30', results_text)
+        self.assertIn('Default Profile: opencode_ready', results_text)
+        self.assertIn('[A] Apply all recommendations', results_text)
+        self.assertIn('[M] Apply MoE only', results_text)
+        self.assertIn('[P] Apply profile only', results_text)
 
 
 class TryLiveStatsTests(unittest.TestCase):

@@ -2,29 +2,36 @@ import curses
 import textwrap
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .app import AppConfig, CONTINUE_MERGE_MODES, context_per_slot
 from .benchmark import (
     append_model_log,
+    apply_full_suite_profile_recommendation,
+    apply_full_suite_recommendations,
     apply_measured_profile,
     apply_moe_recommendation,
     benchmark_all_models_deep,
     benchmark_best_optimization,
     benchmark_fast_profiles,
+    benchmark_full_suite,
     benchmark_moe_placement_tuning,
     benchmark_profile_is_fresh,
     benchmark_raw_speed_profile,
     deep_benchmark_model_decision,
     estimate_text_tokens,
     get_measured_profile,
+    has_moe_recommendation,
     launch_hermes_stack,
     launch_opencode_stack,
     launch_with_failsafe,
     machine_best_summary,
+    moe_recommendation_applied,
     record_matches_profile,
+    suite_run_recommended_profile_key,
     start_model_with_progress,
     sync_opencode_after_tuning,
 )
@@ -37,7 +44,7 @@ from .hermes_benchmark import benchmark_hermes_workflow
 from .hardware import HardwareProfile
 from .models import ModelConfig
 from .opencode_benchmark import benchmark_opencode_workflow
-from .optimize import apply_best_optimization, select_best_tier
+from .optimize import apply_best_optimization, model_is_moe, select_best_tier
 from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, wrap_display_lines
 
 PROFILE_LABELS = {
@@ -134,6 +141,16 @@ SERVER_WINNER_LABELS = {
     'auto': ('Winner', 'Ideal'),
     'moe_placement': ('Winner', 'MoE placement'),
 }
+
+
+@dataclass(frozen=True)
+class SuggestedAction:
+    label: str
+    key: str
+    reason: str
+    severity: str = 'normal'
+
+
 RANK_ROLE_PRIORITY = {
     'Winner': 0,
     'Runner-up': 1,
@@ -1166,8 +1183,18 @@ def build_header_dashboard_items(
         detail_text = compact_message(str(detail or ''))
         if detail_text:
             active_line += f' ({detail_text})'
+        suggested = suggested_next_action(app, active_model, status) if app is not None else SuggestedAction('Launch Model', 'T', 'Model selected.')
+        pick = format_model_recommendation(app, active_model) if app is not None else 'Needs Bench'
+        benchmark_state_text = benchmark_freshness_display(app, active_model) if app is not None else 'Missing'
+        selected_line = (
+            f'selected: {active_model.name or active_model.id}  '
+            f'status: {status}  benchmark: {benchmark_state_text}  recommendation: {pick}'
+        )
+        next_line = f'next: [{suggested.key}] {suggested.label} - {suggested.reason}'
     else:
         active_line = 'active: none'
+        selected_line = 'selected: none'
+        next_line = 'next: select a model'
     engine_line = active_engine_badge_line(app, active_model) if app is not None and active_model is not None else ''
 
     view_line = f'view: {VIEW_LABELS.get(view_mode, view_mode or "Models")}'
@@ -1191,6 +1218,8 @@ def build_header_dashboard_items(
     if engine_line:
         lines.append((engine_line, active_engine_badge_kind(app, active_model) if app is not None and active_model is not None else 'muted'))
     lines.extend([
+        (selected_line, 'status' if status == 'READY' else 'error' if status == 'ERROR' else 'muted'),
+        (next_line, 'message' if active_model else 'muted'),
         (active_line, 'status' if status == 'READY' else 'error' if status == 'ERROR' else 'muted'),
         (view_line, 'muted'),
         (bench_line, 'benchmark' if benchmark_active else 'muted'),
@@ -1211,6 +1240,14 @@ def build_benchmark_progress_items(
     normal_attr: int = 0,
     app: Optional[AppConfig] = None,
 ) -> List[Tuple[str, int]]:
+    if str(state.get('run_kind') or '') == 'full_suite':
+        return build_full_suite_progress_items(
+            model,
+            state,
+            width,
+            accent_attr=accent_attr,
+            normal_attr=normal_attr,
+        )
     completed = int(state.get('completed', 0) or 0)
     total = int(state.get('total', 0) or 0)
     fraction = benchmark_progress_fraction(completed, total)
@@ -1277,6 +1314,101 @@ def build_benchmark_progress_items(
             ('', normal_attr),
             ('latest result: waiting for first row', normal_attr),
         ])
+    return items
+
+
+FULL_SUITE_STAGES = (
+    ('preflight', 'Preflight'),
+    ('moe_placement', 'MoE Placement'),
+    ('model_benchmark', 'Smart Benchmark'),
+    ('hermes', 'Hermes Benchmark'),
+    ('opencode', 'OpenCode Benchmark'),
+)
+
+
+def full_suite_stage_map(records: Sequence[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    stages: Dict[str, Dict[str, object]] = {}
+    for row in list(records or []):
+        if not isinstance(row, dict):
+            continue
+        stage = str(row.get('stage', '') or '')
+        if stage:
+            stages[stage] = dict(row)
+    return stages
+
+
+def full_suite_status_symbol(status: str, active: bool = False) -> str:
+    value = str(status or '').strip().lower()
+    if value in ('ok', 'done', 'passed'):
+        return '[x]'
+    if value == 'skipped':
+        return '[-]'
+    if value in ('failed', 'aborted'):
+        return '[!]'
+    if active:
+        return '[>]'
+    return '[ ]'
+
+
+def full_suite_stage_lines(records: Sequence[Dict[str, object]], active_phase: str = '') -> List[str]:
+    stages = full_suite_stage_map(records)
+    phase_key = str(active_phase or '').strip().lower().replace(' ', '_')
+    lines: List[str] = []
+    for key, label in FULL_SUITE_STAGES:
+        row = stages.get(key, {})
+        status = str(row.get('status', '') or '')
+        active = bool(phase_key and (phase_key == key or key.replace('_', ' ') in str(active_phase or '').lower()))
+        symbol = full_suite_status_symbol(status, active=active)
+        detail = compact_message(str(row.get('detail', '') or ''))
+        if key == 'moe_placement':
+            rec = str(row.get('winner', '') or row.get('candidate', '') or '')
+            if rec:
+                detail = rec
+        if key in ('hermes', 'opencode', 'model_benchmark') and row.get('profile_used'):
+            detail = f'profile {row.get("profile_used")}'
+        suffix = f'  {detail}' if detail else ''
+        lines.append(f'{symbol} {label:17} {status or "pending"}{suffix}')
+    return lines
+
+
+def full_suite_run_from_state(state: Dict[str, object]) -> Dict[str, object]:
+    records = list(state.get('records', []) or [])
+    return {
+        'kind': 'full_suite',
+        'status': state.get('status', ''),
+        'records': records,
+        'recommendations': state.get('recommendations', {}) or {},
+        'warnings': state.get('warnings', []) or [],
+        'summary': state.get('message', '') or '',
+    }
+
+
+def build_full_suite_progress_items(
+    model: ModelConfig,
+    state: Dict[str, object],
+    width: int,
+    accent_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    completed = int(state.get('completed', 0) or 0)
+    total = int(state.get('total', 0) or 0)
+    phase = str(state.get('phase') or '')
+    items: List[Tuple[str, int]] = [
+        ('Full Suite Benchmark', accent_attr),
+        (f'model: {model.name or model.id}', normal_attr),
+        (f'status: {state.get("status") or "idle"}   elapsed: {benchmark_elapsed_text(state)}', normal_attr),
+        (f'progress: {progress_bar_text(completed, total, max(8, width - 18))} {completed}/{total if total else "?"}', accent_attr),
+        ('', normal_attr),
+        ('Stages', accent_attr),
+    ]
+    items.extend((line, normal_attr) for line in full_suite_stage_lines(list(state.get('records', []) or []), active_phase=phase))
+    message = compact_message(str(state.get('message', '') or ''))
+    if message:
+        items.extend([('', normal_attr), (f'Current: {message}', normal_attr)])
+    feed = [compact_message(str(item)) for item in list(state.get('feed', []) or []) if compact_message(str(item))]
+    if feed:
+        items.extend([('', normal_attr), ('Recent', accent_attr)])
+        items.extend((line, normal_attr) for line in feed[-4:])
     return items
 
 
@@ -1783,6 +1915,136 @@ def compact_bytes(value: object) -> str:
     return f'{raw} B'
 
 
+def moe_recommendation_state_text(model: ModelConfig) -> str:
+    if not has_moe_recommendation(model):
+        return 'none'
+    return 'applied' if moe_recommendation_applied(model) else 'available, not applied'
+
+
+def _safe_benchmark_freshness(app: Optional[AppConfig], model: ModelConfig) -> str:
+    if app is None:
+        return 'missing'
+    try:
+        return benchmark_freshness_label(app, model)
+    except Exception:
+        status = str(getattr(model, 'default_benchmark_status', '') or '').strip().lower()
+        return status if status in ('fresh', 'stale', 'missing', 'failed', 'pending', 'running') else 'missing'
+
+
+def _has_any_measured_launch_profile(model: ModelConfig) -> bool:
+    return any(get_measured_profile(model, key) for key in ('opencode_ready', 'auto', 'fast_chat', 'long_context'))
+
+
+def suggested_next_action(
+    app: Optional[AppConfig],
+    model: Optional[ModelConfig],
+    status: str = 'STOPPED',
+) -> SuggestedAction:
+    if model is None:
+        return SuggestedAction('Select a model', 'Enter', 'Choose a model before launching or benchmarking.', 'normal')
+
+    normalized_status = str(status or '').strip().upper()
+    if normalized_status == 'ERROR':
+        return SuggestedAction('View Logs', 'L', 'The selected model is in an error state.', 'error')
+
+    if has_moe_recommendation(model) and not moe_recommendation_applied(model):
+        return SuggestedAction(
+            'Apply MoE Recommendation',
+            'A',
+            'Measured MoE placement exists but current launch config does not use it.',
+            'warning',
+        )
+
+    freshness = _safe_benchmark_freshness(app, model)
+    if freshness == 'failed' and not _has_any_measured_launch_profile(model):
+        return SuggestedAction('View Results', 'R', 'The last benchmark failed and no working measured profile is saved.', 'error')
+
+    try:
+        moe_reason = _moe_menu_disabled_reason(app, model)
+    except Exception:
+        moe_reason = 'not eligible'
+    if not moe_reason and not has_moe_recommendation(model):
+        return SuggestedAction(
+            'Run Full Suite Benchmark',
+            'B',
+            'This MoE model has not measured expert placement yet.',
+            'warning',
+        )
+
+    if not _has_any_measured_launch_profile(model):
+        return SuggestedAction('Run Smart Benchmark', 'B', 'No measured launch profile is saved for this model.', 'warning')
+
+    if freshness in ('stale', 'missing'):
+        return SuggestedAction('Run Smart Benchmark', 'B', f'Benchmark proof is {freshness}.', 'warning')
+
+    if not float(getattr(model, 'last_opencode_benchmark_score', 0.0) or 0.0):
+        return SuggestedAction('Run OpenCode Benchmark', 'B', 'Launch profile exists, but OpenCode workflow is not validated.', 'normal')
+
+    if normalized_status == 'READY':
+        return SuggestedAction('Try Model', 'T', 'Model is running and ready for an interactive check.', 'normal')
+
+    return SuggestedAction('Launch Model', 'T', 'Measured profile exists; launch or try the model.', 'normal')
+
+
+def overview_items(
+    app: Optional[AppConfig],
+    model: ModelConfig,
+    status: str,
+    detail: str = '',
+    width: int = 120,
+    success_attr: int = 0,
+    warning_attr: int = 0,
+    error_attr: int = 0,
+    heading_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    row_summary = build_model_row_summary(app, model, status) if app is not None else {}
+    action = suggested_next_action(app, model, status)
+    severity_attr = {
+        'error': error_attr,
+        'warning': warning_attr,
+        'success': success_attr,
+    }.get(action.severity, normal_attr)
+    health = str(row_summary.get('health', '-') or '-')
+    health_reason = compact_message(str(row_summary.get('health_reason', '') or '-'))
+    health_attr = success_attr if health == 'OK' else warning_attr if health in ('WARN', 'STALE') else error_attr
+    model_type = classify_model_type(model)
+    engine = active_engine_short(app, model) if app is not None else display_runtime(model)
+    benchmark = benchmark_freshness_display(app, model) if app is not None else 'Missing'
+    moe_state = moe_recommendation_state_text(model) if model_is_moe(model) else 'not MoE'
+    status_text = f'{status}'
+    detail_text = compact_message(str(detail or ''))
+    if detail_text and status != 'STOPPED':
+        status_text = f'{status_text} ({detail_text})'
+    items: List[Tuple[str, int]] = [
+        ('Model', heading_attr),
+        (f'Name: {model.name or model.id}', normal_attr),
+        (f'Type: {model_type}', normal_attr),
+        (f'Quant: {extract_quant(model) or "-"}', normal_attr),
+        (f'Engine: {engine}', normal_attr),
+        (f'Status: {status_text}', success_attr if str(status).upper() == 'READY' else error_attr if str(status).upper() == 'ERROR' else normal_attr),
+        ('', normal_attr),
+        ('Health', heading_attr),
+        (f'Benchmark: {benchmark}', success_attr if benchmark == 'Fresh' else warning_attr),
+        (f'Health: {health} / {health_reason}', health_attr),
+        (f'MoE recommendation: {moe_state}', warning_attr if moe_state == 'available, not applied' else normal_attr),
+        ('', normal_attr),
+        ('Recommendation', heading_attr),
+        (f'Suggested next step: {action.label}', severity_attr),
+        (f'Why: {ellipsize(action.reason, max(40, int(width or 120) - 5))}', normal_attr),
+        ('', normal_attr),
+        ('Primary actions', heading_attr),
+        ('[B] Benchmark Menu', normal_attr),
+    ]
+    if action.key == 'A' or (has_moe_recommendation(model) and not moe_recommendation_applied(model)):
+        items.append(('[A] Apply MoE Recommendation', warning_attr))
+    items.extend([
+        ('[T] Try / Launch', normal_attr),
+        ('[R] Results', normal_attr),
+    ])
+    return items
+
+
 def moe_tuning_items(
     model: ModelConfig,
     width: int = 120,
@@ -1799,10 +2061,19 @@ def moe_tuning_items(
         if run:
             items.append((f'latest run: {run.get("status", "-")} {run.get("summary", "")}', warning_attr))
         else:
-            items.append(('No measured MoE placement recommendation yet. Press N to tune.', warning_attr))
+            items.append(('No measured MoE placement recommendation yet.', warning_attr))
+            items.append(('Run MoE tuning from Benchmark Menu to create a recommendation.', normal_attr))
         return items
 
     winner = str(profile.get('measured_candidate_name', '') or profile.get('runtime_profile', '') or '-')
+    applied = moe_recommendation_applied(model)
+    current_bits = []
+    if bool(getattr(model, 'cpu_moe', False)):
+        current_bits.append('cpu_moe_all')
+    if int(getattr(model, 'n_cpu_moe', 0) or 0) > 0:
+        current_bits.append(f'n_cpu_moe_{int(getattr(model, "n_cpu_moe", 0) or 0)}')
+    if getattr(model, 'tensor_overrides', None):
+        current_bits.append('tensor_override')
     speed = float(profile.get('tokens_per_sec', 0.0) or 0.0)
     headroom = profile.get('vram_headroom_bytes', 0)
     peak_vram = profile.get('peak_vram_used', profile.get('peak_vram_bytes', 0))
@@ -1811,6 +2082,8 @@ def moe_tuning_items(
     reason = compact_message(str(profile.get('tuning_summary', '') or profile.get('selection_reason', '') or 'measured winner'))
     items.extend([
         (f'Winner: {winner}', success_attr | curses.A_BOLD if success_attr else normal_attr),
+        (f'Applied: {"Yes" if applied else "No"}', success_attr if applied else warning_attr),
+        (f'Current: {", ".join(current_bits) if current_bits else "none"}', normal_attr),
         (f'Speed: {speed:.2f} tok/s', success_attr if speed > 0 else warning_attr),
         (f'VRAM peak/headroom: {compact_bytes(peak_vram)} / {compact_bytes(headroom)}', normal_attr),
         (f'RAM peak: {compact_bytes(peak_ram)}', normal_attr),
@@ -1845,6 +2118,14 @@ def moe_tuning_items(
     args_preview = str(profile.get('effective_server_args_preview', '') or '')
     if args_preview:
         items.append((f'winner args: {ellipsize(args_preview, max(40, width - 13))}', normal_attr))
+    items.append(('', normal_attr))
+    items.append(('Actions', heading_attr))
+    if applied:
+        items.append(('MoE recommendation is already applied.', success_attr))
+    else:
+        items.append(('[A] Apply MoE Recommendation', warning_attr))
+    items.append(('[B] Benchmark Menu', normal_attr))
+    items.append(('[C] Command tab   [L] Logs tab', normal_attr))
     if run:
         items.append(('', normal_attr))
         items.append(('Candidate Rows', heading_attr))
@@ -1857,6 +2138,68 @@ def moe_tuning_items(
             heading_attr=heading_attr,
             normal_attr=normal_attr,
         ))
+    return items
+
+
+def latest_full_suite_run(model: ModelConfig) -> Dict[str, object]:
+    return latest_benchmark_run(model, 'full_suite')
+
+
+def full_suite_results_items(
+    model: ModelConfig,
+    run: Dict[str, object],
+    width: int = 120,
+    success_attr: int = 0,
+    warning_attr: int = 0,
+    error_attr: int = 0,
+    heading_attr: int = 0,
+    normal_attr: int = 0,
+) -> List[Tuple[str, int]]:
+    if not run:
+        return [('No Full Suite Benchmark run selected.', warning_attr)]
+    records = list(run.get('records', []) or [])
+    recommendations = run.get('recommendations', {}) if isinstance(run.get('recommendations', {}), dict) else {}
+    warnings = [compact_message(str(item)) for item in list(run.get('warnings', []) or []) if compact_message(str(item))]
+    status = str(run.get('status', '-') or '-')
+    profile_key = suite_run_recommended_profile_key(model, run)
+    moe_profile = get_measured_profile(model, 'moe_placement')
+    moe_candidate = (
+        str(recommendations.get('moe_placement', '') or '')
+        or str(moe_profile.get('measured_candidate_name', '') or '')
+        or '-'
+    )
+    profile_label_text = profile_key or '-'
+    applied_moe = moe_recommendation_applied(model) if moe_profile else False
+    summary = compact_message(str(run.get('summary', '') or ''))
+    items: List[Tuple[str, int]] = [
+        ('Full Suite Summary', heading_attr),
+        (f'model: {model.name or model.id}', normal_attr),
+        (f'run: {run.get("id", "-")}   status: {status}', success_attr if status == 'done' else warning_attr if status in ('running', 'aborted') else error_attr),
+    ]
+    if summary:
+        items.append((f'summary: {ellipsize(summary, max(40, width - 9))}', normal_attr))
+    items.extend([('', normal_attr), ('Stages', heading_attr)])
+    for line in full_suite_stage_lines(records):
+        attr = error_attr if '[!]' in line else warning_attr if '[-]' in line else success_attr if '[x]' in line else normal_attr
+        items.append((line, attr))
+    items.extend([
+        ('', normal_attr),
+        ('Recommendations', heading_attr),
+        (f'MoE Placement: {moe_candidate}', success_attr if moe_candidate != '-' else warning_attr),
+        (f'Default Profile: {profile_label_text}', success_attr if profile_key else warning_attr),
+        (f'MoE Applied: {"Yes" if applied_moe else "No" if moe_profile else "-"}', success_attr if applied_moe else warning_attr),
+    ])
+    if warnings:
+        items.extend([('', normal_attr), ('Warnings', heading_attr)])
+        items.extend((f'- {item}', warning_attr) for item in warnings[:6])
+    items.extend([
+        ('', normal_attr),
+        ('Actions', heading_attr),
+        ('[A] Apply all recommendations', success_attr if profile_key or moe_profile else warning_attr),
+        ('[M] Apply MoE only', warning_attr if moe_profile and not applied_moe else normal_attr),
+        ('[P] Apply profile only', normal_attr if profile_key else warning_attr),
+        ('[E] Export/sync configs', normal_attr),
+    ])
     return items
 
 
@@ -2352,6 +2695,10 @@ def reduce_benchmark_event(
         records = list(state.get('records', []) or [])
         records.append(dict(payload.get('record') or {}))
         state['records'] = records[-BENCHMARK_RECORD_LIMIT:]
+    if isinstance(payload.get('recommendations'), dict):
+        state['recommendations'] = dict(payload.get('recommendations') or {})
+    if isinstance(payload.get('warnings'), list):
+        state['warnings'] = list(payload.get('warnings') or [])
 
     if event in ('benchmark_error', 'benchmark_aborted') or is_error_message(message):
         errors = list(state.get('errors', []) or [])
@@ -3083,7 +3430,7 @@ def help_overlay_lines() -> List[str]:
         '',
         'Detail view',
         'Enter or l opens launch actions. T opens Try It Out. v toggles Simple/Advanced detail density.',
-        'B runs deep benchmark, F runs fast benchmark, N tunes MoE placement, O/H run workflow benchmarks.',
+        'B opens the Benchmark Menu. F/N/O/H remain advanced benchmark shortcuts.',
         '',
         'Power tools',
         ': opens a compact command palette. g/c/G export OpenCode, Continue, and Hermes configs.',
@@ -3356,11 +3703,111 @@ def show_compare_overlay(stdscr, colors, app: AppConfig, left: Optional[ModelCon
         stdscr.nodelay(True)
 
 
-def command_palette_options(app: Optional[AppConfig] = None) -> List[Tuple[str, str, str]]:
+LLAMA_CPP_FAMILY_ENGINES = ('llama.cpp', 'buun', 'turboquant', 'tq3')
+
+
+def _active_engine_for_menu(app: Optional[AppConfig], model: Optional[ModelConfig]) -> str:
+    if app is not None and model is not None and hasattr(app, 'active_engine_key_for_model'):
+        try:
+            return str(app.active_engine_key_for_model(model) or '')
+        except Exception:
+            return ''
+    return str(getattr(model, 'runtime', '') or '')
+
+
+def _moe_menu_disabled_reason(app: Optional[AppConfig], model: Optional[ModelConfig]) -> str:
+    if model is None:
+        return 'no model selected'
+    if not str(getattr(model, 'path', '') or '').lower().endswith('.gguf'):
+        return 'GGUF model required'
+    if not model_is_moe(model):
+        return 'model is not detected as MoE'
+    engine = _active_engine_for_menu(app, model).strip().lower()
+    if engine not in LLAMA_CPP_FAMILY_ENGINES:
+        return f'active engine {engine or "-"} is not eligible'
+    return ''
+
+
+def benchmark_menu_recommendation(app: Optional[AppConfig], model: Optional[ModelConfig]) -> Tuple[str, str]:
+    if model is None:
+        return 'quick_benchmark', 'select a model first'
+    if has_moe_recommendation(model) and not moe_recommendation_applied(model):
+        return 'apply_moe_recommendation', 'measured MoE placement exists; press A in the Tuning tab before routine benchmarks'
+    status = str(getattr(model, 'default_benchmark_status', '') or '').strip().lower()
+    moe_disabled = _moe_menu_disabled_reason(app, model)
+    if not moe_disabled and not has_moe_recommendation(model):
+        return 'full_suite', 'MoE placement has not been measured; the suite can tune it before downstream benchmarks'
+    if status in ('failed', 'aborted'):
+        return 'smart_benchmark', f'last benchmark status is {status}'
+    if not float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0):
+        return 'smart_benchmark', 'no measured launch profile is saved'
+    if not float(getattr(model, 'last_opencode_benchmark_score', 0.0) or 0.0):
+        return 'opencode_benchmark', 'benchmark exists, but OpenCode has not been validated'
+    return 'quick_benchmark', 'current benchmark proof exists; quick check is enough'
+
+
+def benchmark_menu_intro_lines(app: Optional[AppConfig], model: Optional[ModelConfig]) -> List[str]:
+    if model is None:
+        return ['Selected model: none']
+    recommended, reason = benchmark_menu_recommendation(app, model)
+    label_by_value = {
+        value: label
+        for _key, label, value in benchmark_menu_options(app, model, include_recommendation=False)
+        if not value.startswith('disabled:')
+    }
+    label = label_by_value.get(recommended, recommended.replace('_', ' '))
+    return [
+        f'Selected: {getattr(model, "name", "") or getattr(model, "id", "-")}',
+        f'Type: {classify_model_type(model)}   Engine: {_active_engine_for_menu(app, model) or "-"}',
+        f'Recommended: {label}',
+        f'Reason: {reason}',
+    ]
+
+
+def benchmark_menu_options(
+    app: Optional[AppConfig],
+    model: Optional[ModelConfig],
+    include_recommendation: bool = True,
+) -> List[Tuple[str, str, str]]:
+    recommended, _reason = benchmark_menu_recommendation(app, model) if include_recommendation else ('', '')
+
+    def label(value: str, text: str) -> str:
+        return f'{text}  (Recommended)' if value == recommended else text
+
+    moe_reason = _moe_menu_disabled_reason(app, model)
+    moe_value = f'disabled:moe:{moe_reason}' if moe_reason else 'moe_tuning_full'
+    moe_label = 'MoE Placement Tuning - expert CPU/GPU placement'
+    if moe_reason:
+        moe_label = f'MoE Placement Tuning - unavailable: {moe_reason}'
+    return [
+        ('1', label('quick_benchmark', 'Quick Benchmark - fast sanity check'), 'quick_benchmark'),
+        ('2', label('smart_benchmark', 'Smart Benchmark - speed/context profiles'), 'smart_benchmark'),
+        ('3', label('moe_tuning_full', moe_label), moe_value),
+        ('4', label('hermes_benchmark', 'Hermes Benchmark - workflow validation'), 'hermes_benchmark'),
+        ('5', label('opencode_benchmark', 'OpenCode Benchmark - workflow validation'), 'opencode_benchmark'),
+        ('6', label('full_suite', 'Full Suite Benchmark - MoE -> Smart -> Hermes -> OpenCode'), 'full_suite'),
+        ('q', 'Cancel', 'cancel'),
+    ]
+
+
+def prompt_benchmark_menu(stdscr, colors, app: AppConfig, model: ModelConfig) -> str:
+    return prompt_modal_choice(
+        stdscr,
+        colors,
+        'Benchmark Menu',
+        benchmark_menu_options(app, model),
+        intro_lines=benchmark_menu_intro_lines(app, model),
+        footer='[Up/Down] Select   Enter Run   Esc Cancel',
+    )
+
+
+def command_palette_options(app: Optional[AppConfig] = None, model: Optional[ModelConfig] = None) -> List[Tuple[str, str, str]]:
     current_density = normalize_choice(getattr(getattr(app, 'ui', None), 'detail_density', 'simple'), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
     next_density = 'advanced' if current_density == 'simple' else 'simple'
     current_browser = normalize_choice(getattr(getattr(app, 'ui', None), 'browser_view', 'compact'), tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact')
     next_browser = 'advanced' if current_browser == 'compact' else 'compact'
+    apply_moe_value = 'apply_moe_recommendation' if model is not None and has_moe_recommendation(model) else 'disabled:apply_moe:Run MoE placement tuning first'
+    apply_moe_label = 'Apply MoE Recommendation' if apply_moe_value == 'apply_moe_recommendation' else 'Apply MoE Recommendation - run MoE tuning first'
     return [
         ('1', 'Search models', 'search'),
         ('2', 'Set filters', 'filters'),
@@ -3374,7 +3821,7 @@ def command_palette_options(app: Optional[AppConfig] = None) -> List[Tuple[str, 
         ('p', 'Raw Speed Benchmark...', 'raw_speed_benchmark'),
         ('n', 'Tune MoE Placement (fast)', 'moe_tuning_fast'),
         ('u', 'Tune MoE Placement (full)', 'moe_tuning_full'),
-        ('r', 'Apply MoE Recommendation', 'apply_moe_recommendation'),
+        ('r', apply_moe_label, apply_moe_value),
         ('m', 'Compare with machine pick', 'compare'),
         ('o', 'Export OpenCode config', 'export_opencode'),
         ('c', 'Export Continue config', 'export_continue'),
@@ -3386,14 +3833,22 @@ def command_palette_options(app: Optional[AppConfig] = None) -> List[Tuple[str, 
     ]
 
 
-def prompt_command_palette(stdscr, colors, app: Optional[AppConfig] = None) -> str:
-    return prompt_modal_choice(stdscr, colors, 'Actions', command_palette_options(app))
+def prompt_command_palette(stdscr, colors, app: Optional[AppConfig] = None, model: Optional[ModelConfig] = None) -> str:
+    return prompt_modal_choice(stdscr, colors, 'Actions', command_palette_options(app, model))
 
 
-def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str, str]]) -> str:
+def prompt_modal_choice(
+    stdscr,
+    colors,
+    title: str,
+    options: List[Tuple[str, str, str]],
+    intro_lines: Optional[List[str]] = None,
+    footer: str = 'Press key to run. Up/Down scroll. Esc cancels.',
+) -> str:
     h, w = stdscr.getmaxyx()
     box_w = min(68, max(48, w - 8))
-    box_h = min(max(8, len(options) + 6), max(8, h - 4))
+    intro = [str(line) for line in list(intro_lines or []) if str(line).strip()]
+    box_h = min(max(8, len(options) + 6 + len(intro)), max(8, h - 4))
     if h < 12 or w < box_w + 4:
         return 'cancel'
     box_x = max(2, (w - box_w) // 2)
@@ -3402,20 +3857,35 @@ def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str
     modal.keypad(True)
     stdscr.nodelay(False)
     scroll = 0
-    visible_rows = max(1, box_h - 5)
+    selected_idx = 0
+    visible_rows = max(1, box_h - 5 - len(intro))
     while True:
+        selected_idx = max(0, min(selected_idx, max(0, len(options) - 1)))
+        if selected_idx < scroll:
+            scroll = selected_idx
+        if selected_idx >= scroll + visible_rows:
+            scroll = selected_idx - visible_rows + 1
         scroll = clamp_scroll(scroll, len(options), visible_rows)
         modal.erase()
         draw_box(modal, 0, 0, box_h - 1, box_w, title, colors['accent'] | curses.A_BOLD, colors['accent'])
-        safe_addstr(modal, 2, 2, ellipsize('Choose an action:', box_w - 4), colors['panel'] | curses.A_BOLD)
+        y = 2
+        for line in intro:
+            safe_addstr(modal, y, 2, ellipsize(line, box_w - 4), colors['panel'])
+            y += 1
+        safe_addstr(modal, y, 2, ellipsize('Choose an action:', box_w - 4), colors['panel'] | curses.A_BOLD)
+        y += 1
         for row, (option_key, label, _val) in enumerate(options[scroll: scroll + visible_rows]):
+            absolute = scroll + row
             marker = ''
             if row == 0 and scroll > 0:
                 marker = '^ '
             elif row == visible_rows - 1 and scroll + visible_rows < len(options):
                 marker = 'v '
-            safe_addstr(modal, 3 + row, 4, ellipsize(f'{marker}[{option_key}] {label}', box_w - 8), colors['panel'])
-        safe_addstr(modal, box_h - 1, 2, ellipsize('Press key to run. Up/Down scroll. Esc cancels.', box_w - 6), colors['muted'])
+            selected_marker = '> ' if absolute == selected_idx else '  '
+            value = str(_val or '')
+            attr = colors['muted'] if value.startswith('disabled:') else colors['selection'] if absolute == selected_idx else colors['panel']
+            safe_addstr(modal, y + row, 2, ellipsize(f'{selected_marker}{marker}[{option_key}] {label}', box_w - 4), attr)
+        safe_addstr(modal, box_h - 1, 2, ellipsize(footer, box_w - 6), colors['muted'])
         modal.refresh()
         key = modal.getch()
         if key == -1:
@@ -3425,11 +3895,15 @@ def prompt_modal_choice(stdscr, colors, title: str, options: List[Tuple[str, str
             stdscr.nodelay(True)
             return 'cancel'
         if key in (curses.KEY_UP, ord('k')):
-            scroll -= 1
+            selected_idx -= 1
             continue
         if key in (curses.KEY_DOWN, ord('j')):
-            scroll += 1
+            selected_idx += 1
             continue
+        if key in (curses.KEY_ENTER, 10, 13):
+            stdscr.touchwin()
+            stdscr.nodelay(True)
+            return options[selected_idx][2] if options else 'cancel'
         key_str = chr(key).lower() if 0 <= key <= 255 else ''
         for option_key, _label, value in options:
             if key_str == option_key:
@@ -3988,6 +4462,158 @@ def tui(stdscr, app: AppConfig):
         if view_mode in ('detail', 'try', 'benchmark', 'results') and detail_model_id:
             return app.get_model(detail_model_id) or selected_model()
         return selected_model()
+
+    def apply_moe_recommendation_for_model(model: Optional[ModelConfig]) -> str:
+        nonlocal message
+        if model is None:
+            return 'No model selected for MoE recommendation.'
+        ok, apply_msg = apply_moe_recommendation(model)
+        if not ok:
+            return apply_msg
+        app.add_or_update(model, sync_exports=False)
+        sync_msg = sync_opencode_after_tuning(app)
+        invalidate_machine_summary()
+        return f'{apply_msg} | {sync_msg}'
+
+    def active_full_suite_run_for_model(model: Optional[ModelConfig]) -> Dict[str, object]:
+        if model is None:
+            return {}
+        if view_mode == 'results':
+            runs = benchmark_runs_for_model(model)
+            if runs and 0 <= results_run_index < len(runs):
+                run = runs[results_run_index]
+                return run if isinstance(run, dict) and str(run.get('kind', '') or '') == 'full_suite' else {}
+        if view_mode == 'benchmark' and str(benchmark_state.get('run_kind') or '') == 'full_suite':
+            run = latest_full_suite_run(model)
+            return run or full_suite_run_from_state(benchmark_state)
+        return {}
+
+    def apply_full_suite_all_for_model(model: Optional[ModelConfig]) -> str:
+        if model is None:
+            return 'No model selected for Full Suite recommendations.'
+        run = active_full_suite_run_for_model(model)
+        ok, apply_msg = apply_full_suite_recommendations(app, model, run)
+        if ok:
+            invalidate_machine_summary()
+        return apply_msg
+
+    def apply_full_suite_profile_for_model(model: Optional[ModelConfig]) -> str:
+        if model is None:
+            return 'No model selected for Full Suite profile recommendation.'
+        run = active_full_suite_run_for_model(model)
+        ok, apply_msg = apply_full_suite_profile_recommendation(model, run)
+        if not ok:
+            return apply_msg
+        app.add_or_update(model, sync_exports=False)
+        sync_msg = sync_opencode_after_tuning(app)
+        invalidate_machine_summary()
+        return f'{apply_msg} | {sync_msg}'
+
+    def sync_suite_exports_for_model(model: Optional[ModelConfig]) -> str:
+        if model is None:
+            return 'No model selected for config export.'
+        sync_msg = sync_opencode_after_tuning(app)
+        append_model_log(app, model, f'Full Suite export sync requested: {sync_msg}')
+        return sync_msg
+
+    def start_benchmark_choice(model: Optional[ModelConfig], choice: str):
+        nonlocal message
+        if model is None:
+            message = 'No model selected for benchmark.'
+            return
+        if str(choice or '').startswith('disabled:'):
+            message = str(choice).split(':', 2)[-1] or 'Benchmark action unavailable.'
+            return
+        if choice == 'cancel':
+            message = 'Benchmark cancelled.'
+            return
+        if choice == 'quick_benchmark':
+            start_background_action(
+                model,
+                'quick benchmark profiles',
+                lambda progress, token, model=model: benchmark_fast_profiles(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
+                done_event='benchmark_done',
+                run_kind='server_fast',
+            )
+            return
+        if choice == 'smart_benchmark':
+            start_background_action(
+                model,
+                'smart bounded benchmark profiles',
+                lambda progress, token, model=model: benchmark_best_optimization(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
+                done_event='benchmark_done',
+                run_kind='server',
+            )
+            return
+        if choice == 'moe_tuning_full':
+            start_background_action(
+                model,
+                'MoE placement tuning (full)',
+                lambda progress, token, model=model: benchmark_moe_placement_tuning(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                    depth='full',
+                ),
+                done_event='benchmark_done',
+                run_kind='moe_tuning',
+            )
+            return
+        if choice == 'hermes_benchmark':
+            start_background_action(
+                model,
+                'Hermes workflow benchmark',
+                lambda progress, token, model=model: benchmark_hermes_workflow(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
+                done_event='benchmark_done',
+                run_kind='hermes',
+            )
+            return
+        if choice == 'opencode_benchmark':
+            start_background_action(
+                model,
+                'opencode workflow benchmark',
+                lambda progress, token, model=model: benchmark_opencode_workflow(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                ),
+                done_event='benchmark_done',
+                run_kind='opencode',
+            )
+            return
+        if choice == 'full_suite':
+            start_background_action(
+                model,
+                'Full Suite Benchmark',
+                lambda progress, token, model=model: benchmark_full_suite(
+                    app,
+                    model,
+                    progress=progress,
+                    cancel_token=token,
+                    depth='full',
+                ),
+                done_event='benchmark_done',
+                run_kind='full_suite',
+            )
+            return
+        message = 'Benchmark action unavailable.'
 
     def model_is_running(model: ModelConfig) -> bool:
         status, _detail = app.health(model)
@@ -4599,42 +5225,56 @@ def tui(stdscr, app: AppConfig):
                 if run_kind == 'server_all'
                 else (model.name or model.id)
             )
-            status_text = str(benchmark_state.get('status') or 'idle')
-            phase = str(benchmark_state.get('phase') or '-')
-            candidate = str(benchmark_state.get('candidate') or '-')
-            completed = int(benchmark_state.get('completed', 0) or 0)
-            total = int(benchmark_state.get('total', 0) or 0)
-            pct = int(round(benchmark_progress_fraction(completed, total) * 100))
-            bar = progress_bar_text(completed, total, max(10, min(34, left_w - 62)))
-            feed = list(benchmark_state.get('feed', []) or [])
-            content_h = content_rows
-            summary_lines = [
-                (f'model: {benchmark_model_label}', curses.A_BOLD),
-                (f'run: {run_kind}   status: {status_text}   elapsed: {benchmark_elapsed_text(benchmark_state)}', colors['accent'] | curses.A_BOLD),
-                (f'phase: {phase}', curses.A_NORMAL),
-                (f'candidate: {candidate}', curses.A_NORMAL),
-                (f'progress: {bar} {completed}/{total if total else "?"} {pct if total else 0}%', colors['warning'] | curses.A_BOLD if benchmark_state.get('active') else colors['success'] | curses.A_BOLD),
-                ('', curses.A_NORMAL),
-                ('live feed:', colors['accent'] | curses.A_BOLD),
-            ]
             y_cursor = box_top + 2
-            for line, attr in summary_lines[:content_h]:
-                safe_addstr(stdscr, y_cursor, 3, line[: left_w - 5], attr)
-                y_cursor += 1
-            rows_available = max(0, content_bottom - y_cursor + 1)
-            feed_target = max(0, rows_available)
-            if not feed and y_cursor <= content_bottom:
-                safe_addstr(stdscr, y_cursor, 3, 'waiting for benchmark updates...', colors['muted'])
-                y_cursor += 1
-            for line in feed[-feed_target:]:
-                if y_cursor > content_bottom:
-                    break
-                attr = colors['error'] if is_error_message(str(line)) else colors['muted']
-                for wrapped in wrap_display_item_lines(str(line), left_w - 5):
+            if run_kind == 'full_suite':
+                suite_items = build_full_suite_progress_items(
+                    model,
+                    benchmark_state,
+                    left_w - 5,
+                    accent_attr=colors['accent'] | curses.A_BOLD,
+                    normal_attr=curses.A_NORMAL,
+                )
+                for line, attr in suite_items[:content_rows]:
                     if y_cursor > content_bottom:
                         break
-                    safe_addstr(stdscr, y_cursor, 3, wrapped[: left_w - 5], attr)
+                    safe_addstr(stdscr, y_cursor, 3, line[: left_w - 5], attr)
                     y_cursor += 1
+            else:
+                status_text = str(benchmark_state.get('status') or 'idle')
+                phase = str(benchmark_state.get('phase') or '-')
+                candidate = str(benchmark_state.get('candidate') or '-')
+                completed = int(benchmark_state.get('completed', 0) or 0)
+                total = int(benchmark_state.get('total', 0) or 0)
+                pct = int(round(benchmark_progress_fraction(completed, total) * 100))
+                bar = progress_bar_text(completed, total, max(10, min(34, left_w - 62)))
+                feed = list(benchmark_state.get('feed', []) or [])
+                content_h = content_rows
+                summary_lines = [
+                    (f'model: {benchmark_model_label}', curses.A_BOLD),
+                    (f'run: {run_kind}   status: {status_text}   elapsed: {benchmark_elapsed_text(benchmark_state)}', colors['accent'] | curses.A_BOLD),
+                    (f'phase: {phase}', curses.A_NORMAL),
+                    (f'candidate: {candidate}', curses.A_NORMAL),
+                    (f'progress: {bar} {completed}/{total if total else "?"} {pct if total else 0}%', colors['warning'] | curses.A_BOLD if benchmark_state.get('active') else colors['success'] | curses.A_BOLD),
+                    ('', curses.A_NORMAL),
+                    ('live feed:', colors['accent'] | curses.A_BOLD),
+                ]
+                for line, attr in summary_lines[:content_h]:
+                    safe_addstr(stdscr, y_cursor, 3, line[: left_w - 5], attr)
+                    y_cursor += 1
+                rows_available = max(0, content_bottom - y_cursor + 1)
+                feed_target = max(0, rows_available)
+                if not feed and y_cursor <= content_bottom:
+                    safe_addstr(stdscr, y_cursor, 3, 'waiting for benchmark updates...', colors['muted'])
+                    y_cursor += 1
+                for line in feed[-feed_target:]:
+                    if y_cursor > content_bottom:
+                        break
+                    attr = colors['error'] if is_error_message(str(line)) else colors['muted']
+                    for wrapped in wrap_display_item_lines(str(line), left_w - 5):
+                        if y_cursor > content_bottom:
+                            break
+                        safe_addstr(stdscr, y_cursor, 3, wrapped[: left_w - 5], attr)
+                        y_cursor += 1
         elif view_mode == 'try' and active_model:
             model = active_model
             input_block_rows = 1 + try_input_rows if try_input_rows > 0 else 0
@@ -4742,46 +5382,46 @@ def tui(stdscr, app: AppConfig):
                 f'configured={cap.get("configured_ctx", "-")} slot={cap.get("ctx_per_slot", context_per_slot(model))} '
                 f'safe={cap.get("estimated_safe_context", "-")} measured={cap.get("measured_max_context", "-")}'
             )
-            detail_rows = [
-                ('[Esc] back   [Enter/l] actions   [T] try   [B] deep bench   [F] fast bench   [O] opencode bench   [H] hermes bench   [R] results   [z] auto   [v] detail density', colors['accent'] | curses.A_BOLD),
-                ('', curses.A_NORMAL),
-                (f'name: {model.name}', curses.A_BOLD),
-                (active_engine_badge_line(app, model), colors['accent'] | curses.A_BOLD),
-                (runtime_engine_source_line(app, model), curses.A_NORMAL),
-                (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
-                (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
-                (f'architecture detail: {architecture_detail(model)}', curses.A_NORMAL),
-                (turboquant_detail_line(model), tq_attr),
-                (tq3_detail_line(model), colors['success'] | curses.A_BOLD if getattr(model, 'tq3_status', '') == 'native' else colors['muted']),
-                (f'quant/source: {extract_quant(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
-                (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {freshness}', curses.A_NORMAL),
-                (f'tags: {tags_text}', curses.A_NORMAL),
-                (f'verification: {verification_status} / {verification_summary}', colors['success'] | curses.A_BOLD if verification_status == 'passed' else colors['warning'] if verification_status in ('warning', 'needs_benchmark', 'unknown') else colors['error'] | curses.A_BOLD),
-                (cap_text, curses.A_NORMAL),
-                (f'path: {model.path}', curses.A_NORMAL),
-                (f'alias/bind: {model.alias} / http://{model.host}:{model.port}', curses.A_NORMAL),
-                (f'status: {status} ({detail})', status_attr(colors, status)),
-                (f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
-                (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
-                (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
-                (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
-                (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
-                (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
-                (f'ctx range: {getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)}', curses.A_NORMAL),
-                (f'last used: {getattr(model, "last_used_at", "") or "-"}', curses.A_NORMAL),
-                (f'detail density: {detail_density_label(detail_density)}', curses.A_NORMAL),
-                (f'hardware: {hardware}', curses.A_NORMAL),
-                (f'last benchmark: {benchmark_summary}', colors['warning'] if benchmark_score <= 0 else colors['success'] | curses.A_BOLD),
-                (f'opencode benchmark: {opencode_summary}', colors['warning'] if opencode_score <= 0 else colors['success'] | curses.A_BOLD),
-                (f'hermes benchmark: {hermes_summary}', colors['warning'] if hermes_score <= 0 else colors['success'] | curses.A_BOLD),
-                ('command preview:', colors['accent'] | curses.A_BOLD),
-                (' '.join(app.build_command(model)), curses.A_NORMAL),
-                ('', curses.A_NORMAL),
-            ]
-            engine_warning = active_engine_warning_line(app, model)
-            if engine_warning:
-                detail_rows.insert(5, (engine_warning, active_engine_warning_attr(engine_warning, colors)))
             if detail_density == 'advanced':
+                detail_rows = [
+                    ('[Esc] back   [Enter/l] actions   [T] try   [B] benchmark menu   [F] fast   [O] opencode   [H] hermes   [R] results   [z] auto   [v] simple', colors['accent'] | curses.A_BOLD),
+                    ('', curses.A_NORMAL),
+                    (f'name: {model.name}', curses.A_BOLD),
+                    (active_engine_badge_line(app, model), colors['accent'] | curses.A_BOLD),
+                    (runtime_engine_source_line(app, model), curses.A_NORMAL),
+                    (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
+                    (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
+                    (f'architecture detail: {architecture_detail(model)}', curses.A_NORMAL),
+                    (turboquant_detail_line(model), tq_attr),
+                    (tq3_detail_line(model), colors['success'] | curses.A_BOLD if getattr(model, 'tq3_status', '') == 'native' else colors['muted']),
+                    (f'quant/source: {extract_quant(model)} / {getattr(model, "source", "manual")}', curses.A_NORMAL),
+                    (f'favorite/freshness: {"yes" if getattr(model, "favorite", False) else "no"} / {freshness}', curses.A_NORMAL),
+                    (f'tags: {tags_text}', curses.A_NORMAL),
+                    (f'verification: {verification_status} / {verification_summary}', colors['success'] | curses.A_BOLD if verification_status == 'passed' else colors['warning'] if verification_status in ('warning', 'needs_benchmark', 'unknown') else colors['error'] | curses.A_BOLD),
+                    (cap_text, curses.A_NORMAL),
+                    (f'path: {model.path}', curses.A_NORMAL),
+                    (f'alias/bind: {model.alias} / http://{model.host}:{model.port}', curses.A_NORMAL),
+                    (f'status: {status} ({detail})', status_attr(colors, status)),
+                    (f'pid/roles: {app.get_pid(model) or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
+                    (f'log: {app.logfile(model.id)}', curses.A_NORMAL),
+                    (f'ctx/output: {model.ctx} / {model.output}', curses.A_NORMAL),
+                    (f'threads/ngl/parallel: {model.threads} / {model.ngl} / {model.parallel}', curses.A_NORMAL),
+                    (f'temp/cache_ram: {model.temp} / {model.cache_ram}', curses.A_NORMAL),
+                    (f'profile: {model_profile_summary(model)}', curses.A_NORMAL),
+                    (f'ctx range: {getattr(model, "ctx_min", 2048)}..{getattr(model, "ctx_max", 131072)}', curses.A_NORMAL),
+                    (f'last used: {getattr(model, "last_used_at", "") or "-"}', curses.A_NORMAL),
+                    (f'detail density: {detail_density_label(detail_density)}', curses.A_NORMAL),
+                    (f'hardware: {hardware}', curses.A_NORMAL),
+                    (f'last benchmark: {benchmark_summary}', colors['warning'] if benchmark_score <= 0 else colors['success'] | curses.A_BOLD),
+                    (f'opencode benchmark: {opencode_summary}', colors['warning'] if opencode_score <= 0 else colors['success'] | curses.A_BOLD),
+                    (f'hermes benchmark: {hermes_summary}', colors['warning'] if hermes_score <= 0 else colors['success'] | curses.A_BOLD),
+                    ('command preview:', colors['accent'] | curses.A_BOLD),
+                    (' '.join(app.build_command(model)), curses.A_NORMAL),
+                    ('', curses.A_NORMAL),
+                ]
+                engine_warning = active_engine_warning_line(app, model)
+                if engine_warning:
+                    detail_rows.insert(5, (engine_warning, active_engine_warning_attr(engine_warning, colors)))
                 detail_rows.extend([
                     ('', curses.A_NORMAL),
                     ('advanced details:', colors['accent'] | curses.A_BOLD),
@@ -4791,11 +5431,25 @@ def tui(stdscr, app: AppConfig):
                     (f'hermes rows: {len(getattr(model, "last_hermes_benchmark_results", []) or [])}', colors['muted']),
                 ])
             else:
+                detail_rows = [
+                    ('[Esc] back   [Enter/l] actions   [B] benchmark menu   [T] try   [R] results   [v] advanced', colors['accent'] | curses.A_BOLD),
+                    ('', curses.A_NORMAL),
+                ]
+                detail_rows.extend(overview_items(
+                    app,
+                    model,
+                    status,
+                    detail,
+                    width=left_w - 5,
+                    success_attr=colors['success'] | curses.A_BOLD,
+                    warning_attr=colors['warning'],
+                    error_attr=colors['error'] | curses.A_BOLD,
+                    heading_attr=colors['accent'] | curses.A_BOLD,
+                    normal_attr=curses.A_NORMAL,
+                ))
                 detail_rows.extend([
-                    ('benchmark tables hidden in Simple mode; press v for Advanced details.', colors['muted']),
-                    (f'server rows: {len(getattr(model, "last_benchmark_results", []) or [])}', colors['muted']),
-                    (f'opencode rows: {len(getattr(model, "last_opencode_benchmark_results", []) or [])}', colors['muted']),
-                    (f'hermes rows: {len(getattr(model, "last_hermes_benchmark_results", []) or [])}', colors['muted']),
+                    ('', curses.A_NORMAL),
+                    ('Advanced paths, commands, and raw benchmark rows are in the right-side tabs.', colors['muted']),
                 ])
 
             detail_items = scrollable_pane_wrapped_items(detail_rows, left_w - 5)
@@ -4906,25 +5560,18 @@ def tui(stdscr, app: AppConfig):
                 hermes_score = float(getattr(model, 'last_hermes_benchmark_score', 0.0) or 0.0)
                 row_summary = build_model_row_summary(app, model, status)
                 if right_active_tab == 'overview':
-                    warnings = [
-                        str(row_summary.get('health_reason', '') or ''),
-                        active_engine_warning_line(app, model),
-                    ]
-                    warnings = [compact_message(item) for item in warnings if compact_message(item)]
-                    right_items = [
-                        (f'name: {model.name}', curses.A_BOLD),
-                        (runtime_engine_source_line(app, model), curses.A_NORMAL),
-                        (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
-                        (f'recommendation: {row_summary.get("pick", "-")}', colors['accent'] | curses.A_BOLD),
-                        (f'health: {row_summary.get("health", "-")} / {row_summary.get("health_reason", "-")}', colors['success'] | curses.A_BOLD if row_summary.get('health') == 'OK' else colors['warning'] if row_summary.get('health') in ('WARN', 'STALE') else colors['error'] | curses.A_BOLD),
-                        (f'status: {status} ({detail})', status_attr(colors, status)),
-                        (f'pid/roles: {pid or "-"} / {app.role_badges(model.id)}', curses.A_NORMAL),
-                        (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
-                        (f'freshness: {benchmark_freshness_display(app, model)}', curses.A_NORMAL),
-                    ]
-                    if warnings:
-                        right_items.extend([('', curses.A_NORMAL), ('top advisories:', colors['accent'] | curses.A_BOLD)])
-                        right_items.extend((f'- {item}', colors['warning']) for item in warnings[:3])
+                    right_items = overview_items(
+                        app,
+                        model,
+                        status,
+                        detail,
+                        width=right_content_w,
+                        success_attr=colors['success'] | curses.A_BOLD,
+                        warning_attr=colors['warning'],
+                        error_attr=colors['error'] | curses.A_BOLD,
+                        heading_attr=colors['accent'] | curses.A_BOLD,
+                        normal_attr=curses.A_NORMAL,
+                    )
                 elif right_active_tab == 'launch':
                     right_items = [
                         ('launch actions:', colors['accent'] | curses.A_BOLD),
@@ -4954,10 +5601,13 @@ def tui(stdscr, app: AppConfig):
                     right_items.extend([
                         ('', curses.A_NORMAL),
                         ('actions:', colors['accent'] | curses.A_BOLD),
-                        ('N tunes MoE placement (fast)', curses.A_NORMAL),
-                        (': palette offers full MoE tuning and Apply MoE Recommendation', curses.A_NORMAL),
+                        ('B opens Benchmark Menu', curses.A_NORMAL),
                         ('', curses.A_NORMAL),
                     ])
+                    if has_moe_recommendation(model) and not moe_recommendation_applied(model):
+                        right_items.insert(-2, ('A applies MoE recommendation', colors['warning']))
+                    elif has_moe_recommendation(model):
+                        right_items.insert(-2, ('MoE recommendation is applied', colors['success']))
                     right_items.extend(moe_tuning_items(
                         model,
                         width=right_content_w,
@@ -5089,20 +5739,33 @@ def tui(stdscr, app: AppConfig):
                         app=app,
                     )
                 elif right_active_tab == 'results':
-                    run = {
-                        'kind': str(benchmark_state.get('run_kind') or ''),
-                        'records': records,
-                        'winners': {},
-                    }
-                    right_items = benchmark_ranking_items(
-                        run,
-                        width=right_content_w,
-                        success_attr=colors['success'] | curses.A_BOLD,
-                        warning_attr=colors['warning'],
-                        error_attr=colors['error'],
-                        heading_attr=colors['accent'] | curses.A_BOLD,
-                        normal_attr=curses.A_NORMAL,
-                    )
+                    if str(benchmark_state.get('run_kind') or '') == 'full_suite':
+                        suite_run = latest_full_suite_run(model) or full_suite_run_from_state(benchmark_state)
+                        right_items = full_suite_results_items(
+                            model,
+                            suite_run,
+                            width=right_content_w,
+                            success_attr=colors['success'] | curses.A_BOLD,
+                            warning_attr=colors['warning'],
+                            error_attr=colors['error'],
+                            heading_attr=colors['accent'] | curses.A_BOLD,
+                            normal_attr=curses.A_NORMAL,
+                        )
+                    else:
+                        run = {
+                            'kind': str(benchmark_state.get('run_kind') or ''),
+                            'records': records,
+                            'winners': {},
+                        }
+                        right_items = benchmark_ranking_items(
+                            run,
+                            width=right_content_w,
+                            success_attr=colors['success'] | curses.A_BOLD,
+                            warning_attr=colors['warning'],
+                            error_attr=colors['error'],
+                            heading_attr=colors['accent'] | curses.A_BOLD,
+                            normal_attr=curses.A_NORMAL,
+                        )
                 elif right_active_tab == 'commands':
                     right_items = [
                         (line, colors['warning'] if kind == 'current' and benchmark_state.get('active') else colors['muted'])
@@ -5159,14 +5822,26 @@ def tui(stdscr, app: AppConfig):
                 run = runs[results_run_index] if runs and 0 <= results_run_index < len(runs) else {}
                 if right_active_tab == 'run_summary':
                     if run:
-                        right_items = [
-                            (f'run: {run.get("id", "-")}', colors['accent'] | curses.A_BOLD),
-                            (f'status: {run.get("status", "-")}  kind: {run.get("kind", "-")}', curses.A_NORMAL),
-                            (f'started: {run.get("started_at", "-")}', curses.A_NORMAL),
-                            (f'ended: {run.get("ended_at", "-")}', curses.A_NORMAL),
-                            (f'elapsed: {float(run.get("elapsed_seconds", 0.0) or 0.0):.1f}s', curses.A_NORMAL),
-                            (f'summary: {run.get("summary", "no summary")}', curses.A_NORMAL),
-                        ]
+                        if str(run.get('kind', '') or '') == 'full_suite':
+                            right_items = full_suite_results_items(
+                                model,
+                                run,
+                                width=right_content_w,
+                                success_attr=colors['success'] | curses.A_BOLD,
+                                warning_attr=colors['warning'],
+                                error_attr=colors['error'],
+                                heading_attr=colors['accent'] | curses.A_BOLD,
+                                normal_attr=curses.A_NORMAL,
+                            )
+                        else:
+                            right_items = [
+                                (f'run: {run.get("id", "-")}', colors['accent'] | curses.A_BOLD),
+                                (f'status: {run.get("status", "-")}  kind: {run.get("kind", "-")}', curses.A_NORMAL),
+                                (f'started: {run.get("started_at", "-")}', curses.A_NORMAL),
+                                (f'ended: {run.get("ended_at", "-")}', curses.A_NORMAL),
+                                (f'elapsed: {float(run.get("elapsed_seconds", 0.0) or 0.0):.1f}s', curses.A_NORMAL),
+                                (f'summary: {run.get("summary", "no summary")}', curses.A_NORMAL),
+                            ]
                     else:
                         right_items = [('No benchmark run selected.', colors['muted'])]
                 elif right_active_tab == 'rankings':
@@ -5244,20 +5919,36 @@ def tui(stdscr, app: AppConfig):
             footer = '[Enter] send  Tab/] next tab  Shift-Tab/[ prev tab  [Esc] stop model + exit'
             footer2 = '[Up/Down] prompt  [Ctrl+P/N/B/F/A/E] convo  [PgUp/PgDn/Home/End] right tab.'
         elif view_mode == 'benchmark':
-            footer = '[Esc] details  [F] fast  [R] results  [W] wiki  Tab/] next  [A] abort'
+            model = active_detail_model()
+            if str(benchmark_state.get('run_kind') or '') == 'full_suite' and not benchmark_state.get('active'):
+                footer = '[Esc] details  A Apply All  M MoE  P Profile  E Export  R Results'
+            else:
+                footer = '[Esc] details  [F] fast  [R] results  [W] wiki  Tab/] next  [A] abort'
             footer2 = '[Up/Down/PgUp/PgDn/Home/End] scroll right tab.'
         elif view_mode == 'results':
-            footer = '[Esc] details  [Up/Down] select run  Tab/] next tab  Shift-Tab/[ prev tab'
+            model = active_detail_model()
+            suite_run = active_full_suite_run_for_model(model)
+            if suite_run:
+                footer = '[Esc] details  A Apply All  M MoE  P Profile  E Export'
+            else:
+                footer = '[Esc] details  [Up/Down] select run  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab.'
         elif view_mode == 'machine_results':
             footer = '[Esc] models  [D] deep all  Tab/] next tab  Shift-Tab/[ prev tab'
             footer2 = '[PgUp/PgDn/Home/End] scroll active right tab  [M] refresh rankings.'
         elif view_mode == 'detail':
-            footer = '[Esc] models  [Enter/l] actions  [T] try  [B/F/N/O/H] bench  [R] results'
-            footer2 = 'Tab/] next  Shift-Tab/[ prev  [v] density  [g/c/G] exports  [Y/y] verify  [:] actions'
+            model = active_detail_model()
+            if right_active_tab == 'tuning':
+                apply_hint = 'A Apply MoE  ' if model and has_moe_recommendation(model) and not moe_recommendation_applied(model) else ''
+                footer = f'[Esc] Back  {apply_hint}B Benchmark  C Command  L Logs  ? Help'
+                footer2 = 'Tab/] next tab  Shift-Tab/[ prev tab'
+            else:
+                apply_hint = 'A Apply MoE  ' if model and has_moe_recommendation(model) and not moe_recommendation_applied(model) else ''
+                footer = f'[Esc] Back  B Benchmark  {apply_hint}T Try  R Results  ? Help'
+                footer2 = 'Tab/] next tab  Shift-Tab/[ prev tab  [:] Actions'
         else:
-            footer = '[Enter] details  [/] search  [f] filter  [T] sort  [C] clear browser  [*] favorite'
-            footer2 = '[a/e/d] models  [x/X] detect/prune  [R/M] ranks  [Y/y] verify  [:] palette  [?] help  [q] quit'
+            footer = '[Enter] Details  B Benchmark  R Results  / Search  ? Help'
+            footer2 = '[a/e/d] models  [x/X] detect/prune  [:] palette  [q] quit'
         if action_running():
             footer = '[A] abort active action   ' + footer
         safe_addstr(stdscr, h - 2, 2, ellipsize(footer, w - 4), colors['accent'] | curses.A_BOLD)
@@ -5282,6 +5973,12 @@ def tui(stdscr, app: AppConfig):
             show_help_overlay(stdscr, colors)
             message = 'Help closed.'
             continue
+        if view_mode == 'detail' and right_tabs and key in (ord('C'), ord('c'), ord('L')):
+            target_tab = 'logs' if key == ord('L') else 'command'
+            if target_tab in right_tabs:
+                right_tab_by_view[view_mode] = target_tab
+                message = f'Right tab: {right_tab_label(target_tab, len(error_source_lines))}.'
+                continue
         if key == ord('V'):
             model = active_detail_model() if view_mode != 'list' else selected_model()
             partner = compare_partner_model(model)
@@ -5292,7 +5989,7 @@ def tui(stdscr, app: AppConfig):
                 message = 'Need at least two models for compare.'
             continue
         if key == ord(':'):
-            action = prompt_command_palette(stdscr, colors, app)
+            action = prompt_command_palette(stdscr, colors, app, active_detail_model() or selected_model())
             palette_keys = {
                 'search': ord('/'),
                 'filters': ord('f'),
@@ -5308,6 +6005,9 @@ def tui(stdscr, app: AppConfig):
                 'verify_selected': ord('Y'),
                 'verify_all': ord('y'),
             }
+            if str(action or '').startswith('disabled:'):
+                message = str(action).split(':', 2)[-1] or 'Action unavailable.'
+                continue
             if action in palette_keys:
                 key = palette_keys[action]
             elif action == 'density':
@@ -5382,17 +6082,7 @@ def tui(stdscr, app: AppConfig):
                 continue
             elif action == 'apply_moe_recommendation':
                 model = active_detail_model() or selected_model()
-                if model is None:
-                    message = 'No model selected for MoE recommendation.'
-                    continue
-                ok, apply_msg = apply_moe_recommendation(model)
-                if ok:
-                    app.add_or_update(model, sync_exports=False)
-                    sync_msg = sync_opencode_after_tuning(app)
-                    invalidate_machine_summary()
-                    message = f'{apply_msg} | {sync_msg}'
-                else:
-                    message = apply_msg
+                message = apply_moe_recommendation_for_model(model)
                 continue
             else:
                 message = 'Command palette cancelled.'
@@ -5457,6 +6147,16 @@ def tui(stdscr, app: AppConfig):
                 action_token.cancel('user requested abort')
             message = '⏳ Aborting active action and cleaning up managed processes...'
             continue
+        if key == ord('A') and view_mode in ('detail', 'benchmark', 'results') and app.models:
+            model = active_detail_model() or selected_model()
+            if view_mode in ('benchmark', 'results'):
+                run = active_full_suite_run_for_model(model)
+                if run:
+                    message = apply_full_suite_all_for_model(model)
+                    continue
+            if model and has_moe_recommendation(model) and not moe_recommendation_applied(model):
+                message = apply_moe_recommendation_for_model(model)
+                continue
         if view_mode == 'list' and key == ord('/'):
             updated_search = prompt_search_query(stdscr, colors, list_search)
             if updated_search is not None:
@@ -5611,6 +6311,23 @@ def tui(stdscr, app: AppConfig):
             model = active_detail_model()
             if model:
                 open_try_view(model)
+        elif key == ord('M') and active_model and view_mode in ('benchmark', 'results'):
+            model = active_detail_model()
+            run = active_full_suite_run_for_model(model)
+            if run:
+                message = apply_moe_recommendation_for_model(model)
+            else:
+                open_machine_results()
+        elif key == ord('P') and active_model and view_mode in ('benchmark', 'results'):
+            model = active_detail_model()
+            run = active_full_suite_run_for_model(model)
+            if run:
+                message = apply_full_suite_profile_for_model(model)
+        elif key == ord('E') and active_model and view_mode in ('benchmark', 'results'):
+            model = active_detail_model()
+            run = active_full_suite_run_for_model(model)
+            if run:
+                message = sync_suite_exports_for_model(model)
         elif key == ord('M') and app.models:
             open_machine_results()
         elif key == ord('R') and app.models and view_mode == 'list':
@@ -5679,21 +6396,11 @@ def tui(stdscr, app: AppConfig):
             invalidate_machine_summary()
             message = f'{tune_msg} | {sync_msg}'
         elif key == ord('B') and app.models:
-            model = active_detail_model()
+            model = active_detail_model() or selected_model()
             if not model:
                 continue
-            start_background_action(
-                model,
-                'smart bounded benchmark profiles',
-                lambda progress, token, model=model: benchmark_best_optimization(
-                    app,
-                    model,
-                    progress=progress,
-                    cancel_token=token,
-                ),
-                done_event='benchmark_done',
-                run_kind='server',
-            )
+            choice = prompt_benchmark_menu(stdscr, colors, app, model)
+            start_benchmark_choice(model, choice)
         elif key == ord('F') and app.models and view_mode in ('detail', 'benchmark'):
             model = active_detail_model()
             if not model:
