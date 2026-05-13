@@ -15,7 +15,7 @@ from urllib import request
 from .constants import CACHE_DIR
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .discovery import extract_quant
-from .engines import ENGINE_TQ3, resolve_engine_install
+from .engines import ENGINE_LLAMA_CPP_MTP, ENGINE_TQ3, resolve_engine_install
 from .gguf import architecture_label, extra_arg_value, gguf_layer_count, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
 from .launch_profiles import (
@@ -33,6 +33,7 @@ from .memory_guardrail import (
 )
 from .moe_placement import MoePlacementCandidate, generate_moe_placement_candidates
 from .models import ModelConfig
+from .mtp import MTP_DRAFT_VALUES, clamp_mtp_draft, model_mtp_allowed, model_mtp_draft_n_max, model_mtp_enabled, mtp_support_auto_hint
 from .optimize import (
     apply_hardware_baseline,
     apply_best_optimization,
@@ -70,6 +71,13 @@ BENCHMARK_SAMPLE_TOKENS = 96
 BENCHMARK_WARMUP_TIMEOUT = 120
 BENCHMARK_SAMPLE_TIMEOUT = 240
 BENCHMARK_READY_TIMEOUT = 180
+BENCHMARK_MIN_CANDIDATE_BUDGET_SECONDS = 10.0
+TQ3_MIN_CANDIDATE_BUDGET_SECONDS = 30.0
+TQ3_RAW_PRESEARCH_FAST_BUDGET_SECONDS = 30.0
+TQ3_RAW_PRESEARCH_FULL_BUDGET_SECONDS = 60.0
+TQ3_RAW_PRESEARCH_FAST_CASE_TIMEOUT = 12.0
+TQ3_RAW_PRESEARCH_FULL_CASE_TIMEOUT = 20.0
+TQ3_RAW_PRESEARCH_FAILURE_LIMIT = 2
 SAFE_BOOTSTRAP_PRESETS = (
     ('max_context', 'safe'),
     ('tokens_per_sec', 'safe'),
@@ -141,6 +149,33 @@ SPECTRUM_LABELS = {
     'failed': 'Failed',
     'break_point': 'Break Point',
 }
+
+
+class BenchmarkDeadline:
+    def __init__(self, seconds: float):
+        self.end = time.monotonic() + max(0.0, float(seconds or 0.0))
+
+    @classmethod
+    def from_end(cls, end: float) -> 'BenchmarkDeadline':
+        item = cls(0)
+        item.end = float(end)
+        return item
+
+    def remaining(self) -> float:
+        return max(0.0, self.end - time.monotonic())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def cap_timeout(self, requested: float, floor: float = 1.0) -> float:
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            return 0.0
+        requested_value = max(0.0, float(requested or 0.0))
+        if requested_value <= 0.0:
+            requested_value = remaining
+        capped = min(requested_value, remaining)
+        return max(0.0, capped if remaining < floor else max(float(floor or 0.0), capped))
 
 
 def sync_opencode_after_tuning(app: AppConfig) -> str:
@@ -1037,6 +1072,62 @@ def low_speed_guardrail_reason(record: Dict[str, object]) -> str:
     return ''
 
 
+def runtime_profile_is_tq3(runtime_profile: Optional[RuntimeProfile]) -> bool:
+    return str(getattr(runtime_profile, 'engine_id', '') or '').strip().lower() == ENGINE_TQ3
+
+
+def record_engine_is_tq3(record: Dict[str, object], runtime_profile: Optional[RuntimeProfile] = None) -> bool:
+    return (
+        runtime_profile_is_tq3(runtime_profile)
+        or str(record.get('engine', '') or '').strip().lower() == ENGINE_TQ3
+    )
+
+
+def tq3_terminal_candidate_failure(record: Dict[str, object], runtime_profile: Optional[RuntimeProfile] = None) -> bool:
+    if not record_engine_is_tq3(record, runtime_profile):
+        return False
+    category = str(record.get('failure_category', '') or '').strip().upper()
+    if category in ('API_TIMEOUT', 'RAW_ENGINE_TIMEOUT'):
+        return True
+    return bool(low_speed_guardrail_reason(record))
+
+
+def candidate_min_budget_seconds(runtime_profile: Optional[RuntimeProfile] = None, engine: str = '') -> float:
+    engine_key = str(engine or getattr(runtime_profile, 'engine_id', '') or '').strip().lower()
+    if engine_key == ENGINE_TQ3:
+        return TQ3_MIN_CANDIDATE_BUDGET_SECONDS
+    return BENCHMARK_MIN_CANDIDATE_BUDGET_SECONDS
+
+
+def deadline_has_candidate_budget(
+    deadline: Optional[BenchmarkDeadline],
+    runtime_profile: Optional[RuntimeProfile] = None,
+    engine: str = '',
+) -> bool:
+    if deadline is None:
+        return True
+    return deadline.remaining() >= candidate_min_budget_seconds(runtime_profile, engine)
+
+
+def budget_exhausted_record(
+    candidate: ModelConfig,
+    objective: str,
+    detail: str,
+    runtime_context: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    record = adaptive_record_from_candidate(
+        candidate,
+        objective,
+        'skipped_budget',
+        detail=detail,
+        **(runtime_context or {}),
+    )
+    record['failure_category'] = 'BUDGET_EXHAUSTED'
+    record['failure_reason'] = detail
+    record['suggested_fix'] = 'Run a shorter fast benchmark or increase the benchmark budget.'
+    return record
+
+
 def _record_decode_tps(record: Dict[str, object]) -> float:
     try:
         return float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
@@ -1454,6 +1545,9 @@ def measured_profile_runtime_profile(
         'reasoning',
         'reasoning_budget',
         'reasoning_format',
+        'mtp_enabled',
+        'mtp_draft_n_max',
+        'spec_type',
     )
     has_replay_data = (
         any(bool(profile.get(field)) for field in replay_fields)
@@ -1470,6 +1564,8 @@ def measured_profile_runtime_profile(
             'reasoning',
             'reasoning_budget',
             'reasoning_format',
+            'mtp_enabled',
+            'mtp_draft_n_max',
         ))
         or any(token in command_tokens for token in (
             '-fit',
@@ -1490,13 +1586,17 @@ def measured_profile_runtime_profile(
             '--reasoning',
             '--reasoning-budget',
             '--reasoning-format',
+            '--spec-type',
+            '--spec-draft-n-max',
         ))
     )
     if not has_replay_data:
         return None
 
     engine = str(profile.get('engine') or fingerprint.get('engine_id') or getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp')
-    if 'turboquant' in engine.lower():
+    if 'mtp' in engine.lower():
+        engine = ENGINE_LLAMA_CPP_MTP
+    elif 'turboquant' in engine.lower():
         engine = 'turboquant'
     elif 'tq3' in engine.lower():
         engine = 'tq3'
@@ -1609,6 +1709,14 @@ def measured_profile_runtime_profile(
     reasoning_format = str(profile.get('reasoning_format') or fingerprint.get('reasoning_format') or '').strip().lower()
     if not reasoning_format:
         reasoning_format = _command_flag_value(command_tokens, '--reasoning-format').strip().lower()
+    mtp_enabled = (
+        _profile_bool(profile, 'mtp_enabled')
+        or bool(fingerprint.get('mtp_enabled'))
+        or _command_flag_value(command_tokens, '--spec-type').strip().lower() == 'mtp'
+    )
+    mtp_draft_n_max = _profile_int(profile, 'mtp_draft_n_max', int(fingerprint.get('mtp_draft_n_max', 0) or 0))
+    if mtp_draft_n_max <= 0:
+        mtp_draft_n_max = int(_command_flag_value(command_tokens, '--spec-draft-n-max') or 0)
     return RuntimeProfile(
         engine_id=engine,
         name=runtime_name or f'measured_{key}',
@@ -1641,6 +1749,8 @@ def measured_profile_runtime_profile(
         reasoning=reasoning,
         reasoning_budget=reasoning_budget,
         reasoning_format=reasoning_format,
+        mtp_enabled=bool(mtp_enabled),
+        mtp_draft_n_max=clamp_mtp_draft(mtp_draft_n_max, default=3) if mtp_enabled else 0,
     )
 
 
@@ -1664,6 +1774,10 @@ def apply_measured_profile(model: ModelConfig, key: str) -> Tuple[bool, str]:
         model.flash_attn = bool(profile['flash_attn'])
     if 'jinja' in profile:
         model.jinja = bool(profile['jinja'])
+    if 'mtp_enabled' in profile:
+        model.mtp_enabled = bool(profile.get('mtp_enabled'))
+    if 'mtp_draft_n_max' in profile:
+        model.mtp_draft_n_max = clamp_mtp_draft(profile.get('mtp_draft_n_max'), default=3)
     if isinstance(profile.get('extra_args'), list):
         model.extra_args = [str(item) for item in profile.get('extra_args', [])]
     placement = profile_moe_placement(profile)
@@ -3075,8 +3189,13 @@ def benchmark_completion(
     prompt: Optional[str] = None,
     cancel_token: Optional[CancelToken] = None,
     launch_profile: Optional[BenchmarkLaunchProfile] = None,
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[bool, Dict]:
     check_cancelled(cancel_token)
+    if deadline is not None:
+        timeout = deadline.cap_timeout(timeout)
+        if timeout <= 0.0:
+            return False, {'error': 'benchmark budget expired before API request'}
     prompt = prompt or BENCHMARK_PROMPTS[0]
     if launch_profile is not None:
         request_fields = benchmark_profile_request_fields(launch_profile, max_tokens=max_tokens)
@@ -3123,6 +3242,7 @@ def benchmark_completion_suite(
     timeout: int = BENCHMARK_SAMPLE_TIMEOUT,
     cancel_token: Optional[CancelToken] = None,
     launch_profile: Optional[BenchmarkLaunchProfile] = None,
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[bool, Dict]:
     samples = []
     failures = []
@@ -3135,6 +3255,7 @@ def benchmark_completion_suite(
             prompt=prompt,
             cancel_token=cancel_token,
             launch_profile=launch_profile,
+            deadline=deadline,
         )
         if ok:
             samples.append(bench)
@@ -3494,6 +3615,8 @@ def adaptive_profile_dict(
         'ngl': int(getattr(candidate, 'ngl', 0) or 0),
         'output': int(getattr(candidate, 'output', 0) or 0),
         'cache_ram': int(getattr(candidate, 'cache_ram', 0) or 0),
+        'mtp_enabled': bool(getattr(candidate, 'mtp_enabled', False)),
+        'mtp_draft_n_max': clamp_mtp_draft(getattr(candidate, 'mtp_draft_n_max', 3), default=3),
         'temp': float(getattr(candidate, 'temp', 0.7) or 0.7),
         'flash_attn': bool(getattr(candidate, 'flash_attn', True)),
         'jinja': bool(getattr(candidate, 'jinja', True)),
@@ -3580,6 +3703,9 @@ def adaptive_profile_dict(
         'cpu_moe',
         'n_cpu_moe',
         'tensor_overrides',
+        'mtp_enabled',
+        'mtp_draft_n_max',
+        'spec_type',
         'rejection_reason',
         'selection_rejection_reason',
         'rejected_by_profile',
@@ -4885,6 +5011,54 @@ def opencode_profile_status_text(winners: Dict[str, Dict[str, object]]) -> str:
     return f'opencode not ready (best ctx/slot={ctx})'
 
 
+def skipped_adaptive_profile(key: str, reason: str, status: str = 'skipped_budget') -> Dict[str, object]:
+    return {
+        'status': status,
+        'kind': 'adaptive_profile',
+        'profile_key': key,
+        'objective': key,
+        'tokens_per_sec': 0.0,
+        'seconds': 0.0,
+        'ctx': 0,
+        'ctx_per_slot': 0,
+        'parallel': 1,
+        'selection_score': 0.0,
+        'selection_reason': reason,
+        'reason': reason,
+    }
+
+
+def fill_missing_adaptive_profiles(
+    winners: Dict[str, Dict[str, object]],
+    reason: str,
+    status: str = 'skipped_budget',
+) -> Dict[str, Dict[str, object]]:
+    updated = dict(winners or {})
+    for key in ADAPTIVE_PROFILE_KEYS:
+        if key not in updated:
+            updated[key] = skipped_adaptive_profile(key, reason, status=status)
+    return updated
+
+
+def adaptive_profile_status_text(winners: Dict[str, Dict[str, object]], key: str) -> str:
+    profile = winners.get(key) or {}
+    status = str(profile.get('status', '') or '')
+    if status == 'ok':
+        if key == 'fast_chat':
+            return f'fast={float(profile.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s'
+        if key == 'long_context':
+            return f'long ctx/slot={int(profile.get("ctx_per_slot", profile.get("ctx", 0)) or 0)}'
+        if key == 'auto':
+            return f'auto ctx={int(profile.get("ctx", 0) or 0)} parallel={int(profile.get("parallel", 1) or 1)}'
+    if not profile:
+        return f'{key}=missing'
+    return f'{key}={status or "not_ready"}'
+
+
+def adaptive_profiles_complete(winners: Dict[str, Dict[str, object]]) -> bool:
+    return all(str((winners.get(key) or {}).get('status', '') or '') == 'ok' for key in ('fast_chat', 'long_context', 'auto'))
+
+
 def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Optional[List[Dict[str, object]]] = None) -> str:
     low_speed_count = sum(1 for row in list(records or []) if low_speed_guardrail_reason(row))
     rejected_partial_count = sum(
@@ -5140,6 +5314,9 @@ def adaptive_record_from_candidate(
     unsupported_launch_flags: Optional[List[str]] = None,
     effective_server_args: Optional[List[str]] = None,
     effective_server_command: str = '',
+    mtp_enabled: bool = False,
+    mtp_draft_n_max: int = 0,
+    spec_type: str = '',
 ) -> Dict[str, object]:
     if not startup_result:
         startup_result = 'READY' if status == 'ok' else 'FAILED' if status in ('start failed', 'not ready') else ''
@@ -5242,6 +5419,9 @@ def adaptive_record_from_candidate(
         'tensor_overrides': tensor_override_values,
         'moe_placement_mode': moe_placement_mode,
         'fit_assisted_moe_placement': bool(fit_assisted_moe_placement),
+        'mtp_enabled': bool(mtp_enabled or getattr(candidate, 'mtp_enabled', False)),
+        'mtp_draft_n_max': clamp_mtp_draft(mtp_draft_n_max or getattr(candidate, 'mtp_draft_n_max', 3), default=3),
+        'spec_type': spec_type or ('mtp' if bool(mtp_enabled or getattr(candidate, 'mtp_enabled', False)) else ''),
         'startup_result': startup_result,
         'failure_category': failure_category,
         'failure_reason': concise_failure(failure_reason, limit=500),
@@ -5388,6 +5568,13 @@ def runtime_record_context(
         'tensor_overrides': list(getattr(profile, 'tensor_overrides', ()) or ()) if profile is not None else [],
         'moe_placement_mode': runtime_profile_moe_placement_mode(profile),
         'fit_assisted_moe_placement': runtime_profile_moe_placement_mode(profile) == 'fit_assisted',
+        'mtp_enabled': bool(getattr(profile, 'mtp_enabled', False)) if profile is not None else bool(getattr(candidate, 'mtp_enabled', False)),
+        'mtp_draft_n_max': (
+            clamp_mtp_draft(getattr(profile, 'mtp_draft_n_max', 0), default=3)
+            if profile is not None and int(getattr(profile, 'mtp_draft_n_max', 0) or 0) > 0
+            else clamp_mtp_draft(getattr(candidate, 'mtp_draft_n_max', 3), default=3)
+        ),
+        'spec_type': 'mtp' if (profile is not None and bool(getattr(profile, 'mtp_enabled', False))) or bool(getattr(candidate, 'mtp_enabled', False)) else '',
         'gpu_layers_mode': (
             'fit' if profile is not None and getattr(profile, 'gpu_layers', None) is None and getattr(profile, 'fit', False)
             else 'fixed' if profile is not None and getattr(profile, 'gpu_layers', None) is not None
@@ -5421,6 +5608,7 @@ def benchmark_adaptive_candidate(
     benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
     benchmark_purpose: str = 'serve_default',
     benchmark_depth: str = 'full',
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[Dict[str, object], Optional[Dict[str, object]]]:
     check_cancelled(cancel_token)
     process_snapshots: Dict[str, Dict[str, object]] = {'before': current_process_pressure_payload()}
@@ -5437,6 +5625,13 @@ def benchmark_adaptive_candidate(
         depth=benchmark_depth,
     )
     runtime_context = runtime_record_context(app, candidate, runtime_profile, benchmark_profile=launch_profile)
+    if deadline is not None and deadline.expired():
+        return budget_exhausted_record(
+            candidate,
+            objective,
+            'benchmark budget expired before candidate launch',
+            runtime_context,
+        ), None
     estimated_safe_ctx = candidate_safe_context_estimate(candidate, before_hw)
     observed_floor = observed_opencode_context_floor(candidate)
     guardrail_state = MemoryGuardrailState()
@@ -5490,7 +5685,15 @@ def benchmark_adaptive_candidate(
     )
     try:
         ready_start = time.monotonic()
-        ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
+        ready_timeout = deadline.cap_timeout(BENCHMARK_READY_TIMEOUT) if deadline is not None else BENCHMARK_READY_TIMEOUT
+        if ready_timeout <= 0.0:
+            return budget_exhausted_record(
+                candidate,
+                objective,
+                'benchmark budget expired before server readiness wait',
+                runtime_context,
+            ), None
+        ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=ready_timeout, cancel_token=cancel_token)
         ready_seconds = time.monotonic() - ready_start
         process_snapshots['after_ready'] = current_process_pressure_payload()
         if not ready_ok:
@@ -5536,6 +5739,13 @@ def benchmark_adaptive_candidate(
                 f'adaptive {objective} ready: ctx={candidate.ctx} slot={ctx_per_slot(candidate)} '
                 f'parallel={candidate.parallel}; measuring...'
             )
+        if deadline is not None and deadline.expired():
+            return budget_exhausted_record(
+                candidate,
+                objective,
+                'benchmark budget expired before warmup request',
+                runtime_context,
+            ), None
         warmup_start = time.monotonic()
         benchmark_completion(
             candidate,
@@ -5543,6 +5753,7 @@ def benchmark_adaptive_candidate(
             timeout=BENCHMARK_WARMUP_TIMEOUT,
             cancel_token=cancel_token,
             launch_profile=launch_profile,
+            deadline=deadline,
         )
         warmup_seconds = time.monotonic() - warmup_start
         if guardrail_state.stop_decision is not None:
@@ -5558,12 +5769,21 @@ def benchmark_adaptive_candidate(
                 **runtime_context,
             )
             return apply_memory_guardrail_record(record, guardrail_state.stop_decision, guardrail_state), None
+        if deadline is not None and deadline.expired():
+            return budget_exhausted_record(
+                candidate,
+                objective,
+                'benchmark budget expired before sample request',
+                runtime_context,
+            ), None
+        bench_timeout = deadline.cap_timeout(BENCHMARK_SAMPLE_TIMEOUT) if deadline is not None else BENCHMARK_SAMPLE_TIMEOUT
         bench_ok, bench = benchmark_completion_suite(
             candidate,
             max_tokens=max(1, launch_profile.measurement_output),
-            timeout=BENCHMARK_SAMPLE_TIMEOUT,
+            timeout=bench_timeout,
             cancel_token=cancel_token,
             launch_profile=launch_profile,
+            deadline=deadline,
         )
         if not bench_ok:
             process_snapshots['after_generation'] = current_process_pressure_payload()
@@ -6315,6 +6535,7 @@ def run_tq3_raw_llama_bench_presearch(
     completed_offset: int = 0,
     total: Optional[int] = None,
     run_kind: str = 'server',
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[List[Dict[str, object]], List[RuntimeProfile]]:
     try:
         engine = app.active_engine_key_for_model(model)
@@ -6365,12 +6586,16 @@ def run_tq3_raw_llama_bench_presearch(
     scores: Dict[Tuple[object, ...], float] = {}
     profiles_by_key = {_tq3_raw_profile_key(item): item for item in raw_profiles}
     fast = (depth or '').strip().lower() == 'fast'
-    phase_budget = 90.0 if fast else 180.0
-    case_timeout = 30.0 if fast else 45.0
+    phase_budget = TQ3_RAW_PRESEARCH_FAST_BUDGET_SECONDS if fast else TQ3_RAW_PRESEARCH_FULL_BUDGET_SECONDS
+    case_timeout = TQ3_RAW_PRESEARCH_FAST_CASE_TIMEOUT if fast else TQ3_RAW_PRESEARCH_FULL_CASE_TIMEOUT
     raw_total = len(raw_profiles) * len(TQ3_RAW_BENCH_CASES)
-    phase_deadline = time.monotonic() + phase_budget
+    phase_deadline = min(
+        time.monotonic() + phase_budget,
+        deadline.end if deadline is not None else time.monotonic() + phase_budget,
+    )
     raw_index = 0
     cancelled = False
+    failed_cases = 0
     if progress:
         progress(
             f'TQ3 raw llama-bench pre-search: {len(raw_profiles)} profile(s), '
@@ -6383,6 +6608,10 @@ def run_tq3_raw_llama_bench_presearch(
         key = _tq3_raw_profile_key(runtime_profile)
         for measurement_type, prompt_tokens, generated_tokens in TQ3_RAW_BENCH_CASES:
             check_cancelled(cancel_token)
+            if failed_cases >= TQ3_RAW_PRESEARCH_FAILURE_LIMIT:
+                if progress:
+                    progress(f'TQ3 raw llama-bench skipped remaining cases after {failed_cases} failed case(s)')
+                break
             raw_index += 1
             remaining = phase_deadline - time.monotonic()
             if remaining <= 0:
@@ -6400,6 +6629,8 @@ def run_tq3_raw_llama_bench_presearch(
             timeout = min(case_timeout, max(1.0, remaining))
             command_preview = shlex.join(str(item) for item in cmd)
             candidate_label = f'{runtime_profile.name}/{measurement_type}'
+            if progress:
+                progress(f'TQ3 raw llama-bench command: {command_preview}')
             emit_benchmark_event(
                 progress,
                 'benchmark_candidate',
@@ -6466,6 +6697,9 @@ def run_tq3_raw_llama_bench_presearch(
             record['measurement_type'] = measurement_type
             record['llama_bench_bin'] = llama_bench_bin
             record['exit_code'] = exit_code
+            record['raw_command'] = command_preview
+            record['stdout_excerpt'] = benchmark_failure_excerpt(output, limit=500)
+            record['stderr_excerpt'] = ''
             record['raw_phase'] = 'raw_engine_search'
             record['raw_profile_index'] = profile_index
             record['raw_profile_total'] = len(raw_profiles)
@@ -6476,6 +6710,7 @@ def run_tq3_raw_llama_bench_presearch(
             record['timed_out'] = timed_out
             record['cancelled'] = cancelled_case
             if status != 'ok':
+                failed_cases += 1
                 if timed_out:
                     apply_failure_context(record, output, default_category='RAW_ENGINE_TIMEOUT')
                 elif cancelled_case:
@@ -6507,7 +6742,7 @@ def run_tq3_raw_llama_bench_presearch(
             )
             if cancelled:
                 break
-        if cancelled or phase_deadline <= time.monotonic():
+        if cancelled or failed_cases >= TQ3_RAW_PRESEARCH_FAILURE_LIMIT or phase_deadline <= time.monotonic():
             break
 
     promoted_keys = [
@@ -6692,6 +6927,8 @@ def active_engine_runtime_profiles(
     fit_only_buun = bool(supports_buun_fit and (heavy_for_gpu or (moe and not fits_gpu)))
     supports_cache_kv = bool(capabilities.supports_cache_type_kv and engine != 'buun')
     base_ctx = max(ctx_min, min(ctx_max, 8192 if (moe or heavy_for_gpu or supports_turbo) else 4096))
+    if engine == 'tq3' and moe:
+        base_ctx = max(ctx_min, min(ctx_max, 4096))
     pressure_payload = current_process_pressure_payload()
     opencode_floor = observed_opencode_context_floor(model)
     context_points = dynamic_context_growth_targets(
@@ -6973,6 +7210,8 @@ def active_engine_runtime_profiles(
         viable_ngl: int = 0,
         viable_ngl_source: str = '',
         placement: Optional[MoePlacementCandidate] = None,
+        mtp_enabled: bool = False,
+        mtp_draft_n_max: int = 0,
     ):
         ctx = max(ctx_min, min(ctx_max, int(ctx or base_ctx)))
         ngl_key = 'fit' if ngl is None else int(ngl)
@@ -6996,6 +7235,8 @@ def active_engine_runtime_profiles(
             int(fit_context or 0),
             bool(no_warmup),
             placement_key(effective_placement),
+            bool(mtp_enabled),
+            int(mtp_draft_n_max or 0),
         )
         if key in seen:
             return
@@ -7025,6 +7266,8 @@ def active_engine_runtime_profiles(
             fit_discovery_phase=fit_discovery_phase,
             viable_ngl=max(0, int(viable_ngl or 0)),
             viable_ngl_source=viable_ngl_source,
+            mtp_enabled=bool(mtp_enabled),
+            mtp_draft_n_max=clamp_mtp_draft(mtp_draft_n_max, default=3) if mtp_enabled else 0,
         )
         profiles.append(apply_placement(profile_item, effective_placement))
 
@@ -7102,6 +7345,32 @@ def active_engine_runtime_profiles(
                 no_warmup=capabilities.supports_no_warmup,
             )
 
+    if engine == ENGINE_LLAMA_CPP_MTP:
+        mtp_ngl = 999 if fits_gpu else partial_ngl
+        add('mtp_baseline', base_ctx, mtp_ngl, 'default', batch=128, ubatch=64, mtp_enabled=False)
+        supports_mtp = bool(
+            getattr(capabilities, 'supports_spec_type', False)
+            and getattr(capabilities, 'supports_mtp', False)
+            and getattr(capabilities, 'supports_spec_draft_n_max', False)
+        )
+        if supports_mtp and model_mtp_allowed(model) and (
+            bool(getattr(model, 'mtp_enabled', False))
+            or str(getattr(model, 'supports_mtp', 'auto') or 'auto').strip().lower() == 'yes'
+            or mtp_support_auto_hint(model)
+        ):
+            for draft in MTP_DRAFT_VALUES:
+                add(
+                    f'mtp_draft_n{draft}',
+                    base_ctx,
+                    mtp_ngl,
+                    'default',
+                    batch=128,
+                    ubatch=64,
+                    mtp_enabled=True,
+                    mtp_draft_n_max=draft,
+                )
+        return finalized_profiles()
+
     if engine == 'tq3':
         baseline_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/q8_0'), None)
         baseline_kv = baseline_profile.kv_preset if baseline_profile is not None else 'q8_0/q8_0'
@@ -7110,7 +7379,22 @@ def active_engine_runtime_profiles(
             add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile)
             return finalized_profiles()
 
-        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, kv_profile=baseline_profile)
+        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile)
+        if moe:
+            growth_target = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
+            if growth_target:
+                suffix = baseline_profile.name_slug if baseline_profile is not None else 'q8_0_q8_0'
+                add(
+                    f'context_growth_sweep_{growth_target}_{suffix}',
+                    growth_target,
+                    partial_ngl,
+                    baseline_kv,
+                    batch=128,
+                    ubatch=64,
+                    kv_profile=baseline_profile,
+                )
+            return finalized_profiles()
+
         for kv_profile in turbo_profiles:
             if kv_profile.kv_preset == baseline_kv:
                 continue
@@ -7377,6 +7661,8 @@ def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfil
     candidate.cpu_moe = bool(getattr(runtime_profile, 'cpu_moe', False))
     candidate.n_cpu_moe = max(0, int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0))
     candidate.tensor_overrides = [str(item) for item in tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ())]
+    candidate.mtp_enabled = bool(getattr(runtime_profile, 'mtp_enabled', False))
+    candidate.mtp_draft_n_max = model_mtp_draft_n_max(candidate, runtime_profile)
     candidate.threads = tq3_moe_cpu_placement_threads(candidate, runtime_profile)
     candidate.optimize_mode = 'manual'
     candidate.optimize_tier = 'measured'
@@ -7393,6 +7679,8 @@ def benchmark_config_fingerprint(candidate: ModelConfig) -> str:
         'ngl': int(getattr(candidate, 'ngl', 0) or 0),
         'output': int(getattr(candidate, 'output', 0) or 0),
         'cache_ram': int(getattr(candidate, 'cache_ram', 0) or 0),
+        'mtp_enabled': bool(getattr(candidate, 'mtp_enabled', False)),
+        'mtp_draft_n_max': clamp_mtp_draft(getattr(candidate, 'mtp_draft_n_max', 3), default=3),
         'temp': float(getattr(candidate, 'temp', 0.7) or 0.7),
         'top_p': float(getattr(candidate, 'top_p', 0.95) or 0.95),
         'top_k': int(getattr(candidate, 'top_k', 40) or 0),
@@ -7450,6 +7738,8 @@ def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: 
         'reasoning': str(getattr(runtime_profile, 'reasoning', '') or ''),
         'reasoning_budget': int(getattr(runtime_profile, 'reasoning_budget', -1) or -1),
         'reasoning_format': str(getattr(runtime_profile, 'reasoning_format', '') or ''),
+        'mtp_enabled': bool(getattr(runtime_profile, 'mtp_enabled', False)),
+        'mtp_draft_n_max': int(getattr(runtime_profile, 'mtp_draft_n_max', 0) or 0),
         'extra_args': list(runtime_profile.extra_args or ()),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
@@ -7642,6 +7932,7 @@ def benchmark_exhaustive_candidate_with_retry(
     run_kind: str = 'server',
     planner_reason: str = '',
     measurement_type: str = 'full',
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[bool, bool, List[Dict[str, object]], List[Dict[str, object]], int]:
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
@@ -7649,6 +7940,14 @@ def benchmark_exhaustive_candidate_with_retry(
     benchmark_label = 'fast benchmark' if run_kind == 'server_fast' else 'smart bounded'
     for attempt in (1, 2):
         check_cancelled(cancel_token)
+        try:
+            engine = app.active_engine_key_for_model(base_model)
+        except Exception:
+            engine = str(getattr(base_model, 'runtime', '') or '')
+        if not deadline_has_candidate_budget(deadline, engine=engine):
+            if progress:
+                progress(f'{benchmark_label} candidate {candidate_label} skipped: benchmark budget exhausted')
+            return False, True, records, measured, completed
         candidate = configure_adaptive_candidate(base_model, profile, objective, ctx, parallel, variant)
         estimated_safe_ctx = candidate_safe_context_estimate(candidate, profile)
         try:
@@ -7690,6 +7989,7 @@ def benchmark_exhaustive_candidate_with_retry(
             benchmark_profile=launch_profile,
             benchmark_purpose='serve_default',
             benchmark_depth=launch_depth,
+            deadline=deadline,
         )
         completed += 1
         ok = record.get('status') == 'ok'
@@ -7718,6 +8018,7 @@ def benchmark_exhaustive_candidate_with_retry(
         if ok:
             return True, False, records, measured, completed
         deterministic_failures = {
+            'BUDGET_EXHAUSTED',
             'CLI_INVALID',
             'MEMORY_GUARDRAIL',
             'MEMORY_FIT_FAILED',
@@ -7729,6 +8030,13 @@ def benchmark_exhaustive_candidate_with_retry(
             'BUUN_CPU_WARMUP_ABORT',
         }
         if str(record.get('failure_category', '') or '') in deterministic_failures:
+            return False, True, records, measured, completed
+        if tq3_terminal_candidate_failure(record):
+            if progress:
+                progress(
+                    f'{benchmark_label} candidate {candidate_label} failed with '
+                    f'{record.get("failure_category") or record.get("status")}; not retrying TQ3 timeout/low-speed profile.'
+                )
             return False, True, records, measured, completed
         if attempt == 1 and progress:
             progress(f'{benchmark_label} candidate {candidate_label} failed once; retrying to confirm break...')
@@ -7748,6 +8056,7 @@ def benchmark_runtime_profile_with_retry(
     max_attempts: int = 2,
     benchmark_depth: str = 'full',
     benchmark_purpose: str = 'serve_default',
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[bool, bool, List[Dict[str, object]], List[Dict[str, object]], int]:
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
@@ -7759,6 +8068,10 @@ def benchmark_runtime_profile_with_retry(
     attempts = max(1, int(max_attempts or 1))
     for attempt in range(1, attempts + 1):
         check_cancelled(cancel_token)
+        if not deadline_has_candidate_budget(deadline, runtime_profile=runtime_profile):
+            if progress:
+                progress(f'runtime profile candidate {candidate_label} skipped: benchmark budget exhausted')
+            break
         candidate = model_for_runtime_profile(base_model, runtime_profile)
         profile_fingerprint = runtime_profile_config_fingerprint(candidate, runtime_profile)
         try:
@@ -7797,6 +8110,7 @@ def benchmark_runtime_profile_with_retry(
             benchmark_profile=launch_profile,
             benchmark_purpose=benchmark_purpose,
             benchmark_depth=benchmark_depth,
+            deadline=deadline,
         )
         completed += 1
         ok = record.get('status') == 'ok'
@@ -7827,6 +8141,7 @@ def benchmark_runtime_profile_with_retry(
         if ok:
             return True, False, records, measured, completed
         deterministic_failures = {
+            'BUDGET_EXHAUSTED',
             'CLI_INVALID',
             'MEMORY_GUARDRAIL',
             'MEMORY_FIT_FAILED',
@@ -7841,6 +8156,13 @@ def benchmark_runtime_profile_with_retry(
             if progress:
                 progress(f'runtime profile candidate {candidate_label} failed with {record.get("failure_category")}; moving to a different profile.')
             break
+        if tq3_terminal_candidate_failure(record, runtime_profile):
+            if progress:
+                progress(
+                    f'runtime profile candidate {candidate_label} failed with '
+                    f'{record.get("failure_category") or record.get("status")}; not retrying TQ3 timeout/low-speed profile.'
+                )
+            break
         if attempt < attempts and progress:
             progress(f'runtime profile candidate {candidate_label} failed once; retrying to confirm break...')
     return False, True, records, measured, completed
@@ -7852,6 +8174,7 @@ def benchmark_frontier_probe_candidate(
     objective: str,
     progress: Optional[Callable[[str], None]],
     cancel_token: Optional[CancelToken],
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[Dict[str, object], bool]:
     check_cancelled(cancel_token)
     try:
@@ -7866,13 +8189,18 @@ def benchmark_frontier_probe_candidate(
         depth='fast',
     )
     runtime_context = runtime_record_context(app, candidate, benchmark_profile=launch_profile)
+    if deadline is not None and deadline.expired():
+        return budget_exhausted_record(candidate, objective, 'benchmark budget expired before frontier probe', runtime_context), False
     ok, msg = app.start(candidate, benchmark_profile=launch_profile)
     if not ok:
         record = adaptive_record_from_candidate(candidate, objective, 'start failed', detail=msg, **runtime_context)
         apply_failure_context(record, msg, default_category='SERVER_TIMEOUT')
         return record, False
     try:
-        ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=BENCHMARK_READY_TIMEOUT, cancel_token=cancel_token)
+        ready_timeout = deadline.cap_timeout(BENCHMARK_READY_TIMEOUT) if deadline is not None else BENCHMARK_READY_TIMEOUT
+        if ready_timeout <= 0.0:
+            return budget_exhausted_record(candidate, objective, 'benchmark budget expired before frontier readiness wait', runtime_context), False
+        ready_ok, ready_msg = app.wait_until_ready(candidate, timeout=ready_timeout, cancel_token=cancel_token)
         if not ready_ok:
             record = adaptive_record_from_candidate(candidate, objective, 'not ready', detail=ready_msg, **runtime_context)
             apply_failure_context(record, ready_msg, default_category='SERVER_TIMEOUT')
@@ -7889,6 +8217,7 @@ def benchmark_frontier_probe_candidate(
             timeout=BENCHMARK_WARMUP_TIMEOUT,
             cancel_token=cancel_token,
             launch_profile=launch_profile,
+            deadline=deadline,
         )
         if not warm_ok:
             detail = str(warm.get('error', 'warmup failed'))
@@ -7931,11 +8260,20 @@ def benchmark_smart_probe_with_retry(
     completed: int,
     total: int,
     planner_reason: str = 'frontier',
+    deadline: Optional[BenchmarkDeadline] = None,
 ) -> Tuple[bool, bool, List[Dict[str, object]], int]:
     records: List[Dict[str, object]] = []
     candidate_label = f'long_context/{variant}/{planner_reason} ctx={ctx} par=1'
     for attempt in (1, 2):
         check_cancelled(cancel_token)
+        try:
+            engine = app.active_engine_key_for_model(base_model)
+        except Exception:
+            engine = str(getattr(base_model, 'runtime', '') or '')
+        if not deadline_has_candidate_budget(deadline, engine=engine):
+            if progress:
+                progress(f'smart frontier probe {candidate_label} skipped: benchmark budget exhausted')
+            return False, True, records, completed
         candidate = configure_adaptive_candidate(base_model, profile, 'long_context', ctx, 1, variant)
         estimated_safe_ctx = candidate_safe_context_estimate(candidate, profile)
         command_preview = benchmark_command_preview(app, candidate)
@@ -7956,7 +8294,7 @@ def benchmark_smart_probe_with_retry(
             candidate=candidate_label,
             command=command_preview,
         )
-        record, ok = benchmark_frontier_probe_candidate(app, candidate, 'long_context', progress, cancel_token)
+        record, ok = benchmark_frontier_probe_candidate(app, candidate, 'long_context', progress, cancel_token, deadline=deadline)
         completed += 1
         break_point = not ok and attempt == 2
         enrich_exhaustive_record(
@@ -7974,6 +8312,13 @@ def benchmark_smart_probe_with_retry(
         emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label)
         if ok:
             return True, False, records, completed
+        if tq3_terminal_candidate_failure(record):
+            if progress:
+                progress(
+                    f'smart frontier probe {candidate_label} failed with '
+                    f'{record.get("failure_category") or record.get("status")}; not retrying TQ3 timeout/low-speed profile.'
+                )
+            return False, True, records, completed
         if attempt == 1 and progress:
             progress(f'smart frontier probe {candidate_label} failed once; retrying to confirm break...')
     return False, True, records, completed
@@ -8010,6 +8355,8 @@ def benchmark_exhaustive_profiles(
     current: Optional[ModelConfig] = None
     completed = 0
     started_monotonic = time.monotonic()
+    deadline = BenchmarkDeadline.from_end(started_monotonic + SMART_BENCHMARK_SOFT_BUDGET_SECONDS)
+    budget_exhausted = False
     full_by_fingerprint: Dict[str, Dict[str, object]] = {}
     disabled_runtime_kv: set[Tuple[str, str]] = set()
     disabled_runtime_memory: set[Tuple[str, ...]] = set()
@@ -8036,7 +8383,7 @@ def benchmark_exhaustive_profiles(
     start_msg = (
         f'smart bounded benchmark started: ctx={ctx_min}..{ctx_max}, '
         f'chat_floor={chat_floor}, opencode_floor={opencode_floor or "none"}, '
-        f'soft_budget={SMART_BENCHMARK_SOFT_BUDGET_SECONDS // 60}m, '
+        f'soft_budget={SMART_BENCHMARK_SOFT_BUDGET_SECONDS // 60}m hard_deadline=on, '
         f'arch={architecture_label(model)}, runtime_profiles={len(runtime_profiles)}, '
         f'{moe_note}{profile.short_summary()} '
         f'{pressure_payload.get("process_pressure_detail", "")}'
@@ -8080,6 +8427,7 @@ def benchmark_exhaustive_profiles(
         completed_offset=completed,
         total=total,
         run_kind='server',
+        deadline=deadline,
     )
     if raw_promotions:
         runtime_profiles = dedupe_runtime_profiles(raw_promotions + runtime_profiles)
@@ -8098,7 +8446,13 @@ def benchmark_exhaustive_profiles(
         optional: bool = False,
     ) -> Tuple[bool, bool]:
         nonlocal completed, current, total
+        nonlocal budget_exhausted
         check_cancelled(cancel_token)
+        if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+            budget_exhausted = True
+            if progress:
+                progress('smart bounded global budget exhausted; selecting from measured candidates')
+            return False, True
         if optional and not optional_refinement_allowed():
             if progress:
                 progress(f'smart bounded skipped optional {planner_reason}: soft budget reached and winners exist')
@@ -8128,6 +8482,7 @@ def benchmark_exhaustive_profiles(
             scan_level=planner_reason,
             planner_reason=planner_reason,
             measurement_type='full',
+            deadline=deadline,
         )
         records.extend(new_records)
         measured.extend(new_measured)
@@ -8143,6 +8498,10 @@ def benchmark_exhaustive_profiles(
 
         def probe(value: int) -> bool:
             nonlocal completed, current
+            nonlocal budget_exhausted
+            if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+                budget_exhausted = True
+                return False
             value = max(ctx_min, min(ctx_max, round_context(value)))
             if value in tested:
                 return value in successes
@@ -8159,6 +8518,7 @@ def benchmark_exhaustive_profiles(
                 completed,
                 total,
                 planner_reason=planner_reason,
+                deadline=deadline,
             )
             records.extend(new_records)
             (successes if ok else failures).append(value)
@@ -8199,6 +8559,7 @@ def benchmark_exhaustive_profiles(
 
     def run_fast_chat_race(ctx: int, variant: str):
         nonlocal completed, current
+        nonlocal budget_exhausted
         max_parallel = max(1, min(4 if model_is_moe(model) else 16, int(getattr(profile, 'cpu_logical', 0) or 1)))
         parallel_values = [value for value in (1, 2, 4, 8, 16) if value <= max_parallel]
         best_parallel = 0
@@ -8207,6 +8568,9 @@ def benchmark_exhaustive_profiles(
         tested_parallel = set()
         for parallel in parallel_values:
             check_cancelled(cancel_token)
+            if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+                budget_exhausted = True
+                break
             if ctx // max(1, parallel) < chat_floor:
                 break
             ok, broke = run_full_measurement('fast_chat', ctx, parallel, variant, 'chat_parallel')
@@ -8241,7 +8605,6 @@ def benchmark_exhaustive_profiles(
                 completed=completed,
                 total=total,
             )
-            runtime_deadline = started_monotonic + FULL_RUNTIME_PROFILE_BUDGET_SECONDS
             fit_succeeded_engines: set[str] = set()
             fit_ceiling_by_engine: Dict[str, Tuple[int, str, str]] = {}
             fixed_fit_engine_skipped = 0
@@ -8264,7 +8627,8 @@ def benchmark_exhaustive_profiles(
                 if runtime_engine in fit_succeeded_engines and runtime_profile_is_fixed_gpu_layers(runtime_profile):
                     fixed_fit_engine_skipped += 1
                     continue
-                if time.monotonic() >= runtime_deadline:
+                if not deadline_has_candidate_budget(deadline, runtime_profile=runtime_profile):
+                    budget_exhausted = True
                     if progress:
                         progress('smart bounded runtime profile budget reached; selecting from measured candidates')
                     break
@@ -8280,6 +8644,7 @@ def benchmark_exhaustive_profiles(
                     total,
                     max_attempts=2,
                     benchmark_depth='full',
+                    deadline=deadline,
                 )
                 records.extend(new_records)
                 measured.extend(new_measured)
@@ -8418,6 +8783,13 @@ def benchmark_exhaustive_profiles(
         )
         return False, msg
 
+    missing_reason = (
+        'No valid candidate measured before benchmark budget expired'
+        if budget_exhausted or deadline.expired()
+        else 'No valid candidate measured for this profile in the bounded benchmark run'
+    )
+    winners = fill_missing_adaptive_profiles(winners, missing_reason, status='skipped_budget' if budget_exhausted or deadline.expired() else 'skipped')
+    run_status = 'done' if adaptive_profiles_complete(winners) else ('skipped_budget' if not any(str((winners.get(key) or {}).get('status', '')) == 'ok' for key in ADAPTIVE_PROFILE_KEYS) else 'partial')
     winners = attach_profile_frontier(model, measured, winners, profile, generated_at=ended_at)
     annotate_spectrum_records(records, winners)
     saved = ModelConfig(**asdict(model))
@@ -8425,7 +8797,7 @@ def benchmark_exhaustive_profiles(
     saved.measured_profiles = winners
     saved.benchmark_fingerprint = app.model_fingerprint(saved)
     saved.default_benchmark_at = ended_at
-    run = build_benchmark_run(run_id, 'server', 'done', records, winners, started_at, ended_at, profile.short_summary())
+    run = build_benchmark_run(run_id, 'server', run_status, records, winners, started_at, ended_at, profile.short_summary())
     upsert_benchmark_run(saved, run)
 
     auto_profile = winners['auto']
@@ -8437,14 +8809,15 @@ def benchmark_exhaustive_profiles(
         f'auto/smart-bounded {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
         f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
     )
-    saved.default_benchmark_status = 'done'
+    saved.default_benchmark_status = run_status
     app.add_or_update(saved)
     sync_msg = sync_opencode_after_tuning(app)
+    prefix = '✅ smart bounded profiles saved' if run_status == 'done' else '⚠ smart bounded partial profiles saved'
     msg = (
-        f'✅ smart bounded profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
-        f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
+        f'{prefix}: {adaptive_profile_status_text(winners, "fast_chat")}, '
+        f'{adaptive_profile_status_text(winners, "long_context")}, '
         f'{opencode_profile_status_text(winners)}, '
-        f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
+        f'{adaptive_profile_status_text(winners, "auto")} | status={run_status} | {sync_msg}'
     )
     if progress:
         progress(msg)
@@ -9460,6 +9833,9 @@ def benchmark_fast_profiles(
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
     completed = 0
+    started_monotonic = time.monotonic()
+    deadline = BenchmarkDeadline.from_end(started_monotonic + FAST_RUNTIME_PROFILE_BUDGET_SECONDS)
+    budget_exhausted = False
     disabled_runtime_kv: set[Tuple[str, str]] = set()
     disabled_runtime_memory: set[Tuple[str, ...]] = set()
 
@@ -9478,6 +9854,7 @@ def benchmark_fast_profiles(
         start_msg = (
             f'fast benchmark started: runtime_profiles={len(runtime_profiles)}, '
             f'budget={FAST_RUNTIME_PROFILE_BUDGET_SECONDS // 60}m, '
+            f'hard_deadline=on, '
             f'arch={architecture_label(model)}, {profile.short_summary()} '
             f'{pressure_payload.get("process_pressure_detail", "")}'
         )
@@ -9485,6 +9862,7 @@ def benchmark_fast_profiles(
         start_msg = (
             f'fast benchmark started: contexts={",".join(str(ctx) for ctx in contexts)}, '
             f'parallel={",".join(str(value) for value in parallel_values)}, default variant, '
+            f'budget={FAST_RUNTIME_PROFILE_BUDGET_SECONDS // 60}m, hard_deadline=on, '
             f'arch={architecture_label(model)}, {profile.short_summary()} '
             f'{pressure_payload.get("process_pressure_detail", "")}'
         )
@@ -9527,6 +9905,7 @@ def benchmark_fast_profiles(
         completed_offset=completed,
         total=total,
         run_kind='server_fast',
+        deadline=deadline,
     )
     if raw_promotions:
         runtime_profiles = dedupe_runtime_profiles(raw_promotions + runtime_profiles)
@@ -9535,7 +9914,6 @@ def benchmark_fast_profiles(
 
     try:
         if runtime_profiles:
-            deadline = time.monotonic() + FAST_RUNTIME_PROFILE_BUDGET_SECONDS
             fit_succeeded_engines: set[str] = set()
             fit_ceiling_by_engine: Dict[str, Tuple[int, str, str]] = {}
             fixed_fit_engine_skipped = 0
@@ -9559,7 +9937,8 @@ def benchmark_fast_profiles(
                 if runtime_engine in fit_succeeded_engines and runtime_profile_is_fixed_gpu_layers(runtime_profile):
                     fixed_fit_engine_skipped += 1
                     continue
-                if time.monotonic() >= deadline:
+                if not deadline_has_candidate_budget(deadline, runtime_profile=runtime_profile):
+                    budget_exhausted = True
                     if progress:
                         progress('fast runtime profile budget reached; selecting from measured candidates')
                     break
@@ -9576,6 +9955,7 @@ def benchmark_fast_profiles(
                     run_kind='server_fast',
                     max_attempts=1,
                     benchmark_depth='fast',
+                    deadline=deadline,
                 )
                 records.extend(new_records)
                 measured.extend(new_measured)
@@ -9602,6 +9982,9 @@ def benchmark_fast_profiles(
             chat_floor = chat_min_ctx_per_slot(model)
             for ctx in contexts:
                 check_cancelled(cancel_token)
+                if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+                    budget_exhausted = True
+                    break
                 current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, 'default')
                 ok, broke, new_records, new_measured, completed = benchmark_exhaustive_candidate_with_retry(
                     app,
@@ -9617,6 +10000,7 @@ def benchmark_fast_profiles(
                     total,
                     scan_level='fast',
                     run_kind='server_fast',
+                    deadline=deadline,
                 )
                 records.extend(new_records)
                 measured.extend(new_measured)
@@ -9640,12 +10024,16 @@ def benchmark_fast_profiles(
                     total,
                     scan_level='fast',
                     run_kind='server_fast',
+                    deadline=deadline,
                 )
                 records.extend(new_records)
                 measured.extend(new_measured)
 
                 for parallel in parallel_values:
                     check_cancelled(cancel_token)
+                    if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+                        budget_exhausted = True
+                        break
                     if ctx // max(1, parallel) < chat_floor:
                         continue
                     current = configure_adaptive_candidate(model, profile, 'fast_chat', ctx, parallel, 'default')
@@ -9663,6 +10051,7 @@ def benchmark_fast_profiles(
                         total,
                         scan_level='fast',
                         run_kind='server_fast',
+                        deadline=deadline,
                     )
                     records.extend(new_records)
                     measured.extend(new_measured)
@@ -9741,7 +10130,7 @@ def benchmark_fast_profiles(
     saved.measured_profiles = winners
     saved.benchmark_fingerprint = app.model_fingerprint(saved)
     saved.default_benchmark_at = ended_at
-    run = build_benchmark_run(run_id, 'server_fast', 'done', records, winners, started_at, ended_at, profile.short_summary())
+    run = build_benchmark_run(run_id, 'server_fast', run_status, records, winners, started_at, ended_at, profile.short_summary())
     upsert_benchmark_run(saved, run)
 
     auto_profile = winners['auto']
@@ -9753,14 +10142,15 @@ def benchmark_fast_profiles(
         f'auto/fast {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
         f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
     )
-    saved.default_benchmark_status = 'done'
+    saved.default_benchmark_status = run_status
     app.add_or_update(saved)
     sync_msg = sync_opencode_after_tuning(app)
+    prefix = '✅ fast profiles saved' if run_status == 'done' else '⚠ fast partial profiles saved'
     msg = (
-        f'✅ fast profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
-        f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
+        f'{prefix}: {adaptive_profile_status_text(winners, "fast_chat")}, '
+        f'{adaptive_profile_status_text(winners, "long_context")}, '
         f'{opencode_profile_status_text(winners)}, '
-        f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
+        f'{adaptive_profile_status_text(winners, "auto")} | status={run_status} | {sync_msg}'
     )
     if progress:
         progress(msg)
@@ -9946,6 +10336,13 @@ def benchmark_adaptive_profiles(
         return False, msg
 
     ended_at = datetime.now().isoformat(timespec='seconds')
+    budget_expired = time.monotonic() >= deadline
+    winners = fill_missing_adaptive_profiles(
+        winners,
+        'No valid candidate measured before benchmark budget expired' if budget_expired else 'No valid candidate measured for this profile',
+        status='skipped_budget' if budget_expired else 'skipped',
+    )
+    run_status = 'done' if adaptive_profiles_complete(winners) else 'partial'
     winners = attach_profile_frontier(model, measured, winners, profile, generated_at=ended_at)
     annotate_spectrum_records(records, winners)
     saved = ModelConfig(**asdict(model))
@@ -9963,14 +10360,15 @@ def benchmark_adaptive_profiles(
         f'auto/measured {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
         f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
     )
-    saved.default_benchmark_status = 'done'
+    saved.default_benchmark_status = run_status
     app.add_or_update(saved)
     sync_msg = sync_opencode_after_tuning(app)
+    prefix = '✅ adaptive profiles saved' if run_status == 'done' else '⚠ adaptive partial profiles saved'
     msg = (
-        f'✅ adaptive profiles saved: fast={winners["fast_chat"]["tokens_per_sec"]:.2f} tok/s, '
-        f'long ctx/slot={winners["long_context"]["ctx_per_slot"]}, '
+        f'{prefix}: {adaptive_profile_status_text(winners, "fast_chat")}, '
+        f'{adaptive_profile_status_text(winners, "long_context")}, '
         f'opencode ctx/slot={winners["opencode_ready"]["ctx_per_slot"]}, '
-        f'auto ctx={saved.ctx} parallel={saved.parallel} | {sync_msg}'
+        f'{adaptive_profile_status_text(winners, "auto")} | status={run_status} | {sync_msg}'
     )
     if progress:
         progress(msg)

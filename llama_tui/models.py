@@ -83,6 +83,9 @@ class ModelConfig:
     tq3_weight_format: str = ''
     tq3_source: str = ''
     tq3_reason: str = ''
+    supports_mtp: str = 'auto'
+    mtp_enabled: bool = False
+    mtp_draft_n_max: int = 3
     moe_placement_strategy: str = ''
     cpu_moe: bool = False
     n_cpu_moe: int = 0

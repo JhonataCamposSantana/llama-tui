@@ -18,6 +18,7 @@ DEFAULT_TQ3_LLAMA_SERVER = (
     if (Path.home() / 'llama.cpp-tq3' / 'build' / 'bin' / 'llama-server').exists()
     else 'tq3-llama-server'
 )
+DEFAULT_LLAMA_CPP_MTP_SERVER = str(Path.home() / 'src' / 'llama.cpp-mtp' / 'build-mtp' / 'bin' / 'llama-server')
 BUUN_KV_MODES = ('turbo4', 'turbo3_tcq', 'turbo2_tcq', 'turbo3', 'turbo2')
 TURBOQUANT_KV_MODES = ('q8_0', 'turbo4', 'turbo3', 'turbo2')
 TQ3_KV_MODES = ('q8_0', 'tq3_0')
@@ -83,6 +84,8 @@ RUNTIME_TUNING_FLAGS = (
     '--override-tensor',
     '--override-tensors',
     '-ot',
+    '--spec-type',
+    '--spec-draft-n-max',
 )
 
 
@@ -114,9 +117,14 @@ class EngineCapabilities:
     supports_cpu_moe: bool = False
     supports_n_cpu_moe: bool = False
     supports_override_tensor: bool = False
+    supports_spec_type: bool = False
+    supports_mtp: bool = False
+    supports_spec_draft_n_max: bool = False
     cpu_moe_flag: str = '-cmoe'
     n_cpu_moe_flag: str = '-ncmoe'
     override_tensor_flag: str = '-ot'
+    spec_type_flag: str = '--spec-type'
+    spec_draft_n_max_flag: str = '--spec-draft-n-max'
     gpu_layers_flag: str = '--n-gpu-layers'
     supported_kv_modes: Tuple[str, ...] = ()
     help_text: str = ''
@@ -244,6 +252,10 @@ class EngineProfile:
     def is_tq3(self) -> bool:
         return self.engine_id == 'tq3'
 
+    @property
+    def is_llama_cpp_mtp(self) -> bool:
+        return self.engine_id == 'llama.cpp-mtp'
+
     def llama_extra_args(self) -> List[str]:
         if not (self.is_buun or self.is_turboquant or self.is_tq3):
             return []
@@ -254,6 +266,8 @@ class EngineProfile:
         if self.is_buun or self.is_turboquant or self.is_tq3:
             key_mode, value_mode = self.engine_kv_pair()
             kv = f'key={key_mode} value={value_mode}'
+        elif self.is_llama_cpp_mtp:
+            kv = 'default | MTP Experimental'
         else:
             kv = (self.kv_mode or '-').strip() or '-'
         ctx = str(self.context_override) if self.context_override is not None else 'model default'
@@ -310,6 +324,18 @@ class RuntimeProfile:
     reasoning: str = ''
     reasoning_budget: int = -1
     reasoning_format: str = ''
+    mtp_enabled: bool = False
+    mtp_draft_n_max: int = 0
+
+
+def llama_cpp_mtp_server_from_env() -> str:
+    value = os.environ.get('LLAMA_CPP_MTP_PATH')
+    if not value:
+        return DEFAULT_LLAMA_CPP_MTP_SERVER
+    path = Path(value).expanduser()
+    if path.name == 'llama-server' or path.is_file():
+        return str(path)
+    return str(path / 'llama-server')
 
 
 def resolve_buun_kv_modes(
@@ -405,6 +431,22 @@ def make_runtime_profile(
             kv_key_mode=key_mode,
             kv_value_mode=value_mode,
         )
+    if normalized in ('llama.cpp-mtp', 'llama-cpp-mtp', 'llamacpp-mtp', 'mtp'):
+        command = llama_cpp_mtp_server_from_env()
+        return EngineProfile(
+            engine_id='llama.cpp-mtp',
+            label='llama.cpp MTP',
+            server_bin=command,
+            default_args=(),
+            supported_kv_modes=('default', 'f16', 'q8_0', 'q4_0'),
+            flash_attn_syntax='value',
+            supports_turbo_kv=False,
+            experimental=True,
+            context_override=ctx_override,
+            kv_mode=(kv_mode or '').strip(),
+            kv_key_mode='',
+            kv_value_mode='',
+        )
     return EngineProfile(
         engine_id='llama.cpp',
         label='llama.cpp',
@@ -459,6 +501,8 @@ def default_engine_capabilities(engine_id: str = 'llama.cpp') -> EngineCapabilit
             gpu_layers_flag='-ngl',
             supported_kv_modes=TQ3_BENCHMARK_FALLBACK_KV_MODES,
         )
+    if normalized in ('llama.cpp-mtp', 'llama-cpp-mtp', 'llamacpp-mtp', 'mtp'):
+        return EngineCapabilities(supported_kv_modes=('f16', 'q8_0', 'q4_0'))
     return EngineCapabilities(supported_kv_modes=('f16', 'q8_0', 'q4_0'))
 
 
@@ -560,6 +604,9 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         or has_long_override_tensors
         or defaults.supports_override_tensor
     )
+    supports_spec_type = '--spec-type' in low or defaults.supports_spec_type
+    supports_spec_draft_n_max = '--spec-draft-n-max' in low or defaults.supports_spec_draft_n_max
+    supports_mtp = bool(supports_spec_type and re.search(r'\bmtp\b', low)) or defaults.supports_mtp
     override_tensor_flag = (
         '-ot' if has_short_override_tensor
         else '--override-tensor' if has_long_override_tensor
@@ -602,9 +649,14 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_cpu_moe=supports_cpu_moe,
         supports_n_cpu_moe=supports_n_cpu_moe,
         supports_override_tensor=supports_override_tensor,
+        supports_spec_type=supports_spec_type,
+        supports_mtp=supports_mtp,
+        supports_spec_draft_n_max=supports_spec_draft_n_max,
         cpu_moe_flag=cpu_moe_flag,
         n_cpu_moe_flag=n_cpu_moe_flag,
         override_tensor_flag=override_tensor_flag,
+        spec_type_flag='--spec-type',
+        spec_draft_n_max_flag='--spec-draft-n-max',
         gpu_layers_flag=gpu_layers_flag,
         supported_kv_modes=supported_kv_modes,
         help_text=text,
@@ -727,5 +779,11 @@ def runtime_profile_extra_args(
             value = str(override or '').strip()
             if value:
                 args += [capabilities.override_tensor_flag or '-ot', value]
+    if engine.is_llama_cpp_mtp and bool(getattr(runtime_profile, 'mtp_enabled', False)):
+        if capabilities.supports_mtp:
+            args += [capabilities.spec_type_flag or '--spec-type', 'mtp']
+        if capabilities.supports_spec_draft_n_max:
+            draft = max(1, min(3, int(getattr(runtime_profile, 'mtp_draft_n_max', 0) or 3)))
+            args += [capabilities.spec_draft_n_max_flag or '--spec-draft-n-max', str(draft)]
     args.extend(str(item) for item in profile_extra_args)
     return args

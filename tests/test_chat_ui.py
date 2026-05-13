@@ -606,6 +606,45 @@ class BrowserAndFormTests(unittest.TestCase):
 
         self.assertEqual(line, 'ENGINE: Buun | KV key=turbo4 value=turbo4 | binary ok')
 
+    def test_mtp_active_engine_badge_shows_experimental_state(self):
+        model = ModelConfig(
+            id='mtp',
+            name='MTP Model',
+            path='model.gguf',
+            alias='mtp-local',
+            port=18080,
+            supports_mtp='yes',
+            mtp_enabled=True,
+            mtp_draft_n_max=2,
+        )
+
+        class FakeApp:
+            runtime_profile = SimpleNamespace()
+
+            def command_exists(self, _command):
+                return True
+
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp-mtp'
+
+            def active_runtime_binary_for_model(self, _model):
+                return '/opt/mtp/bin/llama-server'
+
+            def mtp_session_advisory(self, _model):
+                return 'MTP: n=2 (supported) Experimental'
+
+            def mtp_binary_warning(self, _model):
+                return ''
+
+        line = active_engine_badge_line(FakeApp(), model)
+        detail = active_engine_detail_line(FakeApp(), model)
+        warning = active_engine_warning_line(FakeApp(), model)
+
+        self.assertEqual(line, 'ENGINE: llama.cpp MTP | KV MTP n=2 (supported) | binary ok')
+        self.assertIn('active engine: llama.cpp-mtp', detail)
+        self.assertIn('MTP n=2 (supported)', detail)
+        self.assertIn('Experimental', warning)
+
     def test_turboquant_active_engine_label_kv_and_warning(self):
         model = ModelConfig(id='oss', name='GPT OSS', path='oss.gguf', alias='oss', port=18080)
         model.turboquant_status = 'incompatible'

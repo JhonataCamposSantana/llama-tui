@@ -43,6 +43,7 @@ from .gguf import architecture_detail, tq3_detail, tq3_short, turboquant_detail,
 from .hermes_benchmark import benchmark_hermes_workflow
 from .hardware import HardwareProfile
 from .models import ModelConfig
+from .mtp import mtp_label, mtp_support_label
 from .opencode_benchmark import benchmark_opencode_workflow
 from .optimize import apply_best_optimization, model_is_moe, select_best_tier
 from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, wrap_display_lines
@@ -374,6 +375,8 @@ def format_engine_badge(engine_id: str, narrow: bool = False) -> str:
         return 'TQ' if narrow else 'TurboQuant+'
     if normalized == 'tq3':
         return 'TQ3'
+    if normalized == 'llama.cpp-mtp':
+        return 'MTP' if narrow else 'llama.cpp MTP'
     if normalized == 'buun':
         return 'Buun'
     if normalized == 'vllm':
@@ -584,6 +587,8 @@ def active_engine_short(app: AppConfig, model: ModelConfig) -> str:
         return 'turboquant'
     if engine == 'tq3':
         return 'tq3'
+    if engine == 'llama.cpp-mtp':
+        return 'llama.cpp-mtp'
     if engine == 'vllm':
         return 'vLLM'
     return engine or display_runtime(model)
@@ -604,6 +609,8 @@ def active_engine_binary(app: AppConfig, model: ModelConfig) -> str:
 
 def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
     engine = active_engine_key(app, model)
+    if engine == 'llama.cpp-mtp':
+        return f'MTP {mtp_label(model)} ({mtp_support_label(model)})'
     if engine not in ('buun', 'turboquant', 'tq3'):
         return '-'
     tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
@@ -683,6 +690,8 @@ def active_engine_warning_line(app: AppConfig, model: ModelConfig) -> str:
         'tq3_session_advisory',
         'tq3_binary_warning',
         'tq3_launch_diagnostic',
+        'mtp_session_advisory',
+        'mtp_binary_warning',
     ):
         try:
             value = str(getattr(app, name)(model) or '')
@@ -3517,7 +3526,7 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
         f'Continue Agent tools: tool_use exported for {len(enabled_continue_models)} model(s); MCP requires Agent Mode',
         'success' if enabled_continue_models else 'muted',
     ))
-    if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'buun', 'turboquant', 'tq3'):
+    if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3'):
         try:
             tool_jinja_ready = bool(app.continue_tool_use_launch_required(active_model)) or bool(getattr(active_model, 'jinja', True))
         except Exception:
@@ -3703,7 +3712,7 @@ def show_compare_overlay(stdscr, colors, app: AppConfig, left: Optional[ModelCon
         stdscr.nodelay(True)
 
 
-LLAMA_CPP_FAMILY_ENGINES = ('llama.cpp', 'buun', 'turboquant', 'tq3')
+LLAMA_CPP_FAMILY_ENGINES = ('llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3')
 
 
 def _active_engine_for_menu(app: Optional[AppConfig], model: Optional[ModelConfig]) -> str:

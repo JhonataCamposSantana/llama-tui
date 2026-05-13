@@ -56,6 +56,7 @@ examples/models.sample.json
 - For GGUF models: a built `llama-server` binary.
 - Optional TurboQuant+: a built `TheTom/llama-cpp-turboquant` server binary selected with `--engine turboquant`.
 - Optional llama.cpp-tq3: a built `turbo-tan/llama.cpp-tq3` server binary selected with `--engine tq3`.
+- Optional llama.cpp MTP: an experimental MTP branch server binary selected with `--engine llama.cpp-mtp`.
 - For vLLM models: a working `vllm` command.
 - Optional NVIDIA GPU: `nvidia-smi` in `PATH` lets llama-tui detect VRAM.
 
@@ -240,20 +241,23 @@ Experimental GGUF engines are selected for the whole TUI session:
 python -m llama_tui.main --engine turboquant
 python -m llama_tui.main --engine turboquant --kv-key q8_0 --kv-value turbo4
 python -m llama_tui.main --engine tq3
+python -m llama_tui.main --engine llama.cpp-mtp
 python -m llama_tui.main --engine buun
 ```
 
-Engine path resolution is centralized but remains backward compatible: llama.cpp uses `LLAMA_SERVER` / `llama_server`, TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` or its existing defaults, llama.cpp-tq3 uses `TQ3_LLAMA_SERVER_BIN` or its existing defaults, Buun uses `BUUN_LLAMA_SERVER_BIN` or `buun-llama-server`, and vLLM uses `VLLM_COMMAND` / `vllm_command`.
+Engine path resolution is centralized but remains backward compatible: llama.cpp uses `LLAMA_SERVER` / `llama_server`, TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` or its existing defaults, llama.cpp-tq3 uses `TQ3_LLAMA_SERVER_BIN` or its existing defaults, llama.cpp MTP uses `LLAMA_CPP_MTP_PATH` or `~/src/llama.cpp-mtp/build-mtp/bin/llama-server`, Buun uses `BUUN_LLAMA_SERVER_BIN` or `buun-llama-server`, and vLLM uses `VLLM_COMMAND` / `vllm_command`.
 
 TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` when set, otherwise it looks for `~/llama-cpp-turboquant/build/bin/llama-server` and then `turboquant-llama-server` in `PATH`. v1 does not download or install binaries. The `tqp-v0.1.1` release documents prebuilts for macOS arm64 Metal and Windows x64 CUDA 12.4; Linux CUDA users should build `TheTom/llama-cpp-turboquant` from source first.
 
 llama.cpp-tq3 uses `TQ3_LLAMA_SERVER_BIN` when set, otherwise it looks for `~/llama.cpp-tq3/build/bin/llama-server` and then `tq3-llama-server` in `PATH`. It is treated as a TQ3-native engine: the default browser compatibility filter shows only GGUFs detected as `TQ3_1S` or `TQ3_4S`, and launch/benchmark preflight blocks regular GGUFs with a clear advisory. `q8_0/q8_0` is the default KV cache choice; `tq3_0/tq3_0` is available only as a manual experimental KV mode until local benchmarks prove it is better on this machine.
 
+llama.cpp MTP is separate from stable upstream llama.cpp. It is marked Experimental, uses `LLAMA_CPP_MTP_PATH` when set, and verifies that the selected binary advertises `--spec-type mtp` and `--spec-draft-n-max` before MTP launches are allowed. Model configs can keep `supports_mtp` as `auto` or set it to `yes`/`no`; `mtp_enabled` defaults off and `mtp_draft_n_max` is clamped to 1, 2, or 3. When MTP is enabled, llama-tui emits `--spec-type mtp --spec-draft-n-max N`, forces a single parallel slot, and blocks mmproj/vision launches with a clear error. The helper `./llama-update-engines` can build the experimental branch into `~/src/llama.cpp-mtp/build-mtp`.
+
 The default TurboQuant+ profile is `q8_0/q8_0`. If GGUF metadata reports `head_dim=64`, llama-tui keeps `q8_0/q8_0`, disables automatic turbo V compression, and shows a high-severity advisory. If head dim is unknown, `q8_0/turbo4` is still available manually but automatic benchmark planning stays conservative. For `head_dim >= 128`, benchmarks can try baseline, safe V-only, balanced V-only, extreme V-only, and symmetric turbo profiles. Symmetric turbo is auto-planned only for Q8_0/F16/FP-style weights or explicitly validated family and quantization pairs; low-bit and unknown quantizations keep symmetric profiles manual-only.
 
 If the resolved TurboQuant+ command looks like vanilla llama.cpp or its `--help` output does not advertise `turbo2`, `turbo3`, or `turbo4` cache types, the command preview and launch log show a binary warning.
 
-For Continue Agent Mode tool use, llama-tui forces `--jinja` for enabled Continue-exported llama.cpp, buun, TurboQuant+, and llama.cpp-tq3 models even when the saved model setting has `jinja` off. It does not add a fallback chat template; use model `extra_args` such as `--chat-template-file /path/to/tool-template.jinja` for GGUFs whose embedded template is not tool-use compatible.
+For Continue Agent Mode tool use, llama-tui forces `--jinja` for enabled Continue-exported llama.cpp, buun, TurboQuant+, llama.cpp-tq3, and llama.cpp MTP models even when the saved model setting has `jinja` off. It does not add a fallback chat template; use model `extra_args` such as `--chat-template-file /path/to/tool-template.jinja` for GGUFs whose embedded template is not tool-use compatible.
 
 For vLLM, llama-tui builds:
 

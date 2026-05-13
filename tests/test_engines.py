@@ -5,12 +5,14 @@ from unittest.mock import patch
 from llama_tui.engines import (
     ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
+    ENGINE_LLAMA_CPP_MTP,
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
     command_exists,
     get_engine_definitions,
     get_engine_health,
+    mtp_binary_warning,
     resolve_engine_install,
     tq3_binary_warning,
     turboquant_binary_warning,
@@ -23,11 +25,14 @@ class EngineRegistryTests(unittest.TestCase):
         definitions = get_engine_definitions()
 
         self.assertIn(ENGINE_LLAMA_CPP, definitions)
+        self.assertIn(ENGINE_LLAMA_CPP_MTP, definitions)
         self.assertIn(ENGINE_TURBOQUANT, definitions)
         self.assertIn(ENGINE_TQ3, definitions)
         self.assertIn(ENGINE_BUUN, definitions)
         self.assertIn(ENGINE_VLLM, definitions)
         self.assertTrue(definitions[ENGINE_LLAMA_CPP].supports_gguf)
+        self.assertEqual(definitions[ENGINE_LLAMA_CPP_MTP].display_name, 'llama.cpp MTP')
+        self.assertIn('Experimental', definitions[ENGINE_LLAMA_CPP_MTP].notes)
         self.assertTrue(definitions[ENGINE_VLLM].supports_hf_ref)
 
     def test_resolve_engine_install_preserves_config_and_env_behavior(self):
@@ -38,9 +43,11 @@ class EngineRegistryTests(unittest.TestCase):
         with patch.dict('os.environ', {
             'TURBOQUANT_LLAMA_SERVER_BIN': '/opt/tq/llama-server',
             'TQ3_LLAMA_SERVER_BIN': '/opt/tq3/llama-server',
+            'LLAMA_CPP_MTP_PATH': '/opt/mtp/bin',
         }):
             turbo_install = resolve_engine_install(config, ENGINE_TURBOQUANT)
             tq3_install = resolve_engine_install(config, ENGINE_TQ3)
+            mtp_install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
 
         self.assertEqual(llama_install.resolved_command, '/opt/llama-server')
         self.assertEqual(llama_install.source, 'config:llama_server')
@@ -50,6 +57,8 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertEqual(turbo_install.source, 'env:TURBOQUANT_LLAMA_SERVER_BIN')
         self.assertEqual(tq3_install.resolved_command, '/opt/tq3/llama-server')
         self.assertEqual(tq3_install.source, 'env:TQ3_LLAMA_SERVER_BIN')
+        self.assertEqual(mtp_install.resolved_command, '/opt/mtp/bin/llama-server')
+        self.assertEqual(mtp_install.source, 'env:LLAMA_CPP_MTP_PATH')
 
     def test_missing_binary_health_is_fail_not_exception(self):
         config = SimpleNamespace(llama_server='/definitely/missing/llama-server', vllm_command='vllm')
@@ -101,6 +110,31 @@ class EngineRegistryTests(unittest.TestCase):
             tq3_binary_warning('/work/llama.cpp-tq3/build/bin/llama-server', EngineCapabilities(help_text='allowed values: q8_0 tq3_0')),
             '',
         )
+
+    def test_mtp_binary_warning_requires_speculative_flags(self):
+        caps = EngineCapabilities(help_text='--ctx-size N')
+
+        warning = mtp_binary_warning('/work/llama.cpp/build/bin/llama-server', caps)
+
+        self.assertIn('--spec-type mtp', warning)
+        self.assertIn('stable llama.cpp', warning)
+        self.assertEqual(
+            mtp_binary_warning(
+                '/work/llama.cpp-mtp/build/bin/llama-server',
+                EngineCapabilities(help_text='--spec-type mtp\n--spec-draft-n-max N', supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True),
+            ),
+            '',
+        )
+
+    def test_mtp_engine_health_reports_missing_flags(self):
+        config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
+
+        with patch('llama_tui.engines.command_exists', return_value=True), \
+             patch('llama_tui.engines.detect_engine_capabilities', return_value=EngineCapabilities(help_text='--help')):
+            health = get_engine_health(config, ENGINE_LLAMA_CPP_MTP)
+
+        self.assertEqual(health.status, 'MTP_FLAGS_NOT_FOUND')
+        self.assertIn('--spec-type mtp', health.summary)
 
 
 if __name__ == '__main__':

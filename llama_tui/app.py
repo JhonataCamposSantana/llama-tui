@@ -7,7 +7,7 @@ import shutil
 import signal
 import subprocess
 import time
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -33,9 +33,11 @@ from .discovery import (
     looks_like_model_reference,
 )
 from .engines import (
+    ENGINE_LLAMA_CPP_MTP,
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
+    mtp_binary_warning as engine_mtp_binary_warning,
     resolve_engine_install,
     tq3_binary_warning as engine_tq3_binary_warning,
     turboquant_binary_warning as engine_turboquant_binary_warning,
@@ -68,6 +70,16 @@ from .models import (
     ModelConfig,
     OpencodeSettings,
     UiSettings,
+)
+from .mtp import (
+    clamp_mtp_draft,
+    model_has_mmproj_config,
+    model_mtp_allowed,
+    model_mtp_draft_n_max,
+    model_mtp_enabled,
+    mtp_label,
+    mtp_support_label,
+    normalize_mtp_support,
 )
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
 from .runtime_profiles import (
@@ -462,13 +474,13 @@ class AppConfig:
         runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
         if runtime == ENGINE_VLLM:
             return ENGINE_VLLM
-        if self.runtime_profile.engine in ('buun', 'turboquant', ENGINE_TQ3):
+        if self.runtime_profile.engine in ('buun', 'turboquant', ENGINE_TQ3, ENGINE_LLAMA_CPP_MTP):
             return self.runtime_profile.engine
         return 'llama.cpp'
 
     def active_engine_label_for_model(self, model: ModelConfig) -> str:
         engine = self.active_engine_key_for_model(model)
-        if engine in ('buun', 'turboquant', ENGINE_TQ3):
+        if engine in ('buun', 'turboquant', ENGINE_TQ3, ENGINE_LLAMA_CPP_MTP):
             return self.runtime_profile.display_name
         if engine == 'vllm':
             return 'vLLM'
@@ -629,6 +641,9 @@ class AppConfig:
         payload['tq3_weight_format'] = str(payload.get('tq3_weight_format', '') or '').strip().upper()
         payload['tq3_source'] = str(payload.get('tq3_source', '') or '')
         payload['tq3_reason'] = str(payload.get('tq3_reason', '') or '')
+        payload['supports_mtp'] = normalize_mtp_support(payload.get('supports_mtp', 'auto'))
+        payload['mtp_enabled'] = bool(payload.get('mtp_enabled', False))
+        payload['mtp_draft_n_max'] = clamp_mtp_draft(payload.get('mtp_draft_n_max', 3), default=3)
         payload['moe_placement_strategy'] = str(payload.get('moe_placement_strategy', '') or '').strip()
         payload['cpu_moe'] = bool(payload.get('cpu_moe', False))
         payload['n_cpu_moe'] = max(0, int(payload.get('n_cpu_moe', 0) or 0))
@@ -836,7 +851,7 @@ class AppConfig:
         runtime_key = (runtime or 'llama.cpp').strip().lower()
         if runtime_key == ENGINE_VLLM:
             return str(resolve_engine_install(self, ENGINE_VLLM).resolved_command or self.vllm_command)
-        if runtime_key == 'llama.cpp':
+        if runtime_key in ('llama.cpp', ENGINE_LLAMA_CPP_MTP):
             return str(resolve_engine_install(self, self.runtime_profile.engine).resolved_command or self.runtime_profile.server_command or self.llama_server)
         return runtime
 
@@ -877,6 +892,8 @@ class AppConfig:
         elif engine_id == ENGINE_TQ3:
             key_mode, value_mode = self.runtime_profile.tq3_kv_pair()
             kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
+        elif engine_id == ENGINE_LLAMA_CPP_MTP:
+            kv_preset = 'default'
         else:
             key_mode = (
                 extra_arg_value(args, '--cache-type-k')
@@ -969,6 +986,8 @@ class AppConfig:
             cpu_moe=cpu_moe,
             n_cpu_moe=n_cpu_moe,
             tensor_overrides=tuple(tensor_overrides),
+            mtp_enabled=bool(getattr(model, 'mtp_enabled', False)) if engine_id == ENGINE_LLAMA_CPP_MTP else False,
+            mtp_draft_n_max=clamp_mtp_draft(getattr(model, 'mtp_draft_n_max', 3), default=3) if engine_id == ENGINE_LLAMA_CPP_MTP else 0,
         )
 
     def runtime_indicator(self) -> str:
@@ -1072,6 +1091,55 @@ class AppConfig:
         except Exception:
             return ''
         return engine_tq3_binary_warning(command, capabilities)
+
+    def mtp_binary_warning(self, model: ModelConfig) -> str:
+        if self.active_engine_key_for_model(model) != ENGINE_LLAMA_CPP_MTP:
+            return ''
+        command = self.runtime_server_command('llama.cpp')
+        try:
+            capabilities = self.engine_capabilities()
+        except Exception:
+            return ''
+        return engine_mtp_binary_warning(command, capabilities)
+
+    def mtp_binary_missing_message(self) -> str:
+        install = resolve_engine_install(self, ENGINE_LLAMA_CPP_MTP)
+        command = str(install.resolved_command or 'llama-server')
+        return (
+            f'BINARY_NOT_FOUND: llama.cpp MTP server not found: {command}. '
+            'Set LLAMA_CPP_MTP_PATH=/path/to/llama-server or /path/to/bin'
+        )
+
+    def mtp_session_advisory(self, model: ModelConfig) -> str:
+        if self.active_engine_key_for_model(model) != ENGINE_LLAMA_CPP_MTP:
+            return ''
+        return f'MTP: {mtp_label(model)} ({mtp_support_label(model)}) Experimental'
+
+    def validate_mtp_launch(
+        self,
+        model: ModelConfig,
+        runtime_profile: Optional[RuntimeProfile] = None,
+    ) -> Tuple[bool, str]:
+        if self.active_engine_key_for_model(model) != ENGINE_LLAMA_CPP_MTP:
+            return True, ''
+        enabled = model_mtp_enabled(model, runtime_profile)
+        if not enabled:
+            return True, ''
+        if not model_mtp_allowed(model):
+            return False, 'MTP is disabled for this model (supports_mtp=no). Set supports_mtp=yes/auto or disable MTP.'
+        if model_has_mmproj_config(model):
+            return False, 'MTP + mmproj/vision is currently unsupported/unsafe. Disable MTP or remove mmproj.'
+        try:
+            capabilities = self.engine_capabilities()
+        except Exception:
+            capabilities = EngineCapabilities()
+        if not (
+            getattr(capabilities, 'supports_spec_type', False)
+            and getattr(capabilities, 'supports_mtp', False)
+            and getattr(capabilities, 'supports_spec_draft_n_max', False)
+        ):
+            return False, self.mtp_binary_warning(model) or 'MTP_FLAGS_NOT_FOUND: selected binary does not expose MTP flags.'
+        return True, ''
 
     def tq3_launch_diagnostic(
         self,
@@ -1535,7 +1603,7 @@ class AppConfig:
             return False
         if not getattr(self.continue_settings, 'path', ''):
             return False
-        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant', ENGINE_TQ3)
+        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant', ENGINE_TQ3, ENGINE_LLAMA_CPP_MTP)
 
     def hermes_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
@@ -2481,6 +2549,9 @@ class AppConfig:
             ngl_value,
             runtime_profile=runtime_profile,
         )
+        if self.active_engine_key_for_model(model) == ENGINE_LLAMA_CPP_MTP and model_mtp_enabled(model, measured_runtime):
+            parallel_value = 1
+            measured_runtime = replace(measured_runtime, parallel=1)
         launch_profile = benchmark_profile or build_benchmark_launch_profile(
             model,
             measured_runtime,
@@ -2538,6 +2609,8 @@ class AppConfig:
             label = 'TurboQuant+ server'
         elif engine_key == ENGINE_TQ3:
             label = 'llama.cpp-tq3 server'
+        elif engine_key == ENGINE_LLAMA_CPP_MTP:
+            label = 'llama.cpp MTP server'
         else:
             label = 'llama-server'
         valid, reason = self.validate_model_target(model)
@@ -2549,15 +2622,22 @@ class AppConfig:
         if not self.command_exists(command):
             if engine_key == ENGINE_TQ3:
                 return False, self.tq3_binary_missing_message()
+            if engine_key == ENGINE_LLAMA_CPP_MTP:
+                return False, self.mtp_binary_missing_message()
             return False, f'{label} not found: {command}'
+        mtp_ok, mtp_msg = self.validate_mtp_launch(model, runtime_profile)
+        if not mtp_ok:
+            return False, mtp_msg
         runtime_ok, runtime_msg = self.runtime_command_ready(runtime, command)
         if not runtime_ok:
             self.append_log(model.id, f'{label} runtime check failed: {runtime_msg}')
             return False, f'{label} cannot run: {runtime_msg}'
         tq_advisory = self.turboquant_session_advisory(model)
         tq3_advisory = self.tq3_session_advisory(model)
+        mtp_advisory = self.mtp_session_advisory(model)
         tq_binary_warning = self.turboquant_binary_warning(model)
         tq3_binary_warning = self.tq3_binary_warning(model)
+        mtp_binary_warning = self.mtp_binary_warning(model)
         tq3_launch_diagnostic = self.tq3_launch_diagnostic(model, benchmark_profile=benchmark_profile)
         if runtime_profile is not None:
             profile = {
@@ -2587,6 +2667,10 @@ class AppConfig:
                     f'{profile_msg} benchmark_profile={benchmark_profile.name} '
                     f'output={benchmark_profile.measurement_output}'
                 )
+        if self.active_engine_key_for_model(model) == ENGINE_LLAMA_CPP_MTP and model_mtp_enabled(model, runtime_profile):
+            if int(profile.get('parallel', 1) or 1) != 1:
+                profile_msg = f'{profile_msg} MTP forced parallel=1'
+            profile['parallel'] = 1
         if self.get_pid(model):
             return True, f'{model.id} already running'
         log_path = self.logfile(model.id)
@@ -2607,10 +2691,14 @@ class AppConfig:
             self.append_log(model.id, tq_advisory)
         if tq3_advisory:
             self.append_log(model.id, tq3_advisory)
+        if mtp_advisory:
+            self.append_log(model.id, mtp_advisory)
         if tq_binary_warning:
             self.append_log(model.id, tq_binary_warning)
         if tq3_binary_warning:
             self.append_log(model.id, tq3_binary_warning)
+        if mtp_binary_warning:
+            self.append_log(model.id, mtp_binary_warning)
         if tq3_launch_diagnostic:
             self.append_log(model.id, tq3_launch_diagnostic)
         self.append_log(model.id, f'launch command: {shlex.join(command)}')
@@ -2635,10 +2723,14 @@ class AppConfig:
             detail += f' | {tq_advisory}'
         if tq3_advisory:
             detail += f' | {tq3_advisory}'
+        if mtp_advisory:
+            detail += f' | {mtp_advisory}'
         if tq_binary_warning:
             detail += f' | {tq_binary_warning}'
         if tq3_binary_warning:
             detail += f' | {tq3_binary_warning}'
+        if mtp_binary_warning:
+            detail += f' | {mtp_binary_warning}'
         if tq3_launch_diagnostic:
             detail += f' | {tq3_launch_diagnostic}'
         return True, detail

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+CUDA_ARCH="${CUDA_ARCH:-89}"
+LLAMA_CPP_MTP_SRC="${LLAMA_CPP_MTP_SRC:-$HOME/src/llama.cpp-mtp}"
+
+mkdir -p "$(dirname "$LLAMA_CPP_MTP_SRC")"
+
+if [ ! -d "$LLAMA_CPP_MTP_SRC/.git" ]; then
+  git clone https://github.com/ggml-org/llama.cpp "$LLAMA_CPP_MTP_SRC"
+fi
+
+cd "$LLAMA_CPP_MTP_SRC"
+git remote add am17an https://github.com/am17an/llama.cpp.git 2>/dev/null || true
+git fetch am17an mtp-clean
+git checkout -B mtp-clean am17an/mtp-clean
+
+cmake -S . -B build-mtp \
+  -DGGML_CUDA=ON \
+  -DLLAMA_CURL=ON \
+  -DLLAMA_OPENSSL=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH"
+
+cmake --build build-mtp --config Release -j"$JOBS" --target llama-server llama-cli
+
+echo "llama.cpp MTP llama-server: $LLAMA_CPP_MTP_SRC/build-mtp/bin/llama-server"

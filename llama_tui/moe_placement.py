@@ -8,7 +8,7 @@ from .optimize import model_is_moe
 from .runtime_profiles import EngineCapabilities
 
 
-LLAMA_CPP_FAMILY_ENGINES = {'llama.cpp', 'buun', 'turboquant', 'tq3'}
+LLAMA_CPP_FAMILY_ENGINES = {'llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3'}
 EXPERTS_CPU_OVERRIDE = '.*ffn_.*_exps.*=CPU'
 
 

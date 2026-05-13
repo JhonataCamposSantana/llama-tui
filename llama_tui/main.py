@@ -37,19 +37,21 @@ def ensure_bootstrap_files(config_path: Path) -> Path:
 
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='llama-tui: local LLM control plane for llama.cpp, TurboQuant+, llama.cpp-tq3, Buun, and vLLM models.',
+        description='llama-tui: local LLM control plane for llama.cpp, llama.cpp MTP, TurboQuant+, llama.cpp-tq3, Buun, and vLLM models.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f'''examples:
   llama-tui
   llama-tui {DEFAULT_CONFIG_PATH}
   llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4
+  llama-tui --engine llama.cpp-mtp
   llama-tui --engine tq3
   llama-tui --engine buun --kill-existing
 
 defaults:
-  supported runtimes: llama.cpp, turboquant, tq3, buun, vLLM saved model entries
+  supported runtimes: llama.cpp, llama.cpp-mtp, turboquant, tq3, buun, vLLM saved model entries
   config path: {DEFAULT_CONFIG_PATH}
   llama.cpp binary: LLAMA_SERVER or config llama_server
+  llama.cpp MTP binary: LLAMA_CPP_MTP_PATH
   TurboQuant+ binary: TURBOQUANT_LLAMA_SERVER_BIN
   llama.cpp-tq3 binary: TQ3_LLAMA_SERVER_BIN
   Buun binary: BUUN_LLAMA_SERVER_BIN
@@ -62,7 +64,7 @@ notes:
 ''',
     )
     parser.add_argument('config_path', nargs='?', default=str(DEFAULT_CONFIG_PATH), help='models.json config path (default: %(default)s)')
-    parser.add_argument('--engine', choices=('llama.cpp', 'buun', 'turboquant', 'tq3'), default='llama.cpp', help='active GGUF engine for this session (default: %(default)s)')
+    parser.add_argument('--engine', choices=('llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3'), default='llama.cpp', help='active GGUF engine for this session (default: %(default)s)')
     parser.add_argument('--ctx', type=int, default=None, help='optional session context override for the active GGUF engine')
     parser.add_argument('--kv', default='', help='KV cache mode shorthand for Buun/TurboQuant+/TQ3 sessions')
     parser.add_argument('--kv-key', default='', help='key-cache mode for Buun/TurboQuant+/TQ3 sessions')

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from llama_tui.app import AppConfig
 from llama_tui.benchmark import (
+    BenchmarkDeadline,
     _run_tq3_raw_process,
     _tq3_raw_runtime_profiles,
     active_engine_runtime_profiles,
@@ -29,6 +30,7 @@ from llama_tui.benchmark import (
     close_stale_running_benchmark_runs,
     classify_benchmark_failure,
     expand_workflow_cache_ram_candidates,
+    fill_missing_adaptive_profiles,
     launch_with_failsafe,
     measured_profile_runtime_profile,
     memory_guardrail_admission,
@@ -146,6 +148,16 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.llama_extra_args(), ['--flash-attn', 'on', '-ctk', 'q8_0', '-ctv', 'q8_0'])
         self.assertIn('llama.cpp-tq3', profile.header_indicator())
 
+    def test_mtp_profile_uses_separate_experimental_binary(self):
+        with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': '/opt/mtp/bin'}):
+            profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
+
+        self.assertEqual(profile.engine_id, 'llama.cpp-mtp')
+        self.assertEqual(profile.display_name, 'llama.cpp MTP')
+        self.assertEqual(profile.server_command, '/opt/mtp/bin/llama-server')
+        self.assertTrue(profile.experimental)
+        self.assertIn('Experimental', profile.header_indicator())
+
     def test_capability_parser_detects_buun_flash_value_and_ngl(self):
         caps = parse_engine_capabilities(
             'usage: llama-server --flash-attn on|off|auto -ctk MODE -ctv MODE --parallel N -ngl N -fit on -fitc N --no-warmup',
@@ -159,6 +171,17 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(caps.supports_fit_ctx)
         self.assertTrue(caps.supports_no_warmup)
         self.assertEqual(caps.gpu_layers_flag, '-ngl')
+
+    def test_capability_parser_detects_mtp_speculative_flags(self):
+        caps = parse_engine_capabilities(
+            'usage: llama-server --spec-type mtp --spec-draft-n-max N --parallel N',
+            engine_id='llama.cpp-mtp',
+        )
+
+        self.assertTrue(caps.supports_spec_type)
+        self.assertTrue(caps.supports_mtp)
+        self.assertTrue(caps.supports_spec_draft_n_max)
+        self.assertTrue(caps.supports_parallel)
 
     def test_capability_parser_detects_turboquant_cache_types(self):
         caps = parse_engine_capabilities(
@@ -450,6 +473,70 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
         self.assertEqual(cmd[cmd.index('-ctv') + 1], 'q8_0')
         self.assertNotIn('--cache-type-k', cmd)
+
+    def test_mtp_command_emits_spec_flags_and_forces_single_parallel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='MTP',
+                path='/models/mtp.gguf',
+                alias='mtp',
+                port=18080,
+                parallel=4,
+                supports_mtp='yes',
+                mtp_enabled=True,
+                mtp_draft_n_max=2,
+                extra_args=['--spec-type', 'none', '--spec-draft-n-max', '99'],
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp-mtp'),
+                supports_spec_type=True,
+                supports_mtp=True,
+                supports_spec_draft_n_max=True,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model)
+
+        self.assertEqual(cmd[0], app.runtime_profile.server_command)
+        self.assertEqual(cmd[cmd.index('--parallel') + 1], '1')
+        self.assertEqual(cmd[cmd.index('--spec-type') + 1], 'mtp')
+        self.assertEqual(cmd[cmd.index('--spec-draft-n-max') + 1], '2')
+        self.assertEqual(cmd.count('--spec-type'), 1)
+        self.assertEqual(cmd.count('--spec-draft-n-max'), 1)
+
+    def test_mtp_launch_validation_blocks_mmproj(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='vision',
+                name='Vision',
+                path='/models/vision.gguf',
+                alias='vision',
+                port=18080,
+                supports_mtp='yes',
+                mtp_enabled=True,
+                extra_args=['--mmproj', '/models/mmproj.gguf'],
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp-mtp'),
+                supports_spec_type=True,
+                supports_mtp=True,
+                supports_spec_draft_n_max=True,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                ok, msg = app.validate_mtp_launch(model)
+
+        self.assertFalse(ok)
+        self.assertIn('MTP + mmproj/vision', msg)
 
     def test_runtime_profile_emits_moe_placement_flags_and_strips_stale_args(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -897,25 +984,36 @@ class RuntimeProfileTests(unittest.TestCase):
                     runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
                 )
                 turboquant_app.models = [model]
+                mtp_app = AppConfig(
+                    root / 'mtp.json',
+                    runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+                )
+                mtp_app.models = [model]
 
                 llama_log = llama_app.logfile(model.id)
                 buun_log = buun_app.logfile(model.id)
                 turboquant_log = turboquant_app.logfile(model.id)
+                mtp_log = mtp_app.logfile(model.id)
                 llama_pid = llama_app.pidfile(model.id)
                 buun_pid = buun_app.pidfile(model.id)
                 turboquant_pid = turboquant_app.pidfile(model.id)
+                mtp_pid = mtp_app.pidfile(model.id)
                 legacy_log = buun_app.legacy_logfile(model.id)
 
         self.assertNotEqual(llama_log, buun_log)
         self.assertNotEqual(llama_log, turboquant_log)
+        self.assertNotEqual(llama_log, mtp_log)
         self.assertNotEqual(llama_pid, buun_pid)
         self.assertNotEqual(llama_pid, turboquant_pid)
+        self.assertNotEqual(llama_pid, mtp_pid)
         self.assertEqual(llama_log, root / 'runtime' / 'llama.cpp' / 'm.log')
         self.assertEqual(buun_log, root / 'runtime' / 'buun' / 'm.log')
         self.assertEqual(turboquant_log, root / 'runtime' / 'turboquant' / 'm.log')
+        self.assertEqual(mtp_log, root / 'runtime' / 'llama.cpp-mtp' / 'm.log')
         self.assertEqual(llama_pid, root / 'runtime' / 'llama.cpp' / 'm.pid')
         self.assertEqual(buun_pid, root / 'runtime' / 'buun' / 'm.pid')
         self.assertEqual(turboquant_pid, root / 'runtime' / 'turboquant' / 'm.pid')
+        self.assertEqual(mtp_pid, root / 'runtime' / 'llama.cpp-mtp' / 'm.pid')
         self.assertEqual(legacy_log, root / 'm.log')
 
     def test_llama_command_can_use_supported_q8_cache_flags(self):
@@ -2880,12 +2978,112 @@ class RuntimeProfileTests(unittest.TestCase):
                 on_record=persisted.append,
             )
 
-        self.assertEqual(len(persisted), 3)
-        self.assertEqual(len(records), 3)
+        self.assertEqual(len(persisted), 2)
+        self.assertEqual(len(records), 2)
         self.assertFalse(promoted)
         self.assertTrue(all(item['benchmark_kind'] == 'raw_engine_search' for item in persisted))
         self.assertTrue(all(item['failure_category'] == 'RAW_ENGINE_TIMEOUT' for item in persisted))
         self.assertTrue(all(item['timed_out'] for item in persisted))
+        self.assertTrue(all(item['raw_command'] for item in persisted))
+        self.assertTrue(all('timed out' in item['stdout_excerpt'] for item in persisted))
+
+    def test_tq3_runtime_profile_api_timeout_does_not_retry(self):
+        model = ModelConfig(id='m', name='M', path='/models/moe.TQ3_4S.gguf', alias='m', port=18200)
+        runtime_profile = RuntimeProfile(
+            engine_id='tq3',
+            name='n_cpu_moe_32',
+            ctx_size=4096,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            n_cpu_moe=32,
+        )
+        failed = adaptive_record_from_candidate(
+            model,
+            'long_context',
+            'benchmark failed',
+            detail='request timed out',
+            engine='tq3',
+            failure_category='API_TIMEOUT',
+            failure_reason='request timed out',
+        )
+
+        class FakeApp:
+            def build_command(self, _model, runtime_profile=None, benchmark_profile=None):
+                return ['tq3-llama-server']
+
+        events = []
+        with patch('llama_tui.benchmark.benchmark_adaptive_candidate', return_value=(failed, None)) as runner:
+            ok, broke, records, measured, completed = benchmark_runtime_profile_with_retry(
+                FakeApp(),
+                model,
+                runtime_profile,
+                'long_context',
+                events.append,
+                None,
+                0,
+                2,
+                max_attempts=2,
+            )
+
+        self.assertFalse(ok)
+        self.assertTrue(broke)
+        self.assertEqual(completed, 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(measured, [])
+        self.assertEqual(runner.call_count, 1)
+        self.assertTrue(any('not retrying TQ3' in str(item) for item in events))
+
+    def test_benchmark_deadline_caps_candidate_timeouts(self):
+        deadline = BenchmarkDeadline.from_end(time.monotonic() + 5.0)
+
+        self.assertLessEqual(deadline.cap_timeout(240), 5.0)
+        self.assertGreater(deadline.cap_timeout(240), 0.0)
+
+        expired = BenchmarkDeadline.from_end(time.monotonic() - 1.0)
+        self.assertEqual(expired.cap_timeout(240), 0.0)
+
+    def test_missing_adaptive_profiles_are_explicitly_skipped(self):
+        winners = {
+            'fast_chat': {'status': 'ok', 'tokens_per_sec': 20.0},
+            'auto': {'status': 'ok', 'tokens_per_sec': 18.0},
+        }
+
+        filled = fill_missing_adaptive_profiles(
+            winners,
+            'No valid candidate measured before benchmark budget expired',
+        )
+
+        self.assertEqual(filled['long_context']['status'], 'skipped_budget')
+        self.assertIn('budget expired', filled['long_context']['reason'])
+        self.assertEqual(filled['opencode_ready']['status'], 'skipped_budget')
+
+    def test_tq3_moe_launch_profile_uses_short_measurement_caps(self):
+        model = ModelConfig(
+            id='m',
+            name='MoE TQ3',
+            path='/models/moe.TQ3_4S.gguf',
+            alias='m',
+            port=18200,
+            architecture_type='moe',
+            expert_count=128,
+            output=2048,
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='tq3',
+            name='n_cpu_moe_32',
+            ctx_size=4096,
+            gpu_layers=999,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            n_cpu_moe=32,
+        )
+
+        fast = build_benchmark_launch_profile(model, runtime_profile, default_engine_capabilities('tq3'), depth='fast')
+        full = build_benchmark_launch_profile(model, runtime_profile, default_engine_capabilities('tq3'), depth='full')
+
+        self.assertEqual(fast.measurement_output, 32)
+        self.assertEqual(full.measurement_output, 64)
 
     def test_tq3_raw_cancel_records_aborted_row(self):
         class FakeApp:
@@ -4074,6 +4272,7 @@ class RuntimeProfileTests(unittest.TestCase):
 
         placement_indices = [idx for idx, item in enumerate(profiles) if item.n_cpu_moe > 0 or item.cpu_moe]
         growth_indices = [idx for idx, item in enumerate(profiles) if item.name.startswith('context_growth_sweep')]
+        self.assertLessEqual(len(profiles), 12)
         self.assertTrue(placement_indices)
         self.assertTrue(growth_indices)
         self.assertLess(min(placement_indices), min(growth_indices))
@@ -4131,6 +4330,38 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(any(int(item.ctx_size or 0) >= 16384 for item in reasoning_off))
         self.assertTrue(any(int(item.ctx_size or 0) >= 32768 for item in reasoning_off))
         self.assertFalse(any(item.reasoning == 'off' for item in unsupported_profiles))
+
+    def test_mtp_runtime_profiles_include_baseline_and_draft_matrix(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_spec_draft_n_max=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='Qwen3.6 native-mtp',
+                path='/models/qwen3.6-native-mtp.gguf',
+                alias='mtp',
+                port=18080,
+                ctx_min=4096,
+                ctx_max=32768,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='fast')
+
+        names = [item.name for item in profiles]
+        self.assertIn('mtp_baseline', names)
+        self.assertEqual([item.mtp_draft_n_max for item in profiles if item.mtp_enabled], [1, 2, 3])
+        self.assertTrue(all(item.parallel == 1 for item in profiles))
 
     def test_moe_runtime_profiles_include_bounded_placement_candidates(self):
         caps = replace(
@@ -4285,10 +4516,12 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertIn('examples:', help_text)
         self.assertIn('llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4', help_text)
+        self.assertIn('llama-tui --engine llama.cpp-mtp', help_text)
         self.assertIn('llama-tui --engine tq3', help_text)
         self.assertIn('llama-tui --engine buun --kill-existing', help_text)
-        self.assertIn('supported runtimes: llama.cpp, turboquant, tq3, buun, vLLM saved model entries', help_text)
+        self.assertIn('supported runtimes: llama.cpp, llama.cpp-mtp, turboquant, tq3, buun, vLLM saved model entries', help_text)
         self.assertIn('config path:', help_text)
+        self.assertIn('LLAMA_CPP_MTP_PATH', help_text)
         self.assertIn('TURBOQUANT_LLAMA_SERVER_BIN', help_text)
         self.assertIn('TQ3_LLAMA_SERVER_BIN', help_text)
         self.assertIn('BUUN_LLAMA_SERVER_BIN', help_text)
