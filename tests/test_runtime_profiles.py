@@ -69,6 +69,7 @@ from llama_tui.runtime_profiles import (
     default_engine_capabilities,
     make_runtime_profile,
     parse_engine_capabilities,
+    resolve_llama_cpp_mtp_binary,
 )
 
 
@@ -157,6 +158,40 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.server_command, '/opt/mtp/bin/llama-server')
         self.assertTrue(profile.experimental)
         self.assertIn('Experimental', profile.header_indicator())
+
+    def test_mtp_env_directory_searches_common_build_layouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'llama.cpp-mtp'
+            binary = root / 'build' / 'bin' / 'llama-server'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\n', encoding='utf-8')
+            binary.chmod(0o755)
+
+            with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': str(root)}):
+                profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
+                resolved = resolve_llama_cpp_mtp_binary()
+
+        self.assertEqual(profile.server_command, str(binary))
+        self.assertEqual(resolved.command, str(binary))
+        self.assertTrue(resolved.exists)
+        self.assertTrue(resolved.executable)
+        self.assertEqual(resolved.source, 'env:LLAMA_CPP_MTP_PATH')
+
+    def test_mtp_default_search_checks_home_and_path_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            binary = home / 'llama.cpp-mtp' / 'build-mtp' / 'bin' / 'llama-server'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\n', encoding='utf-8')
+            binary.chmod(0o755)
+
+            with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': ''}, clear=False), \
+                 patch('llama_tui.runtime_profiles.Path.home', return_value=home):
+                resolved = resolve_llama_cpp_mtp_binary()
+
+        self.assertEqual(resolved.command, str(binary))
+        self.assertEqual(resolved.source, 'default')
+        self.assertTrue(resolved.executable)
 
     def test_capability_parser_detects_buun_flash_value_and_ngl(self):
         caps = parse_engine_capabilities(

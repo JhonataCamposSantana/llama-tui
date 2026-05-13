@@ -1,7 +1,6 @@
 import os
 import re
 import shlex
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -9,12 +8,14 @@ from typing import Dict, List, Optional
 from .constants import DEFAULT_LLAMA_SERVER, DEFAULT_VLLM_COMMAND
 from .runtime_profiles import (
     DEFAULT_BUUN_LLAMA_SERVER,
-    DEFAULT_LLAMA_CPP_MTP_SERVER,
     DEFAULT_TQ3_LLAMA_SERVER,
     DEFAULT_TURBOQUANT_LLAMA_SERVER,
     EngineCapabilities,
+    command_file_status,
     default_engine_capabilities,
     detect_engine_capabilities as detect_runtime_engine_capabilities,
+    llama_cpp_mtp_default_candidates,
+    resolve_llama_cpp_mtp_binary,
 )
 
 ENGINE_LLAMA_CPP = 'llama.cpp'
@@ -47,6 +48,9 @@ class EngineInstall:
     exists: bool
     version: Optional[str] = None
     commit: Optional[str] = None
+    executable: bool = False
+    resolved_path: str = ''
+    checked_paths: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -80,9 +84,7 @@ def get_engine_definitions() -> Dict[str, EngineDefinition]:
             display_name='llama.cpp MTP',
             runtime_family='llama.cpp',
             default_binary_env='LLAMA_CPP_MTP_PATH',
-            default_paths=[
-                str(Path.home() / 'src' / 'llama.cpp-mtp' / 'build-mtp' / 'bin' / 'llama-server'),
-            ],
+            default_paths=[*llama_cpp_mtp_default_candidates(), 'llama-server-mtp'],
             path_config_key=None,
             supports_gguf=True,
             supports_hf_ref=False,
@@ -169,20 +171,11 @@ def normalize_engine_id(engine_id: str) -> str:
 
 
 def command_exists(command: Optional[str]) -> bool:
-    parts = shlex.split(command or '')
-    if not parts:
-        return False
-    first = os.path.expanduser(parts[0])
-    if '/' in first or first.startswith('.') or first.startswith('~'):
-        return Path(first).expanduser().exists()
-    return shutil.which(first) is not None
+    return command_file_status(command or '').exists
 
 
 def resolve_llama_cpp_mtp_env(value: str) -> str:
-    path = Path(str(value or '')).expanduser()
-    if path.name == 'llama-server' or path.is_file():
-        return str(path)
-    return str(path / 'llama-server')
+    return resolve_llama_cpp_mtp_binary(env_value=value).command
 
 
 def resolve_engine_install(config, engine_id: str) -> EngineInstall:
@@ -193,6 +186,17 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
 
     env_name = definition.default_binary_env or ''
     env_value = os.environ.get(env_name) if env_name else ''
+    if engine == ENGINE_LLAMA_CPP_MTP and env_value:
+        mtp = resolve_llama_cpp_mtp_binary(env_value=env_value)
+        return EngineInstall(
+            id=engine,
+            resolved_command=mtp.command,
+            source=mtp.source,
+            exists=mtp.exists,
+            executable=mtp.executable,
+            resolved_path=mtp.resolved_path,
+            checked_paths=list(mtp.checked_paths),
+        )
     runtime_profile = getattr(config, 'runtime_profile', None)
     profile_engine = normalize_engine_id(str(getattr(runtime_profile, 'engine_id', '') or getattr(runtime_profile, 'engine', '') or ''))
     profile_command = str(getattr(runtime_profile, 'server_command', '') or getattr(runtime_profile, 'server_bin', '') or '')
@@ -200,7 +204,7 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
         command = profile_command
         source = 'runtime_profile'
     elif env_value:
-        command = resolve_llama_cpp_mtp_env(env_value) if engine == ENGINE_LLAMA_CPP_MTP else env_value
+        command = env_value
         source = f'env:{env_name}'
     elif engine == ENGINE_BUUN:
         command = DEFAULT_BUUN_LLAMA_SERVER
@@ -212,8 +216,16 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
         command = DEFAULT_TQ3_LLAMA_SERVER
         source = 'default'
     elif engine == ENGINE_LLAMA_CPP_MTP:
-        command = DEFAULT_LLAMA_CPP_MTP_SERVER
-        source = 'default'
+        mtp = resolve_llama_cpp_mtp_binary()
+        return EngineInstall(
+            id=engine,
+            resolved_command=mtp.command,
+            source=mtp.source,
+            exists=mtp.exists,
+            executable=mtp.executable,
+            resolved_path=mtp.resolved_path,
+            checked_paths=list(mtp.checked_paths),
+        )
     elif engine == ENGINE_VLLM:
         command = str(getattr(config, 'vllm_command', '') or DEFAULT_VLLM_COMMAND)
         source = 'config:vllm_command' if getattr(config, 'vllm_command', '') else 'default'
@@ -221,11 +233,15 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
         command = str(getattr(config, 'llama_server', '') or DEFAULT_LLAMA_SERVER)
         source = 'config:llama_server' if getattr(config, 'llama_server', '') else 'default'
 
+    status = command_file_status(command)
     return EngineInstall(
         id=engine,
         resolved_command=command,
         source=source,
-        exists=command_exists(command),
+        exists=status.exists,
+        executable=status.executable,
+        resolved_path=status.resolved_path,
+        checked_paths=[command] if command else [],
     )
 
 
@@ -273,14 +289,36 @@ def tq3_binary_warning(command: str, capabilities: EngineCapabilities) -> str:
     )
 
 
-def mtp_binary_warning(command: str, capabilities: EngineCapabilities) -> str:
+def _yes_no(value: bool) -> str:
+    return 'yes' if bool(value) else 'no'
+
+
+def mtp_binary_warning(
+    command: str,
+    capabilities: EngineCapabilities,
+    source: str = '',
+    exists: Optional[bool] = None,
+    executable: Optional[bool] = None,
+) -> str:
     help_text = str(getattr(capabilities, 'help_text', '') or '')
+    status = command_file_status(command or '')
+    exists_value = status.exists if exists is None else bool(exists)
+    executable_value = status.executable if executable is None else bool(executable)
+    supports_spec_type = bool(getattr(capabilities, 'supports_spec_type', False))
+    supports_mtp = bool(getattr(capabilities, 'supports_mtp', False))
+    supports_draft = bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
+    detail = (
+        f'resolved={command or "-"}; source={source or "unknown"}; '
+        f'exists={_yes_no(exists_value)}; executable={_yes_no(executable_value)}; '
+        f'spec_type={_yes_no(supports_spec_type)}; mtp={_yes_no(supports_mtp)}; '
+        f'spec_draft_n_max={_yes_no(supports_draft)}'
+    )
     if not help_text:
-        return 'llama.cpp MTP binary warning: unable to inspect --help output for MTP flags.'
+        return f'llama.cpp MTP binary warning: unable to inspect --help output for MTP flags ({detail}).'
     if (
-        bool(getattr(capabilities, 'supports_spec_type', False))
-        and bool(getattr(capabilities, 'supports_mtp', False))
-        and bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
+        supports_spec_type
+        and supports_mtp
+        and supports_draft
     ):
         return ''
     path_hint = ''
@@ -291,7 +329,8 @@ def mtp_binary_warning(command: str, capabilities: EngineCapabilities) -> str:
             path_hint = ' The path looks like a stable llama.cpp checkout.'
     return (
         f'llama.cpp MTP binary warning: {command} does not advertise '
-        '--spec-type mtp and --spec-draft-n-max in --help.'
+        '--spec-type mtp and --spec-draft-n-max in --help '
+        f'({detail}).'
         f'{path_hint}'
     )
 
@@ -300,17 +339,35 @@ def get_engine_health(config, engine_id: str) -> EngineHealth:
     install = resolve_engine_install(config, engine_id)
     if not install.exists:
         if install.id == ENGINE_LLAMA_CPP_MTP:
+            detail = (
+                f'resolved={install.resolved_command or "-"}; source={install.source or "unknown"}; '
+                f'exists=no; executable={_yes_no(install.executable)}'
+            )
             return EngineHealth(
                 id=install.id,
                 status='BINARY_NOT_FOUND',
-                summary='llama.cpp MTP binary missing',
-                warnings=[f'command not found: {install.resolved_command or "-"}'],
+                summary=f'llama.cpp MTP binary missing ({detail})',
+                warnings=[
+                    f'command not found: {install.resolved_command or "-"}',
+                    *( [f'checked: {", ".join(install.checked_paths)}'] if install.checked_paths else [] ),
+                ],
             )
         return EngineHealth(
             id=install.id,
             status='FAIL',
             summary=f'{engine_display_name(install.id)} binary missing',
             warnings=[f'command not found: {install.resolved_command or "-"}'],
+        )
+    if install.id == ENGINE_LLAMA_CPP_MTP and not install.executable:
+        detail = (
+            f'resolved={install.resolved_command or "-"}; source={install.source or "unknown"}; '
+            f'exists={_yes_no(install.exists)}; executable=no'
+        )
+        return EngineHealth(
+            id=install.id,
+            status='BUILD_REQUIRED',
+            summary=f'llama.cpp MTP binary is not executable ({detail})',
+            warnings=[f'not executable: {install.resolved_command or "-"}'],
         )
     warnings: List[str] = []
     capabilities = detect_engine_capabilities(install)
@@ -328,11 +385,26 @@ def get_engine_health(config, engine_id: str) -> EngineHealth:
         if warning:
             warnings.append(warning)
     if install.id == ENGINE_LLAMA_CPP_MTP:
-        warning = mtp_binary_warning(str(install.resolved_command or ''), capabilities)
+        warning = mtp_binary_warning(
+            str(install.resolved_command or ''),
+            capabilities,
+            source=install.source,
+            exists=install.exists,
+            executable=install.executable,
+        )
         if warning:
             status = 'BUILD_REQUIRED' if not str(getattr(capabilities, 'help_text', '') or '').strip() else 'MTP_FLAGS_NOT_FOUND'
             return EngineHealth(install.id, status, warning, [warning])
-        return EngineHealth(install.id, 'READY', f'{engine_display_name(install.id)} ready (Experimental)', [])
+        return EngineHealth(
+            install.id,
+            'READY',
+            (
+                f'{engine_display_name(install.id)} ready (Experimental; '
+                f'resolved={install.resolved_command}; source={install.source}; '
+                f'exists=yes; executable=yes; spec_type=yes; mtp=yes; spec_draft_n_max=yes)'
+            ),
+            [],
+        )
     if warnings:
         return EngineHealth(install.id, 'WARN', warnings[0], warnings)
     return EngineHealth(install.id, 'OK', f'{engine_display_name(install.id)} ready', [])

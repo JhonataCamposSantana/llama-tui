@@ -1,6 +1,7 @@
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -18,7 +19,6 @@ DEFAULT_TQ3_LLAMA_SERVER = (
     if (Path.home() / 'llama.cpp-tq3' / 'build' / 'bin' / 'llama-server').exists()
     else 'tq3-llama-server'
 )
-DEFAULT_LLAMA_CPP_MTP_SERVER = str(Path.home() / 'src' / 'llama.cpp-mtp' / 'build-mtp' / 'bin' / 'llama-server')
 BUUN_KV_MODES = ('turbo4', 'turbo3_tcq', 'turbo2_tcq', 'turbo3', 'turbo2')
 TURBOQUANT_KV_MODES = ('q8_0', 'turbo4', 'turbo3', 'turbo2')
 TQ3_KV_MODES = ('q8_0', 'tq3_0')
@@ -87,6 +87,113 @@ RUNTIME_TUNING_FLAGS = (
     '--spec-type',
     '--spec-draft-n-max',
 )
+
+
+@dataclass(frozen=True)
+class CommandStatus:
+    command: str
+    exists: bool
+    executable: bool
+    resolved_path: str = ''
+    path_like: bool = False
+
+
+@dataclass(frozen=True)
+class MtpBinaryResolution:
+    command: str
+    source: str
+    exists: bool
+    executable: bool
+    resolved_path: str = ''
+    checked_paths: Tuple[str, ...] = ()
+
+
+def command_file_status(command: str) -> CommandStatus:
+    parts = shlex.split(command or '')
+    if not parts:
+        return CommandStatus('', False, False)
+    first = os.path.expanduser(parts[0])
+    path_like = '/' in first or first.startswith('.') or first.startswith('~')
+    if path_like:
+        path = Path(first).expanduser()
+        exists = path.exists()
+        executable = bool(exists and os.access(path, os.X_OK))
+        return CommandStatus(command, exists, executable, str(path), True)
+    resolved = shutil.which(first)
+    return CommandStatus(command, resolved is not None, resolved is not None, str(resolved or ''), False)
+
+
+MTP_ENV_BINARY_NAMES = ('llama-server', 'server', 'llama-server-mtp')
+MTP_ENV_RELATIVE_CANDIDATES = (
+    Path('llama-server'),
+    Path('build') / 'bin' / 'llama-server',
+    Path('build-mtp') / 'bin' / 'llama-server',
+    Path('build-mtp') / 'bin' / 'server',
+    Path('build') / 'bin' / 'server',
+)
+
+
+def llama_cpp_mtp_default_candidates(home: Optional[Path] = None) -> Tuple[str, ...]:
+    root = Path.home() if home is None else Path(home).expanduser()
+    return (
+        str(root / 'src' / 'llama.cpp-mtp' / 'build-mtp' / 'bin' / 'llama-server'),
+        str(root / 'src' / 'llama.cpp-mtp' / 'build' / 'bin' / 'llama-server'),
+        str(root / 'llama.cpp-mtp' / 'build-mtp' / 'bin' / 'llama-server'),
+        str(root / 'llama.cpp-mtp' / 'build' / 'bin' / 'llama-server'),
+        str(root / 'src' / 'llama.cpp' / 'build-mtp' / 'bin' / 'llama-server'),
+        str(root / '.local' / 'bin' / 'llama-server-mtp'),
+    )
+
+
+DEFAULT_LLAMA_CPP_MTP_SERVER = llama_cpp_mtp_default_candidates()[0]
+
+
+def _select_mtp_candidate(candidates: Sequence[str], source: str) -> MtpBinaryResolution:
+    checked = tuple(str(item) for item in candidates if str(item or '').strip())
+    if not checked:
+        return MtpBinaryResolution(DEFAULT_LLAMA_CPP_MTP_SERVER, source, False, False, checked_paths=())
+    statuses = [command_file_status(item) for item in checked]
+    chosen = next((item for item in statuses if item.executable), None)
+    if chosen is None:
+        chosen = next((item for item in statuses if item.exists), None)
+    if chosen is None:
+        chosen = statuses[0]
+    return MtpBinaryResolution(
+        command=chosen.command,
+        source=source,
+        exists=chosen.exists,
+        executable=chosen.executable,
+        resolved_path=chosen.resolved_path,
+        checked_paths=checked,
+    )
+
+
+def llama_cpp_mtp_candidates_from_env(value: str) -> Tuple[str, ...]:
+    text = str(value or '').strip()
+    if not text:
+        return ()
+    path = Path(text).expanduser()
+    if '/' not in text and not text.startswith('.') and not text.startswith('~'):
+        return (text,)
+    if path.is_file() or path.name in MTP_ENV_BINARY_NAMES:
+        return (str(path),)
+    return tuple(str(path / relative) for relative in MTP_ENV_RELATIVE_CANDIDATES)
+
+
+def resolve_llama_cpp_mtp_binary(env_value: Optional[str] = None) -> MtpBinaryResolution:
+    value = os.environ.get('LLAMA_CPP_MTP_PATH') if env_value is None else env_value
+    if str(value or '').strip():
+        return _select_mtp_candidate(
+            llama_cpp_mtp_candidates_from_env(str(value or '')),
+            'env:LLAMA_CPP_MTP_PATH',
+        )
+    default_resolution = _select_mtp_candidate(llama_cpp_mtp_default_candidates(), 'default')
+    if default_resolution.executable:
+        return default_resolution
+    path_resolution = _select_mtp_candidate(('llama-server-mtp',), 'PATH')
+    if path_resolution.executable:
+        return path_resolution
+    return default_resolution
 
 
 @dataclass(frozen=True)
@@ -333,13 +440,7 @@ class RuntimeProfile:
 
 
 def llama_cpp_mtp_server_from_env() -> str:
-    value = os.environ.get('LLAMA_CPP_MTP_PATH')
-    if not value:
-        return DEFAULT_LLAMA_CPP_MTP_SERVER
-    path = Path(value).expanduser()
-    if path.name == 'llama-server' or path.is_file():
-        return str(path)
-    return str(path / 'llama-server')
+    return resolve_llama_cpp_mtp_binary().command
 
 
 def resolve_buun_kv_modes(

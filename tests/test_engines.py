@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -60,6 +63,59 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertEqual(mtp_install.resolved_command, '/opt/mtp/bin/llama-server')
         self.assertEqual(mtp_install.source, 'env:LLAMA_CPP_MTP_PATH')
 
+    def test_mtp_engine_install_uses_shared_discovery_for_defaults_and_path(self):
+        config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            binary = home / 'src' / 'llama.cpp' / 'build-mtp' / 'bin' / 'llama-server'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\n', encoding='utf-8')
+            binary.chmod(0o755)
+
+            with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': ''}, clear=False), \
+                 patch('llama_tui.runtime_profiles.Path.home', return_value=home):
+                install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
+
+        self.assertEqual(install.resolved_command, str(binary))
+        self.assertEqual(install.source, 'default')
+        self.assertTrue(install.exists)
+        self.assertTrue(install.executable)
+
+        with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': ''}, clear=False), \
+             patch('llama_tui.runtime_profiles.Path.home', return_value=Path('/definitely/missing')), \
+             patch('llama_tui.runtime_profiles.shutil.which', return_value='/usr/local/bin/llama-server-mtp'):
+            path_install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
+
+        self.assertEqual(path_install.resolved_command, 'llama-server-mtp')
+        self.assertEqual(path_install.source, 'PATH')
+        self.assertTrue(path_install.exists)
+        self.assertTrue(path_install.executable)
+
+    def test_mtp_env_path_takes_precedence_over_saved_runtime_profile(self):
+        runtime_profile = SimpleNamespace(
+            engine_id=ENGINE_LLAMA_CPP_MTP,
+            server_command='/old/llama.cpp-mtp/build/bin/llama-server',
+        )
+        config = SimpleNamespace(
+            llama_server='/opt/llama-server',
+            vllm_command='vllm',
+            runtime_profile=runtime_profile,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'llama.cpp-mtp'
+            binary = root / 'build-mtp' / 'bin' / 'llama-server'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\n', encoding='utf-8')
+            binary.chmod(0o755)
+
+            with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': str(root)}, clear=False):
+                install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
+
+        self.assertEqual(install.resolved_command, str(binary))
+        self.assertEqual(install.source, 'env:LLAMA_CPP_MTP_PATH')
+        self.assertTrue(install.exists)
+        self.assertTrue(install.executable)
+
     def test_missing_binary_health_is_fail_not_exception(self):
         config = SimpleNamespace(llama_server='/definitely/missing/llama-server', vllm_command='vllm')
 
@@ -80,7 +136,7 @@ class EngineRegistryTests(unittest.TestCase):
     def test_vllm_command_resolution_uses_path_lookup_for_simple_command(self):
         config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
 
-        with patch('llama_tui.engines.shutil.which', return_value='/usr/bin/vllm'):
+        with patch('llama_tui.runtime_profiles.shutil.which', return_value='/usr/bin/vllm'):
             install = resolve_engine_install(config, ENGINE_VLLM)
             exists = command_exists('vllm')
 
@@ -114,10 +170,18 @@ class EngineRegistryTests(unittest.TestCase):
     def test_mtp_binary_warning_requires_speculative_flags(self):
         caps = EngineCapabilities(help_text='--ctx-size N')
 
-        warning = mtp_binary_warning('/work/llama.cpp/build/bin/llama-server', caps)
+        warning = mtp_binary_warning(
+            '/work/llama.cpp/build/bin/llama-server',
+            caps,
+            source='default',
+            exists=True,
+            executable=True,
+        )
 
         self.assertIn('--spec-type mtp', warning)
         self.assertIn('stable llama.cpp', warning)
+        self.assertIn('source=default', warning)
+        self.assertIn('executable=yes', warning)
         self.assertEqual(
             mtp_binary_warning(
                 '/work/llama.cpp-mtp/build/bin/llama-server',
@@ -129,12 +193,42 @@ class EngineRegistryTests(unittest.TestCase):
     def test_mtp_engine_health_reports_missing_flags(self):
         config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
 
-        with patch('llama_tui.engines.command_exists', return_value=True), \
+        with patch('llama_tui.engines.resolve_engine_install') as resolve_install, \
              patch('llama_tui.engines.detect_engine_capabilities', return_value=EngineCapabilities(help_text='--help')):
+            install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
+            resolve_install.return_value = type(install)(
+                id=ENGINE_LLAMA_CPP_MTP,
+                resolved_command='/work/llama.cpp-mtp/build/bin/llama-server',
+                source='default',
+                exists=True,
+                executable=True,
+                resolved_path='/work/llama.cpp-mtp/build/bin/llama-server',
+                checked_paths=['/work/llama.cpp-mtp/build/bin/llama-server'],
+            )
             health = get_engine_health(config, ENGINE_LLAMA_CPP_MTP)
 
         self.assertEqual(health.status, 'MTP_FLAGS_NOT_FOUND')
         self.assertIn('--spec-type mtp', health.summary)
+        self.assertIn('source=default', health.summary)
+
+    def test_mtp_engine_health_reports_non_executable_binary(self):
+        config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
+
+        with patch('llama_tui.engines.resolve_engine_install') as resolve_install:
+            install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
+            resolve_install.return_value = type(install)(
+                id=ENGINE_LLAMA_CPP_MTP,
+                resolved_command='/work/llama.cpp-mtp/build/bin/llama-server',
+                source='default',
+                exists=True,
+                executable=False,
+                resolved_path='/work/llama.cpp-mtp/build/bin/llama-server',
+                checked_paths=['/work/llama.cpp-mtp/build/bin/llama-server'],
+            )
+            health = get_engine_health(config, ENGINE_LLAMA_CPP_MTP)
+
+        self.assertEqual(health.status, 'BUILD_REQUIRED')
+        self.assertIn('executable=no', health.summary)
 
 
 if __name__ == '__main__':

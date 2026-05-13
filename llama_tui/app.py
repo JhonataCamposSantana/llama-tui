@@ -1131,19 +1131,30 @@ class AppConfig:
     def mtp_binary_warning(self, model: ModelConfig) -> str:
         if self.active_engine_key_for_model(model) != ENGINE_LLAMA_CPP_MTP:
             return ''
-        command = self.runtime_server_command('llama.cpp')
+        install = resolve_engine_install(self, ENGINE_LLAMA_CPP_MTP)
+        command = str(install.resolved_command or self.runtime_server_command('llama.cpp'))
         try:
-            capabilities = self.engine_capabilities()
+            capabilities = detect_engine_capabilities(command, ENGINE_LLAMA_CPP_MTP)
         except Exception:
             return ''
-        return engine_mtp_binary_warning(command, capabilities)
+        return engine_mtp_binary_warning(
+            command,
+            capabilities,
+            source=install.source,
+            exists=install.exists,
+            executable=getattr(install, 'executable', False),
+        )
 
     def mtp_binary_missing_message(self) -> str:
         install = resolve_engine_install(self, ENGINE_LLAMA_CPP_MTP)
         command = str(install.resolved_command or 'llama-server')
+        checked = f' Checked: {", ".join(install.checked_paths)}' if getattr(install, 'checked_paths', None) else ''
         return (
-            f'BINARY_NOT_FOUND: llama.cpp MTP server not found: {command}. '
-            'Set LLAMA_CPP_MTP_PATH=/path/to/llama-server or /path/to/bin'
+            f'BINARY_NOT_FOUND: llama.cpp MTP server not found: {command} '
+            f'(source={install.source or "unknown"}, exists={"yes" if install.exists else "no"}, '
+            f'executable={"yes" if getattr(install, "executable", False) else "no"}). '
+            'Set LLAMA_CPP_MTP_PATH=/path/to/llama-server, /path/to/bin, or a llama.cpp-mtp checkout.'
+            f'{checked}'
         )
 
     def mtp_session_advisory(self, model: ModelConfig) -> str:
