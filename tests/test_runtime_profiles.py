@@ -1374,12 +1374,12 @@ class RuntimeProfileTests(unittest.TestCase):
                 runtime_profile=make_runtime_profile('buun', 'llama-server'),
             )
             model = ModelConfig(
-                id='qwen',
-                name='Qwen3.6 35B A3B',
-                path='/models/qwen.gguf',
-                alias='qwen',
+                id='heavy-moe',
+                name='Generic Heavy MoE',
+                path='/models/heavy-moe.gguf',
+                alias='heavy-moe',
                 port=18080,
-                architecture='qwen35moe',
+                architecture='generic-moe',
                 architecture_type='moe',
                 expert_count=256,
                 expert_used_count=8,
@@ -1871,20 +1871,20 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('turbo4/turbo4', presets)
         self.assertNotIn('turbo3/turbo3', presets)
 
-    def test_turboquant_validated_low_bit_family_allows_symmetric(self):
+    def test_turboquant_low_bit_family_name_does_not_enable_symmetric(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
                 Path(tmp) / 'models.json',
                 runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
             )
             model = ModelConfig(
-                id='mistral',
-                name='Mistral Q4_K_M',
-                path='/models/mistral-Q4_K_M.gguf',
-                alias='mistral',
+                id='renamed',
+                name='Renamed Q4_K_M',
+                path='/models/renamed-Q4_K_M.gguf',
+                alias='renamed',
                 port=18080,
-                architecture='mistral',
-                model_family='mistral',
+                architecture='custom',
+                model_family='custom',
                 architecture_type='dense',
                 turboquant_status='native',
                 turboquant_head_dim=128,
@@ -1898,7 +1898,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3):
                 profiles = active_engine_runtime_profiles(app, model, hardware, depth='full')
 
-        self.assertIn('turbo3/turbo3', {item.kv_preset for item in profiles})
+        self.assertNotIn('turbo3/turbo3', {item.kv_preset for item in profiles})
 
     def test_turboquant_runtime_record_context_includes_cache_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2832,7 +2832,7 @@ class RuntimeProfileTests(unittest.TestCase):
             profile('n_cpu_moe_40', 40),
             profile('n_cpu_moe_30', 30),
             profile('n_cpu_moe_32', 32),
-            profile('q4_model_specific', 32, kv='q4_0/tq3_0'),
+            profile('q4_manual_experiment', 32, kv='q4_0/tq3_0'),
             profile('tensor_override', 32, tensor_overrides=('.*exps.*=CPU',)),
             profile('reasoning_off', 32, reasoning='off'),
             profile('cpu_moe_all', cpu_moe=True),
@@ -4161,7 +4161,7 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('q4_0/tq3_0', unsupported_presets)
         self.assertNotIn('tq3_0/tq3_0', unsupported_presets)
 
-    def test_tq3_q4_tq3_kv_is_only_model_specific(self):
+    def test_tq3_q4_tq3_kv_is_not_enabled_by_model_name(self):
         caps = parse_engine_capabilities(
             'usage: llama-server --flash-attn on|off|auto -ctk TYPE -ctv TYPE -ngl N\n'
             'allowed values: q8_0 q4_0 tq3_0',
@@ -4183,11 +4183,11 @@ class RuntimeProfileTests(unittest.TestCase):
                 tq3_weight_format='TQ3_4S',
                 ctx_max=32768,
             )
-            ytan = ModelConfig(
-                id='ytan',
-                name='YTan2000 Qwen3.6-35B-A3B-TQ3_4S',
-                path='/cache/models--YTan2000--Qwen3.6-35B-A3B-TQ3_4S/snapshots/model.gguf',
-                alias='ytan',
+            renamed = ModelConfig(
+                id='renamed',
+                name='Renamed Native TQ3',
+                path='/cache/models--owner--renamed-TQ3_4S/snapshots/model.gguf',
+                alias='renamed',
                 port=18081,
                 architecture_type='dense',
                 tq3_status='native',
@@ -4199,10 +4199,10 @@ class RuntimeProfileTests(unittest.TestCase):
             with patch.object(app, 'engine_capabilities', return_value=caps), \
                 patch('llama_tui.benchmark.model_file_size', return_value=5 * 1024**3):
                 generic_profiles = active_engine_runtime_profiles(app, generic, hardware, depth='full')
-                ytan_profiles = active_engine_runtime_profiles(app, ytan, hardware, depth='full')
+                renamed_profiles = active_engine_runtime_profiles(app, renamed, hardware, depth='full')
 
         self.assertNotIn('q4_0/tq3_0', {item.kv_preset for item in generic_profiles})
-        self.assertIn('q4_0/tq3_0', {item.kv_preset for item in ytan_profiles})
+        self.assertNotIn('q4_0/tq3_0', {item.kv_preset for item in renamed_profiles})
 
     def test_tq3_launch_diagnostic_reports_partial_offload_and_speed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4212,7 +4212,7 @@ class RuntimeProfileTests(unittest.TestCase):
             )
             model = ModelConfig(
                 id='native',
-                name='Qwen MoE TQ3',
+                name='Generic MoE TQ3',
                 path='/models/native.TQ3_4S.gguf',
                 alias='native',
                 port=18080,
@@ -4252,7 +4252,7 @@ class RuntimeProfileTests(unittest.TestCase):
             )
             model = ModelConfig(
                 id='moe',
-                name='Qwen MoE TQ3',
+                name='Generic MoE TQ3',
                 path='/models/moe.TQ3_4S.gguf',
                 alias='moe',
                 port=18080,
@@ -4301,7 +4301,7 @@ class RuntimeProfileTests(unittest.TestCase):
             )
             model = ModelConfig(
                 id='moe',
-                name='Qwen MoE TQ3',
+                name='Generic MoE TQ3',
                 path='/models/moe.TQ3_4S.gguf',
                 alias='moe',
                 port=18080,
@@ -4327,8 +4327,7 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(reasoning_off)
         self.assertTrue(all(item.reasoning_budget == 0 for item in reasoning_off))
         self.assertTrue(all(item.reasoning_format == 'deepseek' for item in reasoning_off))
-        self.assertTrue(any(int(item.ctx_size or 0) >= 16384 for item in reasoning_off))
-        self.assertTrue(any(int(item.ctx_size or 0) >= 32768 for item in reasoning_off))
+        self.assertTrue(any(int(item.ctx_size or 0) >= model.ctx_min for item in reasoning_off))
         self.assertFalse(any(item.reasoning == 'off' for item in unsupported_profiles))
 
     def test_mtp_runtime_profiles_include_baseline_and_draft_matrix(self):
@@ -4345,8 +4344,8 @@ class RuntimeProfileTests(unittest.TestCase):
             )
             model = ModelConfig(
                 id='mtp',
-                name='Qwen3.6 native-mtp',
-                path='/models/qwen3.6-native-mtp.gguf',
+                name='Generic native-mtp',
+                path='/models/generic-native-mtp.gguf',
                 alias='mtp',
                 port=18080,
                 ctx_min=4096,

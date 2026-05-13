@@ -6,12 +6,15 @@ from typing import List
 from .constants import DEFAULT_MODEL_PORT
 from .gguf import (
     apply_architecture_info,
+    apply_tq3_info,
     apply_turboquant_info,
     architecture_label,
     detect_architecture_info,
+    detect_tq3_info,
     detect_turboquant_info,
     read_gguf_metadata,
 )
+from .model_compat import detect_model_runtime_features
 from .models import ModelConfig
 
 GENERIC_DISCOVERY_CTX = 2048
@@ -140,4 +143,8 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
         extra_args=[],
     )
     apply_architecture_info(model, detect_architecture_info(model))
-    return apply_turboquant_info(model, detect_turboquant_info(model))
+    apply_turboquant_info(model, detect_turboquant_info(model))
+    apply_tq3_info(model, detect_tq3_info(model))
+    if model.supports_mtp == 'auto' and 'mtp_native' in detect_model_runtime_features(model):
+        model.supports_mtp = 'yes'
+    return model

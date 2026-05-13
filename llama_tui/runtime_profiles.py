@@ -326,6 +326,10 @@ class RuntimeProfile:
     reasoning_format: str = ''
     mtp_enabled: bool = False
     mtp_draft_n_max: int = 0
+    benchmark_strategy_id: str = ''
+    benchmark_objectives: Tuple[str, ...] = field(default_factory=tuple)
+    benchmark_phase: str = ''
+    benchmark_metric_group: str = ''
 
 
 def llama_cpp_mtp_server_from_env() -> str:

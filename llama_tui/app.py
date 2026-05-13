@@ -33,10 +33,13 @@ from .discovery import (
     looks_like_model_reference,
 )
 from .engines import (
+    ENGINE_BUUN,
+    ENGINE_LLAMA_CPP,
     ENGINE_LLAMA_CPP_MTP,
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
+    normalize_engine_id,
     mtp_binary_warning as engine_mtp_binary_warning,
     resolve_engine_install,
     tq3_binary_warning as engine_tq3_binary_warning,
@@ -70,6 +73,12 @@ from .models import (
     ModelConfig,
     OpencodeSettings,
     UiSettings,
+)
+from .model_compat import (
+    ModelEngineCompatibility,
+    compatible_engine_ids_for_model,
+    detect_model_runtime_features,
+    engine_supports_model,
 )
 from .mtp import (
     clamp_mtp_draft,
@@ -421,6 +430,8 @@ class AppConfig:
                 roots_changed = True
             if self.enrich_model_tq3(m):
                 roots_changed = True
+            if self.enrich_model_mtp(m):
+                roots_changed = True
             inferred = self.infer_model_source(m)
             if m.source != inferred:
                 m.source = inferred
@@ -743,6 +754,14 @@ class AppConfig:
         apply_tq3_info(model, detected)
         return asdict(model) != before
 
+    def enrich_model_mtp(self, model: ModelConfig) -> bool:
+        if normalize_mtp_support(getattr(model, 'supports_mtp', 'auto')) != 'auto':
+            return False
+        before = asdict(model)
+        if 'mtp_native' in detect_model_runtime_features(model):
+            model.supports_mtp = 'yes'
+        return asdict(model) != before
+
     def _normalize_model_ranks(self) -> bool:
         changed = False
         ordered = sorted(
@@ -1040,21 +1059,38 @@ class AppConfig:
             return detail
         return f'TQ3 status {status or "unknown"}'
 
+    def model_engine_compatibility(
+        self,
+        model: ModelConfig,
+        engine_id: Optional[str] = None,
+        capabilities: Optional[EngineCapabilities] = None,
+    ) -> ModelEngineCompatibility:
+        engine = normalize_engine_id(engine_id or self.active_engine_key_for_model(model))
+        caps = capabilities
+        if caps is None and engine == self.active_engine_key_for_model(model):
+            try:
+                caps = self.engine_capabilities()
+            except Exception:
+                caps = None
+        return engine_supports_model(engine, model, caps)
+
     def active_engine_model_compatibility(self, model: ModelConfig) -> Tuple[bool, str]:
-        active_engine = self.active_engine_key_for_model(model)
-        if self.model_tq3_native(model):
-            if active_engine == ENGINE_TQ3:
-                return True, self.tq3_compatibility_reason(model)
-            return False, (
-                'TQ3-native GGUFs (TQ3_1S/TQ3_4S) require the tq3 engine in llama-tui. '
-                f'Active engine is {active_engine}; selected model is {self.tq3_compatibility_reason(model)}.'
-            )
-        if active_engine != ENGINE_TQ3:
-            return True, ''
-        return False, (
-            'llama.cpp-tq3 only accepts TQ3-native GGUFs in llama-tui '
-            f'(TQ3_1S/TQ3_4S). Selected model is {self.tq3_compatibility_reason(model)}.'
-        )
+        compatibility = self.model_engine_compatibility(model)
+        return compatibility.compatible, compatibility.reason
+
+    def model_runtime_features(self, model: ModelConfig) -> Tuple[str, ...]:
+        return tuple(sorted(detect_model_runtime_features(model)))
+
+    def compatible_engine_ids_for_model(self, model: ModelConfig) -> Tuple[str, ...]:
+        return compatible_engine_ids_for_model(model)
+
+    def hidden_engine_reasons_for_model(self, model: ModelConfig) -> Dict[str, str]:
+        reasons: Dict[str, str] = {}
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
+            compatibility = self.model_engine_compatibility(model, engine_id=engine, capabilities=None)
+            if not compatibility.compatible:
+                reasons[engine] = compatibility.reason
+        return reasons
 
     def tq3_binary_missing_message(self) -> str:
         install = resolve_engine_install(self, ENGINE_TQ3)
@@ -2137,6 +2173,34 @@ class AppConfig:
             'llm-models': Path(self.llm_models_cache_root).expanduser(),
         }
 
+    def cache_discovery_roots(self) -> List[Tuple[str, Path]]:
+        roots: List[Tuple[str, Path]] = []
+
+        def add_env(source: str, env_name: str, suffix: str = ''):
+            value = os.environ.get(env_name, '').strip()
+            if not value:
+                return
+            root = Path(value).expanduser()
+            if suffix:
+                root = root / suffix
+            if root.exists():
+                roots.append((source, root))
+
+        add_env('llama_cache', 'LLAMA_CACHE')
+        add_env('hf_cache', 'HF_HUB_CACHE')
+        add_env('hf_cache', 'HUGGINGFACE_HUB_CACHE')
+        add_env('hf_cache', 'HF_HOME', 'hub')
+
+        default_roots = [
+            ('hf_cache', Path.home() / '.cache' / 'huggingface' / 'hub'),
+            ('llama_cache', Path.home() / '.cache' / 'llama.cpp'),
+        ]
+        for source, root in default_roots:
+            root = root.expanduser()
+            if root.exists():
+                roots.append((source, root))
+        return roots
+
     def lm_studio_roots(self) -> List[Path]:
         roots: List[Path] = []
         seen = set()
@@ -2154,8 +2218,17 @@ class AppConfig:
 
     def managed_source_roots(self) -> List[Tuple[str, Path]]:
         roots = list(self.managed_roots().items())
+        roots.extend(self.cache_discovery_roots())
         roots.extend(('lm-studio', root) for root in self.lm_studio_roots())
-        return roots
+        seen = set()
+        ordered: List[Tuple[str, Path]] = []
+        for source, root in roots:
+            key = (source, str(root.expanduser().resolve(strict=False)))
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append((source, root))
+        return ordered
 
     def normalize_model_path(self, path: str | Path) -> Path:
         return Path(path).expanduser().resolve(strict=False)
@@ -2163,9 +2236,11 @@ class AppConfig:
     def infer_model_source(self, model: ModelConfig) -> str:
         if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
             return 'manual'
-        if getattr(model, 'source', '') in ('manual', 'huggingface', 'llmfit', 'llm-models', 'lm-studio'):
-            existing = getattr(model, 'source', '')
-            if existing and existing != 'manual':
+        known_sources = {'manual', 'huggingface', 'hf_cache', 'llama_cache', 'llmfit', 'llm-models', 'lm-studio'}
+        existing = getattr(model, 'source', '') or ''
+        existing_labels = {label.strip() for label in existing.split(',') if label.strip()}
+        if existing_labels & known_sources:
+            if existing and 'manual' not in existing_labels:
                 return existing
         p = self.normalize_model_path(model.path)
         for source, root in self.managed_source_roots():
@@ -2176,6 +2251,15 @@ class AppConfig:
                 continue
         return 'manual'
 
+    def merge_source_labels(self, *sources: str) -> str:
+        labels: List[str] = []
+        for source in sources:
+            for label in str(source or '').split(','):
+                clean = label.strip()
+                if clean and clean not in labels:
+                    labels.append(clean)
+        return ','.join(labels) if labels else 'manual'
+
     def discover_source_files(self) -> Tuple[Dict[str, Tuple[Path, str]], List[str]]:
         discovered: Dict[str, Tuple[Path, str]] = {}
         notes: List[str] = []
@@ -2185,15 +2269,20 @@ class AppConfig:
                 notes.append(f'{source} cache not found: {root}')
                 continue
 
-            if source == 'huggingface':
-                candidates = root.glob('models--*/snapshots/*/*.gguf')
+            if source in ('huggingface', 'hf_cache'):
+                candidates = root.rglob('*.gguf')
             else:
                 candidates = root.rglob('*.gguf')
 
             for gguf in sorted(candidates):
                 if not is_real_model_file(gguf):
                     continue
-                discovered[str(gguf.resolve(strict=False))] = (gguf, source)
+                resolved = str(gguf.resolve(strict=False))
+                if resolved in discovered:
+                    previous_path, previous_source = discovered[resolved]
+                    discovered[resolved] = (previous_path, self.merge_source_labels(previous_source, source))
+                else:
+                    discovered[resolved] = (gguf, source)
 
         return discovered, notes
 
@@ -2860,6 +2949,7 @@ class AppConfig:
         self.enrich_model_architecture(model)
         self.enrich_model_turboquant(model)
         self.enrich_model_tq3(model)
+        self.enrich_model_mtp(model)
         for idx, existing in enumerate(self.models):
             if existing.id == model.id:
                 if not getattr(model, 'sort_rank', 0):
@@ -2942,8 +3032,17 @@ class AppConfig:
         for resolved, (gguf, source) in discovered.items():
             if resolved in existing_paths:
                 model = existing_paths[resolved]
-                if model.source != source:
-                    model.source = source
+                merged_source = self.merge_source_labels(model.source, source)
+                if model.source != merged_source:
+                    model.source = merged_source
+                    changed = True
+                if self.enrich_model_architecture(model):
+                    changed = True
+                if self.enrich_model_turboquant(model):
+                    changed = True
+                if self.enrich_model_tq3(model):
+                    changed = True
+                if self.enrich_model_mtp(model):
                     changed = True
                 continue
 

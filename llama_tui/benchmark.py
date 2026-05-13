@@ -13,9 +13,17 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib import request
 
 from .constants import CACHE_DIR
+from .benchmark_strategies import BenchmarkStrategy, select_benchmark_strategy
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .discovery import extract_quant
-from .engines import ENGINE_LLAMA_CPP_MTP, ENGINE_TQ3, resolve_engine_install
+from .engines import (
+    ENGINE_BUUN,
+    ENGINE_LLAMA_CPP,
+    ENGINE_LLAMA_CPP_MTP,
+    ENGINE_TQ3,
+    ENGINE_TURBOQUANT,
+    resolve_engine_install,
+)
 from .gguf import architecture_label, extra_arg_value, gguf_layer_count, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
 from .launch_profiles import (
@@ -116,13 +124,6 @@ MAX_CONTEXT_PROBE_MAX_CANDIDATES = 15
 WORKFLOW_CACHE_RAM_VARIANTS = (0, 512, 1024, 2048)
 WORKFLOW_CACHE_RAM_BASE_CANDIDATES = 1
 WORKFLOW_CACHE_RAM_RESERVE_MIB = 1024
-TURBOQUANT_VALIDATED_SYMMETRIC_FAMILIES = (
-    ('llama', 'q4_k_m'),
-    ('mistral', 'q4_k_m'),
-    ('command-r', 'q4_k_m'),
-    ('command-r+', 'q4_k_m'),
-    ('cohere', 'q4_k_m'),
-)
 SMART_MAX_FULL_CONTEXTS_PER_VARIANT = 5
 ADAPTIVE_PROFILE_KEYS = ('fast_chat', 'long_context', 'opencode_ready', 'auto')
 ADAPTIVE_RESERVE_BY_OBJECTIVE = {
@@ -149,6 +150,55 @@ SPECTRUM_LABELS = {
     'failed': 'Failed',
     'break_point': 'Break Point',
 }
+
+
+def app_active_engine_key(app, model: ModelConfig) -> str:
+    if hasattr(app, 'active_engine_key_for_model'):
+        try:
+            return str(app.active_engine_key_for_model(model) or '')
+        except Exception:
+            pass
+    profile = getattr(app, 'runtime_profile', None)
+    engine = str(getattr(profile, 'engine_id', '') or getattr(profile, 'engine', '') or '').strip()
+    if engine:
+        return engine
+    return str(getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp')
+
+
+def benchmark_strategy_for_app(
+    app,
+    model: ModelConfig,
+    hardware: Optional[HardwareProfile] = None,
+    depth: str = 'fast',
+    objective: str = 'quick_sanity',
+) -> BenchmarkStrategy:
+    profile = hardware
+    if profile is None and hasattr(app, 'hardware_profile'):
+        try:
+            profile = app.hardware_profile(refresh=False)
+        except Exception:
+            profile = None
+    try:
+        capabilities = app.engine_capabilities()
+    except Exception:
+        capabilities = None
+    try:
+        size = int(model_file_size(model) or 0)
+    except Exception:
+        size = 0
+    return select_benchmark_strategy(
+        app_active_engine_key(app, model),
+        model,
+        hardware=profile,
+        capabilities=capabilities,
+        objective=objective,
+        depth=depth,
+        model_size_bytes=size,
+    )
+
+
+def _strategy_metric_group(strategy: BenchmarkStrategy) -> str:
+    return ','.join(tuple(getattr(strategy, 'metric_groups', ()) or ()))
 
 
 class BenchmarkDeadline:
@@ -586,6 +636,13 @@ def benchmark_preflight_cleanup(
         active_engine = app.active_engine_key_for_model(model) if hasattr(app, 'active_engine_key_for_model') else ''
     except Exception:
         active_engine = ''
+    if hasattr(app, 'active_engine_model_compatibility'):
+        try:
+            compatible, compatibility_msg = app.active_engine_model_compatibility(model)
+        except Exception:
+            compatible, compatibility_msg = True, ''
+        if not compatible:
+            return False, f'❌ benchmark preflight blocked: {compatibility_msg}'
     if active_engine == ENGINE_TQ3:
         install = resolve_engine_install(app, ENGINE_TQ3)
         if not install.exists:
@@ -594,13 +651,6 @@ def benchmark_preflight_cleanup(
                 f'ENGINE_BINARY_MISSING: llama.cpp-tq3 server not found: {command}. '
                 'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
             )
-    if hasattr(app, 'active_engine_model_compatibility'):
-        try:
-            compatible, compatibility_msg = app.active_engine_model_compatibility(model)
-        except Exception:
-            compatible, compatibility_msg = True, ''
-        if not compatible:
-            return False, f'❌ benchmark preflight blocked: {compatibility_msg}'
     stopped: List[str] = []
     models = list(getattr(app, 'models', []) or [])
     if model.id not in {getattr(item, 'id', '') for item in models}:
@@ -852,24 +902,10 @@ def normalized_model_quant(model: ModelConfig) -> str:
     return str(extract_quant(model) or '').strip().lower()
 
 
-def _normalized_family_tokens(model: ModelConfig) -> Tuple[str, ...]:
-    text = ' '.join([
-        str(getattr(model, 'model_family', '') or ''),
-        str(getattr(model, 'architecture', '') or ''),
-        str(getattr(model, 'name', '') or ''),
-    ]).lower()
-    cleaned = re.sub(r'[^a-z0-9+.-]+', ' ', text)
-    return tuple(token for token in cleaned.split() if token)
-
-
 def turboquant_symmetric_auto_allowed(model: ModelConfig, model_quant: str = '') -> bool:
     quant = (model_quant or normalized_model_quant(model)).strip().lower()
     if quant in ('q8_0', 'f16', 'fp16', 'f32', 'fp32', 'bf16') or quant.startswith('fp'):
         return True
-    families = _normalized_family_tokens(model)
-    for family, validated_quant in TURBOQUANT_VALIDATED_SYMMETRIC_FAMILIES:
-        if quant == validated_quant and any(token == family or family in token for token in families):
-            return True
     return False
 
 
@@ -4352,7 +4388,7 @@ def max_context_probe_kv_profiles(
         return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
     if engine_key == 'tq3':
         profiles = tq3_kv_profiles_for_model(model, capabilities, 'full')
-        preferred = ('q8_0/q8_0', 'tq3_0/tq3_0', 'q4_0/tq3_0')
+        preferred = ('q8_0/q8_0', 'tq3_0/tq3_0')
         return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
     if engine_key == 'buun':
         preferred = ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq', 'turbo2_tcq/turbo2_tcq')
@@ -5314,6 +5350,10 @@ def adaptive_record_from_candidate(
     unsupported_launch_flags: Optional[List[str]] = None,
     effective_server_args: Optional[List[str]] = None,
     effective_server_command: str = '',
+    benchmark_strategy_id: str = '',
+    benchmark_objectives: Optional[List[str]] = None,
+    benchmark_phase: str = '',
+    benchmark_metric_group: str = '',
     mtp_enabled: bool = False,
     mtp_draft_n_max: int = 0,
     spec_type: str = '',
@@ -5386,6 +5426,24 @@ def adaptive_record_from_candidate(
         'kv_compression_tier': kv_compression_tier,
         'kv_score_penalty': round(float(kv_score_penalty or 0.0), 4),
         'benchmark_depth': benchmark_depth,
+        'benchmark_strategy_id': benchmark_strategy_id,
+        'benchmark_objectives': list(benchmark_objectives or []),
+        'benchmark_phase': benchmark_phase,
+        'benchmark_metric_group': benchmark_metric_group,
+        'pp_tps': round(float(prompt_tokens_per_sec), 2),
+        'tg_tps': round(float(tokens_per_sec), 2),
+        'pg_tps': round(float(tokens_per_sec), 2),
+        'ttft_ms': 0.0,
+        'tpot_ms': round(1000.0 / float(tokens_per_sec), 2) if float(tokens_per_sec or 0.0) > 0 else 0.0,
+        'itl_ms': round(1000.0 / float(tokens_per_sec), 2) if float(tokens_per_sec or 0.0) > 0 else 0.0,
+        'e2e_latency_ms': round(float(seconds or 0.0) * 1000.0, 2),
+        'accept_rate': 0.0,
+        'draft_tokens': 0,
+        'accepted_tokens': 0,
+        'peak_ram': max(0, int(getattr(candidate, 'cache_ram', 0) or 0)),
+        'context_max_stable': int(ctx if ctx is not None else getattr(candidate, 'ctx', 0) or 0) if status == 'ok' else 0,
+        'quality_risk': kv_quality_tier if kv_quality_tier in ('experimental', 'aggressive', 'extreme') else '',
+        'engine_status': startup_result or status,
         'runtime_fit': bool(runtime_fit),
         'fit': bool(fit or runtime_fit),
         'fit_context': int(fit_context or 0),
@@ -5551,6 +5609,10 @@ def runtime_record_context(
             turbo_profile.score_penalty if turbo_profile is not None else 0.0
         ),
         'benchmark_depth': getattr(profile, 'benchmark_depth', '') if profile is not None else '',
+        'benchmark_strategy_id': getattr(profile, 'benchmark_strategy_id', '') if profile is not None else '',
+        'benchmark_objectives': list(getattr(profile, 'benchmark_objectives', ()) or ()) if profile is not None else [],
+        'benchmark_phase': getattr(profile, 'benchmark_phase', '') if profile is not None else '',
+        'benchmark_metric_group': getattr(profile, 'benchmark_metric_group', '') if profile is not None else '',
         'runtime_fit': bool(getattr(profile, 'fit', False)) if profile is not None else False,
         'fit_context': int(getattr(profile, 'fit_context', 0) or 0) if profile is not None else 0,
         'runtime_no_warmup': bool(getattr(profile, 'no_warmup', False)) if profile is not None else False,
@@ -5595,6 +5657,76 @@ def apply_failure_context(record: Dict[str, object], detail: str, default_catego
     record['startup_result'] = 'FAILED'
     if not record.get('detail'):
         record['detail'] = concise_failure(detail, limit=500)
+    return record
+
+
+def parse_mtp_acceptance_metrics(text: str) -> Dict[str, object]:
+    payload: Dict[str, object] = {}
+    source = str(text or '')
+    if not source:
+        return payload
+    low = source.lower()
+
+    def first_int(patterns: Sequence[str]) -> int:
+        for pattern in patterns:
+            match = re.search(pattern, low, flags=re.I)
+            if match:
+                try:
+                    return max(0, int(float(match.group(1))))
+                except Exception:
+                    continue
+        return 0
+
+    draft_tokens = first_int((
+        r'\bdraft(?:ed)?[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
+        r'\bspec(?:ulative)?[_\s-]*draft(?:ed)?\s*[:=]\s*([0-9]+)',
+        r'\bn[_\s-]*draft(?:ed)?\s*[:=]\s*([0-9]+)',
+    ))
+    accepted_tokens = first_int((
+        r'\baccepted[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
+        r'\bspec(?:ulative)?[_\s-]*accepted\s*[:=]\s*([0-9]+)',
+        r'\bn[_\s-]*accepted\s*[:=]\s*([0-9]+)',
+    ))
+    rate = 0.0
+    for pattern in (
+        r'\baccept(?:ance)?[_\s-]*rate\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*%?',
+        r'\baccepted\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+    ):
+        match = re.search(pattern, low, flags=re.I)
+        if match:
+            try:
+                value = float(match.group(1))
+                rate = value / 100.0 if value > 1.0 else value
+                break
+            except Exception:
+                continue
+    if not rate and draft_tokens > 0 and accepted_tokens > 0:
+        rate = min(1.0, accepted_tokens / max(1, draft_tokens))
+    if draft_tokens:
+        payload['draft_tokens'] = draft_tokens
+    if accepted_tokens:
+        payload['accepted_tokens'] = accepted_tokens
+    if rate:
+        payload['accept_rate'] = round(max(0.0, min(1.0, rate)), 4)
+    return payload
+
+
+def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object]:
+    if not bool(record.get('mtp_enabled', False)) and str(record.get('spec_type', '') or '') != 'mtp':
+        return record
+    log_path = str(record.get('runtime_log_path', '') or '')
+    text = ''
+    if log_path:
+        try:
+            text = Path(log_path).read_text(encoding='utf-8', errors='replace')[-8000:]
+        except Exception:
+            text = ''
+    metrics = parse_mtp_acceptance_metrics(text)
+    if metrics:
+        record.update(metrics)
+        record['mtp_acceptance_source'] = 'runtime_log'
+    else:
+        record['mtp_acceptance_source'] = 'not_reported'
     return record
 
 
@@ -5804,6 +5936,7 @@ def benchmark_adaptive_candidate(
             else:
                 apply_failure_context(record, str(bench.get('error', 'unknown error')), default_category='API_TIMEOUT')
             enrich_fit_discovery_metadata(record, app, candidate, runtime_profile, success=False)
+            enrich_mtp_acceptance_metrics(record)
             return record, None
         snap = app.hardware_profile(refresh=True)
         process_snapshots['after_generation'] = current_process_pressure_payload()
@@ -5841,6 +5974,7 @@ def benchmark_adaptive_candidate(
         )
         apply_memory_guardrail_record(record, state=guardrail_state)
         enrich_fit_discovery_metadata(record, app, candidate, runtime_profile, success=True)
+        enrich_mtp_acceptance_metrics(record)
         measured = dict(record)
         measured['model'] = ModelConfig(**asdict(candidate))
         return record, measured
@@ -6216,44 +6350,12 @@ def dynamic_context_growth_targets(
     return sorted(ctx for ctx in values if ctx_min <= ctx <= health_ceiling)
 
 
-def tq3_model_card_q4_tq3_kv_enabled(model: ModelConfig) -> bool:
-    text = ' '.join(
-        str(getattr(model, key, '') or '')
-        for key in ('id', 'name', 'path', 'alias', 'model_family', 'architecture')
-    ).lower()
-    return (
-        'ytan2000' in text
-        and 'qwen3.6' in text
-        and '35b' in text
-        and 'tq3' in text
-    )
-
-
 def tq3_kv_profiles_for_model(
     model: ModelConfig,
     capabilities,
     depth: str,
 ) -> List[TurboKvProfile]:
-    profiles = supported_turbo_kv_profiles(capabilities, depth, engine_id='tq3')
-    allowed = {str(item).strip().lower() for item in tuple(getattr(capabilities, 'supported_kv_modes', ()) or ())}
-    if (
-        tq3_model_card_q4_tq3_kv_enabled(model)
-        and 'q4_0' in allowed
-        and 'tq3_0' in allowed
-        and (depth or '').strip().lower() != 'fast'
-        and not any(item.kv_preset == 'q4_0/tq3_0' for item in profiles)
-    ):
-        profiles.append(TurboKvProfile(
-            'q4_0/tq3_0',
-            'Qwen3.6 q4/TQ3',
-            'model_specific',
-            'qwen3.6-tq3',
-            'full',
-            0.12,
-            False,
-            'model-card',
-        ))
-    return profiles
+    return supported_turbo_kv_profiles(capabilities, depth, engine_id='tq3')
 
 
 def sibling_llama_bench_for_server(server_bin: str) -> str:
@@ -6567,6 +6669,10 @@ def run_tq3_raw_llama_bench_presearch(
             runtime_profile=raw_profiles[0].name,
             kv_preset=raw_profiles[0].kv_preset,
             benchmark_depth=depth,
+            benchmark_strategy_id=getattr(raw_profiles[0], 'benchmark_strategy_id', ''),
+            benchmark_objectives=list(getattr(raw_profiles[0], 'benchmark_objectives', ()) or ()),
+            benchmark_phase='pp_baseline',
+            benchmark_metric_group='pp_tps,tg_tps',
             placement_strategy=raw_profiles[0].placement_strategy,
             cpu_moe=raw_profiles[0].cpu_moe,
             n_cpu_moe=raw_profiles[0].n_cpu_moe,
@@ -6681,6 +6787,10 @@ def run_tq3_raw_llama_bench_presearch(
                 runtime_profile=runtime_profile.name,
                 kv_preset=runtime_profile.kv_preset,
                 benchmark_depth=depth,
+                benchmark_strategy_id=getattr(runtime_profile, 'benchmark_strategy_id', ''),
+                benchmark_objectives=list(getattr(runtime_profile, 'benchmark_objectives', ()) or ()),
+                benchmark_phase='pp_baseline' if measurement_type == 'raw_pp' else 'tg_baseline',
+                benchmark_metric_group='pp_tps' if measurement_type == 'raw_pp' else 'tg_tps',
                 placement_strategy=runtime_profile.placement_strategy,
                 cpu_moe=runtime_profile.cpu_moe,
                 n_cpu_moe=runtime_profile.n_cpu_moe,
@@ -6884,7 +6994,7 @@ def active_engine_runtime_profiles(
         engine = app.active_engine_key_for_model(model)
     except Exception:
         engine = getattr(model, 'runtime', 'llama.cpp')
-    if getattr(model, 'runtime', 'llama.cpp') != 'llama.cpp':
+    if engine not in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3):
         return []
     if not str(getattr(model, 'path', '') or '').lower().endswith('.gguf'):
         return []
@@ -6902,6 +7012,17 @@ def active_engine_runtime_profiles(
     if native_ctx > 0:
         ctx_max = max(ctx_min, min(ctx_max, native_ctx))
     size = int(arch.get('model_file_size', 0) or model_file_size(model) or 0)
+    strategy = select_benchmark_strategy(
+        engine,
+        model,
+        hardware=profile,
+        capabilities=capabilities,
+        objective='quick_sanity' if benchmark_depth == 'fast' else 'long_context',
+        depth=benchmark_depth,
+        model_size_bytes=size,
+    )
+    if getattr(strategy, 'blocked_reason', ''):
+        return []
     has_gpu = bool(profile and profile.has_usable_gpu())
     vram_free = int(getattr(profile, 'gpu_memory_free', 0) or 0)
     fits_gpu = bool(has_gpu and size > 0 and size <= int(vram_free * 0.82))
@@ -7064,9 +7185,19 @@ def active_engine_runtime_profiles(
             ))
         return result
 
+    def apply_strategy_limits(items: List[RuntimeProfile]) -> List[RuntimeProfile]:
+        max_candidates = int(getattr(strategy, 'max_candidates', 0) or 0)
+        if max_candidates <= 0 or len(items) <= max_candidates:
+            return items
+        if strategy.id in ('tq3_native_probe', 'mtp_acceptance_matrix'):
+            return items[:max_candidates]
+        if benchmark_depth == 'fast':
+            return items[:max_candidates]
+        return items
+
     def finalized_profiles() -> List[RuntimeProfile]:
         if not moe_placements:
-            return with_tq3_reasoning_off_candidates(profiles)
+            return apply_strategy_limits(with_tq3_reasoning_off_candidates(profiles))
         updated: List[RuntimeProfile] = [
             item if (
                 bool(getattr(item, 'cpu_moe', False))
@@ -7159,9 +7290,9 @@ def active_engine_runtime_profiles(
                 placement_updates.append(candidate)
         if placement_updates and engine == 'tq3' and moe:
             insert_at = next((idx for idx, item in enumerate(updated) if int(item.ctx_size or 0) > base_ctx), len(updated))
-            return with_tq3_reasoning_off_candidates(updated[:insert_at] + placement_updates + updated[insert_at:])
+            return apply_strategy_limits(with_tq3_reasoning_off_candidates(updated[:insert_at] + placement_updates + updated[insert_at:]))
         updated.extend(placement_updates)
-        return with_tq3_reasoning_off_candidates(updated)
+        return apply_strategy_limits(with_tq3_reasoning_off_candidates(updated))
 
     def kv_for_strategy(strategy: str) -> str:
         if supports_cache_kv and strategy in ('kv_compression_probe', 'context_growth_sweep'):
@@ -7212,6 +7343,8 @@ def active_engine_runtime_profiles(
         placement: Optional[MoePlacementCandidate] = None,
         mtp_enabled: bool = False,
         mtp_draft_n_max: int = 0,
+        benchmark_phase: str = '',
+        benchmark_metric_group: str = '',
     ):
         ctx = max(ctx_min, min(ctx_max, int(ctx or base_ctx)))
         ngl_key = 'fit' if ngl is None else int(ngl)
@@ -7263,6 +7396,10 @@ def active_engine_runtime_profiles(
             kv_compression_tier=getattr(kv_profile, 'compression_tier', '') if kv_profile is not None else '',
             kv_score_penalty=float(getattr(kv_profile, 'score_penalty', 0.0) or 0.0) if kv_profile is not None else 0.0,
             benchmark_depth=benchmark_depth,
+            benchmark_strategy_id=strategy.id,
+            benchmark_objectives=tuple(strategy.objectives or ()),
+            benchmark_phase=benchmark_phase or 'server_sanity',
+            benchmark_metric_group=benchmark_metric_group or _strategy_metric_group(strategy),
             fit_discovery_phase=fit_discovery_phase,
             viable_ngl=max(0, int(viable_ngl or 0)),
             viable_ngl_source=viable_ngl_source,
@@ -7347,7 +7484,17 @@ def active_engine_runtime_profiles(
 
     if engine == ENGINE_LLAMA_CPP_MTP:
         mtp_ngl = 999 if fits_gpu else partial_ngl
-        add('mtp_baseline', base_ctx, mtp_ngl, 'default', batch=128, ubatch=64, mtp_enabled=False)
+        add(
+            'mtp_baseline',
+            base_ctx,
+            mtp_ngl,
+            'default',
+            batch=128,
+            ubatch=64,
+            mtp_enabled=False,
+            benchmark_phase='baseline_no_mtp',
+            benchmark_metric_group='tg_tps,ttft_ms,tpot_ms',
+        )
         supports_mtp = bool(
             getattr(capabilities, 'supports_spec_type', False)
             and getattr(capabilities, 'supports_mtp', False)
@@ -7368,6 +7515,8 @@ def active_engine_runtime_profiles(
                     ubatch=64,
                     mtp_enabled=True,
                     mtp_draft_n_max=draft,
+                    benchmark_phase='draft_acceptance',
+                    benchmark_metric_group='tg_tps,draft_tokens,accepted_tokens,accept_rate',
                 )
         return finalized_profiles()
 
@@ -7376,10 +7525,10 @@ def active_engine_runtime_profiles(
         baseline_kv = baseline_profile.kv_preset if baseline_profile is not None else 'q8_0/q8_0'
 
         if not has_gpu:
-            add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile)
+            add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile, benchmark_phase='server_sanity')
             return finalized_profiles()
 
-        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile)
+        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile, benchmark_phase='server_sanity')
         if moe:
             growth_target = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
             if growth_target:
@@ -7392,6 +7541,7 @@ def active_engine_runtime_profiles(
                     batch=128,
                     ubatch=64,
                     kv_profile=baseline_profile,
+                    benchmark_phase='context_probe',
                 )
             return finalized_profiles()
 
@@ -7404,6 +7554,7 @@ def active_engine_runtime_profiles(
                 partial_ngl,
                 kv_profile.kv_preset,
                 kv_profile=kv_profile,
+                benchmark_phase='kv_experiment',
             )
         if benchmark_depth == 'full':
             sweep_kv = baseline_kv
@@ -7429,7 +7580,7 @@ def active_engine_runtime_profiles(
         baseline_kv = baseline_profile.kv_preset if baseline_profile is not None else 'q8_0/q8_0'
 
         if not has_gpu:
-            add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile)
+            add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile, benchmark_phase='q8_baseline')
             return finalized_profiles()
 
         if capabilities.supports_fit:
@@ -7458,6 +7609,7 @@ def active_engine_runtime_profiles(
                 fit_context=fit_context_for(discovery_ctx),
                 no_warmup=capabilities.supports_no_warmup,
                 fit_discovery_phase='weight_fit',
+                benchmark_phase='q8_baseline' if discovery_kv == baseline_kv else 'kv_compression',
             )
 
             gpu_total = int(getattr(profile, 'gpu_memory_total', 0) or 0)
@@ -7486,10 +7638,11 @@ def active_engine_runtime_profiles(
                         fit_context=fit_context_for(ctx),
                         no_warmup=capabilities.supports_no_warmup,
                         fit_discovery_phase='context_growth',
+                        benchmark_phase='context_probe',
                     )
             return finalized_profiles()
 
-        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, kv_profile=baseline_profile)
+        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, kv_profile=baseline_profile, benchmark_phase='q8_baseline')
         for kv_profile in turbo_profiles:
             if kv_profile.kv_preset == baseline_kv:
                 continue
@@ -7500,6 +7653,7 @@ def active_engine_runtime_profiles(
                 partial_ngl,
                 kv_profile.kv_preset,
                 kv_profile=kv_profile,
+                benchmark_phase='kv_compression',
             )
         if benchmark_depth == 'full':
             sweep_kv = preferred_profile.kv_preset if preferred_profile is not None else baseline_kv
@@ -7515,7 +7669,7 @@ def active_engine_runtime_profiles(
         growth_kv = preferred_profile.kv_preset if preferred_profile is not None else baseline_kv
         for ctx in growth_contexts:
             suffix = preferred_profile.name_slug if preferred_profile is not None else 'q8_0_q8_0'
-            add(f'context_growth_sweep_{ctx}_{suffix}', ctx, partial_ngl, growth_kv, kv_profile=preferred_profile)
+            add(f'context_growth_sweep_{ctx}_{suffix}', ctx, partial_ngl, growth_kv, kv_profile=preferred_profile, benchmark_phase='context_probe')
         return finalized_profiles()
 
     if not (engine == 'buun' and has_gpu):
@@ -8337,6 +8491,7 @@ def benchmark_exhaustive_profiles(
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'server-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    strategy = benchmark_strategy_for_app(app, model, profile, depth='full', objective='long_context')
     ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
     ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
     chat_floor = chat_min_ctx_per_slot(model)
@@ -8355,7 +8510,8 @@ def benchmark_exhaustive_profiles(
     current: Optional[ModelConfig] = None
     completed = 0
     started_monotonic = time.monotonic()
-    deadline = BenchmarkDeadline.from_end(started_monotonic + SMART_BENCHMARK_SOFT_BUDGET_SECONDS)
+    strategy_budget = max(60, int(getattr(strategy, 'hard_budget_seconds', 0) or SMART_BENCHMARK_SOFT_BUDGET_SECONDS))
+    deadline = BenchmarkDeadline.from_end(started_monotonic + strategy_budget)
     budget_exhausted = False
     full_by_fingerprint: Dict[str, Dict[str, object]] = {}
     disabled_runtime_kv: set[Tuple[str, str]] = set()
@@ -8383,7 +8539,8 @@ def benchmark_exhaustive_profiles(
     start_msg = (
         f'smart bounded benchmark started: ctx={ctx_min}..{ctx_max}, '
         f'chat_floor={chat_floor}, opencode_floor={opencode_floor or "none"}, '
-        f'soft_budget={SMART_BENCHMARK_SOFT_BUDGET_SECONDS // 60}m hard_deadline=on, '
+        f'strategy={strategy.id}, phases={",".join(phase.id for phase in strategy.phases)}, '
+        f'soft_budget={strategy_budget // 60}m hard_deadline=on, '
         f'arch={architecture_label(model)}, runtime_profiles={len(runtime_profiles)}, '
         f'{moe_note}{profile.short_summary()} '
         f'{pressure_payload.get("process_pressure_detail", "")}'
@@ -8448,7 +8605,7 @@ def benchmark_exhaustive_profiles(
         nonlocal completed, current, total
         nonlocal budget_exhausted
         check_cancelled(cancel_token)
-        if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+        if not deadline_has_candidate_budget(deadline, engine=app_active_engine_key(app, model)):
             budget_exhausted = True
             if progress:
                 progress('smart bounded global budget exhausted; selecting from measured candidates')
@@ -8499,7 +8656,7 @@ def benchmark_exhaustive_profiles(
         def probe(value: int) -> bool:
             nonlocal completed, current
             nonlocal budget_exhausted
-            if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+            if not deadline_has_candidate_budget(deadline, engine=app_active_engine_key(app, model)):
                 budget_exhausted = True
                 return False
             value = max(ctx_min, min(ctx_max, round_context(value)))
@@ -8568,7 +8725,7 @@ def benchmark_exhaustive_profiles(
         tested_parallel = set()
         for parallel in parallel_values:
             check_cancelled(cancel_token)
-            if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+            if not deadline_has_candidate_budget(deadline, engine=app_active_engine_key(app, model)):
                 budget_exhausted = True
                 break
             if ctx // max(1, parallel) < chat_floor:
@@ -8800,8 +8957,18 @@ def benchmark_exhaustive_profiles(
     run = build_benchmark_run(run_id, 'server', run_status, records, winners, started_at, ended_at, profile.short_summary())
     upsert_benchmark_run(saved, run)
 
-    auto_profile = winners['auto']
-    apply_measured_profile(saved, 'auto')
+    apply_key = 'auto'
+    if str((winners.get(apply_key) or {}).get('status', '') or '') != 'ok':
+        apply_key = next(
+            (
+                key for key in ('fast_chat', 'long_context', 'opencode_ready')
+                if str((winners.get(key) or {}).get('status', '') or '') == 'ok'
+            ),
+            'auto',
+        )
+    auto_profile = winners.get(apply_key) or winners.get('auto') or {}
+    if str(auto_profile.get('status', '') or '') == 'ok':
+        apply_measured_profile(saved, apply_key)
     saved.measured_profiles = winners
     saved.last_benchmark_tokens_per_sec = round(float(auto_profile.get('tokens_per_sec', 0.0) or 0.0), 2)
     saved.last_benchmark_seconds = round(float(auto_profile.get('seconds', 0.0) or 0.0), 2)
@@ -9822,6 +9989,7 @@ def benchmark_fast_profiles(
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'server-fast-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    strategy = benchmark_strategy_for_app(app, model, profile, depth='fast', objective='quick_sanity')
     runtime_profiles = active_engine_runtime_profiles(app, model, profile, depth='fast')
     contexts = fast_benchmark_contexts(model, profile)
     parallel_values = fast_benchmark_parallel_values(profile, model)
@@ -9834,7 +10002,8 @@ def benchmark_fast_profiles(
     current: Optional[ModelConfig] = None
     completed = 0
     started_monotonic = time.monotonic()
-    deadline = BenchmarkDeadline.from_end(started_monotonic + FAST_RUNTIME_PROFILE_BUDGET_SECONDS)
+    strategy_budget = max(60, int(getattr(strategy, 'hard_budget_seconds', 0) or FAST_RUNTIME_PROFILE_BUDGET_SECONDS))
+    deadline = BenchmarkDeadline.from_end(started_monotonic + strategy_budget)
     budget_exhausted = False
     disabled_runtime_kv: set[Tuple[str, str]] = set()
     disabled_runtime_memory: set[Tuple[str, ...]] = set()
@@ -9853,7 +10022,8 @@ def benchmark_fast_profiles(
     if runtime_profiles:
         start_msg = (
             f'fast benchmark started: runtime_profiles={len(runtime_profiles)}, '
-            f'budget={FAST_RUNTIME_PROFILE_BUDGET_SECONDS // 60}m, '
+            f'strategy={strategy.id}, phases={",".join(phase.id for phase in strategy.phases)}, '
+            f'budget={strategy_budget // 60}m, '
             f'hard_deadline=on, '
             f'arch={architecture_label(model)}, {profile.short_summary()} '
             f'{pressure_payload.get("process_pressure_detail", "")}'
@@ -9862,7 +10032,7 @@ def benchmark_fast_profiles(
         start_msg = (
             f'fast benchmark started: contexts={",".join(str(ctx) for ctx in contexts)}, '
             f'parallel={",".join(str(value) for value in parallel_values)}, default variant, '
-            f'budget={FAST_RUNTIME_PROFILE_BUDGET_SECONDS // 60}m, hard_deadline=on, '
+            f'strategy={strategy.id}, budget={strategy_budget // 60}m, hard_deadline=on, '
             f'arch={architecture_label(model)}, {profile.short_summary()} '
             f'{pressure_payload.get("process_pressure_detail", "")}'
         )
@@ -9982,7 +10152,7 @@ def benchmark_fast_profiles(
             chat_floor = chat_min_ctx_per_slot(model)
             for ctx in contexts:
                 check_cancelled(cancel_token)
-                if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+                if not deadline_has_candidate_budget(deadline, engine=app_active_engine_key(app, model)):
                     budget_exhausted = True
                     break
                 current = configure_adaptive_candidate(model, profile, 'long_context', ctx, 1, 'default')
@@ -10031,7 +10201,7 @@ def benchmark_fast_profiles(
 
                 for parallel in parallel_values:
                     check_cancelled(cancel_token)
-                    if not deadline_has_candidate_budget(deadline, engine=app.active_engine_key_for_model(model)):
+                    if not deadline_has_candidate_budget(deadline, engine=app_active_engine_key(app, model)):
                         budget_exhausted = True
                         break
                     if ctx // max(1, parallel) < chat_floor:
@@ -10123,6 +10293,25 @@ def benchmark_fast_profiles(
         )
         return False, msg
 
+    missing_reason = (
+        'No valid candidate measured before benchmark budget expired'
+        if budget_exhausted or deadline.expired()
+        else 'No valid candidate measured for this profile during fast benchmark'
+    )
+    winners = fill_missing_adaptive_profiles(
+        winners,
+        missing_reason,
+        status='skipped_budget' if budget_exhausted or deadline.expired() else 'skipped',
+    )
+    run_status = (
+        'done'
+        if adaptive_profiles_complete(winners)
+        else (
+            'skipped_budget'
+            if not any(str((winners.get(key) or {}).get('status', '')) == 'ok' for key in ADAPTIVE_PROFILE_KEYS)
+            else 'partial'
+        )
+    )
     winners = attach_profile_frontier(model, measured, winners, profile, generated_at=ended_at)
     annotate_spectrum_records(records, winners)
     saved = ModelConfig(**asdict(model))
@@ -10133,13 +10322,23 @@ def benchmark_fast_profiles(
     run = build_benchmark_run(run_id, 'server_fast', run_status, records, winners, started_at, ended_at, profile.short_summary())
     upsert_benchmark_run(saved, run)
 
-    auto_profile = winners['auto']
-    apply_measured_profile(saved, 'auto')
+    apply_key = 'auto'
+    if str((winners.get(apply_key) or {}).get('status', '') or '') != 'ok':
+        apply_key = next(
+            (
+                key for key in ('fast_chat', 'long_context', 'opencode_ready')
+                if str((winners.get(key) or {}).get('status', '') or '') == 'ok'
+            ),
+            'auto',
+        )
+    auto_profile = winners.get(apply_key) or winners.get('auto') or {}
+    if str(auto_profile.get('status', '') or '') == 'ok':
+        apply_measured_profile(saved, apply_key)
     saved.measured_profiles = winners
     saved.last_benchmark_tokens_per_sec = round(float(auto_profile.get('tokens_per_sec', 0.0) or 0.0), 2)
     saved.last_benchmark_seconds = round(float(auto_profile.get('seconds', 0.0) or 0.0), 2)
     saved.last_benchmark_profile = (
-        f'auto/fast {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
+        f'{apply_key}/fast {saved.last_benchmark_tokens_per_sec:.2f} tok/s '
         f'ctx={auto_profile.get("ctx")} slot={auto_profile.get("ctx_per_slot")} {profile.short_summary()}'
     )
     saved.default_benchmark_status = run_status

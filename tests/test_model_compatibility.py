@@ -1,0 +1,172 @@
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from llama_tui.app import AppConfig
+from llama_tui.engines import (
+    ENGINE_BUUN,
+    ENGINE_LLAMA_CPP,
+    ENGINE_LLAMA_CPP_MTP,
+    ENGINE_TQ3,
+    ENGINE_TURBOQUANT,
+    ENGINE_VLLM,
+)
+from llama_tui.model_compat import detect_model_runtime_features, engine_supports_model
+from llama_tui.models import ModelConfig
+from llama_tui.runtime_profiles import EngineCapabilities, make_runtime_profile
+from llama_tui.ui import browser_models
+
+
+def model(model_id: str, path: str, **kwargs) -> ModelConfig:
+    return ModelConfig(
+        id=model_id,
+        name=kwargs.pop('name', model_id),
+        path=path,
+        alias=model_id,
+        **kwargs,
+    )
+
+
+class ModelCompatibilityTests(unittest.TestCase):
+    def test_tq3_native_is_only_compatible_with_tq3_engine(self):
+        tq3 = model(
+            'tq3',
+            '/models/generic-native-TQ3_4S.gguf',
+            tq3_status='native',
+            tq3_weight_format='TQ3_4S',
+        )
+
+        self.assertIn('tq3_native', detect_model_runtime_features(tq3))
+        self.assertEqual(engine_supports_model(ENGINE_TQ3, tq3).status, 'preferred')
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_LLAMA_CPP_MTP):
+            self.assertEqual(engine_supports_model(engine, tq3, EngineCapabilities(supports_mtp=True)).status, 'unsupported')
+
+    def test_mtp_native_prefers_mtp_engine_and_warns_on_standard_engines(self):
+        mtp = model(
+            'mtp',
+            '/models/generic-GGUF-MTP.gguf',
+            supports_mtp='yes',
+        )
+
+        self.assertIn('mtp_native', detect_model_runtime_features(mtp))
+        self.assertEqual(engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, EngineCapabilities()).status, 'unsupported')
+        ok = engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, EngineCapabilities(supports_mtp=True))
+        self.assertEqual(ok.status, 'preferred')
+        self.assertTrue(ok.compatible)
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN):
+            self.assertEqual(engine_supports_model(engine, mtp).status, 'compatible_with_warning')
+        self.assertEqual(engine_supports_model(ENGINE_TQ3, mtp).status, 'unknown')
+
+    def test_mtp_hint_detection_is_not_family_specific(self):
+        explicit = model('explicit', '/models/custom-name.gguf', supports_mtp='yes')
+        hinted = model('hinted', '/models/custom-native-mtp.gguf')
+        unrelated = model('unrelated', '/models/future-family.gguf')
+
+        self.assertIn('mtp_native', detect_model_runtime_features(explicit))
+        self.assertIn('mtp_native', detect_model_runtime_features(hinted))
+        self.assertNotIn('mtp_native', detect_model_runtime_features(unrelated))
+
+    def test_normal_gguf_is_uncertain_for_specialized_engines(self):
+        normal = model('normal', '/models/llama-q4_k_m.gguf')
+
+        self.assertIn('normal_gguf', detect_model_runtime_features(normal))
+        self.assertIn('dense', detect_model_runtime_features(normal))
+        self.assertTrue(engine_supports_model(ENGINE_LLAMA_CPP, normal).compatible)
+        self.assertTrue(engine_supports_model(ENGINE_TURBOQUANT, normal).compatible)
+        self.assertTrue(engine_supports_model(ENGINE_BUUN, normal).compatible)
+        self.assertEqual(engine_supports_model(ENGINE_TQ3, normal).status, 'unknown')
+        self.assertEqual(engine_supports_model(ENGINE_LLAMA_CPP_MTP, normal, EngineCapabilities(supports_mtp=True)).status, 'unknown')
+
+    def test_unknown_gguf_is_warning_on_standard_engine(self):
+        unknown = model('unknown', '/models/mystery.gguf')
+
+        result = engine_supports_model(ENGINE_LLAMA_CPP, unknown)
+
+        self.assertIn('unknown_quant', detect_model_runtime_features(unknown))
+        self.assertEqual(result.status, 'compatible_with_warning')
+        self.assertTrue(result.compatible)
+
+    def test_vllm_only_accepts_hf_refs(self):
+        hf = model('hf', 'owner/model', runtime='vllm')
+        gguf = model('gguf', '/models/generic.gguf')
+
+        self.assertEqual(engine_supports_model(ENGINE_VLLM, hf).status, 'preferred')
+        self.assertEqual(engine_supports_model(ENGINE_VLLM, gguf).status, 'unsupported')
+
+    def test_browser_defaults_can_filter_by_active_engine_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            app.models = [
+                model('normal', '/models/normal-q4.gguf', port=18080),
+                model('tq3', '/models/native-TQ3_4S.gguf', port=18081, tq3_status='native', tq3_weight_format='TQ3_4S'),
+                model('mtp', '/models/generic-native-mtp.gguf', port=18082, supports_mtp='yes'),
+            ]
+            statuses = {item.id: ('STOPPED', '') for item in app.models}
+
+            app.runtime_profile = make_runtime_profile('llama.cpp', 'llama-server')
+            self.assertEqual(
+                [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
+                ['normal', 'mtp'],
+            )
+
+            app.runtime_profile = make_runtime_profile('tq3', 'llama-server')
+            self.assertEqual(
+                [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
+                ['tq3'],
+            )
+
+            app.runtime_profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
+            app.engine_capabilities = lambda: EngineCapabilities(supports_mtp=True)
+            self.assertEqual(
+                [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
+                ['mtp'],
+            )
+
+            self.assertEqual(
+                [item.id for item in browser_models(app, statuses, compatibility_filter='all')],
+                ['normal', 'tq3', 'mtp'],
+            )
+
+    def test_hf_and_llama_cache_discovery_dedupes_by_resolved_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / 'home'
+            hf_root = root / 'hf'
+            gguf = hf_root / 'models--owner--repo' / 'snapshots' / 'abc' / 'generic-native-mtp.gguf'
+            gguf.parent.mkdir(parents=True)
+            gguf.write_bytes(b'not a real gguf but enough for discovery')
+
+            with patch.dict(
+                os.environ,
+                {
+                    'HF_HUB_CACHE': str(hf_root),
+                    'HUGGINGFACE_HUB_CACHE': '',
+                    'HF_HOME': '',
+                    'LLAMA_CACHE': '',
+                },
+                clear=False,
+            ), \
+                 patch('llama_tui.app.Path.home', return_value=home):
+                app = AppConfig(root / 'models.json')
+                app.hf_cache_root = str(hf_root)
+
+                discovered, _notes = app.discover_source_files()
+                self.assertEqual(len(discovered), 1)
+                _path, source = next(iter(discovered.values()))
+                self.assertEqual(source, 'huggingface,hf_cache')
+
+                added, _messages = app.detect_models()
+                self.assertEqual(added, 1)
+                self.assertEqual(len(app.models), 1)
+                self.assertEqual(app.models[0].supports_mtp, 'yes')
+                self.assertEqual(app.models[0].source, 'huggingface,hf_cache')
+
+                added_again, _messages = app.detect_models()
+                self.assertEqual(added_again, 0)
+                self.assertEqual(len(app.models), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

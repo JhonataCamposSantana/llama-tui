@@ -1349,7 +1349,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             def add_or_update(self, model):
                 self.saved.append(model)
 
-        def fake_probe(_app, candidate, objective, _progress, _cancel_token):
+        def fake_probe(_app, candidate, objective, _progress, _cancel_token, deadline=None):
             record = adaptive_record_from_candidate(
                 candidate,
                 objective,

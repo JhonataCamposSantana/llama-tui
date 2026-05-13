@@ -21,6 +21,7 @@ from .benchmark import (
     benchmark_moe_placement_tuning,
     benchmark_profile_is_fresh,
     benchmark_raw_speed_profile,
+    benchmark_strategy_for_app,
     deep_benchmark_model_decision,
     estimate_text_tokens,
     get_measured_profile,
@@ -244,6 +245,8 @@ FILTER_SOURCE_OPTIONS = [
     ('all', 'All sources'),
     ('manual', 'Manual'),
     ('huggingface', 'Hugging Face'),
+    ('hf_cache', 'HF cache'),
+    ('llama_cache', 'llama.cpp cache'),
     ('llmfit', 'llmfit'),
     ('llm-models', 'llm-models'),
     ('lm-studio', 'LM Studio'),
@@ -263,8 +266,9 @@ FILTER_STATUS_OPTIONS = [
     ('running', 'Running benchmark'),
 ]
 FILTER_COMPATIBILITY_OPTIONS = [
-    ('all', 'All models'),
     ('active', 'Active engine compatible'),
+    ('incompatible', 'Unsupported/uncertain for active engine'),
+    ('all', 'All models'),
     ('tq3_native', 'TQ3 native'),
 ]
 BENCHMARK_FRESHNESS_LABELS = {
@@ -739,6 +743,41 @@ def tq3_detail_line(model: ModelConfig) -> str:
     return f'tq3: {tq3_detail(model)}'
 
 
+def model_engine_visibility_lines(app: AppConfig, model: ModelConfig) -> List[str]:
+    try:
+        features = ', '.join(app.model_runtime_features(model)) or '-'
+    except Exception:
+        features = '-'
+    try:
+        active_compat = app.model_engine_compatibility(model)
+    except Exception:
+        active_compat = None
+    try:
+        compatible = ', '.join(format_engine_badge(engine) for engine in app.compatible_engine_ids_for_model(model)) or '-'
+    except Exception:
+        compatible = '-'
+    try:
+        hidden = app.hidden_engine_reasons_for_model(model)
+    except Exception:
+        hidden = {}
+    hidden_text = '; '.join(
+        f'{format_engine_badge(engine)}: {reason}'
+        for engine, reason in hidden.items()
+        if reason
+    ) or '-'
+    lines = [
+        f'detected features: {features}',
+        f'compatible engines: {compatible}',
+        f'hidden from: {hidden_text}',
+    ]
+    if active_compat is not None:
+        if not active_compat.compatible:
+            lines.insert(1, f'active engine compatibility: {active_compat.status} - {active_compat.reason}')
+        elif active_compat.status == 'compatible_with_warning':
+            lines.insert(1, f'active engine compatibility: warning - {active_compat.reason}')
+    return lines
+
+
 def filter_option_label(options: List[Tuple[str, str]], value: str) -> str:
     return dict(options).get(value, value or '-')
 
@@ -789,8 +828,14 @@ def model_matches_browser_filters(
     compatibility_filter = str(compatibility_filter or 'all').strip().lower() or 'all'
     if runtime_filter != 'all' and str(getattr(model, 'runtime', 'llama.cpp') or '').strip().lower() != runtime_filter:
         return False
-    if source_filter != 'all' and str(getattr(model, 'source', 'manual') or '').strip().lower() != source_filter:
-        return False
+    if source_filter != 'all':
+        source_labels = {
+            label.strip().lower()
+            for label in str(getattr(model, 'source', 'manual') or 'manual').split(',')
+            if label.strip()
+        }
+        if source_filter not in source_labels:
+            return False
     if status_filter != 'all':
         freshness = benchmark_freshness_label(app, model)
         if status_filter in ('fresh', 'stale', 'missing', 'failed', 'pending', 'running'):
@@ -808,6 +853,13 @@ def model_matches_browser_filters(
         except Exception:
             compatible = True
         if not compatible:
+            return False
+    elif compatibility_filter == 'incompatible':
+        try:
+            compatible, _reason = app.active_engine_model_compatibility(model)
+        except Exception:
+            compatible = True
+        if compatible:
             return False
     elif compatibility_filter == 'tq3_native':
         if (getattr(model, 'tq3_status', '') or 'unknown').strip().lower() != 'native':
@@ -1766,6 +1818,8 @@ def benchmark_launch_profile_detail_lines(record: Dict[str, object]) -> List[str
     if not profile:
         return []
     engine = str(record.get('engine', '') or '-')
+    strategy = str(record.get('benchmark_strategy_id', '') or '')
+    phase = str(record.get('benchmark_phase', '') or '')
     binary = str(record.get('binary_path', '') or record.get('server_bin', '') or '-')
     ctx = int(record.get('ctx', 0) or 0)
     output = int(record.get('output', 0) or 0)
@@ -1809,6 +1863,7 @@ def benchmark_launch_profile_detail_lines(record: Dict[str, object]) -> List[str
     rejection = str(record.get('rejection_reason', '') or record.get('selection_rejection_reason', '') or '')
     return [
         f'  profile: {profile} engine={engine} ctx={ctx} output={output} measure={measurement}',
+        *( [f'  strategy: {strategy}' + (f' phase={phase}' if phase else '')] if strategy else [] ),
         f'  binary: {binary}',
         (
             f'  kv: key={kv_key} value={kv_value} flash={flash} fit={fit}'
@@ -2019,6 +2074,21 @@ def overview_items(
     health_attr = success_attr if health == 'OK' else warning_attr if health in ('WARN', 'STALE') else error_attr
     model_type = classify_model_type(model)
     engine = active_engine_short(app, model) if app is not None else display_runtime(model)
+    compatible = True
+    compatibility_reason = ''
+    compatibility_status = ''
+    if app is not None:
+        try:
+            compatibility = app.model_engine_compatibility(model)
+            compatible = compatibility.compatible
+            compatibility_reason = compatibility.reason
+            compatibility_status = compatibility.status
+        except Exception:
+            compatible = True
+    try:
+        strategy = benchmark_strategy_for_app(app, model, depth='fast', objective='quick_sanity') if app is not None else None
+    except Exception:
+        strategy = None
     benchmark = benchmark_freshness_display(app, model) if app is not None else 'Missing'
     moe_state = moe_recommendation_state_text(model) if model_is_moe(model) else 'not MoE'
     status_text = f'{status}'
@@ -2031,6 +2101,16 @@ def overview_items(
         (f'Type: {model_type}', normal_attr),
         (f'Quant: {extract_quant(model) or "-"}', normal_attr),
         (f'Engine: {engine}', normal_attr),
+        *( [(f'Engine visibility: hidden - {compact_message(compatibility_reason)}', warning_attr)] if not compatible else [] ),
+        *( [(f'Engine visibility: warning - {compact_message(compatibility_reason)}', warning_attr)] if compatibility_status == 'compatible_with_warning' else [] ),
+        *(
+            [(
+                f'Benchmark strategy: {strategy.id}'
+                + (f' blocked - {compact_message(strategy.blocked_reason)}' if getattr(strategy, 'blocked_reason', '') else ''),
+                warning_attr if getattr(strategy, 'blocked_reason', '') else normal_attr,
+            )]
+            if strategy is not None else []
+        ),
         (f'Status: {status_text}', success_attr if str(status).upper() == 'READY' else error_attr if str(status).upper() == 'ERROR' else normal_attr),
         ('', normal_attr),
         ('Health', heading_attr),
@@ -3361,10 +3441,10 @@ def browser_filter_fields(
 ) -> List[Dict[str, str]]:
     return [
         form_field('runtime_filter', 'runtime_filter', runtime_filter, 'all/llama.cpp/vllm'),
-        form_field('source_filter', 'source_filter', source_filter, 'all/manual/huggingface/llmfit/llm-models/lm-studio'),
+        form_field('source_filter', 'source_filter', source_filter, 'all/manual/huggingface/hf_cache/llama_cache/llmfit/llm-models/lm-studio'),
         form_field('status_filter', 'status_filter', status_filter, 'all/READY/LOADING/STARTING/STOPPED/ERROR/fresh/stale/missing/failed/pending/running'),
         form_field('tag_filter', 'tag_filter', tag_filter, 'all/coding/autocomplete/long-context/fast-chat/custom tag'),
-        form_field('compatibility_filter', 'compatibility_filter', compatibility_filter, 'all/active/tq3_native'),
+        form_field('compatibility_filter', 'compatibility_filter', compatibility_filter, 'active/incompatible/all/tq3_native'),
     ]
 
 
@@ -3759,6 +3839,14 @@ def benchmark_menu_intro_lines(app: Optional[AppConfig], model: Optional[ModelCo
     if model is None:
         return ['Selected model: none']
     recommended, reason = benchmark_menu_recommendation(app, model)
+    try:
+        strategy = benchmark_strategy_for_app(app, model, depth='fast', objective='quick_sanity')
+        if getattr(strategy, 'blocked_reason', ''):
+            strategy_line = f'Strategy: {strategy.id} blocked - {compact_message(strategy.blocked_reason)}'
+        else:
+            strategy_line = f'Strategy: {strategy.id} ({strategy.hard_budget_seconds // 60}m, {len(strategy.phases)} phases)'
+    except Exception:
+        strategy_line = 'Strategy: unavailable'
     label_by_value = {
         value: label
         for _key, label, value in benchmark_menu_options(app, model, include_recommendation=False)
@@ -3768,6 +3856,7 @@ def benchmark_menu_intro_lines(app: Optional[AppConfig], model: Optional[ModelCo
     return [
         f'Selected: {getattr(model, "name", "") or getattr(model, "id", "-")}',
         f'Type: {classify_model_type(model)}   Engine: {_active_engine_for_menu(app, model) or "-"}',
+        strategy_line,
         f'Recommended: {label}',
         f'Reason: {reason}',
     ]
@@ -4263,7 +4352,7 @@ def tui(stdscr, app: AppConfig):
     filter_source = 'all'
     filter_status = 'all'
     filter_tag = 'all'
-    filter_compatibility = 'tq3_native' if str(getattr(getattr(app, 'runtime_profile', None), 'engine', '') or '') == 'tq3' else 'all'
+    filter_compatibility = 'active'
     sort_mode = normalize_choice(getattr(app.ui, 'preferred_sort', 'port'), tuple(key for key, _label in SORT_OPTIONS), 'port')
     view_mode = 'list'
     detail_model_id = ''
@@ -5399,6 +5488,13 @@ def tui(stdscr, app: AppConfig):
                     (active_engine_badge_line(app, model), colors['accent'] | curses.A_BOLD),
                     (runtime_engine_source_line(app, model), curses.A_NORMAL),
                     (active_engine_detail_line(app, model), colors['accent'] | curses.A_BOLD),
+                    *[
+                        (
+                            line,
+                            colors['warning'] if any(marker in line for marker in ('unsupported', 'unknown', 'warning')) else curses.A_NORMAL,
+                        )
+                        for line in model_engine_visibility_lines(app, model)
+                    ],
                     (f'architecture/runtime/offload: {classify_model_type(model)} / {display_runtime(model)} / {display_offload(model)}', curses.A_NORMAL),
                     (f'architecture detail: {architecture_detail(model)}', curses.A_NORMAL),
                     (turboquant_detail_line(model), tq_attr),
@@ -6203,9 +6299,9 @@ def tui(stdscr, app: AppConfig):
             filter_source = 'all'
             filter_status = 'all'
             filter_tag = 'all'
-            filter_compatibility = 'all'
+            filter_compatibility = 'active'
             selected = 0
-            message = 'Browser search and filters cleared.'
+            message = 'Browser search cleared; active-engine compatibility filter kept on.'
             continue
         if view_mode == 'list' and key == ord('T'):
             chosen_sort = prompt_sort_mode(stdscr, colors, sort_mode)

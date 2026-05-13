@@ -51,13 +51,23 @@ class LmStudioDiscoveryTests(unittest.TestCase):
             hub_model.write_bytes(b'not a real gguf, but a discoverable file')
             internal_model.write_bytes(b'not a real gguf, but a skipped bundled file')
 
-            app = AppConfig(config)
-            app.hf_cache_root = str(root / 'missing-hf')
-            app.llmfit_cache_root = str(root / 'missing-llmfit')
-            app.llm_models_cache_root = str(root / 'missing-local')
-            app.lm_studio_model_roots = f'{lm_home / "models"}, {lm_home / "hub" / "models"}'
+            with patch.dict(
+                'os.environ',
+                {
+                    'HF_HUB_CACHE': '',
+                    'HUGGINGFACE_HUB_CACHE': '',
+                    'HF_HOME': '',
+                    'LLAMA_CACHE': '',
+                },
+                clear=False,
+            ), patch('llama_tui.app.Path.home', return_value=root / 'isolated-home'):
+                app = AppConfig(config)
+                app.hf_cache_root = str(root / 'missing-hf')
+                app.llmfit_cache_root = str(root / 'missing-llmfit')
+                app.llm_models_cache_root = str(root / 'missing-local')
+                app.lm_studio_model_roots = f'{lm_home / "models"}, {lm_home / "hub" / "models"}'
 
-            count, messages = app.detect_models()
+                count, messages = app.detect_models()
 
         self.assertEqual(count, 2)
         self.assertTrue(any('added:' in message for message in messages))
