@@ -4,6 +4,8 @@ from unittest.mock import patch
 from llama_tui.launch_profiles import (
     MOE_TUNING_FAST_OUTPUT_CAP,
     MOE_TUNING_FULL_OUTPUT_CAP,
+    MTP_ACCEPTANCE_FAST_OUTPUT_CAP,
+    MTP_ACCEPTANCE_FULL_OUTPUT_CAP,
     RAW_SPEED_OUTPUT,
     SERVE_DEFAULT_FAST_OUTPUT_CAP,
     SERVE_DEFAULT_FULL_OUTPUT_CAP,
@@ -82,6 +84,31 @@ class LaunchProfileTests(unittest.TestCase):
         self.assertEqual(fast.name, 'moe_tuning')
         self.assertEqual(fast.measurement_output, MOE_TUNING_FAST_OUTPUT_CAP)
         self.assertEqual(full.measurement_output, MOE_TUNING_FULL_OUTPUT_CAP)
+        self.assertEqual(fast.temp, 0.0)
+        self.assertIsNone(fast.top_p)
+        self.assertIsNone(fast.top_k)
+        self.assertEqual(fast.repeat_penalty, 1.0)
+        self.assertEqual(fast.presence_penalty, 0.0)
+
+    def test_mtp_acceptance_profiles_are_deterministic_and_short(self):
+        model = ModelConfig(
+            id='mtp',
+            name='MTP',
+            path='mtp.gguf',
+            alias='mtp',
+            port=18080,
+            output=4096,
+            temp=0.8,
+            top_p=0.9,
+            top_k=20,
+        )
+
+        fast = build_benchmark_launch_profile(model, purpose='mtp_acceptance', depth='fast')
+        full = build_benchmark_launch_profile(model, purpose='mtp_acceptance', depth='full')
+
+        self.assertEqual(fast.name, 'mtp_acceptance')
+        self.assertEqual(fast.measurement_output, MTP_ACCEPTANCE_FAST_OUTPUT_CAP)
+        self.assertEqual(full.measurement_output, MTP_ACCEPTANCE_FULL_OUTPUT_CAP)
         self.assertEqual(fast.temp, 0.0)
         self.assertIsNone(fast.top_p)
         self.assertIsNone(fast.top_k)

@@ -51,9 +51,21 @@ def _n_cpu_moe_ladder(layer_count: int, small_gpu: bool) -> List[int]:
     return sorted(values, reverse=small_gpu)
 
 
-def _candidate_limit(tier: str) -> int:
+def _candidate_limit(tier: str, small_gpu: bool = False) -> int:
     normalized = (tier or 'full').strip().lower()
+    if small_gpu:
+        return 8 if normalized == 'fast' else 12
     return 3 if normalized == 'fast' else 6
+
+
+def _partial_ngl_ladder(layer_count: int) -> List[int]:
+    values: List[int] = []
+    ceiling = max(1, int(layer_count or 0)) if layer_count > 0 else 999
+    for value in (8, 12, 13, 16, 20):
+        clamped = max(1, min(ceiling, int(value)))
+        if clamped not in values:
+            values.append(clamped)
+    return values
 
 
 def _tq3_small_gpu_candidates(
@@ -106,26 +118,35 @@ def generate_moe_placement_candidates(
     if not model_is_moe(model):
         return []
 
-    candidates: List[MoePlacementCandidate] = [
-        MoePlacementCandidate(
-            name='baseline_ngl',
-            gpu_layers=None,
-            expected_vram_saving_hint='current GPU-layer behavior',
-            risk='baseline',
-        )
-    ]
-    if not (
-        capabilities.supports_cpu_moe
-        or capabilities.supports_n_cpu_moe
-        or capabilities.supports_override_tensor
-    ):
-        return candidates
     has_gpu = bool(profile and profile.has_usable_gpu())
     gpu_total = int(getattr(profile, 'gpu_memory_total', 0) or 0) if profile is not None else 0
     small_gpu = bool(0 < gpu_total <= 9 * 1024**3)
     layer_count = _layer_count(model)
     if engine == 'tq3' and small_gpu:
         return _tq3_small_gpu_candidates(capabilities, layer_count)
+
+    candidates: List[MoePlacementCandidate] = []
+    if has_gpu and small_gpu:
+        for value in _partial_ngl_ladder(layer_count):
+            candidates.append(MoePlacementCandidate(
+                name=f'partial_ngl_{value}',
+                gpu_layers=value,
+                expected_vram_saving_hint=f'conservative {value}-layer GPU offload for small VRAM',
+                risk='safe',
+            ))
+    else:
+        candidates.append(MoePlacementCandidate(
+            name='baseline_ngl',
+            gpu_layers=None,
+            expected_vram_saving_hint='current GPU-layer behavior',
+            risk='baseline',
+        ))
+    if not (
+        capabilities.supports_cpu_moe
+        or capabilities.supports_n_cpu_moe
+        or capabilities.supports_override_tensor
+    ):
+        return candidates[:_candidate_limit(tier, small_gpu)]
 
     body: List[MoePlacementCandidate] = []
 
@@ -156,8 +177,6 @@ def generate_moe_placement_candidates(
                 expected_vram_saving_hint=f'first {value} MoE expert layers on CPU',
                 risk='safe' if small_gpu and value >= max(1, int(layer_count * 0.5)) else 'normal',
             ))
-    if has_gpu and small_gpu:
-        body.append(full_gpu)
     if capabilities.supports_override_tensor:
         body.append(MoePlacementCandidate(
             name='experts_cpu_override',
@@ -165,6 +184,13 @@ def generate_moe_placement_candidates(
             tensor_overrides=(EXPERTS_CPU_OVERRIDE,),
             expected_vram_saving_hint='expert tensors routed to CPU by pattern',
             risk='experimental',
+        ))
+    if has_gpu and small_gpu:
+        body.append(MoePlacementCandidate(
+            name='baseline_ngl',
+            gpu_layers=None,
+            expected_vram_saving_hint='last-resort current GPU-layer behavior',
+            risk='baseline',
         ))
 
     deduped: List[MoePlacementCandidate] = []
@@ -176,12 +202,12 @@ def generate_moe_placement_candidates(
         seen.add(key)
         deduped.append(candidate)
 
-    limit = _candidate_limit(tier)
-    selected = deduped[: max(0, limit - 1)]
+    limit = _candidate_limit(tier, small_gpu)
+    selected = deduped[: max(0, limit - len(candidates))]
     if (tier or '').strip().lower() != 'fast':
         override = next((item for item in deduped if item.name == 'experts_cpu_override'), None)
         if override is not None and override not in selected:
-            if len(selected) >= max(0, limit - 1):
+            if len(candidates) + len(selected) >= limit:
                 selected = selected[:-1]
             selected.append(override)
     return candidates + selected

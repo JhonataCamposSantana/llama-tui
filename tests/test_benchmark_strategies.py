@@ -212,7 +212,7 @@ class BenchmarkStrategyTests(unittest.TestCase):
 
         self.assertEqual(len(profiles), 4)
         self.assertTrue(all(item.benchmark_strategy_id == 'mtp_acceptance_matrix' for item in profiles))
-        self.assertIn('draft_acceptance', {item.benchmark_phase for item in profiles})
+        self.assertIn('draft_n1', {item.benchmark_phase for item in profiles})
 
     def test_parse_mtp_acceptance_metrics(self):
         metrics = parse_mtp_acceptance_metrics('draft_tokens: 120 accepted_tokens: 90 acceptance_rate: 75%')

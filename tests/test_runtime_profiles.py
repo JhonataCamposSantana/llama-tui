@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from llama_tui.app import AppConfig
+from llama_tui.benchmark_strategies import select_benchmark_strategy
 from llama_tui.benchmark import (
     BenchmarkDeadline,
     _run_tq3_raw_process,
@@ -26,6 +27,7 @@ from llama_tui.benchmark import (
     build_profile_frontier,
     benchmark_raw_speed_profile,
     benchmark_run_summary,
+    benchmark_mtp_acceptance_matrix_after_preflight,
     benchmark_runtime_profile_with_retry,
     close_stale_running_benchmark_runs,
     classify_benchmark_failure,
@@ -215,7 +217,9 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(caps.supports_spec_type)
         self.assertTrue(caps.supports_mtp)
+        self.assertIn('mtp', caps.spec_type_values)
         self.assertEqual(caps.mtp_spec_type, 'mtp')
+        self.assertEqual(caps.mtp_spec_type_value, 'mtp')
         self.assertTrue(caps.supports_spec_draft_n_max)
         self.assertTrue(caps.supports_parallel)
 
@@ -228,7 +232,9 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(caps.supports_spec_type)
         self.assertTrue(caps.supports_mtp)
+        self.assertIn('draft-mtp', caps.spec_type_values)
         self.assertEqual(caps.mtp_spec_type, 'draft-mtp')
+        self.assertEqual(caps.mtp_spec_type_value, 'draft-mtp')
         self.assertTrue(caps.supports_spec_draft_n_max)
 
     def test_capability_parser_does_not_treat_spec_draft_flags_as_mtp_value(self):
@@ -239,7 +245,10 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(caps.supports_spec_type)
         self.assertFalse(caps.supports_mtp)
+        self.assertNotIn('mtp', caps.spec_type_values)
+        self.assertNotIn('draft-mtp', caps.spec_type_values)
         self.assertEqual(caps.mtp_spec_type, '')
+        self.assertEqual(caps.mtp_spec_type_value, '')
 
     def test_capability_parser_detects_turboquant_cache_types(self):
         caps = parse_engine_capabilities(
@@ -1433,6 +1442,135 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(measured, [])
         self.assertEqual(attempts, ['mtp'])
         self.assertEqual(records[0]['failure_category'], 'ENGINE_RUNTIME_CRASH')
+
+    def test_mtp_acceptance_runner_skips_recurrent_baseline_and_runs_drafts(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_no_warmup=True,
+            spec_type_values=('none', 'draft-mtp'),
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+            supports_spec_draft_n_max=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='Generic MTP',
+                path='/cache/hub/models--owner--generic-MTP-GGUF/snapshots/abc/model.gguf',
+                alias='mtp',
+                port=18080,
+                runtime='llama.cpp-mtp',
+                ctx_min=2048,
+                ctx_max=32768,
+                supports_mtp='yes',
+                output=1024,
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+            strategy = select_benchmark_strategy(
+                'llama.cpp-mtp',
+                model,
+                hardware=hardware,
+                capabilities=caps,
+                objective='quick_sanity',
+                depth='fast',
+                model_size_bytes=4 * 1024**3,
+            )
+            phases = []
+            purposes = []
+            progress = []
+
+            def fake_runtime_profile_with_retry(
+                _app,
+                base_model,
+                runtime_profile,
+                objective,
+                _progress,
+                _cancel_token,
+                completed,
+                _total,
+                **kwargs,
+            ):
+                self.assertEqual(objective, 'quick_sanity')
+                self.assertEqual(kwargs.get('benchmark_purpose'), 'mtp_acceptance')
+                self.assertEqual(kwargs.get('max_attempts'), 1)
+                phases.append(runtime_profile.benchmark_phase)
+                purposes.append(kwargs.get('benchmark_purpose'))
+                candidate = model_for_runtime_profile(base_model, runtime_profile)
+                if runtime_profile.benchmark_phase == 'baseline_no_mtp':
+                    detail = (
+                        'llama_memory_recurrent.cpp:173: '
+                        'GGML_ASSERT(rollback >= 1 && rollback <= (llama_pos) n_rs_seq) failed\n'
+                        'n_rs_seq = 0'
+                    )
+                    record = adaptive_record_from_candidate(
+                        candidate,
+                        objective,
+                        'not ready',
+                        detail=detail,
+                        engine='llama.cpp-mtp',
+                        benchmark_phase='baseline_no_mtp',
+                        benchmark_strategy_id='mtp_acceptance_matrix',
+                        benchmark_purpose='mtp_acceptance',
+                        runtime_no_warmup=True,
+                    )
+                    record.update(classify_benchmark_failure(detail))
+                    return False, True, [record], [], completed + 1
+                draft = runtime_profile.mtp_draft_n_max
+                record = adaptive_record_from_candidate(
+                    candidate,
+                    objective,
+                    'ok',
+                    tokens_per_sec=10.0 + draft,
+                    seconds=1.0,
+                    engine='llama.cpp-mtp',
+                    benchmark_phase=f'draft_n{draft}',
+                    benchmark_strategy_id='mtp_acceptance_matrix',
+                    benchmark_purpose='mtp_acceptance',
+                    mtp_enabled=True,
+                    mtp_draft_n_max=draft,
+                    spec_type='draft-mtp',
+                    measurement_output=128,
+                    runtime_no_warmup=True,
+                )
+                record['accept_rate'] = 0.5 + (draft / 10.0)
+                record['draft_tokens'] = 100 * draft
+                record['accepted_tokens'] = 50 * draft
+                return True, False, [record], [dict(record)], completed + 1
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=4 * 1024**3), \
+                patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_profile_with_retry):
+                ok, msg = benchmark_mtp_acceptance_matrix_after_preflight(
+                    app,
+                    model,
+                    hardware,
+                    strategy,
+                    'run-mtp',
+                    'server_fast',
+                    '2026-05-14T00:00:00',
+                    progress=progress.append,
+                    depth='fast',
+                )
+
+        self.assertTrue(ok)
+        self.assertIn('partial', msg)
+        self.assertEqual(phases, ['baseline_no_mtp', 'draft_n1', 'draft_n2', 'draft_n3'])
+        self.assertEqual(set(purposes), {'mtp_acceptance'})
+        saved = app.models[0]
+        self.assertEqual(saved.default_benchmark_status, 'partial')
+        self.assertEqual(saved.last_benchmark_results[0]['status'], 'skipped_runtime_assert')
+        self.assertEqual(saved.last_benchmark_results[0]['failure_category'], 'BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN')
+        self.assertTrue(all(item.get('measurement_output') == 128 for item in saved.last_benchmark_results if item.get('mtp_enabled')))
+        self.assertIn('mtp_acceptance', saved.measured_profiles)
+        self.assertTrue(any('MTP spec type selected from binary: draft-mtp' in str(item) for item in progress))
+        self.assertTrue(any('Baseline no-MTP skipped: recurrent/NextN runtime assert' in str(item) for item in progress))
+        self.assertFalse(any('smart bounded' in str(item) or 'long_context not ready' in str(item) for item in progress))
 
     def test_memory_guardrail_admission_skips_critical_memory(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200, ctx=65536)
@@ -4494,7 +4632,9 @@ class RuntimeProfileTests(unittest.TestCase):
             default_engine_capabilities('llama.cpp-mtp'),
             supports_spec_type=True,
             supports_mtp=True,
+            supports_no_warmup=True,
             mtp_spec_type='mtp',
+            mtp_spec_type_value='mtp',
             supports_spec_draft_n_max=True,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -4520,6 +4660,8 @@ class RuntimeProfileTests(unittest.TestCase):
         names = [item.name for item in profiles]
         self.assertIn('mtp_baseline', names)
         self.assertEqual([item.mtp_draft_n_max for item in profiles if item.mtp_enabled], [1, 2, 3])
+        self.assertEqual([item.benchmark_phase for item in profiles if item.mtp_enabled], ['draft_n1', 'draft_n2', 'draft_n3'])
+        self.assertTrue(all(item.no_warmup for item in profiles))
         self.assertTrue(all(item.parallel == 1 for item in profiles))
 
     def test_moe_runtime_profiles_include_bounded_placement_candidates(self):
@@ -4550,10 +4692,11 @@ class RuntimeProfileTests(unittest.TestCase):
                 patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
                 profiles = active_engine_runtime_profiles(app, model, hardware, depth='fast')
 
-        self.assertTrue(any(item.placement_strategy == 'baseline_ngl' for item in profiles))
+        self.assertTrue(any(item.placement_strategy == 'partial_ngl_8' for item in profiles))
         self.assertTrue(any(item.cpu_moe for item in profiles))
         self.assertTrue(any(item.n_cpu_moe == 40 for item in profiles))
-        self.assertLessEqual(len({item.placement_strategy for item in profiles if item.placement_strategy}), 3)
+        self.assertFalse(any(item.placement_strategy == 'full_gpu' for item in profiles))
+        self.assertLessEqual(len({item.placement_strategy for item in profiles if item.placement_strategy}), 8)
 
     def test_small_moe_gguf_can_plan_full_gpu_without_model_specific_names(self):
         with tempfile.TemporaryDirectory() as tmp:

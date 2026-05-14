@@ -32,7 +32,7 @@ class MoePlacementTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
-    def test_small_gpu_prioritizes_high_cpu_moe_ladder(self):
+    def test_small_gpu_starts_with_conservative_partial_ngl_ladder(self):
         caps = EngineCapabilities(
             supports_cpu_moe=True,
             supports_n_cpu_moe=True,
@@ -49,11 +49,12 @@ class MoePlacementTests(unittest.TestCase):
             )
 
         names = [item.name for item in candidates]
-        self.assertEqual(names[0], 'baseline_ngl')
-        self.assertEqual(names[1], 'cpu_moe_all')
-        self.assertEqual(names[2], 'n_cpu_moe_40')
+        self.assertEqual(names[:5], ['partial_ngl_8', 'partial_ngl_12', 'partial_ngl_13', 'partial_ngl_16', 'partial_ngl_20'])
+        self.assertIn('cpu_moe_all', names)
+        self.assertIn('n_cpu_moe_40', names)
         self.assertIn('experts_cpu_override', names)
-        self.assertLessEqual(len(candidates), 6)
+        self.assertNotIn('full_gpu', names)
+        self.assertLessEqual(len(candidates), 12)
 
     def test_unsupported_capabilities_suppress_cpu_moe_candidates(self):
         caps = EngineCapabilities()
@@ -68,6 +69,7 @@ class MoePlacementTests(unittest.TestCase):
             )
 
         names = {item.name for item in candidates}
+        self.assertIn('partial_ngl_8', names)
         self.assertNotIn('cpu_moe_all', names)
         self.assertFalse(any(name.startswith('n_cpu_moe_') for name in names))
 

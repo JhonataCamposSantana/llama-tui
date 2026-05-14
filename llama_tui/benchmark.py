@@ -262,26 +262,27 @@ def persist_blocked_benchmark_strategy(
         hint = ' Hint: set supports_mtp=yes if this GGUF is MTP-capable.'
     message = f'Benchmark strategy blocked: {strategy.id} - {blocked}.{hint}'
     ended_at = datetime.now().isoformat(timespec='seconds')
+    blocked_status = 'blocked_missing_capability' if strategy.engine_id == ENGINE_LLAMA_CPP_MTP else 'skipped_incompatible'
     record = adaptive_record_from_candidate(
         model,
         'quick_sanity',
-        'skipped_incompatible',
+        blocked_status,
         detail=message,
         engine=strategy.engine_id,
         benchmark_strategy_id=strategy.id,
         benchmark_objectives=list(getattr(strategy, 'objectives', ()) or ()),
         benchmark_metric_group=_strategy_metric_group(strategy),
         benchmark_phase='strategy',
-        failure_category='incompatible',
+        failure_category=blocked_status,
         failure_reason=blocked,
         suggested_fix=hint.strip(),
     )
     saved = ModelConfig(**asdict(model))
     close_stale_running_benchmark_runs(saved, ended_at)
     saved.last_benchmark_results = [dict(record)]
-    saved.default_benchmark_status = 'failed'
+    saved.default_benchmark_status = blocked_status
     saved.default_benchmark_at = ended_at
-    run = build_benchmark_run(run_id, run_kind, 'failed', [record], {}, started_at, ended_at, hardware)
+    run = build_benchmark_run(run_id, run_kind, blocked_status, [record], {}, started_at, ended_at, hardware)
     run['summary'] = message
     run['benchmark_strategy_id'] = strategy.id
     run['blocked_reason'] = blocked
@@ -389,6 +390,8 @@ FAILURE_CATEGORIES = (
     'ENGINE_BINARY_MISSING',
     'CLI_INVALID',
     'ENGINE_RUNTIME_CRASH',
+    'BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN',
+    'blocked_missing_capability',
     'MEMORY_GUARDRAIL',
     'MEMORY_FIT_FAILED',
     'FIXED_GPU_LAYERS_FIT_FAILED',
@@ -411,6 +414,7 @@ FAILURE_EXCERPT_MARKERS = (
     'fatal error',
     'error while handling argument',
     'unknown speculative type',
+    'n_rs_seq',
     'unknown value',
     'invalid argument',
     'unrecognized argument',
@@ -2403,7 +2407,7 @@ def benchmark_full_suite(
             emit(f'Selected benchmark strategy: {strategy.id}; routing Full Suite request to MTP strategy runner', 'benchmark_started', 'strategy')
             if depth_key == 'fast':
                 return benchmark_fast_profiles(app, model, progress=progress, cancel_token=cancel_token)
-            return benchmark_best_optimization(app, model, progress=progress, cancel_token=cancel_token)
+            return benchmark_exhaustive_profiles(app, model, progress=progress, cancel_token=cancel_token)
 
         emit(f'Full Suite Benchmark started: model={model.name or model.id} engine={engine}', 'benchmark_started', 'preflight')
         preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'full_suite', progress, cancel_token)
@@ -5361,7 +5365,12 @@ def build_benchmark_run(
     hardware: str = '',
 ) -> Dict[str, object]:
     successful = [row for row in records if row.get('status') == 'ok']
-    failed = [row for row in records if row.get('status') not in ('ok', 'probe ok', 'skipped')]
+    failed = [
+        row for row in records
+        if str(row.get('status', '') or '') not in ('ok', 'probe ok', 'skipped')
+        and not str(row.get('status', '') or '').startswith('skipped_')
+        and not str(row.get('status', '') or '').startswith('blocked_')
+    ]
     elapsed = 0.0
     for row in records:
         elapsed += float(row.get('seconds', 0.0) or 0.0)
@@ -7354,6 +7363,7 @@ def active_engine_runtime_profiles(
                 or int(getattr(item, 'n_cpu_moe', 0) or 0) > 0
                 or tuple(getattr(item, 'tensor_overrides', ()) or ())
                 or str(getattr(item, 'placement_strategy', '') or '').strip()
+                or (bool(getattr(item, 'fit', False)) and getattr(item, 'gpu_layers', None) is None)
             ) else apply_placement(item, baseline_placement)
             for item in profiles
         ]
@@ -7370,6 +7380,8 @@ def active_engine_runtime_profiles(
             )
             for item in updated
         }
+        if updated and all(bool(getattr(item, 'fit', False)) and getattr(item, 'gpu_layers', None) is None for item in updated):
+            return apply_strategy_limits(with_tq3_reasoning_off_candidates(updated))
         preferred_seed_names = (
             'partial_gpu_probe',
             'kv_compression_probe',
@@ -7508,7 +7520,11 @@ def active_engine_runtime_profiles(
                 payload = context_profile_placements.get('auto')
             effective_placement = moe_placement_candidate_from_payload(payload or {})
         if effective_placement is None:
-            effective_placement = baseline_placement
+            if bool(fit) and ngl is None:
+                if has_locked_moe_placement():
+                    effective_placement = baseline_placement
+            else:
+                effective_placement = baseline_placement
         key = (
             name,
             ctx,
@@ -7641,13 +7657,16 @@ def active_engine_runtime_profiles(
             'default',
             batch=128,
             ubatch=64,
+            no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
             mtp_enabled=False,
             benchmark_phase='baseline_no_mtp',
-            benchmark_metric_group='tg_tps,ttft_ms,tpot_ms',
+            benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,startup_status',
         )
+        mtp_spec_type = mtp_spec_type_value(capabilities)
         supports_mtp = bool(
             getattr(capabilities, 'supports_spec_type', False)
             and getattr(capabilities, 'supports_mtp', False)
+            and mtp_spec_type
             and getattr(capabilities, 'supports_spec_draft_n_max', False)
         )
         if supports_mtp and model_mtp_allowed(model) and (
@@ -7663,10 +7682,11 @@ def active_engine_runtime_profiles(
                     'default',
                     batch=128,
                     ubatch=64,
+                    no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
                     mtp_enabled=True,
                     mtp_draft_n_max=draft,
-                    benchmark_phase='draft_acceptance',
-                    benchmark_metric_group='tg_tps,draft_tokens,accepted_tokens,accept_rate',
+                    benchmark_phase=f'draft_n{draft}',
+                    benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,draft_tokens,accepted_tokens,accept_rate,startup_status',
                 )
         return finalized_profiles()
 
@@ -8474,6 +8494,305 @@ def benchmark_runtime_profile_with_retry(
     return False, True, records, measured, completed
 
 
+MTP_BASELINE_RUNTIME_ASSERT_REASON = (
+    'no-MTP recurrent state has n_rs_seq=0; MTP-enabled launch initializes n_rs_seq=2'
+)
+
+
+def mtp_recurrent_baseline_assert_detected(text: str) -> bool:
+    low = str(text or '').lower().replace('_', '-')
+    recurrent = 'llama-memory-recurrent.cpp' in low or 'memory-recurrent' in low or 'recurrent' in low
+    assertion = 'ggml-assert' in low or 'ggml_assert' in low or 'assertion' in low or 'assert(' in low
+    zero_state = re.search(r'n-rs-seq\s*=\s*0\b', low) is not None
+    return bool(recurrent and assertion and zero_state)
+
+
+def mark_mtp_baseline_runtime_assert_if_needed(
+    app: AppConfig,
+    base_model: ModelConfig,
+    runtime_profile: RuntimeProfile,
+    record: Dict[str, object],
+) -> bool:
+    if str(getattr(runtime_profile, 'benchmark_phase', '') or record.get('benchmark_phase', '') or '') != 'baseline_no_mtp':
+        return False
+    text = '\n'.join(
+        str(item or '')
+        for item in (
+            record.get('detail', ''),
+            record.get('failure_excerpt', ''),
+            record.get('failure_reason', ''),
+            runtime_log_text_for_record(app, base_model),
+        )
+    )
+    if not mtp_recurrent_baseline_assert_detected(text):
+        return False
+    record['status'] = 'skipped_runtime_assert'
+    record['startup_result'] = 'SKIPPED'
+    record['failure_category'] = 'BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN'
+    record['failure_reason'] = MTP_BASELINE_RUNTIME_ASSERT_REASON
+    record['suggested_fix'] = 'Run the MTP-only draft acceptance matrix for this NextN/recurrent GGUF.'
+    record['detail'] = (
+        'baseline_no_mtp skipped: recurrent/NextN runtime assert. '
+        f'reason: {MTP_BASELINE_RUNTIME_ASSERT_REASON}'
+    )
+    record['failure_excerpt'] = benchmark_failure_excerpt(text)
+    record['baseline_required'] = False
+    return True
+
+
+def best_mtp_acceptance_record(records: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    candidates = [
+        dict(item)
+        for item in records
+        if str(item.get('status', '') or '') == 'ok'
+        and bool(item.get('mtp_enabled'))
+    ]
+    if not candidates:
+        return {}
+    return max(
+        candidates,
+        key=lambda item: (
+            float(item.get('accept_rate', 0.0) or 0.0),
+            float(item.get('tokens_per_sec', 0.0) or 0.0),
+            int(item.get('mtp_draft_n_max', 0) or 0),
+        ),
+    )
+
+
+def benchmark_mtp_acceptance_matrix_after_preflight(
+    app: AppConfig,
+    model: ModelConfig,
+    profile: HardwareProfile,
+    strategy: BenchmarkStrategy,
+    run_id: str,
+    run_kind: str,
+    started_at: str,
+    progress: Optional[Callable[[object], None]] = None,
+    cancel_token: Optional[CancelToken] = None,
+    depth: str = 'fast',
+) -> Tuple[bool, str]:
+    benchmark_depth = 'fast' if str(depth or '').strip().lower() == 'fast' else 'full'
+    hardware = profile.short_summary() if profile is not None else ''
+    try:
+        capabilities = app.engine_capabilities()
+    except Exception:
+        capabilities = default_engine_capabilities(ENGINE_LLAMA_CPP_MTP)
+    mtp_spec = mtp_spec_type_value(capabilities)
+    runtime_profiles = active_engine_runtime_profiles(app, model, profile, depth=benchmark_depth)
+    runtime_profiles = [
+        item for item in runtime_profiles
+        if str(getattr(item, 'benchmark_strategy_id', '') or strategy.id) == strategy.id
+        and (
+            str(getattr(item, 'benchmark_phase', '') or '') == 'baseline_no_mtp'
+            or bool(getattr(item, 'mtp_enabled', False))
+        )
+    ]
+    total = max(1, len(runtime_profiles))
+    records: List[Dict[str, object]] = []
+    measured: List[Dict[str, object]] = []
+    completed = 0
+    started_monotonic = time.monotonic()
+    budget_seconds = max(60, int(getattr(strategy, 'hard_budget_seconds', 0) or FAST_RUNTIME_PROFILE_BUDGET_SECONDS))
+    deadline = BenchmarkDeadline.from_end(started_monotonic + budget_seconds)
+
+    running_model = ModelConfig(**asdict(model))
+    if close_stale_running_benchmark_runs(running_model, started_at):
+        model.benchmark_runs = list(running_model.benchmark_runs)
+        model.default_benchmark_status = running_model.default_benchmark_status
+        model.default_benchmark_at = running_model.default_benchmark_at
+    running_model.default_benchmark_status = 'running'
+    running_run = build_benchmark_run(run_id, run_kind, 'running', [], {}, started_at, hardware=hardware)
+    running_run['benchmark_strategy_id'] = strategy.id
+    upsert_benchmark_run(running_model, running_run)
+    app.add_or_update(running_model)
+
+    def log_line(message: str):
+        try:
+            append_model_log(app, model, message)
+        except Exception:
+            pass
+        if progress:
+            progress(message)
+
+    log_line(f'MTP spec type selected from binary: {mtp_spec or "-"}')
+    log_line('Running MTP-only draft acceptance matrix')
+    emit_benchmark_event(
+        progress,
+        'benchmark_started',
+        model,
+        run_kind,
+        message=(
+            f'MTP acceptance matrix started: profiles={len(runtime_profiles)}, '
+            f'spec_type={mtp_spec or "-"}, output_cap={"128" if benchmark_depth == "fast" else "256"}'
+        ),
+        phase='mtp acceptance',
+        completed=0,
+        total=total,
+    )
+
+    if not runtime_profiles:
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        detail = 'MTP acceptance matrix had no launchable profiles after strategy selection.'
+        record = adaptive_record_from_candidate(
+            model,
+            'quick_sanity',
+            'blocked_missing_capability',
+            detail=detail,
+            engine=ENGINE_LLAMA_CPP_MTP,
+            benchmark_strategy_id=strategy.id,
+            benchmark_objectives=list(getattr(strategy, 'objectives', ()) or ()),
+            benchmark_metric_group=_strategy_metric_group(strategy),
+            benchmark_phase='strategy',
+            failure_category='blocked_missing_capability',
+            failure_reason=detail,
+            suggested_fix='Verify the binary advertises --spec-type and --spec-draft-n-max, and set supports_mtp=yes if needed.',
+        )
+        saved = ModelConfig(**asdict(model))
+        saved.last_benchmark_results = [record]
+        saved.default_benchmark_status = 'blocked_missing_capability'
+        saved.default_benchmark_at = ended_at
+        run = build_benchmark_run(run_id, run_kind, 'blocked_missing_capability', [record], {}, started_at, ended_at, hardware)
+        run['benchmark_strategy_id'] = strategy.id
+        run['summary'] = detail
+        upsert_benchmark_run(saved, run)
+        app.add_or_update(saved)
+        return False, detail
+
+    try:
+        for runtime_profile in runtime_profiles:
+            check_cancelled(cancel_token)
+            ok, _broke, new_records, new_measured, completed = benchmark_runtime_profile_with_retry(
+                app,
+                model,
+                runtime_profile,
+                'quick_sanity',
+                progress,
+                cancel_token,
+                completed,
+                total,
+                run_kind=run_kind,
+                max_attempts=1,
+                benchmark_depth=benchmark_depth,
+                benchmark_purpose='mtp_acceptance',
+                deadline=deadline,
+            )
+            for record in new_records:
+                if mark_mtp_baseline_runtime_assert_if_needed(app, model, runtime_profile, record):
+                    log_line('Baseline no-MTP skipped: recurrent/NextN runtime assert')
+                    log_line('baseline_no_mtp: skipped_runtime_assert')
+                    log_line(f'reason: {MTP_BASELINE_RUNTIME_ASSERT_REASON}')
+                elif str(record.get('failure_category', '') or '') == 'CLI_INVALID':
+                    log_line(
+                        f'{getattr(runtime_profile, "benchmark_phase", runtime_profile.name)}: failed_terminal CLI_INVALID'
+                    )
+                records.append(dict(record))
+            measured.extend(new_measured)
+            persist_running_benchmark_progress(app, model, run_id, run_kind, records, started_at, hardware)
+            if not ok and new_records and str(new_records[-1].get('failure_category', '') or '') == 'CLI_INVALID':
+                break
+    except CancelledError:
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        app.stop(model, managed_only=True)
+        records.append(adaptive_record_from_candidate(
+            model,
+            'quick_sanity',
+            'aborted',
+            detail='user requested abort',
+            engine=ENGINE_LLAMA_CPP_MTP,
+            benchmark_strategy_id=strategy.id,
+            benchmark_phase='mtp_acceptance',
+        ))
+        saved = ModelConfig(**asdict(model))
+        saved.last_benchmark_results = records
+        saved.default_benchmark_status = 'aborted'
+        saved.default_benchmark_at = ended_at
+        run = build_benchmark_run(run_id, run_kind, 'aborted', records, {}, started_at, ended_at, hardware)
+        run['benchmark_strategy_id'] = strategy.id
+        upsert_benchmark_run(saved, run)
+        app.add_or_update(saved)
+        msg = '⚠ MTP acceptance aborted; managed processes stopped'
+        emit_benchmark_event(progress, 'benchmark_aborted', model, run_kind, message=msg, phase='aborted', completed=completed, total=completed, records=records)
+        return False, msg
+
+    best = best_mtp_acceptance_record(records)
+    baseline_skipped = any(str(item.get('status', '') or '') == 'skipped_runtime_assert' for item in records)
+    cli_invalid = any(str(item.get('failure_category', '') or '') == 'CLI_INVALID' for item in records)
+    draft_profiles = [item for item in runtime_profiles if bool(getattr(item, 'mtp_enabled', False))]
+    draft_successes = [
+        item for item in records
+        if str(item.get('status', '') or '') == 'ok' and bool(item.get('mtp_enabled'))
+    ]
+    if best and baseline_skipped:
+        run_status = 'partial'
+    elif best and len(draft_successes) >= len(draft_profiles):
+        run_status = 'complete'
+    elif best:
+        run_status = 'partial'
+    elif cli_invalid:
+        run_status = 'failed_terminal'
+    else:
+        run_status = 'failed'
+
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    winners = dict(getattr(model, 'measured_profiles', {}) or {})
+    if best:
+        winners['mtp_acceptance'] = dict(best)
+    saved = ModelConfig(**asdict(model))
+    saved.last_benchmark_results = records
+    saved.measured_profiles = winners
+    saved.benchmark_fingerprint = app.model_fingerprint(saved)
+    saved.default_benchmark_at = ended_at
+    saved.default_benchmark_status = run_status
+    if best:
+        saved.last_benchmark_tokens_per_sec = round(float(best.get('tokens_per_sec', 0.0) or 0.0), 2)
+        saved.last_benchmark_seconds = round(float(best.get('seconds', 0.0) or 0.0), 2)
+        saved.last_benchmark_profile = (
+            f'mtp_acceptance draft_n={best.get("mtp_draft_n_max")} '
+            f'{saved.last_benchmark_tokens_per_sec:.2f} tok/s '
+            f'accept={float(best.get("accept_rate", 0.0) or 0.0):.2%} '
+            f'ctx={best.get("ctx")} {hardware}'
+        )
+    run = build_benchmark_run(run_id, run_kind, run_status, records, winners, started_at, ended_at, hardware)
+    run['benchmark_strategy_id'] = strategy.id
+    run['mtp_spec_type'] = mtp_spec
+    if baseline_skipped:
+        run['baseline_no_mtp'] = 'skipped_runtime_assert'
+    upsert_benchmark_run(saved, run)
+    app.add_or_update(saved)
+    sync_msg = sync_opencode_after_tuning(app)
+    if best:
+        prefix = '✅ MTP acceptance complete' if run_status == 'complete' else '⚠ MTP acceptance partial'
+        msg = (
+            f'{prefix}: best draft_n={best.get("mtp_draft_n_max")} '
+            f'{float(best.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s, '
+            f'accept_rate={float(best.get("accept_rate", 0.0) or 0.0):.2%}, '
+            f'status={run_status} | {sync_msg}'
+        )
+        event_name = 'benchmark_done'
+        ok_result = True
+    else:
+        msg = (
+            f'❌ MTP acceptance failed_terminal: {benchmark_failure_summary(records, "no MTP draft candidate completed")}'
+            if cli_invalid else
+            f'❌ MTP acceptance failed: {benchmark_failure_summary(records, "no MTP draft candidate completed")}'
+        )
+        event_name = 'benchmark_error'
+        ok_result = False
+    log_line(msg)
+    emit_benchmark_event(
+        progress,
+        event_name,
+        saved,
+        run_kind,
+        message=msg,
+        phase='mtp acceptance complete' if best else 'mtp acceptance failed',
+        completed=completed,
+        total=completed,
+        records=records,
+    )
+    return ok_result, msg
+
+
 def benchmark_frontier_probe_candidate(
     app: AppConfig,
     candidate: ModelConfig,
@@ -8655,6 +8974,19 @@ def benchmark_exhaustive_profiles(
             started_at,
             profile.short_summary(),
             progress,
+        )
+    if strategy.id == 'mtp_acceptance_matrix':
+        return benchmark_mtp_acceptance_matrix_after_preflight(
+            app,
+            model,
+            profile,
+            strategy,
+            run_id,
+            'server',
+            started_at,
+            progress,
+            cancel_token,
+            depth='full',
         )
     ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
     ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
@@ -10165,6 +10497,19 @@ def benchmark_fast_profiles(
             started_at,
             profile.short_summary(),
             progress,
+        )
+    if strategy.id == 'mtp_acceptance_matrix':
+        return benchmark_mtp_acceptance_matrix_after_preflight(
+            app,
+            model,
+            profile,
+            strategy,
+            run_id,
+            'server_fast',
+            started_at,
+            progress,
+            cancel_token,
+            depth='fast',
         )
     runtime_profiles = active_engine_runtime_profiles(app, model, profile, depth='fast')
     contexts = fast_benchmark_contexts(model, profile)

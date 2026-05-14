@@ -7,13 +7,15 @@ from .models import ModelConfig
 from .runtime_profiles import EngineCapabilities, RuntimeProfile, kv_modes_from_preset, strip_runtime_tuning_args
 
 
-BENCHMARK_PURPOSES = ('raw_speed', 'serve_default', 'moe_tuning', 'max_context_probe')
+BENCHMARK_PURPOSES = ('raw_speed', 'serve_default', 'moe_tuning', 'max_context_probe', 'mtp_acceptance')
 SERVE_DEFAULT_FAST_OUTPUT_CAP = 512
 SERVE_DEFAULT_FULL_OUTPUT_CAP = 1024
 MOE_TUNING_FAST_OUTPUT_CAP = 128
 MOE_TUNING_FULL_OUTPUT_CAP = 256
 TQ3_MOE_FAST_OUTPUT_CAP = 32
 TQ3_MOE_FULL_OUTPUT_CAP = 64
+MTP_ACCEPTANCE_FAST_OUTPUT_CAP = 128
+MTP_ACCEPTANCE_FULL_OUTPUT_CAP = 256
 RAW_SPEED_OUTPUT = 512
 MAX_CONTEXT_PROBE_OUTPUT = 128
 
@@ -189,6 +191,17 @@ def build_benchmark_launch_profile(
     elif purpose_key == 'max_context_probe':
         output = max(1, int(getattr(model, 'output', 4096) or 4096))
         measurement_output = max(1, min(output, MAX_CONTEXT_PROBE_OUTPUT))
+        temp = 0.0
+        top_p = None
+        top_k = None
+        repeat_penalty = 1.0
+        presence_penalty = 0.0
+        no_context_shift = bool(getattr(model, 'no_context_shift', False))
+        cache_prompt = None
+    elif purpose_key == 'mtp_acceptance':
+        output = max(1, int(getattr(model, 'output', 4096) or 4096))
+        cap = MTP_ACCEPTANCE_FAST_OUTPUT_CAP if depth_key == 'fast' else MTP_ACCEPTANCE_FULL_OUTPUT_CAP
+        measurement_output = max(1, min(output, cap))
         temp = 0.0
         top_p = None
         top_k = None

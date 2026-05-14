@@ -134,6 +134,7 @@ def select_benchmark_strategy(
 
     if engine == ENGINE_LLAMA_CPP_MTP:
         mtp_spec_type = mtp_spec_type_value(capabilities)
+        spec_values = tuple(getattr(capabilities, 'spec_type_values', ()) or ()) if capabilities is not None else ()
         mtp_capable_binary = (
             bool(capabilities is not None)
             and bool(getattr(capabilities, 'supports_spec_type', False))
@@ -145,7 +146,11 @@ def select_benchmark_strategy(
         if 'mtp_native' not in features:
             blocked_reason = 'model is not detected as MTP-native'
         elif not mtp_capable_binary:
-            blocked_reason = 'selected llama.cpp-mtp binary does not advertise a supported --spec-type value (mtp or draft-mtp) and --spec-draft-n-max'
+            supported = ','.join(str(item) for item in spec_values) if spec_values else 'none'
+            blocked_reason = (
+                'selected llama.cpp-mtp binary does not advertise a supported --spec-type '
+                f'value (mtp or draft-mtp) and --spec-draft-n-max; advertised spec types: {supported}'
+            )
         return BenchmarkStrategy(
             id='mtp_acceptance_matrix',
             engine_id=engine,
@@ -158,7 +163,7 @@ def select_benchmark_strategy(
             hard_budget_seconds=0 if blocked_reason else (8 * 60 if depth_key == 'fast' else 15 * 60),
             max_candidates=0 if blocked_reason else 4,
             retry_policy='blocked' if blocked_reason else 'terminal_missing_flags_single_start_retry',
-            reason=blocked_reason or f'MTP-capable GGUF needs a no-MTP baseline plus draft acceptance-rate comparison; spec_type={mtp_spec_type}; force np=1 and block vision/mmproj',
+            reason=blocked_reason or f'MTP-capable GGUF uses optional no-MTP baseline plus draft acceptance-rate comparison; spec_type={mtp_spec_type}; force np=1 and block vision/mmproj',
             metric_groups=('tg_tps', 'draft_tokens', 'accepted_tokens', 'accept_rate', 'ttft_ms', 'tpot_ms'),
             blocked_reason=blocked_reason,
         )
@@ -212,7 +217,7 @@ def select_benchmark_strategy(
                 _phase('context_probe', 'server_openai_api', 'long_context', 'Context growth only after viable placement', ('context_max_stable', 'peak_vram'), 1 if depth_key == 'fast' else 4, 240),
             ),
             hard_budget_seconds=12 * 60 if depth_key == 'fast' else 45 * 60,
-            max_candidates=8 if depth_key == 'fast' else 16,
+            max_candidates=12 if depth_key == 'fast' else 16,
             retry_policy='oom_terminal_timeout_guarded',
             reason='MoE models need expert placement measured before dense-style batch/context sweeps',
             metric_groups=('pp_tps', 'tg_tps', 'peak_vram', 'peak_ram', 'context_max_stable'),

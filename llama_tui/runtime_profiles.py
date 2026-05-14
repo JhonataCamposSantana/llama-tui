@@ -226,7 +226,9 @@ class EngineCapabilities:
     supports_override_tensor: bool = False
     supports_spec_type: bool = False
     supports_mtp: bool = False
+    spec_type_values: Tuple[str, ...] = ()
     mtp_spec_type: str = ''
+    mtp_spec_type_value: str = ''
     supports_spec_draft_n_max: bool = False
     cpu_moe_flag: str = '-cmoe'
     n_cpu_moe_flag: str = '-ncmoe'
@@ -633,25 +635,61 @@ def _spec_type_segments(help_text: str) -> Tuple[str, ...]:
     return tuple(segments)
 
 
-def parse_mtp_spec_type(help_text: str, defaults: Optional[EngineCapabilities] = None) -> str:
-    default_value = str(getattr(defaults, 'mtp_spec_type', '') or '').strip().lower() if defaults is not None else ''
+def parse_spec_type_values(help_text: str, defaults: Optional[EngineCapabilities] = None) -> Tuple[str, ...]:
+    default_values = tuple(str(item or '').strip().lower() for item in (getattr(defaults, 'spec_type_values', ()) or ())) if defaults is not None else ()
     segments = _spec_type_segments(help_text)
-    tokens: List[str] = []
+    values: List[str] = []
     for segment in segments:
         for token in re.split(r'[\s,|<>\[\]{}()]+', segment):
-            cleaned = token.strip(' .;:')
-            if cleaned:
-                tokens.append(cleaned)
-    token_set = set(tokens)
-    if 'mtp' in token_set:
+            cleaned = token.strip(' .;:').lower()
+            if not cleaned:
+                continue
+            if cleaned in (
+                '--spec-type',
+                'spec-type',
+                'speculative',
+                'type',
+                'value',
+                'values',
+                'allowed',
+                'usage',
+                'llama-server',
+                'n',
+                'file',
+                'arg',
+                'args',
+            ):
+                continue
+            if cleaned.startswith('-') or '=' in cleaned:
+                continue
+            if not re.match(r'^[a-z0-9][a-z0-9_-]*$', cleaned):
+                continue
+            if cleaned not in values:
+                values.append(cleaned)
+    return tuple(values) or default_values
+
+
+def select_mtp_spec_type_value(spec_type_values: Sequence[str], default_value: str = '') -> str:
+    values = {str(item or '').strip().lower() for item in (spec_type_values or ())}
+    if 'mtp' in values:
         return 'mtp'
-    if 'draft-mtp' in token_set:
+    if 'draft-mtp' in values:
         return 'draft-mtp'
-    return default_value if default_value in MTP_SPEC_TYPE_VALUES else ''
+    default_text = str(default_value or '').strip().lower()
+    return default_text if default_text in MTP_SPEC_TYPE_VALUES else ''
+
+
+def parse_mtp_spec_type(help_text: str, defaults: Optional[EngineCapabilities] = None) -> str:
+    default_value = str(getattr(defaults, 'mtp_spec_type_value', '') or getattr(defaults, 'mtp_spec_type', '') or '').strip().lower() if defaults is not None else ''
+    return select_mtp_spec_type_value(parse_spec_type_values(help_text, defaults), default_value)
 
 
 def mtp_spec_type_value(capabilities: Optional[EngineCapabilities]) -> str:
-    value = str(getattr(capabilities, 'mtp_spec_type', '') or '').strip().lower() if capabilities is not None else ''
+    value = str(
+        getattr(capabilities, 'mtp_spec_type_value', '')
+        or getattr(capabilities, 'mtp_spec_type', '')
+        or ''
+    ).strip().lower() if capabilities is not None else ''
     return value if value in MTP_SPEC_TYPE_VALUES else ''
 
 
@@ -755,7 +793,8 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
     )
     supports_spec_type = '--spec-type' in low or defaults.supports_spec_type
     supports_spec_draft_n_max = '--spec-draft-n-max' in low or defaults.supports_spec_draft_n_max
-    mtp_spec_type = parse_mtp_spec_type(text, defaults)
+    spec_type_values = parse_spec_type_values(text, defaults)
+    mtp_spec_type = select_mtp_spec_type_value(spec_type_values, mtp_spec_type_value(defaults))
     supports_mtp = bool(supports_spec_type and mtp_spec_type) or defaults.supports_mtp
     override_tensor_flag = (
         '-ot' if has_short_override_tensor
@@ -801,7 +840,9 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_override_tensor=supports_override_tensor,
         supports_spec_type=supports_spec_type,
         supports_mtp=supports_mtp,
+        spec_type_values=spec_type_values,
         mtp_spec_type=mtp_spec_type,
+        mtp_spec_type_value=mtp_spec_type,
         supports_spec_draft_n_max=supports_spec_draft_n_max,
         cpu_moe_flag=cpu_moe_flag,
         n_cpu_moe_flag=n_cpu_moe_flag,
