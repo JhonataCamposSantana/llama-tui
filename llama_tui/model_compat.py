@@ -224,6 +224,16 @@ def _result(status: str, reason: str, severity: str, features: Set[str]) -> Mode
     )
 
 
+def _mtp_binary_block_reason(capabilities: Optional[EngineCapabilities]) -> str:
+    if capabilities is not None:
+        supports_spec_type = bool(getattr(capabilities, 'supports_spec_type', False))
+        supports_draft = bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
+        supports_mtp = bool(getattr(capabilities, 'supports_mtp', False))
+        if supports_spec_type and supports_draft and not supports_mtp:
+            return 'MTP_FLAGS_NOT_FOUND: selected binary has --spec-type but does not list mtp'
+    return 'Selected MTP binary does not advertise --spec-type mtp'
+
+
 def engine_supports_model(
     engine_id: str,
     model: ModelConfig,
@@ -246,7 +256,7 @@ def engine_supports_model(
         if 'mtp_native' not in features:
             return _result('unknown', 'MTP capability is unknown for this model', 'warn', features)
         if capabilities is not None and not bool(getattr(capabilities, 'supports_mtp', False)):
-            return _result('unsupported', 'Selected MTP binary does not advertise --spec-type mtp', 'block', features)
+            return _result('unsupported', _mtp_binary_block_reason(capabilities), 'block', features)
         return _result('preferred', 'MTP-capable GGUF', 'info', features)
 
     if engine == ENGINE_TQ3:
@@ -276,6 +286,39 @@ def engine_supports_model(
         return _result('unknown', 'vLLM model entries should be HF refs', 'warn', features)
 
     return _result('unknown', f'Unknown engine {engine_id}', 'warn', features)
+
+
+def engine_shows_model(
+    engine_id: str,
+    model: ModelConfig,
+    capabilities: Optional[EngineCapabilities] = None,
+) -> ModelEngineCompatibility:
+    """Return whether the engine browser should show a model.
+
+    This is intentionally less strict than launch compatibility for cases where
+    a model belongs under an engine but the current binary cannot launch it.
+    """
+    engine = normalize_engine_id(engine_id)
+    features = detect_model_runtime_features(model)
+
+    if 'mmproj' in features:
+        if engine == ENGINE_LLAMA_CPP_MTP:
+            return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
+        return _result('unsupported', 'mmproj files are not standalone language models', 'block', features)
+
+    if 'tq3_native' in features and engine != ENGINE_TQ3:
+        return _result('unsupported', f'TQ3-native GGUFs require the tq3 engine (selected engine: {engine})', 'block', features)
+
+    if engine == ENGINE_LLAMA_CPP_MTP:
+        if 'vision' in features:
+            return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
+        if 'mtp_native' not in features:
+            return _result('unknown', 'MTP capability is unknown for this model', 'warn', features)
+        if capabilities is not None and not bool(getattr(capabilities, 'supports_mtp', False)):
+            return _result('compatible_with_warning', _mtp_binary_block_reason(capabilities), 'warn', features)
+        return _result('preferred', 'MTP-capable GGUF', 'info', features)
+
+    return engine_supports_model(engine, model, capabilities)
 
 
 def compatible_engine_ids_for_model(

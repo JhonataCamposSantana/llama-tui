@@ -13,7 +13,7 @@ from llama_tui.engines import (
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
 )
-from llama_tui.model_compat import detect_model_runtime_features, engine_supports_model
+from llama_tui.model_compat import detect_model_runtime_features, engine_shows_model, engine_supports_model
 from llama_tui.models import ModelConfig
 from llama_tui.runtime_profiles import EngineCapabilities, make_runtime_profile
 from llama_tui.ui import browser_models
@@ -58,6 +58,32 @@ class ModelCompatibilityTests(unittest.TestCase):
         for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN):
             self.assertEqual(engine_supports_model(engine, mtp).status, 'compatible_with_warning')
         self.assertEqual(engine_supports_model(ENGINE_TQ3, mtp).status, 'unknown')
+
+    def test_mtp_visibility_shows_blocked_models_without_allowing_launch(self):
+        mtp = model('mtp', '/models/generic-native-mtp.gguf', supports_mtp='yes')
+        not_ready_caps = EngineCapabilities(
+            supports_spec_type=True,
+            supports_mtp=False,
+            supports_spec_draft_n_max=True,
+        )
+
+        launch = engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, not_ready_caps)
+        visibility = engine_shows_model(ENGINE_LLAMA_CPP_MTP, mtp, not_ready_caps)
+
+        self.assertFalse(launch.compatible)
+        self.assertEqual(launch.status, 'unsupported')
+        self.assertIn('MTP_FLAGS_NOT_FOUND', launch.reason)
+        self.assertTrue(visibility.compatible)
+        self.assertEqual(visibility.status, 'compatible_with_warning')
+        self.assertIn('MTP_FLAGS_NOT_FOUND', visibility.reason)
+
+        ready_caps = EngineCapabilities(
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_spec_draft_n_max=True,
+        )
+        self.assertTrue(engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, ready_caps).compatible)
+        self.assertTrue(engine_shows_model(ENGINE_LLAMA_CPP_MTP, mtp, ready_caps).compatible)
 
     def test_mtp_hint_detection_is_not_family_specific(self):
         explicit = model('explicit', '/models/custom-name.gguf', supports_mtp='yes')
@@ -128,6 +154,34 @@ class ModelCompatibilityTests(unittest.TestCase):
                 [item.id for item in browser_models(app, statuses, compatibility_filter='all')],
                 ['normal', 'tq3', 'mtp'],
             )
+
+    def test_browser_active_filter_shows_mtp_model_when_binary_is_not_launch_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(Path(tmp) / 'models.json')
+            app.models = [
+                model('normal', '/models/normal-q4.gguf', port=18080),
+                model('tq3', '/models/native-TQ3_4S.gguf', port=18081, tq3_status='native', tq3_weight_format='TQ3_4S'),
+                model('mtp', '/models/generic-native-mtp.gguf', port=18082, supports_mtp='yes'),
+            ]
+            statuses = {item.id: ('STOPPED', '') for item in app.models}
+
+            app.runtime_profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
+            app.engine_capabilities = lambda: EngineCapabilities(
+                supports_spec_type=True,
+                supports_mtp=False,
+                supports_spec_draft_n_max=True,
+            )
+
+            self.assertEqual(
+                [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
+                ['mtp'],
+            )
+            visible, visibility_reason = app.active_engine_model_visibility(app.models[2])
+            compatible, compatibility_reason = app.active_engine_model_compatibility(app.models[2])
+            self.assertTrue(visible)
+            self.assertIn('MTP_FLAGS_NOT_FOUND', visibility_reason)
+            self.assertFalse(compatible)
+            self.assertIn('MTP_FLAGS_NOT_FOUND', compatibility_reason)
 
     def test_hf_and_llama_cache_discovery_dedupes_by_resolved_path(self):
         with tempfile.TemporaryDirectory() as tmp:

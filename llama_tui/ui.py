@@ -749,6 +749,10 @@ def model_engine_visibility_lines(app: AppConfig, model: ModelConfig) -> List[st
     except Exception:
         features = '-'
     try:
+        active_visibility = app.model_engine_visibility(model)
+    except Exception:
+        active_visibility = None
+    try:
         active_compat = app.model_engine_compatibility(model)
     except Exception:
         active_compat = None
@@ -770,11 +774,16 @@ def model_engine_visibility_lines(app: AppConfig, model: ModelConfig) -> List[st
         f'compatible engines: {compatible}',
         f'hidden from: {hidden_text}',
     ]
+    if active_visibility is not None:
+        if not active_visibility.compatible:
+            lines.insert(1, f'active engine visibility: hidden - {active_visibility.reason}')
+        elif active_visibility.status == 'compatible_with_warning':
+            lines.insert(1, f'active engine visibility: warning - {active_visibility.reason}')
     if active_compat is not None:
         if not active_compat.compatible:
-            lines.insert(1, f'active engine compatibility: {active_compat.status} - {active_compat.reason}')
+            lines.insert(1, f'active engine launch: {active_compat.status} - {active_compat.reason}')
         elif active_compat.status == 'compatible_with_warning':
-            lines.insert(1, f'active engine compatibility: warning - {active_compat.reason}')
+            lines.insert(1, f'active engine launch: warning - {active_compat.reason}')
     return lines
 
 
@@ -849,7 +858,10 @@ def model_matches_browser_filters(
             return False
     if compatibility_filter == 'active':
         try:
-            compatible, _reason = app.active_engine_model_compatibility(model)
+            if hasattr(app, 'active_engine_model_visibility'):
+                compatible, _reason = app.active_engine_model_visibility(model)
+            else:
+                compatible, _reason = app.active_engine_model_compatibility(model)
         except Exception:
             compatible = True
         if not compatible:
@@ -2075,9 +2087,19 @@ def overview_items(
     model_type = classify_model_type(model)
     engine = active_engine_short(app, model) if app is not None else display_runtime(model)
     compatible = True
+    visible = True
+    visibility_reason = ''
+    visibility_status = ''
     compatibility_reason = ''
     compatibility_status = ''
     if app is not None:
+        try:
+            visibility = app.model_engine_visibility(model)
+            visible = visibility.compatible
+            visibility_reason = visibility.reason
+            visibility_status = visibility.status
+        except Exception:
+            visible = True
         try:
             compatibility = app.model_engine_compatibility(model)
             compatible = compatibility.compatible
@@ -2101,8 +2123,16 @@ def overview_items(
         (f'Type: {model_type}', normal_attr),
         (f'Quant: {extract_quant(model) or "-"}', normal_attr),
         (f'Engine: {engine}', normal_attr),
-        *( [(f'Engine visibility: hidden - {compact_message(compatibility_reason)}', warning_attr)] if not compatible else [] ),
-        *( [(f'Engine visibility: warning - {compact_message(compatibility_reason)}', warning_attr)] if compatibility_status == 'compatible_with_warning' else [] ),
+        *( [(f'Engine visibility: hidden - {compact_message(visibility_reason)}', warning_attr)] if not visible else [] ),
+        *( [(f'Engine launch: blocked - {compact_message(compatibility_reason)}', warning_attr)] if visible and not compatible else [] ),
+        *( [(
+            f'Engine visibility: warning - {compact_message(visibility_reason)}',
+            warning_attr,
+        )] if visible and compatible and visibility_status == 'compatible_with_warning' else [] ),
+        *( [(
+            f'Engine launch: warning - {compact_message(compatibility_reason)}',
+            warning_attr,
+        )] if visible and compatible and compatibility_status == 'compatible_with_warning' else [] ),
         *(
             [(
                 f'Benchmark strategy: {strategy.id}'

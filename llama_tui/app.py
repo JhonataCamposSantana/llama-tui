@@ -78,6 +78,7 @@ from .model_compat import (
     ModelEngineCompatibility,
     compatible_engine_ids_for_model,
     detect_model_runtime_features,
+    engine_shows_model,
     engine_supports_model,
 )
 from .mtp import (
@@ -1074,9 +1075,28 @@ class AppConfig:
                 caps = None
         return engine_supports_model(engine, model, caps)
 
+    def model_engine_visibility(
+        self,
+        model: ModelConfig,
+        engine_id: Optional[str] = None,
+        capabilities: Optional[EngineCapabilities] = None,
+    ) -> ModelEngineCompatibility:
+        engine = normalize_engine_id(engine_id or self.active_engine_key_for_model(model))
+        caps = capabilities
+        if caps is None and engine == self.active_engine_key_for_model(model):
+            try:
+                caps = self.engine_capabilities()
+            except Exception:
+                caps = None
+        return engine_shows_model(engine, model, caps)
+
     def active_engine_model_compatibility(self, model: ModelConfig) -> Tuple[bool, str]:
         compatibility = self.model_engine_compatibility(model)
         return compatibility.compatible, compatibility.reason
+
+    def active_engine_model_visibility(self, model: ModelConfig) -> Tuple[bool, str]:
+        visibility = self.model_engine_visibility(model)
+        return visibility.compatible, visibility.reason
 
     def model_runtime_features(self, model: ModelConfig) -> Tuple[str, ...]:
         return tuple(sorted(detect_model_runtime_features(model)))
@@ -1087,9 +1107,9 @@ class AppConfig:
     def hidden_engine_reasons_for_model(self, model: ModelConfig) -> Dict[str, str]:
         reasons: Dict[str, str] = {}
         for engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
-            compatibility = self.model_engine_compatibility(model, engine_id=engine, capabilities=None)
-            if not compatibility.compatible:
-                reasons[engine] = compatibility.reason
+            visibility = self.model_engine_visibility(model, engine_id=engine, capabilities=None)
+            if not visibility.compatible:
+                reasons[engine] = visibility.reason
         return reasons
 
     def tq3_binary_missing_message(self) -> str:
