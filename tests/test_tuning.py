@@ -15,7 +15,7 @@ from llama_tui.benchmark import (
 )
 from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
-from llama_tui.runtime_profiles import EngineCapabilities, RuntimeProfile
+from llama_tui.runtime_profiles import EngineCapabilities, RuntimeProfile, make_runtime_profile
 from llama_tui.tuning import (
     TuningObjective,
     generate_moe_tuning_candidates,
@@ -63,6 +63,27 @@ def tuning_caps() -> EngineCapabilities:
     )
 
 
+def mtp_tuning_caps() -> EngineCapabilities:
+    return EngineCapabilities(
+        supports_cpu_moe=True,
+        supports_n_cpu_moe=True,
+        supports_override_tensor=True,
+        supports_no_warmup=True,
+        supports_spec_type=True,
+        supports_mtp=True,
+        spec_type_values=('draft-mtp',),
+        mtp_spec_type='draft-mtp',
+        mtp_spec_type_value='draft-mtp',
+        supports_spec_draft_n_max=True,
+        gpu_layers_flag='-ngl',
+        cpu_moe_flag='-cmoe',
+        n_cpu_moe_flag='-ncmoe',
+        override_tensor_flag='-ot',
+        spec_type_flag='--spec-type',
+        spec_draft_n_max_flag='--spec-draft-n-max',
+    )
+
+
 def tuning_hardware() -> HardwareProfile:
     return HardwareProfile(
         cpu_logical=16,
@@ -72,6 +93,18 @@ def tuning_hardware() -> HardwareProfile:
         gpu_name='Test GPU',
         gpu_memory_total=12 * GIB,
         gpu_memory_free=10 * GIB,
+    )
+
+
+def small_gpu_hardware() -> HardwareProfile:
+    return HardwareProfile(
+        cpu_logical=16,
+        cpu_physical=8,
+        memory_total=32 * GIB,
+        memory_available=20 * GIB,
+        gpu_name='RTX 4060 Laptop',
+        gpu_memory_total=8 * GIB,
+        gpu_memory_free=5 * GIB,
     )
 
 
@@ -159,6 +192,41 @@ class TuningHelperTests(unittest.TestCase):
 
         self.assertEqual([candidate.name for candidate in candidates], ['baseline_current'])
 
+    def test_mtp_aware_small_gpu_candidates_keep_mtp_and_conservative_ngl(self):
+        baseline = RuntimeProfile(
+            engine_id='llama.cpp-mtp',
+            name='manual',
+            ctx_size=2048,
+            gpu_layers=13,
+            parallel=1,
+            flash_attn='on',
+            batch_size=128,
+            ubatch_size=64,
+            no_warmup=True,
+            mtp_enabled=True,
+            mtp_draft_n_max=3,
+        )
+
+        candidates = generate_moe_tuning_candidates(
+            baseline,
+            mtp_tuning_caps(),
+            small_gpu_hardware(),
+            layer_count=41,
+            depth='fast',
+        )
+        by_name = {candidate.name: candidate.runtime_profile for candidate in candidates}
+
+        self.assertIn('cpu_moe_all', by_name)
+        self.assertIn('n_cpu_moe_41', by_name)
+        self.assertNotIn('full_gpu_no_moe', by_name)
+        self.assertTrue(all(candidate.runtime_profile.mtp_enabled for candidate in candidates))
+        self.assertTrue(all(candidate.runtime_profile.no_warmup for candidate in candidates))
+        self.assertTrue(all(candidate.runtime_profile.mtp_draft_n_max == 3 for candidate in candidates))
+        self.assertEqual(by_name['baseline_current'].gpu_layers, 13)
+        self.assertEqual(by_name['cpu_moe_all'].gpu_layers, 13)
+        self.assertEqual(by_name['n_cpu_moe_41'].gpu_layers, 13)
+        self.assertFalse(any(candidate.runtime_profile.gpu_layers == 999 for candidate in candidates))
+
     def test_dense_and_non_llama_family_skip(self):
         dense = moe_model(architecture_type='dense', expert_count=0, expert_used_count=0)
 
@@ -225,14 +293,34 @@ class MoeTuningRunnerTests(unittest.TestCase):
 
         return fake
 
-    def run_tuning(self, fake_benchmark, depth='fast', layer_count=32):
-        with patch.object(self.app, 'hardware_profile', return_value=tuning_hardware()), \
-             patch.object(self.app, 'engine_capabilities', return_value=tuning_caps()), \
+    def run_tuning(self, fake_benchmark, depth='fast', layer_count=32, hardware=None, capabilities=None, progress=None):
+        with patch.object(self.app, 'hardware_profile', return_value=hardware or tuning_hardware()), \
+             patch.object(self.app, 'engine_capabilities', return_value=capabilities or tuning_caps()), \
              patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'ok')), \
              patch('llama_tui.benchmark._moe_tuning_layer_count', return_value=layer_count), \
              patch('llama_tui.benchmark.CACHE_DIR', self.root / 'cache'), \
              patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_benchmark):
-            return benchmark_moe_placement_tuning(self.app, self.model, depth=depth)
+            return benchmark_moe_placement_tuning(self.app, self.model, progress=progress, depth=depth)
+
+    def configure_mtp_model(self):
+        self.app.runtime_profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
+        self.model.path = '/cache/hub/models--owner--generic-NextN-MTP-GGUF/snapshots/abc/model.gguf'
+        self.model.ngl = 13
+        self.model.ctx = 2048
+        self.model.ctx_min = 2048
+        self.model.ctx_max = 8192
+        self.model.mtp_draft_n_max = 1
+        self.model.measured_profiles = {
+            'mtp_acceptance': {
+                'status': 'ok',
+                'mtp_enabled': True,
+                'mtp_draft_n_max': 3,
+                'tokens_per_sec': 16.45,
+                'accept_rate': 1.0,
+                'ctx': 8192,
+            }
+        }
+        self.app.add_or_update(self.model)
 
     def test_refinement_candidates_are_benchmarked_before_selection(self):
         calls = []
@@ -321,6 +409,64 @@ class MoeTuningRunnerTests(unittest.TestCase):
         self.assertIn('auto_n_cpu_moe_38', calls)
         self.assertTrue(any(row.get('context_validation_winner') for row in context_rows))
         self.assertEqual(latest_run['profile_moe_placements']['auto']['n_cpu_moe'], 38)
+
+    def test_mtp_aware_moe_tuning_uses_measured_draft_flags(self):
+        self.configure_mtp_model()
+        calls = []
+        progress = []
+
+        ok, msg = self.run_tuning(
+            self.fake_runtime_benchmark(calls, {'baseline_current': 9.0, 'cpu_moe_all': 12.0}),
+            layer_count=41,
+            hardware=small_gpu_hardware(),
+            capabilities=mtp_tuning_caps(),
+            progress=progress.append,
+        )
+
+        saved = self.app.get_model('moe')
+        latest_run = saved.benchmark_runs[0]
+        first_record = latest_run['records'][0]
+        args = first_record['effective_server_args']
+
+        self.assertTrue(ok, msg)
+        self.assertIn('MTP-aware MoE placement: spec_type=draft-mtp draft_n=3 no_warmup=on', progress)
+        self.assertIn('Skipping no-MTP MoE baseline for recurrent/NextN model', progress)
+        self.assertIn('Full GPU MoE placement omitted: model does not fit current VRAM headroom', progress)
+        self.assertIn('--spec-type', args)
+        self.assertEqual(args[args.index('--spec-type') + 1], 'draft-mtp')
+        self.assertIn('--spec-draft-n-max', args)
+        self.assertEqual(args[args.index('--spec-draft-n-max') + 1], '3')
+        self.assertIn('--no-warmup', args)
+        self.assertEqual(first_record['mtp_draft_n_max'], 3)
+        self.assertTrue(first_record['mtp_enabled'])
+        self.assertIn('--spec-type draft-mtp --spec-draft-n-max 3', first_record['effective_server_args_preview'])
+
+    def test_mtp_aware_moe_tuning_continues_after_guardrail_failure(self):
+        self.configure_mtp_model()
+        calls = []
+
+        ok, msg = self.run_tuning(
+            self.fake_runtime_benchmark(
+                calls,
+                {'cpu_moe_all': 12.0, 'n_cpu_moe_41': 11.0},
+                failures={'baseline_current': 'MEMORY_GUARDRAIL'},
+            ),
+            layer_count=41,
+            hardware=small_gpu_hardware(),
+            capabilities=mtp_tuning_caps(),
+        )
+
+        saved = self.app.get_model('moe')
+        latest_run = saved.benchmark_runs[0]
+        baseline = latest_run['records'][0]
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls[0], 'baseline_current')
+        self.assertIn('cpu_moe_all', calls)
+        self.assertEqual(saved.measured_profiles['moe_placement']['measured_candidate_name'], 'cpu_moe_all')
+        self.assertEqual(baseline['failure_category'], 'MEMORY_GUARDRAIL')
+        self.assertIn('candidate-level MEMORY_GUARDRAIL', baseline['selection_reason'])
+        self.assertNotIn('early_stop_reason', latest_run)
 
 
 class ApplyMoeRecommendationTests(unittest.TestCase):

@@ -172,7 +172,17 @@ def _replace_profile(
         reasoning=baseline.reasoning,
         reasoning_budget=baseline.reasoning_budget,
         reasoning_format=baseline.reasoning_format,
+        mtp_enabled=baseline.mtp_enabled,
+        mtp_draft_n_max=baseline.mtp_draft_n_max,
+        benchmark_strategy_id=baseline.benchmark_strategy_id,
+        benchmark_objectives=baseline.benchmark_objectives,
+        benchmark_phase=baseline.benchmark_phase,
+        benchmark_metric_group=baseline.benchmark_metric_group,
     )
+
+
+def _conservative_moe_gpu_layers(baseline: RuntimeProfile, full_gpu_plausible: bool) -> Optional[int]:
+    return 999 if full_gpu_plausible else baseline.gpu_layers
 
 
 def generate_moe_tuning_candidates(
@@ -191,7 +201,12 @@ def generate_moe_tuning_candidates(
         or getattr(capabilities, 'supports_n_cpu_moe', False)
         or getattr(capabilities, 'supports_override_tensor', False)
     )
-    full_gpu_plausible = bool(has_moe_capability and gpu_free > target_vram_headroom_bytes(profile) * 2)
+    full_gpu_plausible = bool(
+        has_moe_capability
+        and not small_gpu
+        and gpu_free > target_vram_headroom_bytes(profile) * 2
+    )
+    moe_candidate_gpu_layers = _conservative_moe_gpu_layers(baseline, full_gpu_plausible)
     candidates: List[TuningCandidate] = [
         TuningCandidate(
             name='baseline_current',
@@ -215,7 +230,7 @@ def generate_moe_tuning_candidates(
             runtime_profile=_replace_profile(
                 baseline,
                 'cpu_moe_all',
-                999,
+                moe_candidate_gpu_layers,
                 'cpu_moe_all',
                 cpu_moe=True,
             ),
@@ -232,7 +247,7 @@ def generate_moe_tuning_candidates(
                 runtime_profile=_replace_profile(
                     baseline,
                     f'n_cpu_moe_{value}',
-                    999,
+                    moe_candidate_gpu_layers,
                     f'n_cpu_moe_{value}',
                     n_cpu_moe=value,
                 ),
@@ -259,7 +274,7 @@ def generate_moe_tuning_candidates(
             runtime_profile=_replace_profile(
                 baseline,
                 'experts_cpu_override',
-                999,
+                moe_candidate_gpu_layers,
                 'experts_cpu_override',
                 tensor_overrides=(EXPERTS_CPU_OVERRIDE,),
             ),
@@ -309,6 +324,11 @@ def generate_refinement_candidates(
         center = int(measured_winner.get('n_cpu_moe', 0) or 0)
     except Exception:
         center = 0
+    try:
+        winner_ngl = int(measured_winner.get('ngl', 0) or 0)
+    except Exception:
+        winner_ngl = 0
+    refinement_gpu_layers = winner_ngl if winner_ngl > 0 else baseline.gpu_layers
     values = refinement_n_cpu_moe_values(center, layer_count)
     candidates: List[TuningCandidate] = []
     for value in values:
@@ -317,7 +337,7 @@ def generate_refinement_candidates(
             runtime_profile=_replace_profile(
                 baseline,
                 f'n_cpu_moe_{value}',
-                999,
+                refinement_gpu_layers,
                 f'n_cpu_moe_{value}',
                 n_cpu_moe=value,
             ),

@@ -9528,6 +9528,79 @@ def _moe_tuning_baseline_profile(app, model: ModelConfig, depth: str) -> Runtime
     return replace(profile, name='baseline_current', benchmark_depth=depth)
 
 
+def _model_mtp_acceptance_records(model: ModelConfig) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    measured_profiles = dict(getattr(model, 'measured_profiles', {}) or {})
+    mtp_profile = measured_profiles.get('mtp_acceptance')
+    if isinstance(mtp_profile, dict):
+        records.append(dict(mtp_profile))
+    for run in list(getattr(model, 'benchmark_runs', []) or []):
+        if not isinstance(run, dict):
+            continue
+        if str(run.get('benchmark_strategy_id', '') or '') != 'mtp_acceptance_matrix':
+            continue
+        for row in list(run.get('records', []) or []):
+            if isinstance(row, dict):
+                records.append(dict(row))
+    return records
+
+
+def _best_mtp_acceptance_draft_for_model(model: ModelConfig) -> int:
+    best = best_mtp_acceptance_record(_model_mtp_acceptance_records(model))
+    if best:
+        return clamp_mtp_draft(best.get('mtp_draft_n_max', 0), default=2)
+    try:
+        saved = int(getattr(model, 'mtp_draft_n_max', 0) or 0)
+    except Exception:
+        saved = 0
+    if saved in MTP_DRAFT_VALUES:
+        return clamp_mtp_draft(saved, default=2)
+    return 2
+
+
+def _moe_tuning_mtp_aware(engine: str, model: ModelConfig, capabilities) -> bool:
+    if str(engine or '').strip().lower() != ENGINE_LLAMA_CPP_MTP:
+        return False
+    features = detect_model_runtime_features(model)
+    return bool(
+        'mtp_native' in features
+        and model_mtp_allowed(model)
+        and getattr(capabilities, 'supports_spec_type', False)
+        and getattr(capabilities, 'supports_mtp', False)
+        and mtp_spec_type_value(capabilities)
+        and getattr(capabilities, 'supports_spec_draft_n_max', False)
+    )
+
+
+def _model_has_nextn_or_recurrent_features(model: ModelConfig) -> bool:
+    features = detect_model_runtime_features(model)
+    if 'nextn_native' in features:
+        return True
+    text = ' '.join(
+        str(item or '').lower()
+        for item in (
+            getattr(model, 'architecture', ''),
+            getattr(model, 'model_family', ''),
+            getattr(model, 'metadata_summary', ''),
+            getattr(model, 'path', ''),
+        )
+    )
+    return any(marker in text for marker in ('nextn', 'next-n', 'next_n', 'recurrent', 'ssm', 'gated_delta_net'))
+
+
+def _mtp_aware_moe_tuning_profile(profile: RuntimeProfile, model: ModelConfig, capabilities) -> RuntimeProfile:
+    return replace(
+        profile,
+        parallel=1,
+        mtp_enabled=True,
+        mtp_draft_n_max=_best_mtp_acceptance_draft_for_model(model),
+        no_warmup=bool(getattr(profile, 'no_warmup', False) or getattr(capabilities, 'supports_no_warmup', False)),
+        benchmark_strategy_id='mtp_aware_moe_placement',
+        benchmark_phase='moe_placement_mtp',
+        benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,draft_tokens,accepted_tokens,accept_rate,startup_status',
+    )
+
+
 def _moe_tuning_effective_args(
     app,
     model: ModelConfig,
@@ -9594,6 +9667,11 @@ def generate_context_moe_validation_candidates(
     candidates: List[TuningCandidate] = []
     winner_payload = profile_moe_placement(winner)
     winner_candidate = moe_placement_candidate_from_payload(winner_payload)
+    try:
+        winner_gpu_layers = int(winner.get('ngl', 0) or 0)
+    except Exception:
+        winner_gpu_layers = 0
+    validation_gpu_layers = winner_gpu_layers if winner_gpu_layers > 0 else baseline.gpu_layers
     if winner_candidate is not None:
         candidates.append(TuningCandidate(
             name=f'{bucket_key}_{winner_candidate.name}',
@@ -9623,7 +9701,7 @@ def generate_context_moe_validation_candidates(
                 runtime_profile=replace(
                     baseline,
                     name=name,
-                    gpu_layers=999,
+                    gpu_layers=validation_gpu_layers,
                     placement_strategy=f'n_cpu_moe_{value}',
                     n_cpu_moe=value,
                     cpu_moe=False,
@@ -9641,7 +9719,7 @@ def generate_context_moe_validation_candidates(
             runtime_profile=replace(
                 baseline,
                 name=name,
-                gpu_layers=999,
+                gpu_layers=validation_gpu_layers,
                 placement_strategy='cpu_moe_all',
                 cpu_moe=True,
                 n_cpu_moe=0,
@@ -9861,6 +9939,9 @@ def _tuning_candidate_payload(candidate: TuningCandidate) -> Dict[str, object]:
         'cpu_moe': profile.cpu_moe,
         'n_cpu_moe': profile.n_cpu_moe,
         'tensor_overrides': list(profile.tensor_overrides),
+        'mtp_enabled': bool(getattr(profile, 'mtp_enabled', False)),
+        'mtp_draft_n_max': int(getattr(profile, 'mtp_draft_n_max', 0) or 0),
+        'no_warmup': bool(getattr(profile, 'no_warmup', False)),
     }
 
 
@@ -9935,6 +10016,9 @@ def _write_moe_tuning_logs(
                 failure=row.get('failure_category', '') or row.get('detail', ''),
             )
         )
+        preview = str(row.get('effective_server_args_preview', '') or '').strip()
+        if preview:
+            lines.append(f'command={row.get("measured_candidate_name", row.get("runtime_profile", "-"))}: {preview}')
     log_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return str(json_path), str(log_path)
 
@@ -9985,6 +10069,9 @@ def benchmark_moe_placement_tuning(
         engine = app.active_engine_key_for_model(model)
     except Exception:
         engine = baseline_profile.engine_id
+    mtp_tuning_enabled = _moe_tuning_mtp_aware(engine, model, capabilities)
+    if mtp_tuning_enabled:
+        baseline_profile = _mtp_aware_moe_tuning_profile(baseline_profile, model, capabilities)
     eligibility = moe_tuning_eligibility_reason(model, profile, capabilities, engine)
     if eligibility:
         msg = f'MoE tuning skipped: {eligibility}'
@@ -10020,6 +10107,14 @@ def benchmark_moe_placement_tuning(
     primary_winner: Dict[str, object] = {}
     profile_moe_placements: Dict[str, Dict[str, object]] = {}
 
+    def log_moe_tuning_line(message: str):
+        try:
+            append_model_log(app, model, message)
+        except Exception:
+            pass
+        if progress:
+            progress(message)
+
     running_model = ModelConfig(**asdict(model))
     if close_stale_running_benchmark_runs(running_model, started_at):
         model.benchmark_runs = list(running_model.benchmark_runs)
@@ -10044,6 +10139,23 @@ def benchmark_moe_placement_tuning(
         completed=0,
         total=total,
     )
+    if mtp_tuning_enabled:
+        spec_type = mtp_spec_type_value(capabilities)
+        log_moe_tuning_line(
+            'MTP-aware MoE placement: '
+            f'spec_type={spec_type or "-"} '
+            f'draft_n={int(getattr(baseline_profile, "mtp_draft_n_max", 0) or 0)} '
+            f'no_warmup={"on" if getattr(baseline_profile, "no_warmup", False) else "off"}'
+        )
+        if _model_has_nextn_or_recurrent_features(model):
+            log_moe_tuning_line('Skipping no-MTP MoE baseline for recurrent/NextN model')
+    gpu_total = int(getattr(profile, 'gpu_memory_total', 0) or 0)
+    if (
+        layer_count > 0
+        and 0 < gpu_total <= 9 * (1024 ** 3)
+        and not any(candidate.runtime_profile.gpu_layers == 999 for candidate in coarse_candidates)
+    ):
+        log_moe_tuning_line('Full GPU MoE placement omitted: model does not fit current VRAM headroom')
 
     def measured_candidate_names() -> set[str]:
         return {
@@ -10079,6 +10191,8 @@ def benchmark_moe_placement_tuning(
         runtime_profile = candidate.runtime_profile
         current_candidate_model = model_for_runtime_profile(model, runtime_profile)
         effective_args = _moe_tuning_effective_args(app, model, runtime_profile, depth_key)
+        if mtp_tuning_enabled:
+            log_moe_tuning_line(f'MoE tuning command {candidate.name}: {shlex.join(effective_args)}')
         if progress:
             progress(f'MoE tuning candidate {candidate.name} ({candidate.phase})')
         ok, _broke, new_records, new_measured, completed = benchmark_runtime_profile_with_retry(
@@ -10114,6 +10228,19 @@ def benchmark_moe_placement_tuning(
                 records[-1]['early_stop_reason'] = early_stop_text
             return False
         if not ok and enriched:
+            category = str(enriched[-1].get('failure_category', '') or '')
+            if mtp_tuning_enabled and category in (
+                'CUDA_OOM_WEIGHTS',
+                'CUDA_OOM_KV',
+                'MEMORY_GUARDRAIL',
+                'MEMORY_FIT_FAILED',
+                'FIXED_GPU_LAYERS_FIT_FAILED',
+                'ENGINE_RUNTIME_CRASH',
+                'BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN',
+                'WARMUP_RECURRENT_ASSERT',
+            ):
+                enriched[-1]['selection_reason'] = f'candidate-level {category}; continuing MTP-aware MoE tuning'
+                return True
             stop_now, next_extra_probe_used, reason = early_stop_reason(enriched[-1], depth_key, extra_probe_used)
             if reason:
                 early_stop_text = reason
