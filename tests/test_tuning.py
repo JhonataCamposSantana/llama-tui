@@ -84,6 +84,23 @@ def mtp_tuning_caps() -> EngineCapabilities:
     )
 
 
+def mtp_missing_launch_caps() -> EngineCapabilities:
+    return EngineCapabilities(
+        supports_cpu_moe=True,
+        supports_n_cpu_moe=True,
+        supports_override_tensor=True,
+        supports_no_warmup=True,
+        supports_spec_type=True,
+        supports_mtp=False,
+        spec_type_values=('draft-simple', 'ngram-simple'),
+        supports_spec_draft_n_max=False,
+        gpu_layers_flag='-ngl',
+        cpu_moe_flag='-cmoe',
+        n_cpu_moe_flag='-ncmoe',
+        override_tensor_flag='-ot',
+    )
+
+
 def tuning_hardware() -> HardwareProfile:
     return HardwareProfile(
         cpu_logical=16,
@@ -299,6 +316,7 @@ class MoeTuningRunnerTests(unittest.TestCase):
              patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'ok')), \
              patch('llama_tui.benchmark._moe_tuning_layer_count', return_value=layer_count), \
              patch('llama_tui.benchmark.CACHE_DIR', self.root / 'cache'), \
+             patch('llama_tui.app.CACHE_DIR', self.root / 'app-cache'), \
              patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_benchmark):
             return benchmark_moe_placement_tuning(self.app, self.model, progress=progress, depth=depth)
 
@@ -467,6 +485,35 @@ class MoeTuningRunnerTests(unittest.TestCase):
         self.assertEqual(baseline['failure_category'], 'MEMORY_GUARDRAIL')
         self.assertIn('candidate-level MEMORY_GUARDRAIL', baseline['selection_reason'])
         self.assertNotIn('early_stop_reason', latest_run)
+
+    def test_mtp_native_moe_tuning_blocks_when_binary_lacks_mtp_launch_capability(self):
+        self.configure_mtp_model()
+        calls = []
+        progress = []
+
+        def forbidden_runtime(*_args, **_kwargs):
+            calls.append('launched')
+            raise AssertionError('MTP-native MoE tuning must block before unsafe no-MTP candidates')
+
+        ok, msg = self.run_tuning(
+            forbidden_runtime,
+            layer_count=41,
+            hardware=small_gpu_hardware(),
+            capabilities=mtp_missing_launch_caps(),
+            progress=progress.append,
+        )
+
+        saved = self.app.get_model('moe')
+        latest_run = saved.benchmark_runs[0]
+        record = latest_run['records'][0]
+
+        self.assertFalse(ok)
+        self.assertFalse(calls)
+        self.assertEqual(latest_run['status'], 'blocked_missing_capability')
+        self.assertEqual(record['failure_category'], 'blocked_missing_capability')
+        self.assertIn('MTP-aware MoE placement blocked', msg)
+        self.assertIn('draft-mtp', msg)
+        self.assertTrue(any('MTP-aware MoE diagnostics' in line for line in progress))
 
 
 class ApplyMoeRecommendationTests(unittest.TestCase):

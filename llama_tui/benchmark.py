@@ -2223,6 +2223,47 @@ def _annotate_latest_stage_run(
     return changed
 
 
+def _latest_benchmark_run(
+    model: ModelConfig,
+    kind: str,
+    strategy_id: str = '',
+) -> Dict[str, object]:
+    for run in list(getattr(model, 'benchmark_runs', []) or []):
+        if not isinstance(run, dict):
+            continue
+        if str(run.get('kind', '') or '') != kind:
+            continue
+        if strategy_id and str(run.get('benchmark_strategy_id', '') or '') != strategy_id:
+            continue
+        return run
+    return {}
+
+
+def _mtp_acceptance_best_from_run(model: ModelConfig, run: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    run = dict(run or {})
+    winners = run.get('winners') if isinstance(run, dict) else {}
+    if isinstance(winners, dict) and isinstance(winners.get('mtp_acceptance'), dict):
+        return dict(winners.get('mtp_acceptance') or {})
+    record = best_mtp_acceptance_record([
+        dict(row)
+        for row in list(run.get('records', []) or [])
+        if isinstance(row, dict)
+    ])
+    if record:
+        return record
+    measured = get_measured_profile(model, 'mtp_acceptance')
+    return dict(measured) if measured else {}
+
+
+def _mtp_acceptance_stage_status(run: Dict[str, object], best: Dict[str, object]) -> str:
+    run_status = str(run.get('status', '') or '').lower()
+    if not best:
+        return 'failed'
+    if run_status in ('complete', 'done'):
+        return 'done'
+    return 'usable'
+
+
 def _write_full_suite_log(
     app,
     model: ModelConfig,
@@ -2394,20 +2435,150 @@ def benchmark_full_suite(
 
     try:
         if engine == ENGINE_LLAMA_CPP_MTP:
+            emit(f'MTP Full Suite started: model={model.name or model.id} engine={engine}', 'benchmark_started', 'preflight')
             strategy = benchmark_strategy_for_app(app, model, hardware_profile, depth=depth_key, objective='quick_sanity')
             emit_benchmark_strategy_diagnostics(app, model, strategy, progress)
             if getattr(strategy, 'blocked_reason', ''):
-                add_stage('strategy', 'skipped_incompatible', strategy.blocked_reason, benchmark_strategy_id=strategy.id)
+                add_stage('mtp_acceptance', 'blocked_missing_capability', strategy.blocked_reason, benchmark_strategy_id=strategy.id)
                 ended_at = datetime.now().isoformat(timespec='seconds')
                 persist_suite('failed', ended_at)
                 blocked_msg = f'Benchmark strategy blocked: {strategy.id} - {strategy.blocked_reason}'
                 if 'MTP-native' in str(strategy.blocked_reason):
                     blocked_msg += '. Hint: set supports_mtp=yes if this GGUF is MTP-capable'
                 return False, blocked_msg
-            emit(f'Selected benchmark strategy: {strategy.id}; routing Full Suite request to MTP strategy runner', 'benchmark_started', 'strategy')
-            if depth_key == 'fast':
-                return benchmark_fast_profiles(app, model, progress=progress, cancel_token=cancel_token)
-            return benchmark_exhaustive_profiles(app, model, progress=progress, cancel_token=cancel_token)
+            preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'full_suite', progress, cancel_token)
+            if not preflight_ok:
+                add_stage('preflight', 'failed', preflight_msg)
+                ended_at = datetime.now().isoformat(timespec='seconds')
+                persist_suite('failed', ended_at)
+                return False, preflight_msg
+            add_stage('preflight', 'ok', preflight_msg, benchmark_strategy_id=strategy.id)
+            persist_suite('running')
+
+            emit(f'Selected benchmark strategy: {strategy.id}; running MTP acceptance stage', 'benchmark_started', 'mtp_acceptance')
+            mtp_ok, mtp_msg = benchmark_mtp_acceptance_matrix_after_preflight(
+                app,
+                model,
+                hardware_profile,
+                strategy,
+                f'{suite_run_id}-mtp',
+                'server',
+                datetime.now().isoformat(timespec='seconds'),
+                progress,
+                cancel_token,
+                depth='fast' if depth_key == 'fast' else 'full',
+            )
+            current = _current_model_for_suite(app, model)
+            _annotate_latest_stage_run(current, 'server', suite_run_id, 'mtp_acceptance')
+            app.add_or_update(current)
+            mtp_run = _latest_benchmark_run(current, 'server', strategy.id)
+            mtp_best = _mtp_acceptance_best_from_run(current, mtp_run)
+            mtp_stage_status = _mtp_acceptance_stage_status(mtp_run, mtp_best)
+            mtp_baseline = str((mtp_run or {}).get('baseline_no_mtp', '') or '')
+            add_stage(
+                'mtp_acceptance',
+                mtp_stage_status,
+                mtp_msg,
+                benchmark_strategy_id=strategy.id,
+                run_status=str((mtp_run or {}).get('status', '') or ''),
+                baseline_no_mtp=mtp_baseline,
+                best_draft_n=int(mtp_best.get('mtp_draft_n_max', 0) or 0) if mtp_best else 0,
+                tokens_per_sec=float(mtp_best.get('tokens_per_sec', 0.0) or 0.0) if mtp_best else 0.0,
+                accept_rate=float(mtp_best.get('accept_rate', 0.0) or 0.0) if mtp_best else 0.0,
+            )
+            if mtp_best:
+                recommendations['mtp_acceptance'] = {
+                    'draft_n': int(mtp_best.get('mtp_draft_n_max', 0) or 0),
+                    'tokens_per_sec': float(mtp_best.get('tokens_per_sec', 0.0) or 0.0),
+                    'accept_rate': float(mtp_best.get('accept_rate', 0.0) or 0.0),
+                    'baseline_no_mtp': mtp_baseline,
+                }
+                if mtp_baseline == 'skipped_runtime_assert':
+                    warnings.append('MTP no-MTP baseline skipped as expected for recurrent/NextN model')
+                    emit('MTP acceptance usable: baseline skipped as expected for recurrent/NextN, draft candidates measured', stage='mtp_acceptance')
+            if not mtp_ok or not mtp_best:
+                add_stage('summary', 'failed', 'no MTP draft candidate completed')
+                ended_at = datetime.now().isoformat(timespec='seconds')
+                saved, run = persist_suite('failed', ended_at)
+                msg = run.get('summary', '') or 'MTP Full Suite failed: no MTP draft candidate completed'
+                if 'no MTP draft candidate completed' not in msg:
+                    msg = f'{msg}; no MTP draft candidate completed'
+                emit_benchmark_event(
+                    progress,
+                    'benchmark_error',
+                    saved,
+                    'full_suite',
+                    message=msg,
+                    phase='summary',
+                    completed=len(stage_records),
+                    total=len(stage_records),
+                    records=stage_records,
+                )
+                return False, msg
+            persist_suite('running')
+
+            current = _current_model_for_suite(app, model)
+            skip_reason = _moe_tuning_skip_reason_for_app(app, current, depth_key)
+            if skip_reason:
+                add_stage('moe_placement', 'skipped', skip_reason)
+                warnings.append(f'MoE placement skipped: {skip_reason}')
+            else:
+                prior_profiles = dict(getattr(current, 'measured_profiles', {}) or {})
+                emit('MTP Full Suite stage: MTP-aware MoE placement tuning', stage='moe_placement')
+                ok, msg = moe_runner(app, current, progress=progress, cancel_token=cancel_token, depth=depth_key)
+                current = _current_model_for_suite(app, current)
+                current = _suite_restore_config_fields(current, original, prior_profiles)
+                _annotate_latest_stage_run(current, 'moe_tuning', suite_run_id, 'moe_placement')
+                app.add_or_update(current)
+                add_stage('moe_placement', 'done' if ok else 'failed', msg)
+                if ok:
+                    overlay = build_runtime_overlay_from_moe_recommendation(current, source='current_suite')
+                    if overlay:
+                        overlay['suite_run_id'] = suite_run_id
+                        current_suite_moe_winner = True
+                        recommendations['moe_placement'] = overlay.get('candidate_name') or overlay.get('moe_placement_strategy')
+                        emit(moe_overlay_log_text(overlay, prefix='MTP Full Suite MoE winner'), stage='moe_placement')
+                        if stage_records and stage_records[-1].get('stage') == 'moe_placement':
+                            stage_records[-1]['moe_overlay'] = dict(overlay)
+                            stage_records[-1]['moe_overlay_source'] = overlay.get('source')
+                            stage_records[-1]['moe_overlay_candidate'] = overlay.get('candidate_name')
+                            stage_records[-1]['moe_overlay_expected_flags'] = list(overlay.get('expected_flags') or [])
+                            stage_records[-1]['moe_overlay_flags'] = overlay.get('expected_flags_preview', '')
+                else:
+                    warnings.append(f'MoE placement failed: {compact_message(msg)}')
+
+            mtp_stage = next((row for row in stage_records if row.get('stage') == 'mtp_acceptance'), {})
+            moe_stage = next((row for row in stage_records if row.get('stage') == 'moe_placement'), {})
+            final_status = (
+                'done'
+                if str(mtp_stage.get('status', '') or '') == 'done'
+                and str(moe_stage.get('status', '') or '') in ('done', 'skipped')
+                else 'partial'
+            )
+            add_stage(
+                'summary',
+                final_status,
+                f'MTP Full Suite {final_status}: '
+                f'mtp_acceptance={mtp_stage.get("status", "unknown")}, '
+                f'moe_placement={moe_stage.get("status", "skipped")}',
+            )
+            ended_at = datetime.now().isoformat(timespec='seconds')
+            saved, run = persist_suite(final_status, ended_at)
+            msg = run.get('summary', '') or full_suite_summary_text(stage_records, recommendations, warnings)
+            if progress:
+                progress(msg)
+            emit_benchmark_event(
+                progress,
+                'benchmark_done',
+                saved,
+                'full_suite',
+                message=msg,
+                phase='summary',
+                completed=len(stage_records),
+                total=len(stage_records),
+                records=stage_records,
+            )
+            return True, msg
 
         emit(f'Full Suite Benchmark started: model={model.name or model.id} engine={engine}', 'benchmark_started', 'preflight')
         preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'full_suite', progress, cancel_token)
@@ -2551,6 +2722,25 @@ def full_suite_summary_text(
 ) -> str:
     recommendations = dict(recommendations or {})
     warnings = list(warnings or [])
+    mtp_row = next((item for item in stage_records if str(item.get('stage', '') or '') == 'mtp_acceptance'), None)
+    if mtp_row:
+        mtp_status = str(mtp_row.get('status', '') or 'unknown')
+        moe_row = next((item for item in stage_records if str(item.get('stage', '') or '') == 'moe_placement'), None)
+        moe_status = str((moe_row or {}).get('status', '') or 'skipped')
+        summary_row = next((item for item in reversed(stage_records) if str(item.get('stage', '') or '') == 'summary'), None)
+        suite_status = str((summary_row or {}).get('status', '') or '')
+        if not suite_status:
+            suite_status = 'failed' if mtp_status in ('failed', 'blocked_missing_capability') else 'partial'
+            if mtp_status == 'done' and moe_status in ('done', 'skipped'):
+                suite_status = 'done'
+        parts = [f'mtp_acceptance={mtp_status}', f'moe_placement={moe_status}']
+        mtp_recommendation = recommendations.get('mtp_acceptance')
+        if isinstance(mtp_recommendation, dict) and mtp_recommendation.get('draft_n'):
+            parts.append(f'best_draft_n={mtp_recommendation.get("draft_n")}')
+        if warnings:
+            parts.append(f'{len(warnings)} warning(s)')
+        return f'MTP Full Suite {suite_status}: ' + ', '.join(parts)
+
     parts = []
     for name in ('moe_placement', 'model_benchmark', 'hermes', 'opencode'):
         row = next((item for item in stage_records if str(item.get('stage', '') or '') == name), None)
@@ -8761,12 +8951,18 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
     app.add_or_update(saved)
     sync_msg = sync_opencode_after_tuning(app)
     if best:
-        prefix = '✅ MTP acceptance complete' if run_status == 'complete' else '⚠ MTP acceptance partial'
+        if run_status == 'complete':
+            prefix = '✅ MTP acceptance complete'
+        elif baseline_skipped:
+            prefix = '✅ MTP acceptance usable partial'
+        else:
+            prefix = '⚠ MTP acceptance partial'
+        baseline_note = '; baseline no-MTP skipped as expected for recurrent/NextN' if baseline_skipped else ''
         msg = (
             f'{prefix}: best draft_n={best.get("mtp_draft_n_max")} '
             f'{float(best.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s, '
             f'accept_rate={float(best.get("accept_rate", 0.0) or 0.0):.2%}, '
-            f'status={run_status} | {sync_msg}'
+            f'status={run_status}{baseline_note} | {sync_msg}'
         )
         event_name = 'benchmark_done'
         ok_result = True
@@ -9572,6 +9768,64 @@ def _moe_tuning_mtp_aware(engine: str, model: ModelConfig, capabilities) -> bool
     )
 
 
+def _moe_tuning_mtp_required(engine: str, model: ModelConfig) -> bool:
+    if str(engine or '').strip().lower() != ENGINE_LLAMA_CPP_MTP:
+        return False
+    features = detect_model_runtime_features(model)
+    return bool('mtp_native' in features and model_mtp_allowed(model))
+
+
+def _moe_tuning_mtp_blocked_reason(capabilities) -> str:
+    spec_values = tuple(getattr(capabilities, 'spec_type_values', ()) or ()) if capabilities is not None else ()
+    supported = ','.join(str(item) for item in spec_values) if spec_values else 'none'
+    missing: List[str] = []
+    if not getattr(capabilities, 'supports_spec_type', False):
+        missing.append('--spec-type')
+    if not getattr(capabilities, 'supports_mtp', False) or not mtp_spec_type_value(capabilities):
+        missing.append('mtp/draft-mtp spec value')
+    if not getattr(capabilities, 'supports_spec_draft_n_max', False):
+        missing.append('--spec-draft-n-max')
+    missing_text = ', '.join(missing) if missing else 'MTP launch capability'
+    return (
+        'MTP-aware MoE placement blocked: selected llama.cpp-mtp binary is missing '
+        f'{missing_text}; advertised spec types: {supported}'
+    )
+
+
+def _mark_moe_recurrent_assert_if_needed(
+    app: AppConfig,
+    base_model: ModelConfig,
+    runtime_profile: RuntimeProfile,
+    record: Dict[str, object],
+) -> bool:
+    if bool(getattr(runtime_profile, 'mtp_enabled', False)):
+        return False
+    if not _model_has_nextn_or_recurrent_features(base_model):
+        return False
+    text = '\n'.join(
+        str(item or '')
+        for item in (
+            record.get('detail', ''),
+            record.get('failure_excerpt', ''),
+            record.get('failure_reason', ''),
+            runtime_log_text_for_record(app, base_model),
+        )
+    )
+    if not mtp_recurrent_baseline_assert_detected(text):
+        return False
+    record['status'] = 'skipped_runtime_assert'
+    record['startup_result'] = 'SKIPPED'
+    record['failure_category'] = 'BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN'
+    record['failure_reason'] = MTP_BASELINE_RUNTIME_ASSERT_REASON
+    record['suggested_fix'] = 'Run MoE placement with MTP enabled for this NextN/recurrent GGUF.'
+    record['detail'] = (
+        'MoE placement no-MTP candidate skipped: recurrent/NextN runtime assert. '
+        f'reason: {MTP_BASELINE_RUNTIME_ASSERT_REASON}'
+    )
+    record['failure_excerpt'] = benchmark_failure_excerpt(text)
+    return True
+
+
 def _model_has_nextn_or_recurrent_features(model: ModelConfig) -> bool:
     features = detect_model_runtime_features(model)
     if 'nextn_native' in features:
@@ -10062,6 +10316,8 @@ def benchmark_moe_placement_tuning(
     depth: str = 'fast',
 ) -> Tuple[bool, str]:
     depth_key = 'full' if str(depth or '').strip().lower() == 'full' else 'fast'
+    started_at = datetime.now().isoformat(timespec='seconds')
+    run_id = f'moe-tuning-{datetime.now().strftime("%Y%m%d%H%M%S")}'
     profile = app.hardware_profile(refresh=True)
     baseline_profile = _moe_tuning_baseline_profile(app, model, depth_key)
     capabilities = _moe_tuning_capabilities(app, baseline_profile)
@@ -10069,7 +10325,70 @@ def benchmark_moe_placement_tuning(
         engine = app.active_engine_key_for_model(model)
     except Exception:
         engine = baseline_profile.engine_id
+    mtp_required = _moe_tuning_mtp_required(engine, model)
     mtp_tuning_enabled = _moe_tuning_mtp_aware(engine, model, capabilities)
+    if mtp_required and not mtp_tuning_enabled:
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        features = sorted(detect_model_runtime_features(model))
+        spec_type = mtp_spec_type_value(capabilities)
+        reason = _moe_tuning_mtp_blocked_reason(capabilities)
+        detail = (
+            f'{reason}. engine={engine}; detected_features={",".join(features) or "none"}; '
+            f'spec_type={spec_type or "-"}; supports_spec_type={bool(getattr(capabilities, "supports_spec_type", False))}; '
+            f'supports_spec_draft_n_max={bool(getattr(capabilities, "supports_spec_draft_n_max", False))}. '
+            'Hint: set supports_mtp=yes if this GGUF is MTP-capable and verify the llama.cpp-mtp binary.'
+        )
+        record = adaptive_record_from_candidate(
+            model,
+            'moe_placement',
+            'blocked_missing_capability',
+            detail=detail,
+            engine=engine,
+            benchmark_purpose='moe_tuning',
+            failure_category='blocked_missing_capability',
+            failure_reason=reason,
+            suggested_fix='Use a llama.cpp-mtp binary that advertises --spec-type draft-mtp/mtp and --spec-draft-n-max.',
+            spec_type=spec_type,
+        )
+        record['benchmark_kind'] = 'moe_tuning'
+        record['measured_profile_key'] = 'moe_placement'
+        record['detected_features'] = features
+        record['mtp_spec_type'] = spec_type
+        saved = ModelConfig(**asdict(model))
+        saved.last_benchmark_results = [record]
+        saved.default_benchmark_status = 'blocked_missing_capability'
+        saved.default_benchmark_at = ended_at
+        run = build_benchmark_run(run_id, 'moe_tuning', 'blocked_missing_capability', [record], {}, started_at, ended_at, profile.short_summary())
+        run['depth'] = depth_key
+        run['warnings'] = [reason]
+        run['summary'] = detail
+        upsert_benchmark_run(saved, run)
+        app.add_or_update(saved)
+        for line in (
+            reason,
+            f'MTP-aware MoE diagnostics: engine={engine} features={",".join(features) or "none"} spec_type={spec_type or "-"} '
+            f'supports_spec_type={bool(getattr(capabilities, "supports_spec_type", False))} '
+            f'supports_spec_draft_n_max={bool(getattr(capabilities, "supports_spec_draft_n_max", False))}',
+            'Hint: set supports_mtp=yes if this GGUF is MTP-capable and verify the llama.cpp-mtp binary.',
+        ):
+            try:
+                append_model_log(app, model, line)
+            except Exception:
+                pass
+            if progress:
+                progress(line)
+        emit_benchmark_event(
+            progress,
+            'benchmark_error',
+            saved,
+            'moe_tuning',
+            message=detail,
+            phase='blocked_missing_capability',
+            completed=0,
+            total=0,
+            records=[record],
+        )
+        return False, detail
     if mtp_tuning_enabled:
         baseline_profile = _mtp_aware_moe_tuning_profile(baseline_profile, model, capabilities)
     eligibility = moe_tuning_eligibility_reason(model, profile, capabilities, engine)
@@ -10084,8 +10403,6 @@ def benchmark_moe_placement_tuning(
         return False, preflight_msg
 
     profile = app.hardware_profile(refresh=True)
-    started_at = datetime.now().isoformat(timespec='seconds')
-    run_id = f'moe-tuning-{datetime.now().strftime("%Y%m%d%H%M%S")}'
     layer_count = _moe_tuning_layer_count(model)
     objective = tuning_objective_for_model(model, profile, depth_key)
     coarse_candidates = generate_moe_tuning_candidates(
@@ -10218,6 +10535,8 @@ def benchmark_moe_placement_tuning(
             effective_args,
             early_stop_text,
         )
+        for row in enriched:
+            _mark_moe_recurrent_assert_if_needed(app, model, runtime_profile, row)
         records.extend(enriched)
         measured.extend(new_measured)
         persist_progress()

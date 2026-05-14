@@ -89,6 +89,7 @@ class SuiteFakeApp:
     def runtime_profile_from_model(self, model, ctx_value, parallel_value, ngl_value, runtime_profile=None):
         if runtime_profile is not None:
             return runtime_profile
+        mtp_enabled = bool(getattr(model, 'mtp_enabled', False)) if self.engine == 'llama.cpp-mtp' else False
         return RuntimeProfile(
             engine_id=self.engine,
             name='manual',
@@ -99,9 +100,22 @@ class SuiteFakeApp:
             cpu_moe=bool(getattr(model, 'cpu_moe', False)),
             n_cpu_moe=max(0, int(getattr(model, 'n_cpu_moe', 0) or 0)),
             tensor_overrides=tuple(getattr(model, 'tensor_overrides', []) or []),
+            mtp_enabled=mtp_enabled,
+            mtp_draft_n_max=int(getattr(model, 'mtp_draft_n_max', 0) or 0) if mtp_enabled else 0,
+            no_warmup=mtp_enabled,
         )
 
     def engine_capabilities(self):
+        mtp_kwargs = {}
+        if self.engine == 'llama.cpp-mtp':
+            mtp_kwargs = {
+                'supports_spec_type': True,
+                'supports_mtp': True,
+                'spec_type_values': ('draft-mtp',),
+                'mtp_spec_type': 'draft-mtp',
+                'mtp_spec_type_value': 'draft-mtp',
+                'supports_spec_draft_n_max': True,
+            }
         return EngineCapabilities(
             supports_cpu_moe=True,
             supports_n_cpu_moe=True,
@@ -109,12 +123,13 @@ class SuiteFakeApp:
             supports_ctk_ctv=True,
             supports_fit=self.supports_fit,
             supports_fit_ctx=self.supports_fit,
-            supports_no_warmup=self.supports_fit,
+            supports_no_warmup=bool(self.supports_fit or self.engine == 'llama.cpp-mtp'),
             cpu_moe_flag='-cmoe',
             n_cpu_moe_flag='-ncmoe',
             override_tensor_flag='-ot',
             gpu_layers_flag='-ngl',
             supported_kv_modes=('q8_0', 'turbo4', 'turbo3', 'turbo2'),
+            **mtp_kwargs,
         )
 
     def build_command(
@@ -259,6 +274,88 @@ def suite_stage_runners(order, seen, fail_moe=False):
 
 
 class FullSuiteBackendTests(unittest.TestCase):
+    def mtp_suite_model(self, **overrides):
+        model = suite_model(
+            id='suite-mtp',
+            name='Suite MTP MoE',
+            path='/cache/hub/models--owner--generic-NextN-MTP-GGUF/snapshots/abc/model.gguf',
+            runtime='llama.cpp',
+            ctx=2048,
+            ctx_min=2048,
+            ctx_max=8192,
+            ngl=13,
+            supports_mtp='yes',
+            mtp_enabled=True,
+            mtp_draft_n_max=1,
+            architecture_type='moe',
+            expert_count=256,
+            expert_used_count=8,
+        )
+        for key, value in overrides.items():
+            setattr(model, key, value)
+        return model
+
+    def fake_mtp_acceptance_runner(self, ok=True, best=True):
+        def runner(app, model, profile, strategy, run_id, run_kind, started_at, progress=None, cancel_token=None, depth='fast'):
+            saved = ModelConfig(**asdict(model))
+            records = []
+            if best:
+                baseline = adaptive_record_from_candidate(
+                    model,
+                    'quick_sanity',
+                    'skipped_runtime_assert',
+                    benchmark_phase='baseline_no_mtp',
+                    mtp_enabled=False,
+                    failure_category='BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN',
+                    detail='baseline_no_mtp skipped: recurrent/NextN runtime assert',
+                )
+                draft = adaptive_record_from_candidate(
+                    model,
+                    'quick_sanity',
+                    'ok',
+                    tokens_per_sec=16.45,
+                    seconds=1.0,
+                    generated_tokens=128,
+                    benchmark_phase='draft_n3',
+                    mtp_enabled=True,
+                    mtp_draft_n_max=3,
+                    ctx=2048,
+                    spec_type='draft-mtp',
+                    effective_server_args=['llama-server', '--spec-type', 'draft-mtp', '--spec-draft-n-max', '3'],
+                )
+                draft['accept_rate'] = 1.0
+                records = [baseline, draft]
+                saved.measured_profiles = dict(getattr(saved, 'measured_profiles', {}) or {})
+                saved.measured_profiles['mtp_acceptance'] = dict(draft)
+                append_run(saved, run_kind, 'partial', winners={'mtp_acceptance': draft})
+                run = saved.benchmark_runs[0]
+                run['records'] = records
+                run['benchmark_strategy_id'] = strategy.id
+                run['baseline_no_mtp'] = 'skipped_runtime_assert'
+            else:
+                failed = adaptive_record_from_candidate(
+                    model,
+                    'quick_sanity',
+                    'failed_terminal',
+                    benchmark_phase='draft_n3',
+                    mtp_enabled=True,
+                    mtp_draft_n_max=3,
+                    failure_category='CLI_INVALID',
+                    detail='unknown speculative type',
+                )
+                append_run(saved, run_kind, 'failed_terminal', record=failed)
+                run = saved.benchmark_runs[0]
+                run['benchmark_strategy_id'] = strategy.id
+            run['id'] = run_id
+            app.add_or_update(saved)
+            return ok and best, (
+                '✅ MTP acceptance usable partial: best draft_n=3 status=partial'
+                if best else
+                '❌ MTP acceptance failed_terminal: no MTP draft candidate completed'
+            )
+
+        return runner
+
     def run_suite_with_measured_moe_profile(self, moe_profile, initial_model=None):
         model = initial_model or suite_model()
         app = SuiteFakeApp(model)
@@ -696,6 +793,97 @@ class FullSuiteBackendTests(unittest.TestCase):
         self.assertEqual(seen['smart_n_cpu_moe'], 0)
         self.assertEqual(suite_run['stages']['moe_placement']['status'], 'failed')
         self.assertTrue(any('MoE placement failed' in warning for warning in suite_run['warnings']))
+
+    def test_mtp_full_suite_usable_partial_runs_moe_and_skips_generic_runners(self):
+        model = self.mtp_suite_model()
+        app = SuiteFakeApp(model, engine='llama.cpp-mtp')
+        order = []
+        seen = {}
+        runners = suite_stage_runners(order, seen)
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError('MTP Full Suite must not run generic smart/Hermes/OpenCode stages')
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch('llama_tui.benchmark.CACHE_DIR', Path(tmp)), \
+             patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'ok')), \
+             patch('llama_tui.benchmark.benchmark_mtp_acceptance_matrix_after_preflight', side_effect=self.fake_mtp_acceptance_runner()):
+            ok, msg = benchmark_full_suite(
+                app,
+                model,
+                moe_runner=runners[0],
+                smart_runner=forbidden,
+                hermes_runner=forbidden,
+                opencode_runner=forbidden,
+            )
+
+        saved = app.get_model(model.id)
+        suite_run = next(run for run in saved.benchmark_runs if run['kind'] == 'full_suite')
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(order, ['moe'])
+        self.assertEqual(suite_run['status'], 'partial')
+        self.assertEqual(suite_run['stages']['mtp_acceptance']['status'], 'usable')
+        self.assertEqual(suite_run['stages']['mtp_acceptance']['baseline_no_mtp'], 'skipped_runtime_assert')
+        self.assertEqual(suite_run['stages']['moe_placement']['status'], 'done')
+        self.assertIn('MTP Full Suite partial', msg)
+
+    def test_mtp_full_suite_moe_failure_is_partial_success(self):
+        model = self.mtp_suite_model()
+        app = SuiteFakeApp(model, engine='llama.cpp-mtp')
+        order = []
+        seen = {}
+        runners = suite_stage_runners(order, seen, fail_moe=True)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch('llama_tui.benchmark.CACHE_DIR', Path(tmp)), \
+             patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'ok')), \
+             patch('llama_tui.benchmark.benchmark_mtp_acceptance_matrix_after_preflight', side_effect=self.fake_mtp_acceptance_runner()):
+            ok, msg = benchmark_full_suite(
+                app,
+                model,
+                moe_runner=runners[0],
+                smart_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('no generic smart')),
+                hermes_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('no Hermes')),
+                opencode_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('no OpenCode')),
+            )
+
+        saved = app.get_model(model.id)
+        suite_run = next(run for run in saved.benchmark_runs if run['kind'] == 'full_suite')
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(order, ['moe'])
+        self.assertEqual(suite_run['status'], 'partial')
+        self.assertEqual(suite_run['stages']['moe_placement']['status'], 'failed')
+        self.assertIn('moe_placement=failed', msg)
+
+    def test_mtp_full_suite_fails_only_when_no_draft_candidate_completed(self):
+        model = self.mtp_suite_model()
+        app = SuiteFakeApp(model, engine='llama.cpp-mtp')
+
+        def forbidden_moe(*_args, **_kwargs):
+            raise AssertionError('MoE should not run when MTP acceptance has no draft winner')
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch('llama_tui.benchmark.CACHE_DIR', Path(tmp)), \
+             patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'ok')), \
+             patch('llama_tui.benchmark.benchmark_mtp_acceptance_matrix_after_preflight', side_effect=self.fake_mtp_acceptance_runner(ok=False, best=False)):
+            ok, msg = benchmark_full_suite(
+                app,
+                model,
+                moe_runner=forbidden_moe,
+                smart_runner=forbidden_moe,
+                hermes_runner=forbidden_moe,
+                opencode_runner=forbidden_moe,
+            )
+
+        saved = app.get_model(model.id)
+        suite_run = next(run for run in saved.benchmark_runs if run['kind'] == 'full_suite')
+
+        self.assertFalse(ok)
+        self.assertEqual(suite_run['status'], 'failed')
+        self.assertEqual(suite_run['stages']['mtp_acceptance']['status'], 'failed')
+        self.assertIn('no MTP draft candidate completed', msg)
 
     def test_overlay_helpers_apply_only_moe_runtime_fields(self):
         model = suite_model(
