@@ -53,7 +53,12 @@ class ModelCompatibilityTests(unittest.TestCase):
 
         self.assertIn('mtp_native', detect_model_runtime_features(mtp))
         self.assertEqual(engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, EngineCapabilities()).status, 'unsupported')
-        ok = engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, EngineCapabilities(supports_mtp=True))
+        ok = engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, EngineCapabilities(
+            supports_spec_type=True,
+            supports_mtp=True,
+            mtp_spec_type='mtp',
+            supports_spec_draft_n_max=True,
+        ))
         self.assertEqual(ok.status, 'preferred')
         self.assertTrue(ok.compatible)
         for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN):
@@ -81,6 +86,7 @@ class ModelCompatibilityTests(unittest.TestCase):
         ready_caps = EngineCapabilities(
             supports_spec_type=True,
             supports_mtp=True,
+            mtp_spec_type='mtp',
             supports_spec_draft_n_max=True,
         )
         self.assertTrue(engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, ready_caps).compatible)
@@ -170,7 +176,12 @@ class ModelCompatibilityTests(unittest.TestCase):
             )
 
             app.runtime_profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
-            app.engine_capabilities = lambda: EngineCapabilities(supports_mtp=True)
+            app.engine_capabilities = lambda: EngineCapabilities(
+                supports_spec_type=True,
+                supports_mtp=True,
+                mtp_spec_type='mtp',
+                supports_spec_draft_n_max=True,
+            )
             self.assertEqual(
                 [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
                 ['mtp'],

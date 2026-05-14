@@ -58,6 +58,7 @@ from .runtime_profiles import (
     TurboKvProfile,
     default_engine_capabilities,
     kv_modes_from_preset,
+    mtp_spec_type_value,
     supported_turbo_kv_profiles,
     turbo_kv_profile_for_preset,
 )
@@ -387,6 +388,7 @@ def benchmark_effective_server_args(
 FAILURE_CATEGORIES = (
     'ENGINE_BINARY_MISSING',
     'CLI_INVALID',
+    'ENGINE_RUNTIME_CRASH',
     'MEMORY_GUARDRAIL',
     'MEMORY_FIT_FAILED',
     'FIXED_GPU_LAYERS_FIT_FAILED',
@@ -404,6 +406,14 @@ FAILURE_CATEGORIES = (
 )
 
 FAILURE_EXCERPT_MARKERS = (
+    'ggml_assert',
+    'assertion',
+    'fatal error',
+    'error while handling argument',
+    'unknown speculative type',
+    'unknown value',
+    'invalid argument',
+    'unrecognized argument',
     'failed to fit params',
     'cannot meet free memory target',
     'n_gpu_layers already set by user',
@@ -519,15 +529,28 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
     reason = excerpt or detail or category
     suggested = ''
     terminal = False
+    if 'ggml_assert' in low or 'assertion' in low or ('fatal error' in low and 'ggml' in low):
+        category = 'ENGINE_RUNTIME_CRASH'
+        reason = excerpt or detail or 'The engine crashed during startup.'
+        suggested = 'Treat this as an engine/runtime crash; try another binary or runtime flag set.'
+        terminal = True
     if 'engine_binary_missing' in low or ('llama.cpp-tq3 server not found' in low and 'tq3_llama_server_bin' in low):
         category = 'ENGINE_BINARY_MISSING'
         reason = detail or 'The active TQ3 server binary is missing.'
         suggested = 'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
         terminal = True
-    if re.search(r'(unknown|invalid|unrecognized).{0,80}(argument|option|value|flag)', low) or 'requires an argument' in low:
+    if (
+        re.search(r'(unknown|invalid|unrecognized).{0,80}(argument|option|value|flag|type)', low)
+        or 'unknown speculative type' in low
+        or 'error while handling argument' in low
+        or 'requires an argument' in low
+    ):
         category = 'CLI_INVALID'
         suggested = 'Check the generated command and use syntax supported by this server binary.'
         terminal = True
+        if 'spec-type' in low or 'speculative type' in low:
+            reason = excerpt or detail or 'The binary rejected the generated --spec-type value.'
+            suggested = 'Use the speculative decoding type advertised by this server binary.'
         if 'flash-attn' in low or '-fa' in low:
             reason = 'The binary rejected the generated flash-attn syntax.'
             suggested = 'Use "--flash-attn on" or "-fa on" for builds that require a flash-attn value.'
@@ -1849,10 +1872,11 @@ def measured_profile_runtime_profile(
     reasoning_format = str(profile.get('reasoning_format') or fingerprint.get('reasoning_format') or '').strip().lower()
     if not reasoning_format:
         reasoning_format = _command_flag_value(command_tokens, '--reasoning-format').strip().lower()
+    command_spec_type = _command_flag_value(command_tokens, '--spec-type').strip().lower()
     mtp_enabled = (
         _profile_bool(profile, 'mtp_enabled')
         or bool(fingerprint.get('mtp_enabled'))
-        or _command_flag_value(command_tokens, '--spec-type').strip().lower() == 'mtp'
+        or command_spec_type in ('mtp', 'draft-mtp')
     )
     mtp_draft_n_max = _profile_int(profile, 'mtp_draft_n_max', int(fingerprint.get('mtp_draft_n_max', 0) or 0))
     if mtp_draft_n_max <= 0:
@@ -5697,10 +5721,14 @@ def runtime_record_context(
         try:
             capabilities = app.engine_capabilities()
             supported_cache_types = [str(item) for item in list(getattr(capabilities, 'supported_kv_modes', ()) or ())]
+            spec_type = mtp_spec_type_value(capabilities)
             if benchmark_profile is not None and str(getattr(candidate, 'runtime', 'llama.cpp') or 'llama.cpp') != 'vllm':
                 _args, unsupported_launch_flags = benchmark_profile_server_args(benchmark_profile, capabilities)
         except Exception:
             supported_cache_types = []
+            spec_type = ''
+    else:
+        spec_type = ''
     context = {
         'engine': engine or getattr(candidate, 'runtime', 'llama.cpp'),
         'server_bin': server_bin,
@@ -5758,7 +5786,7 @@ def runtime_record_context(
             if profile is not None and int(getattr(profile, 'mtp_draft_n_max', 0) or 0) > 0
             else clamp_mtp_draft(getattr(candidate, 'mtp_draft_n_max', 3), default=3)
         ),
-        'spec_type': 'mtp' if (profile is not None and bool(getattr(profile, 'mtp_enabled', False))) or bool(getattr(candidate, 'mtp_enabled', False)) else '',
+        'spec_type': spec_type if ((profile is not None and bool(getattr(profile, 'mtp_enabled', False))) or bool(getattr(candidate, 'mtp_enabled', False))) else '',
         'gpu_layers_mode': (
             'fit' if profile is not None and getattr(profile, 'gpu_layers', None) is None and getattr(profile, 'fit', False)
             else 'fixed' if profile is not None and getattr(profile, 'gpu_layers', None) is not None
@@ -5834,7 +5862,7 @@ def parse_mtp_acceptance_metrics(text: str) -> Dict[str, object]:
 
 
 def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object]:
-    if not bool(record.get('mtp_enabled', False)) and str(record.get('spec_type', '') or '') != 'mtp':
+    if not bool(record.get('mtp_enabled', False)) and str(record.get('spec_type', '') or '') not in ('mtp', 'draft-mtp'):
         return record
     log_path = str(record.get('runtime_log_path', '') or '')
     text = ''
@@ -8304,6 +8332,7 @@ def benchmark_exhaustive_candidate_with_retry(
             'KV_MODE_INCOMPATIBLE',
             'BUUN_FIT_FAILED',
             'BUUN_CPU_WARMUP_ABORT',
+            'ENGINE_RUNTIME_CRASH',
         }
         if str(record.get('failure_category', '') or '') in deterministic_failures:
             return False, True, records, measured, completed
@@ -8427,6 +8456,7 @@ def benchmark_runtime_profile_with_retry(
             'KV_MODE_INCOMPATIBLE',
             'BUUN_FIT_FAILED',
             'BUUN_CPU_WARMUP_ABORT',
+            'ENGINE_RUNTIME_CRASH',
         }
         if str(record.get('failure_category', '') or '') in deterministic_failures:
             if progress:

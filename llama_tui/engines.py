@@ -15,6 +15,7 @@ from .runtime_profiles import (
     default_engine_capabilities,
     detect_engine_capabilities as detect_runtime_engine_capabilities,
     llama_cpp_mtp_default_candidates,
+    mtp_spec_type_value,
     resolve_llama_cpp_mtp_binary,
 )
 
@@ -306,11 +307,12 @@ def mtp_binary_warning(
     executable_value = status.executable if executable is None else bool(executable)
     supports_spec_type = bool(getattr(capabilities, 'supports_spec_type', False))
     supports_mtp = bool(getattr(capabilities, 'supports_mtp', False))
+    mtp_spec_type = mtp_spec_type_value(capabilities)
     supports_draft = bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
     detail = (
         f'resolved={command or "-"}; source={source or "unknown"}; '
         f'exists={_yes_no(exists_value)}; executable={_yes_no(executable_value)}; '
-        f'spec_type={_yes_no(supports_spec_type)}; mtp={_yes_no(supports_mtp)}; '
+        f'spec_type={_yes_no(supports_spec_type)}; mtp_value={mtp_spec_type or "none"}; mtp={_yes_no(supports_mtp)}; '
         f'spec_draft_n_max={_yes_no(supports_draft)}'
     )
     if not help_text:
@@ -318,6 +320,7 @@ def mtp_binary_warning(
     if (
         supports_spec_type
         and supports_mtp
+        and mtp_spec_type
         and supports_draft
     ):
         return ''
@@ -329,7 +332,7 @@ def mtp_binary_warning(
             path_hint = ' The path looks like a stable llama.cpp checkout.'
     return (
         f'llama.cpp MTP binary warning: {command} does not advertise '
-        '--spec-type mtp and --spec-draft-n-max in --help '
+        '--spec-type mtp/draft-mtp and --spec-draft-n-max in --help '
         f'({detail}).'
         f'{path_hint}'
     )
@@ -401,7 +404,8 @@ def get_engine_health(config, engine_id: str) -> EngineHealth:
             (
                 f'{engine_display_name(install.id)} ready (Experimental; '
                 f'resolved={install.resolved_command}; source={install.source}; '
-                f'exists=yes; executable=yes; spec_type=yes; mtp=yes; spec_draft_n_max=yes)'
+                f'exists=yes; executable=yes; spec_type=yes; mtp_value={mtp_spec_type_value(capabilities)}; '
+                f'mtp=yes; spec_draft_n_max=yes)'
             ),
             [],
         )

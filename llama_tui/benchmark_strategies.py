@@ -13,7 +13,7 @@ from .engines import (
 from .hardware import HardwareProfile
 from .model_compat import detect_model_runtime_features
 from .models import ModelConfig
-from .runtime_profiles import EngineCapabilities
+from .runtime_profiles import EngineCapabilities, mtp_spec_type_value
 
 
 BENCHMARK_OBJECTIVES = (
@@ -133,19 +133,19 @@ def select_benchmark_strategy(
         )
 
     if engine == ENGINE_LLAMA_CPP_MTP:
+        mtp_spec_type = mtp_spec_type_value(capabilities)
         mtp_capable_binary = (
-            capabilities is None
-            or (
-                bool(getattr(capabilities, 'supports_spec_type', False))
-                and bool(getattr(capabilities, 'supports_mtp', False))
-                and bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
-            )
+            bool(capabilities is not None)
+            and bool(getattr(capabilities, 'supports_spec_type', False))
+            and bool(getattr(capabilities, 'supports_mtp', False))
+            and bool(mtp_spec_type)
+            and bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
         )
         blocked_reason = ''
         if 'mtp_native' not in features:
             blocked_reason = 'model is not detected as MTP-native'
         elif not mtp_capable_binary:
-            blocked_reason = 'selected llama.cpp-mtp binary does not advertise --spec-type mtp and --spec-draft-n-max'
+            blocked_reason = 'selected llama.cpp-mtp binary does not advertise a supported --spec-type value (mtp or draft-mtp) and --spec-draft-n-max'
         return BenchmarkStrategy(
             id='mtp_acceptance_matrix',
             engine_id=engine,
@@ -158,7 +158,7 @@ def select_benchmark_strategy(
             hard_budget_seconds=0 if blocked_reason else (8 * 60 if depth_key == 'fast' else 15 * 60),
             max_candidates=0 if blocked_reason else 4,
             retry_policy='blocked' if blocked_reason else 'terminal_missing_flags_single_start_retry',
-            reason=blocked_reason or 'MTP-capable GGUF needs a no-MTP baseline plus draft acceptance-rate comparison; force np=1 and block vision/mmproj',
+            reason=blocked_reason or f'MTP-capable GGUF needs a no-MTP baseline plus draft acceptance-rate comparison; spec_type={mtp_spec_type}; force np=1 and block vision/mmproj',
             metric_groups=('tg_tps', 'draft_tokens', 'accepted_tokens', 'accept_rate', 'ttft_ms', 'tpot_ms'),
             blocked_reason=blocked_reason,
         )

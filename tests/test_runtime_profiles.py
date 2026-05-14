@@ -215,8 +215,31 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(caps.supports_spec_type)
         self.assertTrue(caps.supports_mtp)
+        self.assertEqual(caps.mtp_spec_type, 'mtp')
         self.assertTrue(caps.supports_spec_draft_n_max)
         self.assertTrue(caps.supports_parallel)
+
+    def test_capability_parser_detects_draft_mtp_spec_type_dialect(self):
+        caps = parse_engine_capabilities(
+            '--spec-type none,draft-simple,draft-eagle3,draft-mtp,ngram-simple\n'
+            '--spec-draft-n-max N\n',
+            engine_id='llama.cpp-mtp',
+        )
+
+        self.assertTrue(caps.supports_spec_type)
+        self.assertTrue(caps.supports_mtp)
+        self.assertEqual(caps.mtp_spec_type, 'draft-mtp')
+        self.assertTrue(caps.supports_spec_draft_n_max)
+
+    def test_capability_parser_does_not_treat_spec_draft_flags_as_mtp_value(self):
+        caps = parse_engine_capabilities(
+            '--spec-type none,draft-simple --spec-draft-n-max N --spec-draft-model FILE',
+            engine_id='llama.cpp-mtp',
+        )
+
+        self.assertTrue(caps.supports_spec_type)
+        self.assertFalse(caps.supports_mtp)
+        self.assertEqual(caps.mtp_spec_type, '')
 
     def test_capability_parser_detects_turboquant_cache_types(self):
         caps = parse_engine_capabilities(
@@ -531,6 +554,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 default_engine_capabilities('llama.cpp-mtp'),
                 supports_spec_type=True,
                 supports_mtp=True,
+                mtp_spec_type='mtp',
                 supports_spec_draft_n_max=True,
             )
 
@@ -543,6 +567,38 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('--spec-draft-n-max') + 1], '2')
         self.assertEqual(cmd.count('--spec-type'), 1)
         self.assertEqual(cmd.count('--spec-draft-n-max'), 1)
+
+    def test_mtp_command_uses_advertised_draft_mtp_spec_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='MTP',
+                path='/models/mtp.gguf',
+                alias='mtp',
+                port=18080,
+                supports_mtp='yes',
+                mtp_enabled=True,
+                mtp_draft_n_max=2,
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp-mtp'),
+                supports_spec_type=True,
+                supports_mtp=True,
+                mtp_spec_type='draft-mtp',
+                supports_spec_draft_n_max=True,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model)
+                context = runtime_record_context(app, model)
+
+        self.assertEqual(cmd[cmd.index('--spec-type') + 1], 'draft-mtp')
+        self.assertEqual(cmd[cmd.index('--spec-draft-n-max') + 1], '2')
+        self.assertEqual(context['spec_type'], 'draft-mtp')
 
     def test_mtp_launch_validation_blocks_mmproj(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -564,6 +620,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 default_engine_capabilities('llama.cpp-mtp'),
                 supports_spec_type=True,
                 supports_mtp=True,
+                mtp_spec_type='mtp',
                 supports_spec_draft_n_max=True,
             )
 
@@ -1273,6 +1330,8 @@ class RuntimeProfileTests(unittest.TestCase):
             'llama_params_fit_impl: projected to use 9879 MiB of device memory vs. 7665 MiB of free device memory; cannot meet free memory target of 1024 MiB': 'MEMORY_FIT_FAILED',
             'failed to allocate buffer for kv cache; failed to create context': 'CUDA_OOM_KV',
             'ggml-cpu/ops.cpp:4443: fatal error in ggml_compute_forward_scale': 'BUUN_CPU_WARMUP_ABORT',
+            'llama-memory-recurrent.cpp:173: GGML_ASSERT(rollback >= 1 && rollback <= n_rs_seq) failed': 'ENGINE_RUNTIME_CRASH',
+            'error while handling argument "--spec-type": unknown speculative type: mtp': 'CLI_INVALID',
             'failed to load model': 'MODEL_LOAD_FAILED',
             'server timed out': 'SERVER_TIMEOUT',
             'request timed out': 'API_TIMEOUT',
@@ -1309,6 +1368,71 @@ class RuntimeProfileTests(unittest.TestCase):
         classified = classify_benchmark_failure(observed_weight_oom)
         self.assertIn('cudaMalloc failed', classified['failure_excerpt'])
         self.assertEqual(classified['failure_category'], 'CUDA_OOM_WEIGHTS')
+
+    def test_runtime_profile_retry_does_not_repeat_recurrent_engine_crash(self):
+        crash = 'llama-memory-recurrent.cpp:173: GGML_ASSERT(rollback >= 1 && rollback <= n_rs_seq) failed'
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='MTP',
+                path='/models/mtp.gguf',
+                alias='mtp',
+                runtime='llama.cpp-mtp',
+                supports_mtp='yes',
+            )
+            runtime_profile = RuntimeProfile(
+                engine_id='llama.cpp-mtp',
+                name='mtp_baseline',
+                ctx_size=8192,
+                gpu_layers=13,
+                parallel=1,
+                kv_preset='default',
+                flash_attn='on',
+                benchmark_strategy_id='mtp_acceptance_matrix',
+                benchmark_phase='baseline_no_mtp',
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp-mtp'),
+                supports_spec_type=True,
+                supports_mtp=True,
+                mtp_spec_type='draft-mtp',
+                supports_spec_draft_n_max=True,
+            )
+            attempts = []
+
+            def fake_candidate(_app, candidate, objective, *_args, **_kwargs):
+                attempts.append(candidate.id)
+                record = adaptive_record_from_candidate(candidate, objective, 'not ready', detail=crash)
+                record.update(classify_benchmark_failure(crash))
+                record['startup_result'] = 'FAILED'
+                return record, None
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.benchmark_adaptive_candidate', side_effect=fake_candidate):
+                ok, broke, records, measured, completed = benchmark_runtime_profile_with_retry(
+                    app,
+                    model,
+                    runtime_profile,
+                    'long_context',
+                    progress=None,
+                    cancel_token=None,
+                    completed=0,
+                    total=1,
+                    max_attempts=2,
+                    benchmark_depth='fast',
+                )
+
+        self.assertFalse(ok)
+        self.assertTrue(broke)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(completed, 1)
+        self.assertEqual(measured, [])
+        self.assertEqual(attempts, ['mtp'])
+        self.assertEqual(records[0]['failure_category'], 'ENGINE_RUNTIME_CRASH')
 
     def test_memory_guardrail_admission_skips_critical_memory(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200, ctx=65536)
@@ -4370,6 +4494,7 @@ class RuntimeProfileTests(unittest.TestCase):
             default_engine_capabilities('llama.cpp-mtp'),
             supports_spec_type=True,
             supports_mtp=True,
+            mtp_spec_type='mtp',
             supports_spec_draft_n_max=True,
         )
         with tempfile.TemporaryDirectory() as tmp:

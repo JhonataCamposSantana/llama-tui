@@ -178,14 +178,14 @@ class EngineRegistryTests(unittest.TestCase):
             executable=True,
         )
 
-        self.assertIn('--spec-type mtp', warning)
+        self.assertIn('--spec-type mtp/draft-mtp', warning)
         self.assertIn('stable llama.cpp', warning)
         self.assertIn('source=default', warning)
         self.assertIn('executable=yes', warning)
         self.assertEqual(
             mtp_binary_warning(
                 '/work/llama.cpp-mtp/build/bin/llama-server',
-                EngineCapabilities(help_text='--spec-type mtp\n--spec-draft-n-max N', supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True),
+                EngineCapabilities(help_text='--spec-type mtp\n--spec-draft-n-max N', supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True),
             ),
             '',
         )
@@ -208,7 +208,7 @@ class EngineRegistryTests(unittest.TestCase):
             health = get_engine_health(config, ENGINE_LLAMA_CPP_MTP)
 
         self.assertEqual(health.status, 'MTP_FLAGS_NOT_FOUND')
-        self.assertIn('--spec-type mtp', health.summary)
+        self.assertIn('--spec-type mtp/draft-mtp', health.summary)
         self.assertIn('source=default', health.summary)
 
     def test_mtp_engine_health_reports_non_executable_binary(self):

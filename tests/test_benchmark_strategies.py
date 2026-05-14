@@ -106,14 +106,15 @@ class BenchmarkStrategyTests(unittest.TestCase):
             alias='mtp',
             supports_mtp='yes',
         )
-        strategy = select_benchmark_strategy('llama.cpp-mtp', model, depth='fast')
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
+        strategy = select_benchmark_strategy('llama.cpp-mtp', model, capabilities=caps, depth='fast')
 
         self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
         self.assertIn('accept_rate', strategy.metric_groups)
         self.assertEqual(strategy.max_candidates, 4)
 
     def test_mtp_engine_selects_acceptance_matrix_from_generic_cache_provenance(self):
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
         model = ModelConfig(
             id='generic',
             name='Generic Model',
@@ -132,7 +133,7 @@ class BenchmarkStrategyTests(unittest.TestCase):
         self.assertFalse(strategy.blocked_reason)
 
     def test_mtp_engine_blocks_uncertain_model_instead_of_full_suite(self):
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
         model = ModelConfig(
             id='generic',
             name='Generic Model',
@@ -204,7 +205,7 @@ class BenchmarkStrategyTests(unittest.TestCase):
             Path('/tmp/llama-tui-test-strategy.json'),
             runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
         )
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
         app.engine_capabilities = lambda: caps
 
         profiles = active_engine_runtime_profiles(app, model, HardwareProfile(gpu_memory_total=8 * 1024 ** 3, gpu_memory_free=6 * 1024 ** 3), depth='fast')
@@ -221,7 +222,7 @@ class BenchmarkStrategyTests(unittest.TestCase):
         self.assertEqual(metrics['accept_rate'], 0.75)
 
     def test_blocked_mtp_fast_and_smart_benchmarks_do_not_run_generic_fallback(self):
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
         for runner in (benchmark_fast_profiles, benchmark_best_optimization):
             with self.subTest(runner=runner.__name__), tempfile.TemporaryDirectory() as tmp:
                 app = AppConfig(
@@ -252,7 +253,7 @@ class BenchmarkStrategyTests(unittest.TestCase):
                 self.assertIn('supports_mtp=yes', progress_text)
 
     def test_blocked_mtp_full_suite_does_not_start_generic_full_suite(self):
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
                 Path(tmp) / 'models.json',

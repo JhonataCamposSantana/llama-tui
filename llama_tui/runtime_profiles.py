@@ -226,6 +226,7 @@ class EngineCapabilities:
     supports_override_tensor: bool = False
     supports_spec_type: bool = False
     supports_mtp: bool = False
+    mtp_spec_type: str = ''
     supports_spec_draft_n_max: bool = False
     cpu_moe_flag: str = '-cmoe'
     n_cpu_moe_flag: str = '-ncmoe'
@@ -611,6 +612,49 @@ def default_engine_capabilities(engine_id: str = 'llama.cpp') -> EngineCapabilit
     return EngineCapabilities(supported_kv_modes=('f16', 'q8_0', 'q4_0'))
 
 
+MTP_SPEC_TYPE_VALUES = ('mtp', 'draft-mtp')
+
+
+def _spec_type_segments(help_text: str) -> Tuple[str, ...]:
+    lines = str(help_text or '').lower().splitlines()
+    segments: List[str] = []
+    for index, line in enumerate(lines):
+        if '--spec-type' not in line:
+            continue
+        segment = line
+        next_index = index + 1
+        while next_index < len(lines):
+            continuation = lines[next_index].strip()
+            if not continuation or continuation.startswith('-'):
+                break
+            segment = f'{segment} {continuation}'
+            next_index += 1
+        segments.append(segment)
+    return tuple(segments)
+
+
+def parse_mtp_spec_type(help_text: str, defaults: Optional[EngineCapabilities] = None) -> str:
+    default_value = str(getattr(defaults, 'mtp_spec_type', '') or '').strip().lower() if defaults is not None else ''
+    segments = _spec_type_segments(help_text)
+    tokens: List[str] = []
+    for segment in segments:
+        for token in re.split(r'[\s,|<>\[\]{}()]+', segment):
+            cleaned = token.strip(' .;:')
+            if cleaned:
+                tokens.append(cleaned)
+    token_set = set(tokens)
+    if 'mtp' in token_set:
+        return 'mtp'
+    if 'draft-mtp' in token_set:
+        return 'draft-mtp'
+    return default_value if default_value in MTP_SPEC_TYPE_VALUES else ''
+
+
+def mtp_spec_type_value(capabilities: Optional[EngineCapabilities]) -> str:
+    value = str(getattr(capabilities, 'mtp_spec_type', '') or '').strip().lower() if capabilities is not None else ''
+    return value if value in MTP_SPEC_TYPE_VALUES else ''
+
+
 def parse_supported_kv_modes(help_text: str, engine_id: str, defaults: EngineCapabilities) -> Tuple[str, ...]:
     text = (help_text or '').lower()
     found: List[str] = []
@@ -711,7 +755,8 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
     )
     supports_spec_type = '--spec-type' in low or defaults.supports_spec_type
     supports_spec_draft_n_max = '--spec-draft-n-max' in low or defaults.supports_spec_draft_n_max
-    supports_mtp = bool(supports_spec_type and re.search(r'\bmtp\b', low)) or defaults.supports_mtp
+    mtp_spec_type = parse_mtp_spec_type(text, defaults)
+    supports_mtp = bool(supports_spec_type and mtp_spec_type) or defaults.supports_mtp
     override_tensor_flag = (
         '-ot' if has_short_override_tensor
         else '--override-tensor' if has_long_override_tensor
@@ -756,6 +801,7 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_override_tensor=supports_override_tensor,
         supports_spec_type=supports_spec_type,
         supports_mtp=supports_mtp,
+        mtp_spec_type=mtp_spec_type,
         supports_spec_draft_n_max=supports_spec_draft_n_max,
         cpu_moe_flag=cpu_moe_flag,
         n_cpu_moe_flag=n_cpu_moe_flag,
@@ -885,10 +931,11 @@ def runtime_profile_extra_args(
             if value:
                 args += [capabilities.override_tensor_flag or '-ot', value]
     if engine.is_llama_cpp_mtp and bool(getattr(runtime_profile, 'mtp_enabled', False)):
-        if capabilities.supports_mtp:
-            args += [capabilities.spec_type_flag or '--spec-type', 'mtp']
-        if capabilities.supports_spec_draft_n_max:
-            draft = max(1, min(3, int(getattr(runtime_profile, 'mtp_draft_n_max', 0) or 3)))
-            args += [capabilities.spec_draft_n_max_flag or '--spec-draft-n-max', str(draft)]
+        mtp_spec_type = mtp_spec_type_value(capabilities)
+        if capabilities.supports_mtp and mtp_spec_type:
+            args += [capabilities.spec_type_flag or '--spec-type', mtp_spec_type]
+            if capabilities.supports_spec_draft_n_max:
+                draft = max(1, min(3, int(getattr(runtime_profile, 'mtp_draft_n_max', 0) or 3)))
+                args += [capabilities.spec_draft_n_max_flag or '--spec-draft-n-max', str(draft)]
     args.extend(str(item) for item in profile_extra_args)
     return args

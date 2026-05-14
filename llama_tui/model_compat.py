@@ -16,7 +16,7 @@ from .gguf import read_gguf_metadata
 from .models import ModelConfig
 from .mtp import model_has_mmproj_config, mtp_support_auto_hint, normalize_mtp_support
 from .provenance import parse_hf_cache_provenance
-from .runtime_profiles import EngineCapabilities
+from .runtime_profiles import EngineCapabilities, mtp_spec_type_value
 
 
 @dataclass(frozen=True)
@@ -242,9 +242,12 @@ def _mtp_binary_block_reason(capabilities: Optional[EngineCapabilities]) -> str:
         supports_spec_type = bool(getattr(capabilities, 'supports_spec_type', False))
         supports_draft = bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
         supports_mtp = bool(getattr(capabilities, 'supports_mtp', False))
-        if supports_spec_type and supports_draft and not supports_mtp:
-            return 'MTP_FLAGS_NOT_FOUND: selected binary has --spec-type but does not list mtp'
-    return 'Selected MTP binary does not advertise --spec-type mtp'
+        spec_type = mtp_spec_type_value(capabilities)
+        if supports_spec_type and supports_draft and not spec_type:
+            return 'MTP_FLAGS_NOT_FOUND: selected binary has --spec-type but does not list mtp or draft-mtp'
+        if supports_spec_type and supports_draft and supports_mtp and spec_type:
+            return ''
+    return 'Selected MTP binary does not advertise --spec-type mtp/draft-mtp'
 
 
 def engine_supports_model(
@@ -268,7 +271,10 @@ def engine_supports_model(
             return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
         if 'mtp_native' not in features:
             return _result('unknown', 'MTP capability is unknown for this model', 'warn', features)
-        if capabilities is not None and not bool(getattr(capabilities, 'supports_mtp', False)):
+        if capabilities is not None and (
+            not bool(getattr(capabilities, 'supports_mtp', False))
+            or not mtp_spec_type_value(capabilities)
+        ):
             return _result('unsupported', _mtp_binary_block_reason(capabilities), 'block', features)
         return _result('preferred', 'MTP-capable GGUF', 'info', features)
 
@@ -327,7 +333,10 @@ def engine_shows_model(
             return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
         if 'mtp_native' not in features:
             return _result('unknown', 'MTP capability is unknown for this model', 'warn', features)
-        if capabilities is not None and not bool(getattr(capabilities, 'supports_mtp', False)):
+        if capabilities is not None and (
+            not bool(getattr(capabilities, 'supports_mtp', False))
+            or not mtp_spec_type_value(capabilities)
+        ):
             return _result('compatible_with_warning', _mtp_binary_block_reason(capabilities), 'warn', features)
         return _result('preferred', 'MTP-capable GGUF', 'info', features)
 
