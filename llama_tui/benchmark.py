@@ -39,6 +39,7 @@ from .memory_guardrail import (
     memory_guardrail_record_fields,
     start_memory_guardrail_watchdog,
 )
+from .model_compat import detect_model_runtime_features
 from .moe_placement import MoePlacementCandidate, generate_moe_placement_candidates
 from .models import ModelConfig
 from .mtp import MTP_DRAFT_VALUES, clamp_mtp_draft, model_mtp_allowed, model_mtp_draft_n_max, model_mtp_enabled, mtp_support_auto_hint
@@ -51,6 +52,7 @@ from .optimize import (
     model_is_moe,
     select_best_tier,
 )
+from .provenance import parse_hf_cache_provenance
 from .runtime_profiles import (
     RuntimeProfile,
     TurboKvProfile,
@@ -195,6 +197,108 @@ def benchmark_strategy_for_app(
         depth=depth,
         model_size_bytes=size,
     )
+
+
+def benchmark_detection_sources_text(model: ModelConfig) -> str:
+    path = Path(str(getattr(model, 'path', '') or '')).expanduser()
+    parsed = parse_hf_cache_provenance(path)
+    labels = list(getattr(model, 'source_labels', []) or [])
+    if not labels:
+        labels = [item.strip() for item in str(getattr(model, 'source', '') or '').split(',') if item.strip()]
+    parts = [
+        f'repo_id={getattr(model, "source_repo_id", "") or parsed.get("repo_id", "") or "-"}',
+        f'snapshot={getattr(model, "source_snapshot", "") or parsed.get("snapshot", "") or "-"}',
+        f'labels={",".join(labels) if labels else "-"}',
+        f'path={getattr(model, "source_path", "") or getattr(model, "path", "") or "-"}',
+    ]
+    source_root = str(getattr(model, 'source_root', '') or '')
+    if source_root:
+        parts.insert(2, f'root={source_root}')
+    return ', '.join(parts)
+
+
+def emit_benchmark_strategy_diagnostics(
+    app,
+    model: ModelConfig,
+    strategy: BenchmarkStrategy,
+    progress: Optional[Callable[[object], None]] = None,
+) -> List[str]:
+    features = ', '.join(sorted(detect_model_runtime_features(model))) or '-'
+    lines = [
+        f'Detected features: {features}',
+        f'Detection sources: {benchmark_detection_sources_text(model)}',
+    ]
+    blocked = str(getattr(strategy, 'blocked_reason', '') or '')
+    if blocked:
+        lines.append(f'Benchmark strategy blocked: {strategy.id} - {blocked}')
+        if strategy.engine_id == ENGINE_LLAMA_CPP_MTP and 'MTP-native' in blocked:
+            lines.append('Hint: set supports_mtp=yes if this GGUF is MTP-capable')
+    else:
+        lines.append(f'Selected benchmark strategy: {strategy.id}')
+    for line in lines:
+        try:
+            append_model_log(app, model, line)
+        except Exception:
+            pass
+        if progress:
+            progress(line)
+    return lines
+
+
+def persist_blocked_benchmark_strategy(
+    app,
+    model: ModelConfig,
+    strategy: BenchmarkStrategy,
+    run_id: str,
+    run_kind: str,
+    started_at: str,
+    hardware: str,
+    progress: Optional[Callable[[object], None]] = None,
+) -> Tuple[bool, str]:
+    blocked = str(getattr(strategy, 'blocked_reason', '') or 'benchmark strategy is blocked')
+    hint = ''
+    if strategy.engine_id == ENGINE_LLAMA_CPP_MTP and 'MTP-native' in blocked:
+        hint = ' Hint: set supports_mtp=yes if this GGUF is MTP-capable.'
+    message = f'Benchmark strategy blocked: {strategy.id} - {blocked}.{hint}'
+    ended_at = datetime.now().isoformat(timespec='seconds')
+    record = adaptive_record_from_candidate(
+        model,
+        'quick_sanity',
+        'skipped_incompatible',
+        detail=message,
+        engine=strategy.engine_id,
+        benchmark_strategy_id=strategy.id,
+        benchmark_objectives=list(getattr(strategy, 'objectives', ()) or ()),
+        benchmark_metric_group=_strategy_metric_group(strategy),
+        benchmark_phase='strategy',
+        failure_category='incompatible',
+        failure_reason=blocked,
+        suggested_fix=hint.strip(),
+    )
+    saved = ModelConfig(**asdict(model))
+    close_stale_running_benchmark_runs(saved, ended_at)
+    saved.last_benchmark_results = [dict(record)]
+    saved.default_benchmark_status = 'failed'
+    saved.default_benchmark_at = ended_at
+    run = build_benchmark_run(run_id, run_kind, 'failed', [record], {}, started_at, ended_at, hardware)
+    run['summary'] = message
+    run['benchmark_strategy_id'] = strategy.id
+    run['blocked_reason'] = blocked
+    upsert_benchmark_run(saved, run)
+    app.add_or_update(saved)
+    emit_benchmark_event(
+        progress,
+        'benchmark_failed',
+        saved,
+        run_kind,
+        message=message,
+        phase='strategy blocked',
+        completed=1,
+        total=1,
+        record=record,
+        records=[record],
+    )
+    return False, message
 
 
 def _strategy_metric_group(strategy: BenchmarkStrategy) -> str:
@@ -2170,8 +2274,10 @@ def benchmark_full_suite(
     except Exception:
         engine = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
     try:
-        hardware = app.hardware_profile(refresh=True).short_summary()
+        hardware_profile = app.hardware_profile(refresh=True)
+        hardware = hardware_profile.short_summary()
     except Exception:
+        hardware_profile = HardwareProfile()
         hardware = ''
     stage_records: List[Dict[str, object]] = []
     warnings: List[str] = []
@@ -2259,6 +2365,22 @@ def benchmark_full_suite(
         from .opencode_benchmark import benchmark_opencode_workflow as opencode_runner
 
     try:
+        if engine == ENGINE_LLAMA_CPP_MTP:
+            strategy = benchmark_strategy_for_app(app, model, hardware_profile, depth=depth_key, objective='quick_sanity')
+            emit_benchmark_strategy_diagnostics(app, model, strategy, progress)
+            if getattr(strategy, 'blocked_reason', ''):
+                add_stage('strategy', 'skipped_incompatible', strategy.blocked_reason, benchmark_strategy_id=strategy.id)
+                ended_at = datetime.now().isoformat(timespec='seconds')
+                persist_suite('failed', ended_at)
+                blocked_msg = f'Benchmark strategy blocked: {strategy.id} - {strategy.blocked_reason}'
+                if 'MTP-native' in str(strategy.blocked_reason):
+                    blocked_msg += '. Hint: set supports_mtp=yes if this GGUF is MTP-capable'
+                return False, blocked_msg
+            emit(f'Selected benchmark strategy: {strategy.id}; routing Full Suite request to MTP strategy runner', 'benchmark_started', 'strategy')
+            if depth_key == 'fast':
+                return benchmark_fast_profiles(app, model, progress=progress, cancel_token=cancel_token)
+            return benchmark_best_optimization(app, model, progress=progress, cancel_token=cancel_token)
+
         emit(f'Full Suite Benchmark started: model={model.name or model.id} engine={engine}', 'benchmark_started', 'preflight')
         preflight_ok, preflight_msg = benchmark_preflight_cleanup(app, model, 'full_suite', progress, cancel_token)
         add_stage('preflight', 'ok' if preflight_ok else 'failed', preflight_msg)
@@ -8492,6 +8614,18 @@ def benchmark_exhaustive_profiles(
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'server-{datetime.now().strftime("%Y%m%d%H%M%S")}'
     strategy = benchmark_strategy_for_app(app, model, profile, depth='full', objective='long_context')
+    emit_benchmark_strategy_diagnostics(app, model, strategy, progress)
+    if getattr(strategy, 'blocked_reason', ''):
+        return persist_blocked_benchmark_strategy(
+            app,
+            model,
+            strategy,
+            run_id,
+            'server',
+            started_at,
+            profile.short_summary(),
+            progress,
+        )
     ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
     ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072) or 131072))
     chat_floor = chat_min_ctx_per_slot(model)
@@ -9990,6 +10124,18 @@ def benchmark_fast_profiles(
     started_at = datetime.now().isoformat(timespec='seconds')
     run_id = f'server-fast-{datetime.now().strftime("%Y%m%d%H%M%S")}'
     strategy = benchmark_strategy_for_app(app, model, profile, depth='fast', objective='quick_sanity')
+    emit_benchmark_strategy_diagnostics(app, model, strategy, progress)
+    if getattr(strategy, 'blocked_reason', ''):
+        return persist_blocked_benchmark_strategy(
+            app,
+            model,
+            strategy,
+            run_id,
+            'server_fast',
+            started_at,
+            profile.short_summary(),
+            progress,
+        )
     runtime_profiles = active_engine_runtime_profiles(app, model, profile, depth='fast')
     contexts = fast_benchmark_contexts(model, profile)
     parallel_values = fast_benchmark_parallel_values(profile, model)

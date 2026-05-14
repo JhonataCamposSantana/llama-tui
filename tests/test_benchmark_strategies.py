@@ -5,7 +5,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from llama_tui.benchmark import active_engine_runtime_profiles, parse_mtp_acceptance_metrics
+from llama_tui.benchmark import (
+    active_engine_runtime_profiles,
+    benchmark_best_optimization,
+    benchmark_fast_profiles,
+    benchmark_full_suite,
+    parse_mtp_acceptance_metrics,
+)
 from llama_tui.benchmark_strategies import select_benchmark_strategy
 from llama_tui.hardware import HardwareProfile
 from llama_tui.model_compat import detect_model_runtime_features
@@ -106,6 +112,46 @@ class BenchmarkStrategyTests(unittest.TestCase):
         self.assertIn('accept_rate', strategy.metric_groups)
         self.assertEqual(strategy.max_candidates, 4)
 
+    def test_mtp_engine_selects_acceptance_matrix_from_generic_cache_provenance(self):
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        model = ModelConfig(
+            id='generic',
+            name='Generic Model',
+            path='/cache/hub/models--owner--generic-MTP-GGUF/snapshots/abc/model.gguf',
+            alias='generic',
+        )
+
+        strategy = select_benchmark_strategy(
+            engine_id='llama.cpp-mtp',
+            model=model,
+            capabilities=caps,
+            objective='quick_sanity',
+        )
+
+        self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
+        self.assertFalse(strategy.blocked_reason)
+
+    def test_mtp_engine_blocks_uncertain_model_instead_of_full_suite(self):
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        model = ModelConfig(
+            id='generic',
+            name='Generic Model',
+            path='/models/generic.gguf',
+            alias='generic',
+        )
+
+        strategy = select_benchmark_strategy(
+            engine_id='llama.cpp-mtp',
+            model=model,
+            capabilities=caps,
+            objective='quick_sanity',
+        )
+
+        self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
+        self.assertTrue(strategy.blocked_reason)
+        self.assertEqual(strategy.max_candidates, 0)
+        self.assertEqual(strategy.phases, ())
+
     def test_mtp_strategy_blocks_when_binary_lacks_spec_flags(self):
         model = ModelConfig(
             id='mtp',
@@ -173,6 +219,74 @@ class BenchmarkStrategyTests(unittest.TestCase):
         self.assertEqual(metrics['draft_tokens'], 120)
         self.assertEqual(metrics['accepted_tokens'], 90)
         self.assertEqual(metrics['accept_rate'], 0.75)
+
+    def test_blocked_mtp_fast_and_smart_benchmarks_do_not_run_generic_fallback(self):
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        for runner in (benchmark_fast_profiles, benchmark_best_optimization):
+            with self.subTest(runner=runner.__name__), tempfile.TemporaryDirectory() as tmp:
+                app = AppConfig(
+                    Path(tmp) / 'models.json',
+                    runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+                )
+                model = ModelConfig(
+                    id='generic',
+                    name='Generic Model',
+                    path='/models/generic.gguf',
+                    alias='generic',
+                    port=18080,
+                )
+                progress = []
+                with patch.object(app, 'hardware_profile', return_value=HardwareProfile(gpu_memory_total=8 * 1024 ** 3, gpu_memory_free=6 * 1024 ** 3)), \
+                     patch.object(app, 'engine_capabilities', return_value=caps), \
+                     patch('llama_tui.benchmark.benchmark_preflight_cleanup', return_value=(True, 'ok')), \
+                     patch('llama_tui.benchmark.active_engine_runtime_profiles') as planner:
+                    ok, msg = runner(app, model, progress=progress.append)
+
+                self.assertFalse(ok)
+                self.assertIn('Benchmark strategy blocked: mtp_acceptance_matrix', msg)
+                planner.assert_not_called()
+                progress_text = '\n'.join(str(item) for item in progress)
+                self.assertIn('Detected features:', progress_text)
+                self.assertIn('Detection sources:', progress_text)
+                self.assertIn('Benchmark strategy blocked: mtp_acceptance_matrix', progress_text)
+                self.assertIn('supports_mtp=yes', progress_text)
+
+    def test_blocked_mtp_full_suite_does_not_start_generic_full_suite(self):
+        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, supports_spec_draft_n_max=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='generic',
+                name='Generic Model',
+                path='/models/generic.gguf',
+                alias='generic',
+                port=18080,
+            )
+            progress = []
+
+            def forbidden(*_args, **_kwargs):
+                raise AssertionError('generic full suite runner should not be called')
+
+            with patch.object(app, 'hardware_profile', return_value=HardwareProfile(gpu_memory_total=8 * 1024 ** 3, gpu_memory_free=6 * 1024 ** 3)), \
+                 patch.object(app, 'engine_capabilities', return_value=caps):
+                ok, msg = benchmark_full_suite(
+                    app,
+                    model,
+                    progress=progress.append,
+                    moe_runner=forbidden,
+                    smart_runner=forbidden,
+                    hermes_runner=forbidden,
+                    opencode_runner=forbidden,
+                )
+
+        self.assertFalse(ok)
+        self.assertIn('Benchmark strategy blocked: mtp_acceptance_matrix', msg)
+        progress_text = '\n'.join(str(item) for item in progress)
+        self.assertNotIn('Full Suite Benchmark started', progress_text)
+        self.assertIn('Benchmark strategy blocked: mtp_acceptance_matrix', progress_text)
 
 
 if __name__ == '__main__':

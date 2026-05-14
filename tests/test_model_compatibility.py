@@ -15,6 +15,7 @@ from llama_tui.engines import (
 )
 from llama_tui.model_compat import detect_model_runtime_features, engine_shows_model, engine_supports_model
 from llama_tui.models import ModelConfig
+from llama_tui.provenance import parse_hf_cache_provenance
 from llama_tui.runtime_profiles import EngineCapabilities, make_runtime_profile
 from llama_tui.ui import browser_models
 
@@ -93,6 +94,31 @@ class ModelCompatibilityTests(unittest.TestCase):
         self.assertIn('mtp_native', detect_model_runtime_features(explicit))
         self.assertIn('mtp_native', detect_model_runtime_features(hinted))
         self.assertNotIn('mtp_native', detect_model_runtime_features(unrelated))
+
+    def test_parse_hf_cache_provenance_is_generic(self):
+        provenance = parse_hf_cache_provenance(Path('/cache/hub/models--some-owner--some-model-MTP-GGUF/snapshots/abc123/Generic.gguf'))
+
+        self.assertEqual(provenance['repo_folder'], 'models--some-owner--some-model-MTP-GGUF')
+        self.assertEqual(provenance['repo_id'], 'some-owner/some-model-MTP-GGUF')
+        self.assertEqual(provenance['snapshot'], 'abc123')
+
+    def test_detects_mtp_from_hf_cache_repo_folder_even_if_file_name_lacks_mtp(self):
+        candidate = model(
+            'generic',
+            '/cache/hub/models--some-owner--some-model-MTP-GGUF/snapshots/abc123/Generic-UD-Q3_K_XL.gguf',
+            name='Generic UD Q3 K XL',
+        )
+
+        self.assertIn('mtp_native', detect_model_runtime_features(candidate))
+
+    def test_detects_tq3_from_hf_cache_repo_folder_even_if_display_name_is_generic(self):
+        candidate = model(
+            'generic-tq3',
+            '/cache/hub/models--some-owner--some-model-TQ3_4S-GGUF/snapshots/abc123/Generic.gguf',
+            name='Generic Model',
+        )
+
+        self.assertIn('tq3_native', detect_model_runtime_features(candidate))
 
     def test_normal_gguf_is_uncertain_for_specialized_engines(self):
         normal = model('normal', '/models/llama-q4_k_m.gguf')
@@ -208,14 +234,22 @@ class ModelCompatibilityTests(unittest.TestCase):
 
                 discovered, _notes = app.discover_source_files()
                 self.assertEqual(len(discovered), 1)
-                _path, source = next(iter(discovered.values()))
+                _path, source, provenance = next(iter(discovered.values()))
                 self.assertEqual(source, 'huggingface,hf_cache')
+                self.assertEqual(provenance['source_labels'], ['huggingface', 'hf_cache'])
+                self.assertEqual(provenance['source_repo_id'], 'owner/repo')
+                self.assertEqual(provenance['source_snapshot'], 'abc')
 
                 added, _messages = app.detect_models()
                 self.assertEqual(added, 1)
                 self.assertEqual(len(app.models), 1)
                 self.assertEqual(app.models[0].supports_mtp, 'yes')
                 self.assertEqual(app.models[0].source, 'huggingface,hf_cache')
+                self.assertEqual(app.models[0].source_labels, ['huggingface', 'hf_cache'])
+                self.assertEqual(app.models[0].source_repo_id, 'owner/repo')
+                self.assertEqual(app.models[0].source_snapshot, 'abc')
+                self.assertEqual(app.models[0].source_path, str(gguf))
+                self.assertEqual(app.models[0].source_root, str(hf_root))
 
                 added_again, _messages = app.detect_models()
                 self.assertEqual(added_again, 0)

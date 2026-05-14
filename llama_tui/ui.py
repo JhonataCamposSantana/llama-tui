@@ -16,6 +16,7 @@ from .benchmark import (
     apply_moe_recommendation,
     benchmark_all_models_deep,
     benchmark_best_optimization,
+    benchmark_detection_sources_text,
     benchmark_fast_profiles,
     benchmark_full_suite,
     benchmark_moe_placement_tuning,
@@ -44,7 +45,7 @@ from .gguf import architecture_detail, tq3_detail, tq3_short, turboquant_detail,
 from .hermes_benchmark import benchmark_hermes_workflow
 from .hardware import HardwareProfile
 from .models import ModelConfig
-from .mtp import mtp_label, mtp_support_label
+from .mtp import mtp_label, mtp_support_label, normalize_mtp_support
 from .opencode_benchmark import benchmark_opencode_workflow
 from .optimize import apply_best_optimization, model_is_moe, select_best_tier
 from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, wrap_display_lines
@@ -771,6 +772,7 @@ def model_engine_visibility_lines(app: AppConfig, model: ModelConfig) -> List[st
     ) or '-'
     lines = [
         f'detected features: {features}',
+        f'detection sources: {benchmark_detection_sources_text(model)}',
         f'compatible engines: {compatible}',
         f'hidden from: {hidden_text}',
     ]
@@ -3079,6 +3081,7 @@ def model_form_fields(initial: ModelConfig) -> List[Dict[str, str]]:
         form_field('flash_attn', 'flash_attn', str(initial.flash_attn).lower(), 'true/false'),
         form_field('jinja', 'jinja', str(initial.jinja).lower(), 'true/false'),
         form_field('favorite', 'favorite', str(getattr(initial, 'favorite', False)).lower(), 'true/false'),
+        form_field('supports_mtp', 'supports_mtp', normalize_mtp_support(getattr(initial, 'supports_mtp', 'auto')), 'auto/yes/no'),
         form_field('tags', 'tags', ', '.join(list(getattr(initial, 'tags', []) or [])), 'comma-separated: coding/autocomplete/long-context/fast-chat/custom'),
         form_field('extra_args', 'extra_args', ' '.join(initial.extra_args), 'space-separated extra runtime flags'),
     ]
@@ -3171,7 +3174,13 @@ def parse_model_form_answers(answers: Dict[str, str], initial: Optional[ModelCon
         flash_attn=parse_bool_text(cleaned['flash_attn'], 'flash_attn'),
         jinja=parse_bool_text(cleaned['jinja'], 'jinja'),
         favorite=parse_bool_text(cleaned['favorite'], 'favorite'),
+        supports_mtp=normalize_mtp_support(cleaned.get('supports_mtp', 'auto')),
         source=getattr(initial, 'source', 'manual'),
+        source_path=str(getattr(initial, 'source_path', '') or ''),
+        source_root=str(getattr(initial, 'source_root', '') or ''),
+        source_repo_id=str(getattr(initial, 'source_repo_id', '') or ''),
+        source_snapshot=str(getattr(initial, 'source_snapshot', '') or ''),
+        source_labels=list(getattr(initial, 'source_labels', []) or []),
         last_used_at=str(getattr(initial, 'last_used_at', '') or ''),
         sort_rank=int(getattr(initial, 'sort_rank', 0) or 0),
         tags=[item.strip() for item in cleaned.get('tags', '').split(',') if item.strip()],

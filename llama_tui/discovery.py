@@ -16,6 +16,7 @@ from .gguf import (
 )
 from .model_compat import detect_model_runtime_features
 from .models import ModelConfig
+from .provenance import model_source_provenance
 
 GENERIC_DISCOVERY_CTX = 2048
 GENERIC_DISCOVERY_CTX_MAX = 131072
@@ -107,7 +108,7 @@ def classify_model_type(model: ModelConfig) -> str:
     if (getattr(model, 'architecture_type', '') or '').strip().lower() in ('dense', 'moe'):
         return architecture_label(model)
     return architecture_label(apply_architecture_info(ModelConfig(**asdict(model)), detect_architecture_info(model)))
-def detected_model_from_path(path: Path, existing_models: List[ModelConfig], source: str = 'manual') -> ModelConfig:
+def detected_model_from_path(path: Path, existing_models: List[ModelConfig], source: str = 'manual', source_root: Path | None = None) -> ModelConfig:
     stem = path.stem
     name = pretty_name_from_filename(stem)
     base_id = slugify(name)
@@ -118,6 +119,7 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
         model_id = f'{base_id}_{i}'
         i += 1
     ctx_max = gguf_context_max(path)
+    provenance = model_source_provenance(path, source, source_root)
     model = ModelConfig(
         id=model_id,
         name=name,
@@ -140,6 +142,11 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
         memory_reserve_percent=GENERIC_DISCOVERY_MEMORY_RESERVE,
         default_benchmark_status='pending',
         source=source,
+        source_path=str(provenance.get('source_path', '') or ''),
+        source_root=str(provenance.get('source_root', '') or ''),
+        source_repo_id=str(provenance.get('source_repo_id', '') or ''),
+        source_snapshot=str(provenance.get('source_snapshot', '') or ''),
+        source_labels=list(provenance.get('source_labels', []) or []),
         extra_args=[],
     )
     apply_architecture_info(model, detect_architecture_info(model))

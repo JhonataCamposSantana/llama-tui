@@ -59,6 +59,11 @@ class ModelConfig:
     enabled: bool = True
     runtime: str = 'llama.cpp'
     source: str = 'manual'
+    source_path: str = ''
+    source_root: str = ''
+    source_repo_id: str = ''
+    source_snapshot: str = ''
+    source_labels: List[str] = field(default_factory=list)
     architecture: str = ''
     architecture_type: str = 'unknown'
     model_family: str = ''

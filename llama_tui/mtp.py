@@ -4,7 +4,7 @@ from typing import Iterable, Tuple
 
 MTP_SUPPORT_VALUES = ('auto', 'yes', 'no')
 MTP_DRAFT_VALUES = (1, 2, 3)
-MTP_AUTO_HINTS = ('gguf-mtp', 'native-mtp', 'mtp')
+MTP_AUTO_HINTS = ('gguf-mtp', 'native-mtp', 'mtp', 'nextn', 'next-n', 'next_n')
 
 
 def normalize_mtp_support(value: object) -> str:

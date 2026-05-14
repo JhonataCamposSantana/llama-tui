@@ -81,6 +81,11 @@ from .model_compat import (
     engine_shows_model,
     engine_supports_model,
 )
+from .provenance import (
+    model_source_provenance,
+    normalize_source_labels,
+    source_labels_text,
+)
 from .mtp import (
     clamp_mtp_draft,
     model_has_mmproj_config,
@@ -435,7 +440,8 @@ class AppConfig:
                 roots_changed = True
             inferred = self.infer_model_source(m)
             if m.source != inferred:
-                m.source = inferred
+                m.source = self.merge_source_labels(m.source, inferred)
+                m.source_labels = normalize_source_labels(getattr(m, 'source_labels', []), inferred)
                 roots_changed = True
             if not getattr(m, 'benchmark_fingerprint', '') and float(getattr(m, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0:
                 m.benchmark_fingerprint = self.model_fingerprint(m)
@@ -621,6 +627,12 @@ class AppConfig:
         payload['no_context_shift'] = bool(payload.get('no_context_shift', False))
         preserve_thinking = str(payload.get('preserve_thinking', 'auto') or 'auto').strip().lower()
         payload['preserve_thinking'] = preserve_thinking if preserve_thinking in ('auto', 'on', 'off') else 'auto'
+        payload['source'] = source_labels_text(payload.get('source', 'manual'))
+        payload['source_path'] = str(payload.get('source_path', '') or '')
+        payload['source_root'] = str(payload.get('source_root', '') or '')
+        payload['source_repo_id'] = str(payload.get('source_repo_id', '') or '')
+        payload['source_snapshot'] = str(payload.get('source_snapshot', '') or '')
+        payload['source_labels'] = normalize_source_labels(payload.get('source_labels', []), payload['source'])
         payload['architecture'] = str(payload.get('architecture', '') or '')
         payload['architecture_type'] = str(payload.get('architecture_type', 'unknown') or 'unknown').strip().lower()
         if payload['architecture_type'] not in ('dense', 'moe', 'unknown'):
@@ -2269,10 +2281,9 @@ class AppConfig:
             return 'manual'
         known_sources = {'manual', 'huggingface', 'hf_cache', 'llama_cache', 'llmfit', 'llm-models', 'lm-studio'}
         existing = getattr(model, 'source', '') or ''
-        existing_labels = {label.strip() for label in existing.split(',') if label.strip()}
-        if existing_labels & known_sources:
-            if existing and 'manual' not in existing_labels:
-                return existing
+        existing_labels = normalize_source_labels(existing, getattr(model, 'source_labels', []))
+        if any(label in (known_sources - {'manual'}) for label in existing_labels):
+            return source_labels_text(existing_labels)
         p = self.normalize_model_path(model.path)
         for source, root in self.managed_source_roots():
             try:
@@ -2283,16 +2294,30 @@ class AppConfig:
         return 'manual'
 
     def merge_source_labels(self, *sources: str) -> str:
-        labels: List[str] = []
-        for source in sources:
-            for label in str(source or '').split(','):
-                clean = label.strip()
-                if clean and clean not in labels:
-                    labels.append(clean)
-        return ','.join(labels) if labels else 'manual'
+        return source_labels_text(*sources)
 
-    def discover_source_files(self) -> Tuple[Dict[str, Tuple[Path, str]], List[str]]:
-        discovered: Dict[str, Tuple[Path, str]] = {}
+    def _apply_model_provenance(self, model: ModelConfig, provenance: Dict[str, object], source: str = '') -> bool:
+        before = asdict(model)
+        labels = normalize_source_labels(
+            getattr(model, 'source_labels', []),
+            getattr(model, 'source', ''),
+            provenance.get('source_labels', []),
+            source,
+        )
+        model.source = source_labels_text(labels)
+        model.source_labels = labels
+        for key in ('source_path', 'source_root'):
+            value = str(provenance.get(key, '') or '')
+            if value and not str(getattr(model, key, '') or ''):
+                setattr(model, key, value)
+        for key in ('source_repo_id', 'source_snapshot'):
+            value = str(provenance.get(key, '') or '')
+            if value and str(getattr(model, key, '') or '') != value:
+                setattr(model, key, value)
+        return asdict(model) != before
+
+    def discover_source_files(self) -> Tuple[Dict[str, Tuple[Path, str, Dict[str, object]]], List[str]]:
+        discovered: Dict[str, Tuple[Path, str, Dict[str, object]]] = {}
         notes: List[str] = []
 
         for source, root in self.managed_source_roots():
@@ -2309,11 +2334,19 @@ class AppConfig:
                 if not is_real_model_file(gguf):
                     continue
                 resolved = str(gguf.resolve(strict=False))
+                provenance = model_source_provenance(gguf, source, root)
                 if resolved in discovered:
-                    previous_path, previous_source = discovered[resolved]
-                    discovered[resolved] = (previous_path, self.merge_source_labels(previous_source, source))
+                    previous_path, previous_source, previous_provenance = discovered[resolved]
+                    labels = normalize_source_labels(previous_provenance.get('source_labels', []), previous_source, source)
+                    merged_source = source_labels_text(labels)
+                    merged_provenance = dict(previous_provenance)
+                    merged_provenance['source_labels'] = labels
+                    for key in ('source_path', 'source_root', 'source_repo_id', 'source_snapshot'):
+                        if not merged_provenance.get(key) and provenance.get(key):
+                            merged_provenance[key] = provenance[key]
+                    discovered[resolved] = (previous_path, merged_source, merged_provenance)
                 else:
-                    discovered[resolved] = (gguf, source)
+                    discovered[resolved] = (gguf, source, provenance)
 
         return discovered, notes
 
@@ -2977,6 +3010,9 @@ class AppConfig:
         self._shutdown_cleanup_done = True
 
     def add_or_update(self, model: ModelConfig, sync_exports: bool = False):
+        if not getattr(model, 'source_labels', []):
+            model.source_labels = normalize_source_labels(getattr(model, 'source', 'manual') or 'manual')
+        model.source = source_labels_text(getattr(model, 'source', 'manual'), getattr(model, 'source_labels', []))
         self.enrich_model_architecture(model)
         self.enrich_model_turboquant(model)
         self.enrich_model_tq3(model)
@@ -3025,7 +3061,8 @@ class AppConfig:
         for model in list(self.models):
             source = self.infer_model_source(model)
             if model.source != source:
-                model.source = source
+                model.source = self.merge_source_labels(model.source, source)
+                model.source_labels = normalize_source_labels(getattr(model, 'source_labels', []), source)
                 changed = True
             normalized = str(self.normalize_model_path(model.path))
             path_exists = Path(model.path).expanduser().exists()
@@ -3060,12 +3097,10 @@ class AppConfig:
         added = []
         changed = False
 
-        for resolved, (gguf, source) in discovered.items():
+        for resolved, (gguf, source, provenance) in discovered.items():
             if resolved in existing_paths:
                 model = existing_paths[resolved]
-                merged_source = self.merge_source_labels(model.source, source)
-                if model.source != merged_source:
-                    model.source = merged_source
+                if self._apply_model_provenance(model, provenance, source):
                     changed = True
                 if self.enrich_model_architecture(model):
                     changed = True
@@ -3077,7 +3112,9 @@ class AppConfig:
                     changed = True
                 continue
 
-            model = detected_model_from_path(gguf, self.models, source=source)
+            source_root = Path(str(provenance.get('source_root', '') or '')) if provenance.get('source_root') else None
+            model = detected_model_from_path(gguf, self.models, source=source, source_root=source_root)
+            self._apply_model_provenance(model, provenance, source)
             self.add_or_update(model, sync_exports=False)
             existing_paths[resolved] = model
             added.append(model.id)

@@ -15,6 +15,7 @@ from .engines import (
 from .gguf import read_gguf_metadata
 from .models import ModelConfig
 from .mtp import model_has_mmproj_config, mtp_support_auto_hint, normalize_mtp_support
+from .provenance import parse_hf_cache_provenance
 from .runtime_profiles import EngineCapabilities
 
 
@@ -28,7 +29,8 @@ class ModelEngineCompatibility:
 
 
 TQ3_TEXT_RE = re.compile(r'(?i)(?:^|[^a-z0-9])tq3(?:[-_]?(?:1s|4s|native))?(?:[^a-z0-9]|$)')
-MTP_TEXT_RE = re.compile(r'(?i)(?:^|[^a-z0-9])(?:gguf[-_]?mtp|native[-_]?mtp|mtp)(?:[^a-z0-9]|$)')
+MTP_TEXT_RE = re.compile(r'(?i)(?:^|[^a-z0-9])(?:gguf[-_]?mtp|native[-_]?mtp|mtp|nextn|next[-_]?n)(?:[^a-z0-9]|$)')
+TURBOQUANT_TEXT_RE = re.compile(r'(?i)(?:^|[^a-z0-9])(?:turboquant|tq4(?:[-_]?(?:1s|native))?)(?:[^a-z0-9]|$)')
 QUANT_TEXT_RE = re.compile(
     r'(?i)(?:^|[^a-z0-9])(?:q[2-8](?:_[a-z0-9]+)*|iq[1-4](?:_[a-z0-9]+)*|f16|bf16|f32|tq3(?:_[14]s)?)(?:[^a-z0-9]|$)'
 )
@@ -69,6 +71,7 @@ def _metadata_text(path: Path) -> str:
 
 def _model_text(model: ModelConfig) -> str:
     path = _path_for_model(model)
+    provenance = parse_hf_cache_provenance(path)
     return ' '.join(
         str(item or '')
         for item in (
@@ -78,6 +81,14 @@ def _model_text(model: ModelConfig) -> str:
             getattr(model, 'path', ''),
             path.name,
             getattr(model, 'source', ''),
+            getattr(model, 'source_path', ''),
+            getattr(model, 'source_root', ''),
+            getattr(model, 'source_repo_id', ''),
+            getattr(model, 'source_snapshot', ''),
+            ' '.join(getattr(model, 'source_labels', []) or []),
+            provenance.get('repo_folder', ''),
+            provenance.get('repo_id', ''),
+            provenance.get('snapshot', ''),
             getattr(model, 'model_family', ''),
             getattr(model, 'architecture', ''),
             getattr(model, 'tq3_weight_format', ''),
@@ -153,6 +164,7 @@ def detect_model_runtime_features(
     elif tq3_source != 'manual' and (
         'tq3_1s' in combined
         or 'tq3_4s' in combined
+        or TQ3_TEXT_RE.search(combined)
         or TQ3_TEXT_RE.search(filename_text)
     ):
         features.add('tq3_native')
@@ -173,9 +185,10 @@ def detect_model_runtime_features(
         or 'next_n' in combined
     ) and mtp_support != 'no':
         features.add('nextn_native')
+        features.add('mtp_native')
 
     turboquant_status = str(getattr(model, 'turboquant_status', '') or '').strip().lower()
-    if turboquant_status in ('native', 'padded'):
+    if turboquant_status in ('native', 'padded') or TURBOQUANT_TEXT_RE.search(combined):
         features.add('turboquant_weight_native')
 
     try:
