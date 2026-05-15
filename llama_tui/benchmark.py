@@ -3557,6 +3557,38 @@ BENCHMARK_PROMPTS = [
         'server. Include practical steps and keep the answer compact.'
     ),
 ]
+MTP_DECODE_HEAVY_PROMPTS = (
+    (
+        'Write a concise technical checklist for keeping a local language model '
+        'server fast and stable. Use short bullet points.'
+    ),
+    (
+        'Explain how to diagnose a CUDA out-of-memory error in a local inference '
+        'server. Include practical steps and keep the answer compact.'
+    ),
+)
+MTP_PROMPT_HEAVY_CONTEXT = (
+    'You are reviewing a local LLM control-plane benchmark design. The system manages '
+    'llama.cpp-family servers, launch profiles, context limits, GPU offload, KV cache '
+    'settings, model provenance, OpenCode and Hermes readiness, and measured profile '
+    'selection. The benchmark must compare a no-speculative baseline against MTP draft '
+    'settings without confusing startup success with throughput. MTP can improve decode '
+    'speed when draft acceptance is high, but it can regress prompt processing and add '
+    'memory pressure. The optimizer should reject failed launches, empty API responses, '
+    'very low acceptance, and profiles that are slower for prompt-heavy workflows. It '
+    'should keep separate recommendations for fast chat, safe launch, long context, and '
+    'OpenCode readiness. It must not enable MTP for vision/mmproj models, and it should '
+    'explain blocked binary capability states in plain language. '
+) * 6
+MTP_PROMPT_HEAVY_PROMPTS = (
+    MTP_PROMPT_HEAVY_CONTEXT
+    + 'Summarize the benchmark policy as a decision memo with risks, acceptance criteria, '
+    + 'and the recommended next action.',
+)
+MTP_WORKLOAD_OUTPUT_CAPS = {
+    'decode_heavy': {'fast': 128, 'full': 256},
+    'prompt_heavy': {'fast': 96, 'full': 160},
+}
 
 def benchmark_completion(
     model: ModelConfig,
@@ -3619,10 +3651,14 @@ def benchmark_completion_suite(
     cancel_token: Optional[CancelToken] = None,
     launch_profile: Optional[BenchmarkLaunchProfile] = None,
     deadline: Optional[BenchmarkDeadline] = None,
+    prompts: Optional[Sequence[str]] = None,
 ) -> Tuple[bool, Dict]:
     samples = []
     failures = []
-    for prompt in BENCHMARK_PROMPTS:
+    active_prompts = tuple(prompts or BENCHMARK_PROMPTS)
+    if not active_prompts:
+        return False, {'error': 'no benchmark prompts configured'}
+    for prompt in active_prompts:
         check_cancelled(cancel_token)
         ok, bench = benchmark_completion(
             model,
@@ -3644,14 +3680,142 @@ def benchmark_completion_suite(
     elapsed = sum(float(sample['elapsed']) for sample in samples)
     completion_tokens = sum(int(sample['completion_tokens']) for sample in samples)
     prompt_tokens = sum(int(sample['prompt_tokens']) for sample in samples)
+    texts = [str(sample.get('text', '') or '') for sample in samples]
     return True, {
         'elapsed': elapsed,
         'completion_tokens': completion_tokens,
         'prompt_tokens': prompt_tokens,
         'tokens_per_sec': statistics.median(scores),
+        'prompt_tokens_per_sec': prompt_tokens / elapsed if elapsed > 0 else 0.0,
         'sample_tokens_per_sec': scores,
         'sample_count': len(samples),
         'error': '; '.join(failures),
+        'texts': texts,
+    }
+
+
+def mtp_optimizer_workload_specs(depth: str = 'fast') -> Tuple[Dict[str, object], ...]:
+    depth_key = 'fast' if str(depth or '').strip().lower() == 'fast' else 'full'
+    return (
+        {
+            'name': 'decode_heavy',
+            'prompts': MTP_DECODE_HEAVY_PROMPTS,
+            'max_tokens': MTP_WORKLOAD_OUTPUT_CAPS['decode_heavy'][depth_key],
+        },
+        {
+            'name': 'prompt_heavy',
+            'prompts': MTP_PROMPT_HEAVY_PROMPTS,
+            'max_tokens': MTP_WORKLOAD_OUTPUT_CAPS['prompt_heavy'][depth_key],
+        },
+    )
+
+
+def _mtp_workload_profile(
+    launch_profile: BenchmarkLaunchProfile,
+    workload_name: str,
+    max_tokens: int,
+) -> BenchmarkLaunchProfile:
+    output = max(int(getattr(launch_profile, 'output', 0) or 0), int(max_tokens or 1))
+    return replace(
+        launch_profile,
+        name=f'{launch_profile.name}_{workload_name}',
+        output=output,
+        measurement_output=max(1, int(max_tokens or 1)),
+    )
+
+
+def _mtp_workload_result(name: str, bench: Dict[str, object]) -> Dict[str, object]:
+    elapsed = float(bench.get('elapsed', 0.0) or 0.0)
+    prompt_tokens = int(bench.get('prompt_tokens', 0) or 0)
+    completion_tokens = int(bench.get('completion_tokens', 0) or 0)
+    return {
+        'name': name,
+        'elapsed': round(elapsed, 4),
+        'prompt_tokens': prompt_tokens,
+        'completion_tokens': completion_tokens,
+        'tokens_per_sec': round(float(bench.get('tokens_per_sec', 0.0) or 0.0), 4),
+        'prompt_tokens_per_sec': round((prompt_tokens / elapsed) if elapsed > 0 else 0.0, 4),
+        'sample_count': int(bench.get('sample_count', 0) or 0),
+        'sample_tokens_per_sec': list(bench.get('sample_tokens_per_sec', []) or []),
+        'error': str(bench.get('error', '') or ''),
+    }
+
+
+def benchmark_mtp_optimizer_workloads(
+    model: ModelConfig,
+    launch_profile: BenchmarkLaunchProfile,
+    depth: str = 'fast',
+    timeout: int = BENCHMARK_SAMPLE_TIMEOUT,
+    cancel_token: Optional[CancelToken] = None,
+    deadline: Optional[BenchmarkDeadline] = None,
+) -> Tuple[bool, Dict[str, object]]:
+    workloads: Dict[str, Dict[str, object]] = {}
+    total_elapsed = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_samples = 0
+    errors: List[str] = []
+    for spec in mtp_optimizer_workload_specs(depth):
+        name = str(spec['name'])
+        max_tokens = int(spec['max_tokens'])
+        workload_profile = _mtp_workload_profile(launch_profile, name, max_tokens)
+        ok, bench = benchmark_completion_suite(
+            model,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            cancel_token=cancel_token,
+            launch_profile=workload_profile,
+            deadline=deadline,
+            prompts=tuple(spec['prompts']),
+        )
+        if not ok:
+            errors.append(f'{name}: {bench.get("error", "unknown error")}')
+            workloads[name] = {
+                'name': name,
+                'elapsed': 0.0,
+                'prompt_tokens': 0,
+                'completion_tokens': 0,
+                'tokens_per_sec': 0.0,
+                'prompt_tokens_per_sec': 0.0,
+                'sample_count': 0,
+                'sample_tokens_per_sec': [],
+                'error': str(bench.get('error', 'unknown error')),
+            }
+            continue
+        texts = [str(item or '').strip() for item in list(bench.get('texts', []) or [])]
+        if int(bench.get('completion_tokens', 0) or 0) <= 0 or not any(texts):
+            errors.append(f'{name}: empty benchmark output')
+            bench['error'] = 'empty benchmark output'
+        result = _mtp_workload_result(name, bench)
+        workloads[name] = result
+        total_elapsed += float(result['elapsed'])
+        total_prompt_tokens += int(result['prompt_tokens'])
+        total_completion_tokens += int(result['completion_tokens'])
+        total_samples += int(result['sample_count'])
+
+    if errors:
+        return False, {
+            'error': '; '.join(errors),
+            'mtp_workloads': workloads,
+            'elapsed': total_elapsed,
+            'completion_tokens': total_completion_tokens,
+            'prompt_tokens': total_prompt_tokens,
+            'tokens_per_sec': 0.0,
+            'prompt_tokens_per_sec': 0.0,
+            'sample_count': total_samples,
+        }
+
+    decode = workloads.get('decode_heavy', {})
+    prompt_heavy = workloads.get('prompt_heavy', {})
+    return True, {
+        'elapsed': total_elapsed,
+        'completion_tokens': total_completion_tokens,
+        'prompt_tokens': total_prompt_tokens,
+        'tokens_per_sec': float(decode.get('tokens_per_sec', 0.0) or 0.0),
+        'prompt_tokens_per_sec': float(prompt_heavy.get('prompt_tokens_per_sec', 0.0) or 0.0),
+        'sample_count': total_samples,
+        'error': '',
+        'mtp_workloads': workloads,
     }
 def benchmark_candidate_models(model: ModelConfig, profile: HardwareProfile) -> List[Tuple[str, str, ModelConfig, str]]:
     selected_tier = select_best_tier(model, profile)
@@ -6258,14 +6422,24 @@ def benchmark_adaptive_candidate(
                 runtime_context,
             ), None
         bench_timeout = deadline.cap_timeout(BENCHMARK_SAMPLE_TIMEOUT) if deadline is not None else BENCHMARK_SAMPLE_TIMEOUT
-        bench_ok, bench = benchmark_completion_suite(
-            candidate,
-            max_tokens=max(1, launch_profile.measurement_output),
-            timeout=bench_timeout,
-            cancel_token=cancel_token,
-            launch_profile=launch_profile,
-            deadline=deadline,
-        )
+        if benchmark_purpose == 'mtp_acceptance':
+            bench_ok, bench = benchmark_mtp_optimizer_workloads(
+                candidate,
+                launch_profile,
+                depth=benchmark_depth,
+                timeout=bench_timeout,
+                cancel_token=cancel_token,
+                deadline=deadline,
+            )
+        else:
+            bench_ok, bench = benchmark_completion_suite(
+                candidate,
+                max_tokens=max(1, launch_profile.measurement_output),
+                timeout=bench_timeout,
+                cancel_token=cancel_token,
+                launch_profile=launch_profile,
+                deadline=deadline,
+            )
         if not bench_ok:
             process_snapshots['after_generation'] = current_process_pressure_payload()
             detail = guardrail_state.stop_decision.reason if guardrail_state.stop_decision is not None else str(bench.get('error', 'unknown error'))
@@ -6284,6 +6458,10 @@ def benchmark_adaptive_candidate(
                 apply_memory_guardrail_record(record, guardrail_state.stop_decision, guardrail_state)
             else:
                 apply_failure_context(record, str(bench.get('error', 'unknown error')), default_category='API_TIMEOUT')
+            if isinstance(bench.get('mtp_workloads'), dict):
+                record['mtp_workloads'] = dict(bench.get('mtp_workloads') or {})
+                record['mtp_workload_names'] = sorted(record['mtp_workloads'])
+                record['mtp_workload_count'] = len(record['mtp_workloads'])
             enrich_fit_discovery_metadata(record, app, candidate, runtime_profile, success=False)
             enrich_mtp_acceptance_metrics(record)
             return record, None
@@ -6291,7 +6469,9 @@ def benchmark_adaptive_candidate(
         process_snapshots['after_generation'] = current_process_pressure_payload()
         score = float(bench.get('tokens_per_sec', 0.0) or 0.0)
         elapsed = float(bench.get('elapsed', 0.0) or 0.0)
-        prompt_tps = (int(bench.get('prompt_tokens', 0) or 0) / elapsed) if elapsed > 0 else 0.0
+        prompt_tps = float(bench.get('prompt_tokens_per_sec', 0.0) or 0.0)
+        if prompt_tps <= 0.0:
+            prompt_tps = (int(bench.get('prompt_tokens', 0) or 0) / elapsed) if elapsed > 0 else 0.0
         min_free = min(
             value for value in (
                 int(getattr(before_hw, 'gpu_memory_free', 0) or 0),
@@ -6321,6 +6501,10 @@ def benchmark_adaptive_candidate(
             process_snapshots=process_snapshots,
             **runtime_context,
         )
+        if isinstance(bench.get('mtp_workloads'), dict):
+            record['mtp_workloads'] = dict(bench.get('mtp_workloads') or {})
+            record['mtp_workload_names'] = sorted(record['mtp_workloads'])
+            record['mtp_workload_count'] = len(record['mtp_workloads'])
         apply_memory_guardrail_record(record, state=guardrail_state)
         enrich_fit_discovery_metadata(record, app, candidate, runtime_profile, success=True)
         enrich_mtp_acceptance_metrics(record)
@@ -8736,6 +8920,7 @@ def best_mtp_acceptance_record(records: Sequence[Dict[str, object]]) -> Dict[str
         for item in records
         if str(item.get('status', '') or '') == 'ok'
         and bool(item.get('mtp_enabled'))
+        and str(item.get('mtp_risk_level', '') or 'usable') != 'failed'
     ]
     if not candidates:
         return {}
@@ -8747,6 +8932,162 @@ def best_mtp_acceptance_record(records: Sequence[Dict[str, object]]) -> Dict[str
             int(item.get('mtp_draft_n_max', 0) or 0),
         ),
     )
+
+
+def _record_float(record: Dict[str, object], key: str) -> float:
+    try:
+        return float(record.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_int(record: Dict[str, object], key: str) -> int:
+    try:
+        return int(record.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mtp_baseline_record(records: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    for item in records:
+        if bool(item.get('mtp_enabled')):
+            continue
+        if str(item.get('benchmark_phase', '') or '') == 'baseline_no_mtp':
+            return dict(item)
+    return {}
+
+
+def _mtp_acceptance_missing(record: Dict[str, object]) -> bool:
+    source = str(record.get('mtp_acceptance_source', '') or '').strip().lower()
+    return source == 'not_reported' and _record_float(record, 'accept_rate') <= 0.0
+
+
+def _mtp_candidate_risk(record: Dict[str, object], baseline: Dict[str, object]) -> Tuple[str, str]:
+    if str(record.get('status', '') or '') != 'ok':
+        return 'failed', str(record.get('failure_reason') or record.get('detail') or 'candidate did not complete')
+    if not bool(record.get('mtp_enabled')):
+        return 'baseline', 'no-MTP baseline'
+    if _mtp_acceptance_missing(record):
+        return 'risky', 'acceptance rate was not reported by the runtime log'
+    accept_rate = _record_float(record, 'accept_rate')
+    if accept_rate < 0.60:
+        return 'failed', f'accept_rate {accept_rate:.0%} is below 60%'
+    if accept_rate < 0.70:
+        return 'risky', f'accept_rate {accept_rate:.0%} is below 70%'
+    prefill_cost = _record_float(record, 'prefill_cost_vs_baseline')
+    if prefill_cost > 0.50:
+        return 'failed', f'prefill cost {prefill_cost:.0%} is above 50%'
+    decode_gain = _record_float(record, 'decode_gain_vs_baseline')
+    baseline_available = bool(baseline and str(baseline.get('status', '') or '') == 'ok')
+    if accept_rate >= 0.80 and baseline_available and decode_gain >= 1.50:
+        return 'excellent', f'accept_rate {accept_rate:.0%}, decode gain {decode_gain:.2f}x'
+    if accept_rate >= 0.75 and (not baseline_available or decode_gain > 1.0):
+        gain_text = f', decode gain {decode_gain:.2f}x' if baseline_available else ''
+        return 'good', f'accept_rate {accept_rate:.0%}{gain_text}'
+    return 'usable', f'accept_rate {accept_rate:.0%}'
+
+
+def annotate_mtp_optimizer_records(records: Sequence[Dict[str, object]], spec_type: str = '') -> List[Dict[str, object]]:
+    mutable = [dict(item) for item in records]
+    baseline = _mtp_baseline_record(mutable)
+    baseline_ok = bool(baseline and str(baseline.get('status', '') or '') == 'ok')
+    baseline_tps = _record_float(baseline, 'tokens_per_sec') if baseline_ok else 0.0
+    baseline_pp = _record_float(baseline, 'prompt_tokens_per_sec') if baseline_ok else 0.0
+    baseline_seconds = _record_float(baseline, 'seconds') if baseline_ok else 0.0
+    baseline_memory = _record_int(baseline, 'peak_vram_used') if baseline_ok else 0
+    baseline_id = str(baseline.get('benchmark_phase') or 'baseline_no_mtp') if baseline else ''
+    if baseline and str(baseline.get('status', '') or '') == 'skipped_runtime_assert':
+        baseline_id = 'baseline_no_mtp:skipped_runtime_assert'
+
+    for record in mutable:
+        record['kind'] = 'mtp_optimizer'
+        record['mtp_objective'] = 'decode_heavy'
+        record['mtp_spec_type'] = str(record.get('spec_type') or spec_type or '')
+        record['total_wall_seconds'] = _record_float(record, 'seconds')
+        record['loaded_vram_bytes'] = _record_int(record, 'peak_vram_used')
+        record['loaded_ram_bytes'] = _record_int(record, 'peak_ram')
+        record['final_command'] = str(record.get('command') or record.get('effective_server_command') or '')
+        record['baseline_profile_id'] = baseline_id
+        if str(record.get('status', '') or '') == 'ok' and bool(record.get('mtp_enabled')) and baseline_ok:
+            current_tps = _record_float(record, 'tokens_per_sec')
+            current_pp = _record_float(record, 'prompt_tokens_per_sec')
+            current_seconds = _record_float(record, 'seconds')
+            current_memory = _record_int(record, 'peak_vram_used')
+            record['decode_gain_vs_baseline'] = round(current_tps / baseline_tps, 4) if baseline_tps > 0 else 0.0
+            record['prefill_cost_vs_baseline'] = round(max(0.0, (baseline_pp - current_pp) / baseline_pp), 4) if baseline_pp > 0 and current_pp > 0 else 0.0
+            record['total_wall_gain_vs_baseline'] = round(baseline_seconds / current_seconds, 4) if baseline_seconds > 0 and current_seconds > 0 else 0.0
+            record['memory_delta_vs_baseline'] = int(current_memory - baseline_memory)
+        elif str(record.get('benchmark_phase', '') or '') == 'baseline_no_mtp' and str(record.get('status', '') or '') == 'ok':
+            record['decode_gain_vs_baseline'] = 1.0
+            record['prefill_cost_vs_baseline'] = 0.0
+            record['total_wall_gain_vs_baseline'] = 1.0
+            record['memory_delta_vs_baseline'] = 0
+        else:
+            record.setdefault('decode_gain_vs_baseline', 0.0)
+            record.setdefault('prefill_cost_vs_baseline', 0.0)
+            record.setdefault('total_wall_gain_vs_baseline', 0.0)
+            record.setdefault('memory_delta_vs_baseline', 0)
+        risk, reason = _mtp_candidate_risk(record, baseline)
+        record['mtp_risk_level'] = risk
+        record['mtp_recommendation_reason'] = reason
+    return mutable
+
+
+def mtp_optimizer_profile_recommendations(records: Sequence[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    annotated = [dict(item) for item in records]
+    recommendations: Dict[str, Dict[str, object]] = {}
+    baseline = _mtp_baseline_record(annotated)
+    baseline_ok = bool(baseline and str(baseline.get('status', '') or '') == 'ok')
+    if baseline:
+        recommendations['mtp_baseline_no_spec'] = dict(baseline)
+    candidates = [
+        dict(item)
+        for item in annotated
+        if str(item.get('status', '') or '') == 'ok'
+        and bool(item.get('mtp_enabled'))
+        and str(item.get('mtp_risk_level', '') or '') not in ('', 'failed')
+    ]
+    if not candidates:
+        return recommendations
+    risk_rank = {'excellent': 0, 'good': 1, 'usable': 2, 'risky': 3}
+    recommendations['mtp_fast_chat'] = max(
+        candidates,
+        key=lambda item: (
+            str(item.get('mtp_risk_level', '') or '') != 'failed',
+            _record_float(item, 'tokens_per_sec'),
+            _record_float(item, 'accept_rate'),
+        ),
+    )
+    safe_candidates = [
+        item for item in candidates
+        if str(item.get('mtp_risk_level', '') or '') in ('excellent', 'good', 'usable')
+        and (not baseline_ok or _record_float(item, 'prefill_cost_vs_baseline') <= 0.30)
+    ]
+    if safe_candidates:
+        recommendations['mtp_safe'] = min(
+            safe_candidates,
+            key=lambda item: (
+                risk_rank.get(str(item.get('mtp_risk_level', '') or ''), 9),
+                _record_int(item, 'mtp_draft_n_max') if _record_int(item, 'mtp_draft_n_max') > 0 else 99,
+                -_record_float(item, 'accept_rate'),
+            ),
+        )
+        recommendations['mtp_long_context'] = dict(recommendations['mtp_safe'])
+    opencode_candidates = [
+        item for item in safe_candidates
+        if baseline_ok
+        if _record_float(item, 'total_wall_gain_vs_baseline') > 1.0
+        and _record_float(item, 'prefill_cost_vs_baseline') <= 0.30
+    ]
+    if opencode_candidates:
+        recommendations['mtp_opencode_ready'] = max(
+            opencode_candidates,
+            key=lambda item: (
+                _record_float(item, 'total_wall_gain_vs_baseline'),
+                _record_float(item, 'tokens_per_sec'),
+            ),
+        )
+    return recommendations
 
 
 def benchmark_mtp_acceptance_matrix_after_preflight(
@@ -8904,6 +9245,7 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
         emit_benchmark_event(progress, 'benchmark_aborted', model, run_kind, message=msg, phase='aborted', completed=completed, total=completed, records=records)
         return False, msg
 
+    records = annotate_mtp_optimizer_records(records, mtp_spec)
     best = best_mtp_acceptance_record(records)
     baseline_skipped = any(str(item.get('status', '') or '') == 'skipped_runtime_assert' for item in records)
     cli_invalid = any(str(item.get('failure_category', '') or '') == 'CLI_INVALID' for item in records)
@@ -8925,6 +9267,7 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
 
     ended_at = datetime.now().isoformat(timespec='seconds')
     winners = dict(getattr(model, 'measured_profiles', {}) or {})
+    winners.update(mtp_optimizer_profile_recommendations(records))
     if best:
         winners['mtp_acceptance'] = dict(best)
     saved = ModelConfig(**asdict(model))
@@ -8944,6 +9287,7 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
         )
     run = build_benchmark_run(run_id, run_kind, run_status, records, winners, started_at, ended_at, hardware)
     run['benchmark_strategy_id'] = strategy.id
+    run['optimizer'] = 'mtp_optimizer'
     run['mtp_spec_type'] = mtp_spec
     if baseline_skipped:
         run['baseline_no_mtp'] = 'skipped_runtime_assert'
@@ -9741,17 +10085,32 @@ def _model_mtp_acceptance_records(model: ModelConfig) -> List[Dict[str, object]]
     return records
 
 
+def _usable_mtp_acceptance_record_for_model(model: ModelConfig) -> Dict[str, object]:
+    records = annotate_mtp_optimizer_records(_model_mtp_acceptance_records(model))
+    candidates = [
+        dict(item)
+        for item in records
+        if str(item.get('status', '') or '') == 'ok'
+        and bool(item.get('mtp_enabled'))
+        and str(item.get('mtp_risk_level', '') or '') in ('excellent', 'good', 'usable')
+    ]
+    if not candidates:
+        return {}
+    return max(
+        candidates,
+        key=lambda item: (
+            float(item.get('accept_rate', 0.0) or 0.0),
+            float(item.get('tokens_per_sec', 0.0) or 0.0),
+            int(item.get('mtp_draft_n_max', 0) or 0),
+        ),
+    )
+
+
 def _best_mtp_acceptance_draft_for_model(model: ModelConfig) -> int:
-    best = best_mtp_acceptance_record(_model_mtp_acceptance_records(model))
+    best = _usable_mtp_acceptance_record_for_model(model)
     if best:
         return clamp_mtp_draft(best.get('mtp_draft_n_max', 0), default=2)
-    try:
-        saved = int(getattr(model, 'mtp_draft_n_max', 0) or 0)
-    except Exception:
-        saved = 0
-    if saved in MTP_DRAFT_VALUES:
-        return clamp_mtp_draft(saved, default=2)
-    return 2
+    return 0
 
 
 def _moe_tuning_mtp_aware(engine: str, model: ModelConfig, capabilities) -> bool:
@@ -9789,6 +10148,13 @@ def _moe_tuning_mtp_blocked_reason(capabilities) -> str:
     return (
         'MTP-aware MoE placement blocked: selected llama.cpp-mtp binary is missing '
         f'{missing_text}; advertised spec types: {supported}'
+    )
+
+
+def _moe_tuning_mtp_acceptance_required_reason(model: ModelConfig) -> str:
+    return (
+        'MTP-aware MoE placement skipped: no usable MTP acceptance winner is saved. '
+        'Run MTP Optimizer first so MoE tuning can reuse a measured draft_n.'
     )
 
 
@@ -9843,11 +10209,12 @@ def _model_has_nextn_or_recurrent_features(model: ModelConfig) -> bool:
 
 
 def _mtp_aware_moe_tuning_profile(profile: RuntimeProfile, model: ModelConfig, capabilities) -> RuntimeProfile:
+    draft_n = _best_mtp_acceptance_draft_for_model(model)
     return replace(
         profile,
         parallel=1,
         mtp_enabled=True,
-        mtp_draft_n_max=_best_mtp_acceptance_draft_for_model(model),
+        mtp_draft_n_max=draft_n if draft_n in MTP_DRAFT_VALUES else 2,
         no_warmup=bool(getattr(profile, 'no_warmup', False) or getattr(capabilities, 'supports_no_warmup', False)),
         benchmark_strategy_id='mtp_aware_moe_placement',
         benchmark_phase='moe_placement_mtp',
@@ -10384,6 +10751,64 @@ def benchmark_moe_placement_tuning(
             'moe_tuning',
             message=detail,
             phase='blocked_missing_capability',
+            completed=0,
+            total=0,
+            records=[record],
+        )
+        return False, detail
+    if mtp_tuning_enabled and not _usable_mtp_acceptance_record_for_model(model):
+        ended_at = datetime.now().isoformat(timespec='seconds')
+        features = sorted(detect_model_runtime_features(model))
+        spec_type = mtp_spec_type_value(capabilities)
+        reason = _moe_tuning_mtp_acceptance_required_reason(model)
+        detail = (
+            f'{reason} engine={engine}; detected_features={",".join(features) or "none"}; '
+            f'spec_type={spec_type or "-"}; supports_spec_draft_n_max={bool(getattr(capabilities, "supports_spec_draft_n_max", False))}.'
+        )
+        record = adaptive_record_from_candidate(
+            model,
+            'moe_placement',
+            'skipped_missing_baseline',
+            detail=detail,
+            engine=engine,
+            benchmark_purpose='moe_tuning',
+            failure_category='skipped_missing_mtp_acceptance',
+            failure_reason=reason,
+            suggested_fix='Run MTP Optimizer first and retry MoE placement tuning.',
+            spec_type=spec_type,
+        )
+        record['benchmark_kind'] = 'moe_tuning'
+        record['measured_profile_key'] = 'moe_placement'
+        record['detected_features'] = features
+        record['mtp_spec_type'] = spec_type
+        saved = ModelConfig(**asdict(model))
+        saved.last_benchmark_results = [record]
+        saved.default_benchmark_status = 'skipped_missing_baseline'
+        saved.default_benchmark_at = ended_at
+        run = build_benchmark_run(run_id, 'moe_tuning', 'skipped_missing_baseline', [record], {}, started_at, ended_at, profile.short_summary())
+        run['depth'] = depth_key
+        run['warnings'] = [reason]
+        run['summary'] = detail
+        upsert_benchmark_run(saved, run)
+        app.add_or_update(saved)
+        for line in (
+            reason,
+            f'MTP-aware MoE diagnostics: engine={engine} features={",".join(features) or "none"} spec_type={spec_type or "-"} acceptance=missing',
+            'Hint: run MTP Optimizer first so MoE tuning can reuse a measured draft_n.',
+        ):
+            try:
+                append_model_log(app, model, line)
+            except Exception:
+                pass
+            if progress:
+                progress(line)
+        emit_benchmark_event(
+            progress,
+            'benchmark_error',
+            saved,
+            'moe_tuning',
+            message=detail,
+            phase='skipped_missing_baseline',
             completed=0,
             total=0,
             records=[record],

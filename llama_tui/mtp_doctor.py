@@ -1,0 +1,303 @@
+import shlex
+from dataclasses import dataclass
+from typing import Any, Dict, Sequence, Tuple
+
+from .engines import ENGINE_LLAMA_CPP_MTP, resolve_engine_install
+from .model_compat import detect_model_runtime_features, engine_supports_model
+from .mtp import (
+    clamp_mtp_draft,
+    model_has_mmproj_config,
+    model_mtp_allowed,
+    model_mtp_enabled,
+    model_mtp_draft_n_max,
+    normalize_mtp_support,
+)
+from .runtime_profiles import EngineCapabilities, build_mtp_args, detect_engine_capabilities, mtp_spec_type_value
+
+
+@dataclass(frozen=True)
+class MtpStatusSummary:
+    status: str
+    reason: str
+    next_action: str
+    risk_level: str = 'info'
+
+
+@dataclass(frozen=True)
+class MtpLaunchDiagnostics:
+    selected_spec_type: str = ''
+    draft_n_max: int = 0
+    added_flags: Tuple[str, ...] = ()
+    skipped_flags: Tuple[str, ...] = ()
+    command_preview: str = ''
+    includes_spec_type: bool = False
+    includes_spec_draft_n_max: bool = False
+    includes_parallel: bool = False
+    includes_no_warmup: bool = False
+    includes_cache_flags: bool = False
+    warnings: Tuple[str, ...] = ()
+    blocked_reason: str = ''
+
+
+@dataclass(frozen=True)
+class MtpDoctorReport:
+    engine_id: str
+    binary_command: str
+    binary_source: str
+    binary_exists: bool
+    binary_executable: bool
+    binary_resolved_path: str
+    checked_paths: Tuple[str, ...]
+    help_inspected: bool
+    supports_spec_type: bool
+    spec_type_values: Tuple[str, ...]
+    selected_spec_type: str
+    supports_spec_draft_n_max: bool
+    supports_mtp: bool
+    supports_no_warmup: bool
+    supports_parallel: bool
+    supports_cache_flags: bool
+    model_id: str
+    model_name: str
+    model_path: str
+    detected_features: Tuple[str, ...]
+    supports_mtp_setting: str
+    mtp_enabled: bool
+    mtp_draft_n_max: int
+    mmproj_detected: bool
+    model_allowed: bool
+    compatibility_status: str
+    compatibility_reason: str
+    launch_status: str
+    reason: str
+    next_action: str
+    risk_level: str
+    launch: MtpLaunchDiagnostics
+
+
+def _safe_capabilities(command: str) -> EngineCapabilities:
+    try:
+        return detect_engine_capabilities(command, ENGINE_LLAMA_CPP_MTP)
+    except Exception:
+        return EngineCapabilities()
+
+
+def _active_engine(app: Any, model: Any) -> str:
+    try:
+        return str(app.active_engine_key_for_model(model) or '')
+    except Exception:
+        runtime_profile = getattr(app, 'runtime_profile', None)
+        return str(getattr(runtime_profile, 'engine_id', '') or getattr(runtime_profile, 'engine', '') or '')
+
+
+def _command_contains(tokens: Sequence[str], *flags: str) -> bool:
+    lowered = tuple(str(item or '').strip().lower() for item in tokens)
+    for flag in flags:
+        low = str(flag or '').strip().lower()
+        if low in lowered:
+            return True
+        if any(item.startswith(f'{low}=') for item in lowered):
+            return True
+    return False
+
+
+def _build_launch_diagnostics(
+    app: Any,
+    model: Any,
+    runtime_profile: Any,
+    capabilities: EngineCapabilities,
+    blocked_reason: str = '',
+) -> MtpLaunchDiagnostics:
+    warnings = []
+    command_tokens = []
+    command_preview = ''
+    effective_profile = runtime_profile
+    if effective_profile is None:
+        try:
+            effective_profile = app.runtime_profile_from_model(
+                model,
+                int(getattr(model, 'ctx', 0) or 0),
+                int(getattr(model, 'parallel', 1) or 1),
+                int(getattr(model, 'ngl', 0) or 0),
+            )
+        except Exception:
+            effective_profile = None
+    _mtp_args, mtp_arg_diagnostics = build_mtp_args(model, effective_profile, capabilities)
+    try:
+        command_tokens = list(app.build_command(model, runtime_profile=runtime_profile))
+        command_preview = shlex.join(str(item) for item in command_tokens)
+    except Exception as exc:
+        warnings.append(f'command preview unavailable: {str(exc).splitlines()[0]}')
+    warnings.extend(mtp_arg_diagnostics.warnings)
+    selected = mtp_arg_diagnostics.selected_spec_type or mtp_spec_type_value(capabilities)
+    return MtpLaunchDiagnostics(
+        selected_spec_type=selected,
+        draft_n_max=mtp_arg_diagnostics.draft_n_max,
+        added_flags=mtp_arg_diagnostics.added_flags,
+        skipped_flags=mtp_arg_diagnostics.skipped_flags,
+        command_preview=command_preview,
+        includes_spec_type=_command_contains(command_tokens, '--spec-type'),
+        includes_spec_draft_n_max=_command_contains(command_tokens, '--spec-draft-n-max'),
+        includes_parallel=_command_contains(command_tokens, '--parallel', '-np'),
+        includes_no_warmup=_command_contains(command_tokens, '--no-warmup'),
+        includes_cache_flags=_command_contains(command_tokens, '--cache-type-k', '--cache-type-v', '-ctk', '-ctv'),
+        warnings=tuple(warnings),
+        blocked_reason=mtp_arg_diagnostics.blocked_reason or blocked_reason,
+    )
+
+
+def _capability_block_reason(install: Any, capabilities: EngineCapabilities) -> str:
+    if not bool(getattr(install, 'exists', False)):
+        return 'binary not found'
+    if not bool(getattr(install, 'executable', False)):
+        return 'binary not executable'
+    if not str(getattr(capabilities, 'help_text', '') or '').strip():
+        return 'help output unavailable'
+    if not bool(getattr(capabilities, 'supports_spec_type', False)):
+        return 'missing --spec-type'
+    if not mtp_spec_type_value(capabilities):
+        return 'missing mtp/draft-mtp value'
+    if not bool(getattr(capabilities, 'supports_spec_draft_n_max', False)):
+        return 'missing --spec-draft-n-max'
+    return ''
+
+
+def _measured_mtp_status(model: Any) -> Tuple[str, str, str]:
+    profiles: Dict[str, Any] = dict(getattr(model, 'measured_profiles', {}) or {})
+    profile = dict(profiles.get('mtp_acceptance') or {})
+    if not profile:
+        return '', '', ''
+    status = str(profile.get('status', '') or '').strip().lower()
+    if status not in ('ok', 'complete', 'partial'):
+        return 'failed', f'latest MTP acceptance status is {status or "unknown"}', 'Run MTP Optimizer again after fixing the failure.'
+    accept_rate = profile.get('accept_rate', profile.get('acceptance_rate', None))
+    try:
+        acceptance = float(accept_rate)
+    except (TypeError, ValueError):
+        acceptance = -1.0
+    draft = int(profile.get('mtp_draft_n_max', profile.get('draft_n', 0)) or 0)
+    if acceptance >= 0.75:
+        return 'usable', f'MTP acceptance is usable at draft_n={draft or "-"} accept={acceptance:.0%}', 'Use the measured MTP profile or run MTP Optimizer for more workloads.'
+    if acceptance >= 0.0:
+        return 'risky', f'MTP acceptance is low at draft_n={draft or "-"} accept={acceptance:.0%}', 'Keep MTP opt-in and run the MTP Optimizer before saving a profile.'
+    return 'usable', f'MTP acceptance has a usable {status} record', 'Review MTP Optimizer details before promoting the profile.'
+
+
+def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -> MtpDoctorReport:
+    install = resolve_engine_install(app, ENGINE_LLAMA_CPP_MTP)
+    command = str(getattr(install, 'resolved_command', '') or '')
+    capabilities = _safe_capabilities(command)
+    selected_spec = mtp_spec_type_value(capabilities)
+    features = tuple(sorted(detect_model_runtime_features(model)))
+    support_setting = normalize_mtp_support(getattr(model, 'supports_mtp', 'auto'))
+    mtp_enabled = model_mtp_enabled(model, runtime_profile)
+    draft_n = model_mtp_draft_n_max(model, runtime_profile) if mtp_enabled else clamp_mtp_draft(getattr(model, 'mtp_draft_n_max', 3), default=3)
+    mmproj = model_has_mmproj_config(model) or 'mmproj' in features or 'vision' in features
+    model_allowed = (
+        model_mtp_allowed(model)
+        and not mmproj
+        and (support_setting == 'yes' or 'mtp_native' in features or 'nextn_native' in features)
+    )
+    compatibility = engine_supports_model(ENGINE_LLAMA_CPP_MTP, model, capabilities)
+    active_engine = _active_engine(app, model)
+    cap_reason = _capability_block_reason(install, capabilities)
+
+    launch_status = 'ready'
+    reason = 'MTP launch prerequisites are ready.'
+    next_action = 'Run MTP Optimizer before promoting an MTP profile.'
+    risk_level = 'info'
+    if active_engine != ENGINE_LLAMA_CPP_MTP:
+        launch_status = 'off'
+        reason = f'active engine is {active_engine or "unknown"}, not llama.cpp-mtp'
+        next_action = 'Select the llama.cpp-mtp engine to test MTP.'
+        risk_level = 'muted'
+    elif support_setting == 'no':
+        launch_status = 'blocked'
+        reason = 'supports_mtp=no disables MTP for this model.'
+        next_action = 'Set supports_mtp=auto/yes only if this GGUF is MTP-capable.'
+        risk_level = 'block'
+    elif mmproj:
+        launch_status = 'blocked'
+        reason = 'MTP + mmproj/vision is currently unsupported.'
+        next_action = 'Disable MTP or remove the mmproj/vision entry.'
+        risk_level = 'block'
+    elif not model_allowed:
+        launch_status = 'unknown'
+        reason = 'model MTP capability is unknown.'
+        next_action = 'Set supports_mtp=yes only if this GGUF is MTP-capable, or run baseline validation first.'
+        risk_level = 'warn'
+    elif cap_reason:
+        launch_status = 'failed' if cap_reason in ('binary not found', 'binary not executable', 'help output unavailable') else 'blocked'
+        reason = cap_reason
+        next_action = 'Build/select a llama.cpp MTP binary that advertises --spec-type mtp/draft-mtp and --spec-draft-n-max.'
+        risk_level = 'block'
+    elif not mtp_enabled:
+        measured_status, measured_reason, measured_action = _measured_mtp_status(model)
+        if measured_status:
+            launch_status = measured_status
+            reason = measured_reason
+            next_action = measured_action
+            risk_level = 'success' if measured_status == 'usable' else 'warn'
+        else:
+            launch_status = 'ready'
+            reason = 'MTP is available but disabled for the current launch profile.'
+            next_action = 'Run MTP Optimizer or enable mtp_enabled for a measured profile.'
+            risk_level = 'info'
+    else:
+        measured_status, measured_reason, measured_action = _measured_mtp_status(model)
+        if measured_status in ('usable', 'risky'):
+            launch_status = measured_status
+            reason = measured_reason
+            next_action = measured_action
+            risk_level = 'success' if measured_status == 'usable' else 'warn'
+        else:
+            launch_status = 'ready'
+            reason = f'MTP launch enabled with spec_type={selected_spec or "none"} draft_n={draft_n}.'
+            next_action = 'Launch or run MTP Optimizer to measure baseline-vs-MTP behavior.'
+            risk_level = 'info'
+
+    launch = _build_launch_diagnostics(app, model, runtime_profile, capabilities, cap_reason)
+    return MtpDoctorReport(
+        engine_id=ENGINE_LLAMA_CPP_MTP,
+        binary_command=command,
+        binary_source=str(getattr(install, 'source', '') or ''),
+        binary_exists=bool(getattr(install, 'exists', False)),
+        binary_executable=bool(getattr(install, 'executable', False)),
+        binary_resolved_path=str(getattr(install, 'resolved_path', '') or ''),
+        checked_paths=tuple(str(item) for item in (getattr(install, 'checked_paths', []) or [])),
+        help_inspected=bool(str(getattr(capabilities, 'help_text', '') or '').strip()),
+        supports_spec_type=bool(getattr(capabilities, 'supports_spec_type', False)),
+        spec_type_values=tuple(str(item) for item in (getattr(capabilities, 'spec_type_values', ()) or ())),
+        selected_spec_type=selected_spec,
+        supports_spec_draft_n_max=bool(getattr(capabilities, 'supports_spec_draft_n_max', False)),
+        supports_mtp=bool(getattr(capabilities, 'supports_mtp', False)) and bool(selected_spec),
+        supports_no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
+        supports_parallel=bool(getattr(capabilities, 'supports_parallel', False)),
+        supports_cache_flags=bool(getattr(capabilities, 'supports_cache_type_kv', False) or getattr(capabilities, 'supports_ctk_ctv', False)),
+        model_id=str(getattr(model, 'id', '') or ''),
+        model_name=str(getattr(model, 'name', '') or ''),
+        model_path=str(getattr(model, 'path', '') or ''),
+        detected_features=features,
+        supports_mtp_setting=support_setting,
+        mtp_enabled=mtp_enabled,
+        mtp_draft_n_max=draft_n,
+        mmproj_detected=mmproj,
+        model_allowed=model_allowed,
+        compatibility_status=str(getattr(compatibility, 'status', '') or ''),
+        compatibility_reason=str(getattr(compatibility, 'reason', '') or ''),
+        launch_status=launch_status,
+        reason=reason,
+        next_action=next_action,
+        risk_level=risk_level,
+        launch=launch,
+    )
+
+
+def mtp_status_for_model(app: Any, model: Any, runtime_profile: Any = None) -> MtpStatusSummary:
+    report = build_mtp_doctor_report(app, model, runtime_profile=runtime_profile)
+    return MtpStatusSummary(
+        status=report.launch_status,
+        reason=report.reason,
+        next_action=report.next_action,
+        risk_level=report.risk_level,
+    )

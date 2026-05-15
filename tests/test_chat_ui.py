@@ -68,6 +68,7 @@ from llama_tui.ui import (
     machine_ranking_items,
     moe_recommendation_state_text,
     moe_tuning_items,
+    mtp_status_short,
     model_sort_key,
     new_try_live_metrics,
     new_benchmark_run_state,
@@ -256,6 +257,52 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn('port', errors)
         self.assertIn('ctx_max', errors)
         self.assertIn('host', errors)
+
+    def test_parse_model_form_answers_preserves_hidden_mtp_launch_fields(self):
+        initial = ModelConfig(
+            id='mtp',
+            name='MTP',
+            path='native-mtp.gguf',
+            alias='mtp',
+            port=18080,
+            supports_mtp='yes',
+            mtp_enabled=True,
+            mtp_draft_n_max=2,
+        )
+
+        model, errors = parse_model_form_answers({
+            'id': 'mtp',
+            'name': 'MTP',
+            'path': 'native-mtp.gguf',
+            'alias': 'mtp',
+            'runtime': 'llama.cpp',
+            'optimize_mode': 'max_context_safe',
+            'optimize_tier': 'moderate',
+            'port': '18080',
+            'host': '127.0.0.1',
+            'ctx': '8192',
+            'ctx_min': '2048',
+            'ctx_max': '8192',
+            'threads': '4',
+            'ngl': '10',
+            'temp': '0.7',
+            'parallel': '1',
+            'memory_reserve_percent': '25',
+            'cache_ram': '0',
+            'output': '512',
+            'enabled': 'true',
+            'flash_attn': 'true',
+            'jinja': 'true',
+            'favorite': 'false',
+            'supports_mtp': 'yes',
+            'tags': '',
+            'extra_args': '',
+        }, initial=initial)
+
+        self.assertEqual(errors, {})
+        self.assertIsNotNone(model)
+        self.assertTrue(model.mtp_enabled)
+        self.assertEqual(model.mtp_draft_n_max, 2)
 
     def test_parse_settings_form_answers_validates_preferences(self):
         parsed, errors = parse_settings_form_answers({
@@ -737,13 +784,37 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertEqual(summary['ctx'], 16384)
         self.assertEqual(summary['engine'], 'TurboQuant+')
         self.assertEqual(summary['health'], 'OK')
+        self.assertEqual(summary['mtp'], 'off')
         self.assertIn('Code Model', line)
         self.assertIn('OpenCode', line)
         self.assertIn('16384', line)
         self.assertIn('TurboQuant+', line)
         self.assertIn('OK', line)
+        self.assertIn('off', line)
         self.assertIn('MODEL', browser_header_for_view('compact', 100))
+        self.assertIn('MTP', browser_header_for_view('compact', 100))
         self.assertEqual(browser_view_label('advanced'), 'Advanced')
+
+    def test_mtp_short_status_uses_measured_profile_when_engine_is_not_mtp(self):
+        model = ModelConfig(
+            id='mtp',
+            name='MTP Model',
+            path='native-mtp.gguf',
+            alias='mtp',
+            port=18080,
+            measured_profiles={
+                'mtp_acceptance': {
+                    'status': 'ok',
+                    'mtp_risk_level': 'good',
+                }
+            },
+        )
+
+        class FakeApp:
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp'
+
+        self.assertEqual(mtp_status_short(FakeApp(), model), 'usable')
 
     def test_suggested_next_action_guides_moe_and_apply_paths(self):
         class FakeApp:
@@ -1017,6 +1088,8 @@ class ProfileUiTests(unittest.TestCase):
 
     def test_right_tabs_by_view_and_defaults(self):
         self.assertEqual(right_tabs_for_view('detail'), ['overview', 'launch', 'tuning', 'benchmarks', 'logs', 'command', 'exports'])
+        self.assertEqual(right_tabs_for_view('detail', 'simple'), ['overview', 'launch', 'benchmarks', 'logs'])
+        self.assertEqual(right_tabs_for_view('detail', 'advanced'), ['overview', 'launch', 'tuning', 'benchmarks', 'logs', 'command', 'exports'])
         self.assertEqual(right_tabs_for_view('benchmark'), ['progress', 'results', 'commands', 'logs', 'errors'])
         self.assertEqual(right_tabs_for_view('try'), ['profile', 'logs', 'errors', 'stats', 'command'])
         self.assertEqual(right_tabs_for_view('results'), ['run_summary', 'rankings', 'failures'])
@@ -1026,6 +1099,7 @@ class ProfileUiTests(unittest.TestCase):
         self.assertEqual(default_right_tab('benchmark'), 'progress')
         self.assertEqual(default_right_tab('machine_results'), 'overview')
         self.assertEqual(normalize_right_tab('detail', 'missing'), 'overview')
+        self.assertEqual(normalize_right_tab('detail', 'command', 'simple'), 'overview')
 
     def test_right_tab_cycling_and_scroll_keys(self):
         self.assertEqual(cycle_right_tab('benchmark', 'progress', 1), 'results')
@@ -1330,6 +1404,7 @@ class ProfileUiTests(unittest.TestCase):
         self.assertIn('Raw Speed Benchmark...', text)
         self.assertIn('Settings...', text)
         self.assertIn('Config Doctor...', text)
+        self.assertIn('MTP Doctor...', text)
         self.assertIn('Apply MoE Recommendation - run MoE tuning first', text)
         self.assertTrue(all(len(f'[{key}] {label}') <= 68 for key, label, _value in options))
 
@@ -1418,6 +1493,32 @@ class ProfileUiTests(unittest.TestCase):
         self.assertEqual(recommended, 'full_suite')
         self.assertIn('MoE placement has not been measured', reason)
         self.assertIn('Recommended: Full Suite Benchmark', intro)
+
+    def test_benchmark_menu_renames_full_suite_for_mtp_engine(self):
+        class FakeApp:
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp-mtp'
+
+        model = ModelConfig(
+            id='mtp-moe',
+            name='MTP MoE',
+            path='native-mtp.gguf',
+            alias='mtp-moe',
+            port=18080,
+            architecture_type='moe',
+            expert_count=64,
+            supports_mtp='yes',
+        )
+
+        options = benchmark_menu_options(FakeApp(), model)
+        labels = '\n'.join(label for _key, label, _value in options)
+        intro = '\n'.join(benchmark_menu_intro_lines(FakeApp(), model))
+        action = suggested_next_action(FakeApp(), model)
+
+        self.assertIn('MTP Suite - Acceptance + MoE Tuning', labels)
+        self.assertNotIn('Full Suite Benchmark - MoE -> Smart -> Hermes -> OpenCode', labels)
+        self.assertIn('Recommended: MTP Suite', intro)
+        self.assertEqual(action.label, 'Run MTP Suite')
 
     def test_benchmark_menu_disables_moe_for_dense_model(self):
         class FakeApp:
@@ -1556,6 +1657,34 @@ class ProfileUiTests(unittest.TestCase):
         self.assertIn('[A] Apply all recommendations', results_text)
         self.assertIn('[M] Apply MoE only', results_text)
         self.assertIn('[P] Apply profile only', results_text)
+
+    def test_mtp_suite_progress_uses_mtp_stage_labels(self):
+        model = ModelConfig(id='mtp', name='MTP Model', path='mtp.gguf', alias='mtp', port=18080)
+        records = [
+            {'stage': 'preflight', 'status': 'ok', 'detail': 'ready'},
+            {'stage': 'mtp_acceptance', 'status': 'usable', 'detail': 'best draft_n=3'},
+            {'stage': 'moe_placement', 'status': 'done', 'detail': 'winner n_cpu_moe_30'},
+            {'stage': 'summary', 'status': 'partial', 'detail': 'usable partial'},
+        ]
+        state = new_benchmark_run_state(model.id, 'full_suite', 'suite', now=10.0)
+        state.update({'status': 'running', 'phase': 'mtp_acceptance', 'completed': 2, 'total': 4, 'records': records})
+        run = {
+            'id': 'mtp-suite-1',
+            'kind': 'full_suite',
+            'status': 'partial',
+            'records': records,
+            'recommendations': {'mtp_acceptance': {'draft_n': 3}},
+            'summary': 'MTP Full Suite partial',
+        }
+
+        progress_text = '\n'.join(line for line, _attr in build_full_suite_progress_items(model, state, width=80))
+        results_text = '\n'.join(line for line, _attr in full_suite_results_items(model, run, width=80))
+        stage_text = '\n'.join(full_suite_stage_lines(records))
+
+        self.assertIn('MTP Suite', progress_text)
+        self.assertIn('MTP Acceptance', stage_text)
+        self.assertNotIn('Hermes Benchmark', stage_text)
+        self.assertIn('MTP Suite Summary', results_text)
 
 
 class TryLiveStatsTests(unittest.TestCase):

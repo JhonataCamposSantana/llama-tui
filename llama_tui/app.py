@@ -103,6 +103,7 @@ from .runtime_profiles import (
     RuntimeProfile,
     detect_engine_capabilities,
     make_runtime_profile,
+    mtp_spec_type_value,
     runtime_profile_extra_args,
 )
 from .textutil import compact_message, important_log_excerpt
@@ -1215,6 +1216,7 @@ class AppConfig:
         if not (
             getattr(capabilities, 'supports_spec_type', False)
             and getattr(capabilities, 'supports_mtp', False)
+            and mtp_spec_type_value(capabilities)
             and getattr(capabilities, 'supports_spec_draft_n_max', False)
         ):
             return False, self.mtp_binary_warning(model) or 'MTP_FLAGS_NOT_FOUND: selected binary does not expose MTP flags.'

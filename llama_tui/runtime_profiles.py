@@ -442,6 +442,17 @@ class RuntimeProfile:
     benchmark_metric_group: str = ''
 
 
+@dataclass(frozen=True)
+class MtpArgDiagnostics:
+    enabled: bool = False
+    selected_spec_type: str = ''
+    draft_n_max: int = 0
+    added_flags: Tuple[str, ...] = ()
+    skipped_flags: Tuple[str, ...] = ()
+    warnings: Tuple[str, ...] = ()
+    blocked_reason: str = ''
+
+
 def llama_cpp_mtp_server_from_env() -> str:
     return resolve_llama_cpp_mtp_binary().command
 
@@ -935,6 +946,71 @@ def build_flash_attn_args(mode: str, capabilities: EngineCapabilities) -> List[s
     return [flag, normalized]
 
 
+def clamp_mtp_draft_n_max(value: object, default: int = 3) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(1, min(3, parsed))
+
+
+def build_mtp_args(
+    model,
+    runtime_profile: Optional[RuntimeProfile],
+    capabilities: EngineCapabilities,
+) -> Tuple[List[str], MtpArgDiagnostics]:
+    if runtime_profile is None:
+        return [], MtpArgDiagnostics(skipped_flags=('runtime_profile_missing',))
+    engine_id = str(getattr(runtime_profile, 'engine_id', '') or '').strip().lower()
+    if engine_id != 'llama.cpp-mtp':
+        return [], MtpArgDiagnostics(skipped_flags=('engine_not_llama.cpp-mtp',))
+    if not bool(getattr(runtime_profile, 'mtp_enabled', False)):
+        return [], MtpArgDiagnostics(skipped_flags=('mtp_disabled',))
+    if not bool(getattr(capabilities, 'supports_spec_type', False)):
+        return [], MtpArgDiagnostics(
+            enabled=True,
+            skipped_flags=(getattr(capabilities, 'spec_type_flag', '--spec-type') or '--spec-type',),
+            blocked_reason='missing --spec-type',
+        )
+    spec_type = mtp_spec_type_value(capabilities)
+    if not bool(getattr(capabilities, 'supports_mtp', False)) or not spec_type:
+        return [], MtpArgDiagnostics(
+            enabled=True,
+            selected_spec_type=spec_type,
+            skipped_flags=(getattr(capabilities, 'spec_type_flag', '--spec-type') or '--spec-type',),
+            blocked_reason='missing mtp/draft-mtp value',
+        )
+    if not bool(getattr(capabilities, 'supports_spec_draft_n_max', False)):
+        return [], MtpArgDiagnostics(
+            enabled=True,
+            selected_spec_type=spec_type,
+            skipped_flags=(getattr(capabilities, 'spec_draft_n_max_flag', '--spec-draft-n-max') or '--spec-draft-n-max',),
+            blocked_reason='missing --spec-draft-n-max',
+        )
+    try:
+        draft_source = int(getattr(runtime_profile, 'mtp_draft_n_max', 0) or 0)
+    except (TypeError, ValueError):
+        draft_source = 0
+    if draft_source <= 0 and model is not None:
+        try:
+            draft_source = int(getattr(model, 'mtp_draft_n_max', 0) or 0)
+        except (TypeError, ValueError):
+            draft_source = 0
+    draft = clamp_mtp_draft_n_max(draft_source or 3, default=3)
+    args = [
+        getattr(capabilities, 'spec_type_flag', '--spec-type') or '--spec-type',
+        spec_type,
+        getattr(capabilities, 'spec_draft_n_max_flag', '--spec-draft-n-max') or '--spec-draft-n-max',
+        str(draft),
+    ]
+    return args, MtpArgDiagnostics(
+        enabled=True,
+        selected_spec_type=spec_type,
+        draft_n_max=draft,
+        added_flags=tuple(args),
+    )
+
+
 def runtime_profile_extra_args(
     engine: EngineProfile,
     runtime_profile: RuntimeProfile,
@@ -971,12 +1047,8 @@ def runtime_profile_extra_args(
             value = str(override or '').strip()
             if value:
                 args += [capabilities.override_tensor_flag or '-ot', value]
-    if engine.is_llama_cpp_mtp and bool(getattr(runtime_profile, 'mtp_enabled', False)):
-        mtp_spec_type = mtp_spec_type_value(capabilities)
-        if capabilities.supports_mtp and mtp_spec_type:
-            args += [capabilities.spec_type_flag or '--spec-type', mtp_spec_type]
-            if capabilities.supports_spec_draft_n_max:
-                draft = max(1, min(3, int(getattr(runtime_profile, 'mtp_draft_n_max', 0) or 3)))
-                args += [capabilities.spec_draft_n_max_flag or '--spec-draft-n-max', str(draft)]
+    if engine.is_llama_cpp_mtp:
+        mtp_args, _mtp_diagnostics = build_mtp_args(None, runtime_profile, capabilities)
+        args += mtp_args
     args.extend(str(item) for item in profile_extra_args)
     return args

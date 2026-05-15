@@ -515,6 +515,37 @@ class MoeTuningRunnerTests(unittest.TestCase):
         self.assertIn('draft-mtp', msg)
         self.assertTrue(any('MTP-aware MoE diagnostics' in line for line in progress))
 
+    def test_mtp_native_moe_tuning_requires_usable_mtp_acceptance_winner(self):
+        self.configure_mtp_model()
+        self.model.measured_profiles = {}
+        self.model.mtp_draft_n_max = 3
+        self.app.add_or_update(self.model)
+        calls = []
+        progress = []
+
+        def forbidden_runtime(*_args, **_kwargs):
+            calls.append('launched')
+            raise AssertionError('MoE tuning must not launch before MTP Optimizer has a usable winner')
+
+        ok, msg = self.run_tuning(
+            forbidden_runtime,
+            layer_count=41,
+            hardware=small_gpu_hardware(),
+            capabilities=mtp_tuning_caps(),
+            progress=progress.append,
+        )
+
+        saved = self.app.get_model('moe')
+        latest_run = saved.benchmark_runs[0]
+        record = latest_run['records'][0]
+
+        self.assertFalse(ok)
+        self.assertFalse(calls)
+        self.assertEqual(latest_run['status'], 'skipped_missing_baseline')
+        self.assertEqual(record['failure_category'], 'skipped_missing_mtp_acceptance')
+        self.assertIn('Run MTP Optimizer first', msg)
+        self.assertTrue(any('acceptance=missing' in line for line in progress))
+
 
 class ApplyMoeRecommendationTests(unittest.TestCase):
     def test_apply_mutates_only_moe_fields_without_ngl_requirement(self):

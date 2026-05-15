@@ -45,7 +45,8 @@ from .gguf import architecture_detail, tq3_detail, tq3_short, turboquant_detail,
 from .hermes_benchmark import benchmark_hermes_workflow
 from .hardware import HardwareProfile
 from .models import ModelConfig
-from .mtp import mtp_label, mtp_support_label, normalize_mtp_support
+from .mtp import clamp_mtp_draft, mtp_label, mtp_support_label, normalize_mtp_support
+from .mtp_doctor import build_mtp_doctor_report, mtp_status_for_model
 from .opencode_benchmark import benchmark_opencode_workflow
 from .optimize import apply_best_optimization, model_is_moe, select_best_tier
 from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, wrap_display_lines
@@ -118,6 +119,7 @@ RIGHT_TABS = {
     'results': ['run_summary', 'rankings', 'failures'],
     'machine_results': ['overview', 'rankings', 'failures'],
 }
+SIMPLE_DETAIL_TABS = ['overview', 'launch', 'benchmarks', 'logs']
 RIGHT_TAB_LABELS = {
     'summary': 'Summary',
     'logs': 'Logs',
@@ -492,6 +494,7 @@ def build_model_row_summary(app: AppConfig, model: ModelConfig, status: str = 'S
         'engine': format_engine_badge(engine_id),
         'health': health,
         'health_reason': health_reason,
+        'mtp': mtp_status_short(app, model),
     }
 
 
@@ -507,11 +510,11 @@ def compact_browser_model_line(
     left_w: int,
     header: bool = False,
 ) -> str:
-    name_w = max(12, int(left_w or 80) - 54)
+    name_w = max(12, int(left_w or 80) - 62)
     if header:
         return (
             f' {"MODEL":{name_w}} {"STATE":8} {"PICK":11} '
-            f'{"CTX":>7} {"TOK/S":>7} {"ENGINE":11} {"HEALTH":6}'
+            f'{"CTX":>7} {"TOK/S":>7} {"ENGINE":11} {"MTP":7} {"HEALTH":6}'
         )
     assert app is not None and model is not None
     summary = build_model_row_summary(app, model, status)
@@ -530,6 +533,7 @@ def compact_browser_model_line(
         f'{str(summary["pick"])[:11]:11} '
         f'{ctx_text:>7} {tok_text:>7} '
         f'{str(summary["engine"])[:11]:11} '
+        f'{str(summary.get("mtp", "off"))[:7]:7} '
         f'{str(summary["health"])[:6]:6}'
     )
 
@@ -641,6 +645,31 @@ def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
     return f'key={key_mode or "-"} value={value_mode or "-"}'
 
 
+def mtp_status_short(app: Optional[AppConfig], model: ModelConfig) -> str:
+    if app is None:
+        return 'off'
+    measured = dict((getattr(model, 'measured_profiles', {}) or {}).get('mtp_acceptance') or {})
+    try:
+        engine = active_engine_key(app, model)
+    except Exception:
+        engine = ''
+    if engine == 'llama.cpp-mtp':
+        try:
+            return str(mtp_status_for_model(app, model).status or 'unknown')
+        except Exception:
+            return 'unknown'
+    if measured:
+        status = str(measured.get('status', '') or '').strip().lower()
+        risk = str(measured.get('mtp_risk_level', '') or '').strip().lower()
+        if status in ('ok', 'complete', 'partial') and risk in ('excellent', 'good', 'usable'):
+            return 'usable'
+        if status in ('ok', 'complete', 'partial') and risk == 'risky':
+            return 'risky'
+        if status:
+            return 'failed' if status not in ('ok', 'complete', 'partial') else 'testing'
+    return 'off'
+
+
 def runtime_engine_source_line(app: AppConfig, model: ModelConfig) -> str:
     return (
         f'id/model runtime/active engine/source: {model.id} / {display_runtime(model)} / '
@@ -650,7 +679,9 @@ def runtime_engine_source_line(app: AppConfig, model: ModelConfig) -> str:
 
 def active_engine_detail_line(app: AppConfig, model: ModelConfig) -> str:
     binary = active_engine_binary(app, model) or '-'
-    return f'active engine: {active_engine_short(app, model)}  binary: {binary}  kv: {active_engine_kv(app, model)}'
+    engine = active_engine_key(app, model)
+    mode_label = 'mtp' if engine == 'llama.cpp-mtp' else 'kv'
+    return f'active engine: {active_engine_short(app, model)}  binary: {binary}  {mode_label}: {active_engine_kv(app, model)}'
 
 
 def active_engine_badge_line(app: AppConfig, model: Optional[ModelConfig] = None) -> str:
@@ -1027,27 +1058,29 @@ def read_display_file_lines(path: Path) -> List[str]:
         return [f'<failed to read log: {exc}>']
 
 
-def right_tabs_for_view(view_mode: str) -> List[str]:
+def right_tabs_for_view(view_mode: str, detail_density: str = 'advanced') -> List[str]:
+    if view_mode == 'detail' and normalize_choice(detail_density, tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'advanced') == 'simple':
+        return list(SIMPLE_DETAIL_TABS)
     return list(RIGHT_TABS.get(view_mode, []))
 
 
-def default_right_tab(view_mode: str) -> str:
-    tabs = right_tabs_for_view(view_mode)
+def default_right_tab(view_mode: str, detail_density: str = 'advanced') -> str:
+    tabs = right_tabs_for_view(view_mode, detail_density)
     return RIGHT_DEFAULT_TAB.get(view_mode, tabs[0] if tabs else '')
 
 
-def normalize_right_tab(view_mode: str, tab: str) -> str:
-    tabs = right_tabs_for_view(view_mode)
+def normalize_right_tab(view_mode: str, tab: str, detail_density: str = 'advanced') -> str:
+    tabs = right_tabs_for_view(view_mode, detail_density)
     if tab in tabs:
         return tab
-    return default_right_tab(view_mode)
+    return default_right_tab(view_mode, detail_density)
 
 
-def cycle_right_tab(view_mode: str, current_tab: str, direction: int = 1) -> str:
-    tabs = right_tabs_for_view(view_mode)
+def cycle_right_tab(view_mode: str, current_tab: str, direction: int = 1, detail_density: str = 'advanced') -> str:
+    tabs = right_tabs_for_view(view_mode, detail_density)
     if not tabs:
         return ''
-    current = normalize_right_tab(view_mode, current_tab)
+    current = normalize_right_tab(view_mode, current_tab, detail_density)
     try:
         index = tabs.index(current)
     except ValueError:
@@ -1399,6 +1432,12 @@ FULL_SUITE_STAGES = (
     ('hermes', 'Hermes Benchmark'),
     ('opencode', 'OpenCode Benchmark'),
 )
+MTP_SUITE_STAGES = (
+    ('preflight', 'Preflight'),
+    ('mtp_acceptance', 'MTP Acceptance'),
+    ('moe_placement', 'MoE Placement'),
+    ('summary', 'Summary'),
+)
 
 
 def full_suite_stage_map(records: Sequence[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
@@ -1412,13 +1451,17 @@ def full_suite_stage_map(records: Sequence[Dict[str, object]]) -> Dict[str, Dict
     return stages
 
 
+def full_suite_is_mtp(records: Sequence[Dict[str, object]]) -> bool:
+    return any(str(row.get('stage', '') or '') == 'mtp_acceptance' for row in list(records or []) if isinstance(row, dict))
+
+
 def full_suite_status_symbol(status: str, active: bool = False) -> str:
     value = str(status or '').strip().lower()
-    if value in ('ok', 'done', 'passed'):
+    if value in ('ok', 'done', 'passed', 'usable', 'complete', 'partial'):
         return '[x]'
-    if value == 'skipped':
+    if value in ('skipped', 'skipped_runtime_assert', 'skipped_missing_baseline'):
         return '[-]'
-    if value in ('failed', 'aborted'):
+    if value in ('failed', 'aborted', 'blocked', 'blocked_missing_capability', 'failed_terminal'):
         return '[!]'
     if active:
         return '[>]'
@@ -1429,7 +1472,8 @@ def full_suite_stage_lines(records: Sequence[Dict[str, object]], active_phase: s
     stages = full_suite_stage_map(records)
     phase_key = str(active_phase or '').strip().lower().replace(' ', '_')
     lines: List[str] = []
-    for key, label in FULL_SUITE_STAGES:
+    stage_sequence = MTP_SUITE_STAGES if full_suite_is_mtp(records) else FULL_SUITE_STAGES
+    for key, label in stage_sequence:
         row = stages.get(key, {})
         status = str(row.get('status', '') or '')
         active = bool(phase_key and (phase_key == key or key.replace('_', ' ') in str(active_phase or '').lower()))
@@ -1468,15 +1512,17 @@ def build_full_suite_progress_items(
     completed = int(state.get('completed', 0) or 0)
     total = int(state.get('total', 0) or 0)
     phase = str(state.get('phase') or '')
+    records = list(state.get('records', []) or [])
+    title = 'MTP Suite' if full_suite_is_mtp(records) else 'Full Suite Benchmark'
     items: List[Tuple[str, int]] = [
-        ('Full Suite Benchmark', accent_attr),
+        (title, accent_attr),
         (f'model: {model.name or model.id}', normal_attr),
         (f'status: {state.get("status") or "idle"}   elapsed: {benchmark_elapsed_text(state)}', normal_attr),
         (f'progress: {progress_bar_text(completed, total, max(8, width - 18))} {completed}/{total if total else "?"}', accent_attr),
         ('', normal_attr),
         ('Stages', accent_attr),
     ]
-    items.extend((line, normal_attr) for line in full_suite_stage_lines(list(state.get('records', []) or []), active_phase=phase))
+    items.extend((line, normal_attr) for line in full_suite_stage_lines(records, active_phase=phase))
     message = compact_message(str(state.get('message', '') or ''))
     if message:
         items.extend([('', normal_attr), (f'Current: {message}', normal_attr)])
@@ -2042,10 +2088,11 @@ def suggested_next_action(
     except Exception:
         moe_reason = 'not eligible'
     if not moe_reason and not has_moe_recommendation(model):
+        mtp_suite = app is not None and active_engine_key(app, model) == 'llama.cpp-mtp'
         return SuggestedAction(
-            'Run Full Suite Benchmark',
+            'Run MTP Suite' if mtp_suite else 'Run Full Suite Benchmark',
             'B',
-            'This MoE model has not measured expert placement yet.',
+            'This MTP MoE model needs acceptance plus placement tuning.' if mtp_suite else 'This MoE model has not measured expert placement yet.',
             'warning',
         )
 
@@ -2115,6 +2162,7 @@ def overview_items(
         strategy = None
     benchmark = benchmark_freshness_display(app, model) if app is not None else 'Missing'
     moe_state = moe_recommendation_state_text(model) if model_is_moe(model) else 'not MoE'
+    mtp_state = mtp_status_short(app, model) if app is not None else 'off'
     status_text = f'{status}'
     detail_text = compact_message(str(detail or ''))
     if detail_text and status != 'STOPPED':
@@ -2148,6 +2196,7 @@ def overview_items(
         ('Health', heading_attr),
         (f'Benchmark: {benchmark}', success_attr if benchmark == 'Fresh' else warning_attr),
         (f'Health: {health} / {health_reason}', health_attr),
+        (f'MTP: {mtp_state}', success_attr if mtp_state in ('ready', 'usable') else warning_attr if mtp_state in ('unknown', 'risky', 'testing') else error_attr if mtp_state in ('blocked', 'failed') else normal_attr),
         (f'MoE recommendation: {moe_state}', warning_attr if moe_state == 'available, not applied' else normal_attr),
         ('', normal_attr),
         ('Recommendation', heading_attr),
@@ -2292,8 +2341,9 @@ def full_suite_results_items(
     profile_label_text = profile_key or '-'
     applied_moe = moe_recommendation_applied(model) if moe_profile else False
     summary = compact_message(str(run.get('summary', '') or ''))
+    mtp_suite = full_suite_is_mtp(records)
     items: List[Tuple[str, int]] = [
-        ('Full Suite Summary', heading_attr),
+        ('MTP Suite Summary' if mtp_suite else 'Full Suite Summary', heading_attr),
         (f'model: {model.name or model.id}', normal_attr),
         (f'run: {run.get("id", "-")}   status: {status}', success_attr if status == 'done' else warning_attr if status in ('running', 'aborted') else error_attr),
     ]
@@ -3175,6 +3225,8 @@ def parse_model_form_answers(answers: Dict[str, str], initial: Optional[ModelCon
         jinja=parse_bool_text(cleaned['jinja'], 'jinja'),
         favorite=parse_bool_text(cleaned['favorite'], 'favorite'),
         supports_mtp=normalize_mtp_support(cleaned.get('supports_mtp', 'auto')),
+        mtp_enabled=bool(getattr(initial, 'mtp_enabled', False)),
+        mtp_draft_n_max=clamp_mtp_draft(getattr(initial, 'mtp_draft_n_max', 3), default=3),
         source=getattr(initial, 'source', 'manual'),
         source_path=str(getattr(initial, 'source_path', '') or ''),
         source_root=str(getattr(initial, 'source_root', '') or ''),
@@ -3716,6 +3768,127 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
     return items
 
 
+def mtp_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = None) -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = [('MTP Doctor', 'heading')]
+    if active_model is None:
+        items.append(('selected model: none', 'warning'))
+        items.append(('next action: select an MTP-capable GGUF before opening MTP Doctor', 'muted'))
+        return items
+    report = build_mtp_doctor_report(app, active_model)
+
+    def yn(value: bool) -> str:
+        return 'yes' if bool(value) else 'no'
+
+    def kind_for_status(status: str) -> str:
+        normalized = str(status or '').lower()
+        if normalized in ('ready', 'usable', 'preferred', 'compatible'):
+            return 'success'
+        if normalized in ('blocked', 'failed', 'unsupported'):
+            return 'error'
+        if normalized in ('unknown', 'risky', 'compatible_with_warning'):
+            return 'warning'
+        return 'muted'
+
+    values = ', '.join(report.spec_type_values) if report.spec_type_values else 'none'
+    checked = ', '.join(report.checked_paths[:4])
+    if len(report.checked_paths) > 4:
+        checked += ' ...'
+    features = ', '.join(report.detected_features) if report.detected_features else 'none'
+    items.extend([
+        (f'final status: {report.launch_status}', kind_for_status(report.launch_status)),
+        (f'reason: {report.reason}', kind_for_status(report.launch_status)),
+        (f'next action: {report.next_action}', 'normal'),
+        ('', 'normal'),
+        ('Binary', 'heading'),
+        (f'engine id: {report.engine_id}', 'normal'),
+        (f'command: {report.binary_command or "-"}', 'normal'),
+        (f'source: {report.binary_source or "unknown"}', 'normal'),
+        (f'exists: {yn(report.binary_exists)}  executable: {yn(report.binary_executable)}', 'success' if report.binary_exists and report.binary_executable else 'error'),
+        (f'resolved path: {report.binary_resolved_path or "-"}', 'muted'),
+    ])
+    if checked:
+        items.append((f'checked paths: {checked}', 'muted'))
+    items.extend([
+        ('', 'normal'),
+        ('Capabilities', 'heading'),
+        (f'help inspected: {yn(report.help_inspected)}', 'success' if report.help_inspected else 'warning'),
+        (f'--spec-type present: {yn(report.supports_spec_type)}', 'success' if report.supports_spec_type else 'error'),
+        (f'advertised spec values: {values}', 'normal' if report.spec_type_values else 'warning'),
+        (f'selected spec value: {report.selected_spec_type or "none"}', 'success' if report.selected_spec_type else 'error'),
+        (f'--spec-draft-n-max present: {yn(report.supports_spec_draft_n_max)}', 'success' if report.supports_spec_draft_n_max else 'error'),
+        (f'supports MTP: {yn(report.supports_mtp)}', 'success' if report.supports_mtp else 'error'),
+        (f'supports no-warmup: {yn(report.supports_no_warmup)}', 'success' if report.supports_no_warmup else 'muted'),
+        (f'supports parallel: {yn(report.supports_parallel)}', 'success' if report.supports_parallel else 'warning'),
+        (f'supports cache flags: {yn(report.supports_cache_flags)}', 'success' if report.supports_cache_flags else 'muted'),
+        ('', 'normal'),
+        ('Selected Model', 'heading'),
+        (f'model: {report.model_id}  {report.model_name}', 'normal'),
+        (f'path: {report.model_path}', 'muted'),
+        (f'detected features: {features}', 'normal'),
+        (f'supports_mtp: {report.supports_mtp_setting}', 'normal'),
+        (f'mtp_enabled: {yn(report.mtp_enabled)}  mtp_draft_n_max: {report.mtp_draft_n_max}', 'success' if report.mtp_enabled else 'muted'),
+        (f'mmproj/vision detected: {yn(report.mmproj_detected)}', 'error' if report.mmproj_detected else 'success'),
+        (f'model allowed for MTP: {yn(report.model_allowed)}', 'success' if report.model_allowed else 'warning'),
+        (f'compatibility: {report.compatibility_status} - {report.compatibility_reason}', kind_for_status(report.compatibility_status)),
+        ('', 'normal'),
+        ('Final Command Preview', 'heading'),
+        (f'--spec-type included: {yn(report.launch.includes_spec_type)}', 'success' if report.launch.includes_spec_type else 'muted'),
+        (f'--spec-draft-n-max included: {yn(report.launch.includes_spec_draft_n_max)}', 'success' if report.launch.includes_spec_draft_n_max else 'muted'),
+        (f'--parallel/-np included: {yn(report.launch.includes_parallel)}', 'success' if report.launch.includes_parallel else 'warning'),
+        (f'--no-warmup included: {yn(report.launch.includes_no_warmup)}', 'success' if report.launch.includes_no_warmup else 'muted'),
+        (f'cache flags included: {yn(report.launch.includes_cache_flags)}', 'success' if report.launch.includes_cache_flags else 'muted'),
+        (f'command: {report.launch.command_preview or "-"}', 'normal' if report.launch.command_preview else 'warning'),
+    ])
+    for warning in report.launch.warnings:
+        items.append((warning, 'warning'))
+    return items
+
+
+def show_mtp_doctor_overlay(stdscr, colors, app: AppConfig, active_model: Optional[ModelConfig] = None):
+    h, w = stdscr.getmaxyx()
+    box_w = min(112, max(64, w - 8))
+    box_h = min(max(12, h - 6), 26)
+    if h < 12 or w < 66:
+        return
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(2, (h - box_h) // 2)
+    modal = curses.newwin(box_h, box_w, box_y, box_x)
+    modal.keypad(True)
+    content_h = max(1, box_h - 4)
+    rows = mtp_doctor_items(app, active_model=active_model)
+    items = []
+    for text, kind in rows:
+        attr = (
+            colors['accent'] | curses.A_BOLD if kind == 'heading'
+            else colors['success'] | curses.A_BOLD if kind == 'success'
+            else colors['warning'] if kind == 'warning'
+            else colors['error'] | curses.A_BOLD if kind == 'error'
+            else colors['muted'] if kind == 'muted'
+            else curses.A_NORMAL
+        )
+        items.extend((line, attr) for line in wrap_display_item_lines(text, box_w - 4))
+    scroll = 0
+    stdscr.nodelay(False)
+    try:
+        while True:
+            visible, scroll, _older, _newer, _total = scrollable_pane_item_view(items, box_w - 4, content_h, scroll)
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, 'MTP Doctor', colors['accent'] | curses.A_BOLD, colors['accent'])
+            for idx, (line, attr) in enumerate(visible):
+                safe_addstr(modal, 2 + idx, 2, line[: box_w - 4], attr)
+            safe_addstr(modal, box_h - 2, 2, '[PgUp/PgDn] scroll  [Esc/q] close'[: box_w - 4], colors['muted'])
+            modal.refresh()
+            key = modal.getch()
+            if key in (27, ord('q')):
+                return
+            action = RIGHT_PANE_SCROLL_KEYS.get(key, '')
+            if action:
+                scroll = adjust_scroll_offset(scroll, action, len(items), content_h)
+    finally:
+        stdscr.touchwin()
+        stdscr.nodelay(True)
+
+
 def show_config_doctor_overlay(stdscr, colors, app: AppConfig, active_model: Optional[ModelConfig] = None):
     h, w = stdscr.getmaxyx()
     box_w = min(108, max(62, w - 8))
@@ -3864,6 +4037,8 @@ def benchmark_menu_recommendation(app: Optional[AppConfig], model: Optional[Mode
     status = str(getattr(model, 'default_benchmark_status', '') or '').strip().lower()
     moe_disabled = _moe_menu_disabled_reason(app, model)
     if not moe_disabled and not has_moe_recommendation(model):
+        if _active_engine_for_menu(app, model).strip().lower() == 'llama.cpp-mtp':
+            return 'full_suite', 'MTP acceptance and MoE placement have not both been measured'
         return 'full_suite', 'MoE placement has not been measured; the suite can tune it before downstream benchmarks'
     if status in ('failed', 'aborted'):
         return 'smart_benchmark', f'last benchmark status is {status}'
@@ -3916,13 +4091,19 @@ def benchmark_menu_options(
     moe_label = 'MoE Placement Tuning - expert CPU/GPU placement'
     if moe_reason:
         moe_label = f'MoE Placement Tuning - unavailable: {moe_reason}'
+    mtp_suite = model is not None and _active_engine_for_menu(app, model).strip().lower() == 'llama.cpp-mtp'
+    full_suite_label = (
+        'MTP Suite - Acceptance + MoE Tuning'
+        if mtp_suite
+        else 'Full Suite Benchmark - MoE -> Smart -> Hermes -> OpenCode'
+    )
     return [
         ('1', label('quick_benchmark', 'Quick Benchmark - fast sanity check'), 'quick_benchmark'),
         ('2', label('smart_benchmark', 'Smart Benchmark - speed/context profiles'), 'smart_benchmark'),
         ('3', label('moe_tuning_full', moe_label), moe_value),
         ('4', label('hermes_benchmark', 'Hermes Benchmark - workflow validation'), 'hermes_benchmark'),
         ('5', label('opencode_benchmark', 'OpenCode Benchmark - workflow validation'), 'opencode_benchmark'),
-        ('6', label('full_suite', 'Full Suite Benchmark - MoE -> Smart -> Hermes -> OpenCode'), 'full_suite'),
+        ('6', label('full_suite', full_suite_label), 'full_suite'),
         ('q', 'Cancel', 'cancel'),
     ]
 
@@ -3966,6 +4147,7 @@ def command_palette_options(app: Optional[AppConfig] = None, model: Optional[Mod
         ('v', 'Verify selected model', 'verify_selected'),
         ('a', 'Verify all benchmark proof', 'verify_all'),
         ('!', 'Config Doctor...', 'config_doctor'),
+        ('t', 'MTP Doctor...', 'mtp_doctor'),
         ('q', 'Cancel', 'cancel'),
     ]
 
@@ -5280,8 +5462,9 @@ def tui(stdscr, app: AppConfig):
             last_error_message=last_error_message,
         )
         error_text = '\n'.join(error_source_lines)
-        right_tabs = right_tabs_for_view(view_mode)
-        right_active_tab = normalize_right_tab(view_mode, right_tab_by_view.get(view_mode, '')) if right_tabs else ''
+        current_detail_density = normalize_choice(getattr(app.ui, 'detail_density', 'simple'), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+        right_tabs = right_tabs_for_view(view_mode, current_detail_density)
+        right_active_tab = normalize_right_tab(view_mode, right_tab_by_view.get(view_mode, ''), current_detail_density) if right_tabs else ''
         if right_tabs:
             right_tab_by_view[view_mode] = right_active_tab
         right_panel_h = right_total_h
@@ -6110,7 +6293,8 @@ def tui(stdscr, app: AppConfig):
         scroll_action = right_scroll_action_for_view(view_mode, key)
         tab_direction = right_tab_key_direction(key)
         if right_tabs and tab_direction:
-            right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, tab_direction)
+            current_detail_density = normalize_choice(getattr(app.ui, 'detail_density', 'simple'), tuple(key for key, _label in DETAIL_DENSITY_OPTIONS), 'simple')
+            right_tab_by_view[view_mode] = cycle_right_tab(view_mode, right_active_tab, tab_direction, current_detail_density)
             message = f'Right tab: {right_tab_label(right_tab_by_view[view_mode], len(error_source_lines))}.'
             continue
         if key == ord('?'):
@@ -6185,6 +6369,14 @@ def tui(stdscr, app: AppConfig):
             elif action == 'config_doctor':
                 show_config_doctor_overlay(stdscr, colors, app, active_detail_model() or selected_model())
                 message = 'Config Doctor closed.'
+                continue
+            elif action == 'mtp_doctor':
+                model = active_detail_model() or selected_model()
+                if model is None:
+                    message = 'No model selected for MTP Doctor.'
+                    continue
+                show_mtp_doctor_overlay(stdscr, colors, app, model)
+                message = 'MTP Doctor closed.'
                 continue
             elif action == 'raw_speed_benchmark':
                 model = active_detail_model() or selected_model()
