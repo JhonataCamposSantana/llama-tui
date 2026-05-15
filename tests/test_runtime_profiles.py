@@ -838,6 +838,35 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('MTP + mmproj/vision', msg)
 
+    def test_mtp_launch_validation_blocks_detected_vision_feature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='vision',
+                name='Vision Model',
+                path='/models/native-mtp-vision.gguf',
+                alias='vision',
+                port=18080,
+                supports_mtp='yes',
+                mtp_enabled=True,
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp-mtp'),
+                supports_spec_type=True,
+                supports_mtp=True,
+                mtp_spec_type='mtp',
+                supports_spec_draft_n_max=True,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                ok, msg = app.validate_mtp_launch(model)
+
+        self.assertFalse(ok)
+        self.assertIn('MTP + mmproj/vision', msg)
+
     def test_mtp_launch_validation_requires_selected_spec_type_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
@@ -1818,7 +1847,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'benchmark_phase': 'baseline_no_mtp',
                 'mtp_enabled': False,
                 'tokens_per_sec': 10.0,
-                'prompt_tokens_per_sec': 100.0,
+                'prompt_workload_tokens_per_sec': 100.0,
                 'seconds': 10.0,
                 'peak_vram_used': 1000,
             },
@@ -1828,7 +1857,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'mtp_enabled': True,
                 'mtp_draft_n_max': 1,
                 'tokens_per_sec': 20.0,
-                'prompt_tokens_per_sec': 90.0,
+                'prompt_workload_tokens_per_sec': 90.0,
                 'seconds': 8.0,
                 'peak_vram_used': 1300,
                 'accept_rate': 0.55,
@@ -1839,7 +1868,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'mtp_enabled': True,
                 'mtp_draft_n_max': 2,
                 'tokens_per_sec': 12.0,
-                'prompt_tokens_per_sec': 80.0,
+                'prompt_workload_tokens_per_sec': 80.0,
                 'seconds': 8.0,
                 'peak_vram_used': 1200,
                 'accept_rate': 0.78,
@@ -1850,7 +1879,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'mtp_enabled': True,
                 'mtp_draft_n_max': 3,
                 'tokens_per_sec': 16.0,
-                'prompt_tokens_per_sec': 40.0,
+                'prompt_workload_tokens_per_sec': 40.0,
                 'seconds': 9.0,
                 'peak_vram_used': 1400,
                 'accept_rate': 0.82,
@@ -1882,7 +1911,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'benchmark_phase': 'baseline_no_mtp',
                 'mtp_enabled': False,
                 'tokens_per_sec': 10.0,
-                'prompt_tokens_per_sec': 100.0,
+                'prompt_workload_tokens_per_sec': 100.0,
                 'seconds': 10.0,
             },
             {
@@ -1891,7 +1920,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'mtp_enabled': True,
                 'mtp_draft_n_max': 1,
                 'tokens_per_sec': 12.0,
-                'prompt_tokens_per_sec': 90.0,
+                'prompt_workload_tokens_per_sec': 90.0,
                 'seconds': 8.0,
                 'accept_rate': 0.78,
             },
@@ -1901,7 +1930,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'mtp_enabled': True,
                 'mtp_draft_n_max': 3,
                 'tokens_per_sec': 30.0,
-                'prompt_tokens_per_sec': 60.0,
+                'prompt_workload_tokens_per_sec': 60.0,
                 'seconds': 6.0,
                 'accept_rate': 0.84,
             },
@@ -1927,7 +1956,7 @@ class RuntimeProfileTests(unittest.TestCase):
                 'mtp_enabled': True,
                 'mtp_draft_n_max': 2,
                 'tokens_per_sec': 20.0,
-                'prompt_tokens_per_sec': 80.0,
+                'prompt_workload_tokens_per_sec': 80.0,
                 'seconds': 5.0,
                 'accept_rate': 0.82,
             },
@@ -1938,6 +1967,68 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertIn('mtp_fast_chat', recommendations)
         self.assertIn('mtp_safe', recommendations)
+        self.assertNotIn('mtp_opencode_ready', recommendations)
+
+    def test_mtp_optimizer_does_not_promote_decode_regression(self):
+        records = [
+            {
+                'status': 'ok',
+                'benchmark_phase': 'baseline_no_mtp',
+                'mtp_enabled': False,
+                'tokens_per_sec': 20.0,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 10.0,
+            },
+            {
+                'status': 'ok',
+                'benchmark_phase': 'draft_n2',
+                'mtp_enabled': True,
+                'mtp_draft_n_max': 2,
+                'tokens_per_sec': 19.0,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 8.0,
+                'accept_rate': 0.80,
+            },
+        ]
+
+        annotated = annotate_mtp_optimizer_records(records, 'draft-mtp')
+        recommendations = mtp_optimizer_profile_recommendations(annotated)
+
+        draft = next(item for item in annotated if item['benchmark_phase'] == 'draft_n2')
+        self.assertEqual(draft['decode_gain_vs_baseline'], 0.95)
+        self.assertNotIn('mtp_fast_chat', recommendations)
+        self.assertNotIn('mtp_safe', recommendations)
+        self.assertNotIn('mtp_opencode_ready', recommendations)
+
+    def test_mtp_optimizer_prompt_regression_blocks_safe_and_opencode_profiles(self):
+        records = [
+            {
+                'status': 'ok',
+                'benchmark_phase': 'baseline_no_mtp',
+                'mtp_enabled': False,
+                'tokens_per_sec': 10.0,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 10.0,
+            },
+            {
+                'status': 'ok',
+                'benchmark_phase': 'draft_n3',
+                'mtp_enabled': True,
+                'mtp_draft_n_max': 3,
+                'tokens_per_sec': 20.0,
+                'prompt_workload_tokens_per_sec': 65.0,
+                'seconds': 5.0,
+                'accept_rate': 0.84,
+            },
+        ]
+
+        annotated = annotate_mtp_optimizer_records(records, 'draft-mtp')
+        recommendations = mtp_optimizer_profile_recommendations(annotated)
+
+        draft = next(item for item in annotated if item['benchmark_phase'] == 'draft_n3')
+        self.assertEqual(draft['prefill_cost_vs_baseline'], 0.35)
+        self.assertEqual(recommendations['mtp_fast_chat']['benchmark_phase'], 'draft_n3')
+        self.assertNotIn('mtp_safe', recommendations)
         self.assertNotIn('mtp_opencode_ready', recommendations)
 
     def test_memory_guardrail_admission_skips_critical_memory(self):
@@ -2703,7 +2794,6 @@ class RuntimeProfileTests(unittest.TestCase):
                     'completion_tokens': 64,
                     'prompt_tokens': 40,
                     'tokens_per_sec': 32.0,
-                    'prompt_tokens_per_sec': 20.0,
                     'sample_count': 2,
                     'sample_tokens_per_sec': [31.0, 33.0],
                     'texts': ['decode ok'],
@@ -2714,7 +2804,6 @@ class RuntimeProfileTests(unittest.TestCase):
                 'completion_tokens': 24,
                 'prompt_tokens': 480,
                 'tokens_per_sec': 6.0,
-                'prompt_tokens_per_sec': 120.0,
                 'sample_count': 1,
                 'sample_tokens_per_sec': [6.0],
                 'texts': ['prompt ok'],
@@ -2728,7 +2817,10 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual([item[0] for item in calls], [128, 96])
         self.assertEqual(set(result['mtp_workloads']), {'decode_heavy', 'prompt_heavy'})
         self.assertEqual(result['tokens_per_sec'], 32.0)
-        self.assertEqual(result['prompt_tokens_per_sec'], 120.0)
+        self.assertEqual(result['prompt_workload_tokens_per_sec'], 120.0)
+        self.assertNotIn('prompt_tokens_per_sec', result)
+        self.assertEqual(result['mtp_workloads']['prompt_heavy']['prompt_workload_tokens_per_sec'], 120.0)
+        self.assertNotIn('prompt_tokens_per_sec', result['mtp_workloads']['prompt_heavy'])
         self.assertEqual(result['elapsed'], 6.0)
         self.assertEqual(result['completion_tokens'], 88)
 
@@ -2742,7 +2834,6 @@ class RuntimeProfileTests(unittest.TestCase):
                 'completion_tokens': 0,
                 'prompt_tokens': 50,
                 'tokens_per_sec': 0.0,
-                'prompt_tokens_per_sec': 50.0,
                 'sample_count': 1,
                 'texts': [''],
                 'error': '',
@@ -2823,7 +2914,6 @@ class RuntimeProfileTests(unittest.TestCase):
                     'completion_tokens': 64,
                     'prompt_tokens': 40,
                     'tokens_per_sec': 32.0,
-                    'prompt_tokens_per_sec': 20.0,
                     'sample_count': 2,
                     'texts': ['decode ok'],
                     'error': '',
@@ -2833,7 +2923,6 @@ class RuntimeProfileTests(unittest.TestCase):
                 'completion_tokens': 24,
                 'prompt_tokens': 480,
                 'tokens_per_sec': 6.0,
-                'prompt_tokens_per_sec': 120.0,
                 'sample_count': 1,
                 'texts': ['prompt ok'],
                 'error': '',
@@ -2857,9 +2946,11 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(record['status'], 'ok')
         self.assertIsNotNone(measured)
         self.assertEqual(record['tokens_per_sec'], 32.0)
-        self.assertEqual(record['prompt_tokens_per_sec'], 120.0)
+        self.assertEqual(record['prompt_tokens_per_sec'], 0.0)
+        self.assertEqual(record['prompt_workload_tokens_per_sec'], 120.0)
         self.assertEqual(record['seconds'], 6.0)
         self.assertEqual(set(record['mtp_workloads']), {'decode_heavy', 'prompt_heavy'})
+        self.assertNotIn('prompt_tokens_per_sec', record['mtp_workloads']['prompt_heavy'])
         self.assertEqual(record['mtp_workloads']['prompt_heavy']['completion_tokens'], 24)
         self.assertGreaterEqual(app.stops, 1)
 

@@ -149,6 +149,39 @@ class MtpDoctorTests(unittest.TestCase):
         self.assertFalse(report.model_allowed)
         self.assertIn('unknown', report.reason)
 
+    def test_auto_without_hints_blocks_when_mtp_enabled_consistently(self):
+        app = self.make_app()
+        model = ModelConfig(
+            id='generic',
+            name='Generic',
+            path='/models/generic.gguf',
+            alias='generic',
+            port=18080,
+            supports_mtp='auto',
+            mtp_enabled=True,
+        )
+        caps = mtp_capabilities('mtp')
+        install = EngineInstall(
+            id=ENGINE_LLAMA_CPP_MTP,
+            resolved_command='/opt/mtp/bin/llama-server',
+            source='env:LLAMA_CPP_MTP_PATH',
+            exists=True,
+            executable=True,
+        )
+
+        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
+             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+             patch.object(app, 'engine_capabilities', return_value=caps):
+            report = build_mtp_doctor_report(app, model)
+            launch_ok, launch_msg = app.validate_mtp_launch(model)
+
+        self.assertFalse(launch_ok)
+        self.assertEqual(report.launch_status, 'blocked')
+        self.assertFalse(report.model_allowed)
+        self.assertEqual(report.risk_level, 'block')
+        self.assertIn('MTP capability is unknown', launch_msg)
+        self.assertIn('MTP capability is unknown', report.reason)
+
     def test_ui_items_include_status_capabilities_model_and_command(self):
         app = self.make_app()
         model = ModelConfig(

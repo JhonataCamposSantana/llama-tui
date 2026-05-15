@@ -222,10 +222,14 @@ def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -
         next_action = 'Disable MTP or remove the mmproj/vision entry.'
         risk_level = 'block'
     elif not model_allowed:
-        launch_status = 'unknown'
+        launch_status = 'blocked' if mtp_enabled else 'unknown'
         reason = 'model MTP capability is unknown.'
-        next_action = 'Set supports_mtp=yes only if this GGUF is MTP-capable, or run baseline validation first.'
-        risk_level = 'warn'
+        next_action = (
+            'Set supports_mtp=yes only if this GGUF is MTP-capable, or disable MTP.'
+            if mtp_enabled else
+            'Set supports_mtp=yes only if this GGUF is MTP-capable, or run baseline validation first.'
+        )
+        risk_level = 'block' if mtp_enabled else 'warn'
     elif cap_reason:
         launch_status = 'failed' if cap_reason in ('binary not found', 'binary not executable', 'help output unavailable') else 'blocked'
         reason = cap_reason

@@ -3728,13 +3728,14 @@ def _mtp_workload_result(name: str, bench: Dict[str, object]) -> Dict[str, objec
     elapsed = float(bench.get('elapsed', 0.0) or 0.0)
     prompt_tokens = int(bench.get('prompt_tokens', 0) or 0)
     completion_tokens = int(bench.get('completion_tokens', 0) or 0)
+    prompt_workload_tps = round((prompt_tokens / elapsed) if elapsed > 0 else 0.0, 4)
     return {
         'name': name,
         'elapsed': round(elapsed, 4),
         'prompt_tokens': prompt_tokens,
         'completion_tokens': completion_tokens,
         'tokens_per_sec': round(float(bench.get('tokens_per_sec', 0.0) or 0.0), 4),
-        'prompt_tokens_per_sec': round((prompt_tokens / elapsed) if elapsed > 0 else 0.0, 4),
+        'prompt_workload_tokens_per_sec': prompt_workload_tps,
         'sample_count': int(bench.get('sample_count', 0) or 0),
         'sample_tokens_per_sec': list(bench.get('sample_tokens_per_sec', []) or []),
         'error': str(bench.get('error', '') or ''),
@@ -3776,7 +3777,7 @@ def benchmark_mtp_optimizer_workloads(
                 'prompt_tokens': 0,
                 'completion_tokens': 0,
                 'tokens_per_sec': 0.0,
-                'prompt_tokens_per_sec': 0.0,
+                'prompt_workload_tokens_per_sec': 0.0,
                 'sample_count': 0,
                 'sample_tokens_per_sec': [],
                 'error': str(bench.get('error', 'unknown error')),
@@ -3801,7 +3802,7 @@ def benchmark_mtp_optimizer_workloads(
             'completion_tokens': total_completion_tokens,
             'prompt_tokens': total_prompt_tokens,
             'tokens_per_sec': 0.0,
-            'prompt_tokens_per_sec': 0.0,
+            'prompt_workload_tokens_per_sec': 0.0,
             'sample_count': total_samples,
         }
 
@@ -3812,7 +3813,7 @@ def benchmark_mtp_optimizer_workloads(
         'completion_tokens': total_completion_tokens,
         'prompt_tokens': total_prompt_tokens,
         'tokens_per_sec': float(decode.get('tokens_per_sec', 0.0) or 0.0),
-        'prompt_tokens_per_sec': float(prompt_heavy.get('prompt_tokens_per_sec', 0.0) or 0.0),
+        'prompt_workload_tokens_per_sec': float(prompt_heavy.get('prompt_workload_tokens_per_sec', 0.0) or 0.0),
         'sample_count': total_samples,
         'error': '',
         'mtp_workloads': workloads,
@@ -5831,6 +5832,7 @@ def adaptive_record_from_candidate(
     suggested_fix: str = '',
     command: str = '',
     prompt_tokens_per_sec: float = 0.0,
+    prompt_workload_tokens_per_sec: float = 0.0,
     peak_vram_used: int = 0,
     gpu_memory_total: int = 0,
     ctx: Optional[int] = None,
@@ -5893,6 +5895,7 @@ def adaptive_record_from_candidate(
         'decode_tokens_per_sec': round(float(tokens_per_sec), 2),
         'generation_tokens_per_sec': round(float(tokens_per_sec), 2),
         'prompt_tokens_per_sec': round(float(prompt_tokens_per_sec), 2),
+        'prompt_workload_tokens_per_sec': round(float(prompt_workload_tokens_per_sec), 2),
         'total_tokens_per_sec': round(float(tokens_per_sec), 2),
         'seconds': round(float(seconds), 2),
         'startup_seconds': round(float(startup_seconds), 2),
@@ -6469,8 +6472,11 @@ def benchmark_adaptive_candidate(
         process_snapshots['after_generation'] = current_process_pressure_payload()
         score = float(bench.get('tokens_per_sec', 0.0) or 0.0)
         elapsed = float(bench.get('elapsed', 0.0) or 0.0)
+        mtp_workloads = bench.get('mtp_workloads')
+        has_mtp_workloads = isinstance(mtp_workloads, dict)
         prompt_tps = float(bench.get('prompt_tokens_per_sec', 0.0) or 0.0)
-        if prompt_tps <= 0.0:
+        prompt_workload_tps = float(bench.get('prompt_workload_tokens_per_sec', 0.0) or 0.0)
+        if prompt_tps <= 0.0 and not has_mtp_workloads:
             prompt_tps = (int(bench.get('prompt_tokens', 0) or 0) / elapsed) if elapsed > 0 else 0.0
         min_free = min(
             value for value in (
@@ -6497,12 +6503,13 @@ def benchmark_adaptive_candidate(
             warmup_seconds=warmup_seconds,
             prompt_tokens=int(bench.get('prompt_tokens', 0) or 0),
             prompt_tokens_per_sec=prompt_tps,
+            prompt_workload_tokens_per_sec=prompt_workload_tps,
             generated_tokens=int(bench.get('completion_tokens', 0) or 0),
             process_snapshots=process_snapshots,
             **runtime_context,
         )
-        if isinstance(bench.get('mtp_workloads'), dict):
-            record['mtp_workloads'] = dict(bench.get('mtp_workloads') or {})
+        if has_mtp_workloads:
+            record['mtp_workloads'] = dict(mtp_workloads or {})
             record['mtp_workload_names'] = sorted(record['mtp_workloads'])
             record['mtp_workload_count'] = len(record['mtp_workloads'])
         apply_memory_guardrail_record(record, state=guardrail_state)
@@ -8962,6 +8969,14 @@ def _mtp_acceptance_missing(record: Dict[str, object]) -> bool:
     return source == 'not_reported' and _record_float(record, 'accept_rate') <= 0.0
 
 
+def _record_prompt_workload_tps(record: Optional[Dict[str, object]]) -> float:
+    if not record:
+        return 0.0
+    if 'prompt_workload_tokens_per_sec' in record:
+        return _record_float(record, 'prompt_workload_tokens_per_sec')
+    return _record_float(record, 'prompt_tokens_per_sec')
+
+
 def _mtp_candidate_risk(record: Dict[str, object], baseline: Dict[str, object]) -> Tuple[str, str]:
     if str(record.get('status', '') or '') != 'ok':
         return 'failed', str(record.get('failure_reason') or record.get('detail') or 'candidate did not complete')
@@ -8992,7 +9007,7 @@ def annotate_mtp_optimizer_records(records: Sequence[Dict[str, object]], spec_ty
     baseline = _mtp_baseline_record(mutable)
     baseline_ok = bool(baseline and str(baseline.get('status', '') or '') == 'ok')
     baseline_tps = _record_float(baseline, 'tokens_per_sec') if baseline_ok else 0.0
-    baseline_pp = _record_float(baseline, 'prompt_tokens_per_sec') if baseline_ok else 0.0
+    baseline_prompt_workload_tps = _record_prompt_workload_tps(baseline) if baseline_ok else 0.0
     baseline_seconds = _record_float(baseline, 'seconds') if baseline_ok else 0.0
     baseline_memory = _record_int(baseline, 'peak_vram_used') if baseline_ok else 0
     baseline_id = str(baseline.get('benchmark_phase') or 'baseline_no_mtp') if baseline else ''
@@ -9010,11 +9025,20 @@ def annotate_mtp_optimizer_records(records: Sequence[Dict[str, object]], spec_ty
         record['baseline_profile_id'] = baseline_id
         if str(record.get('status', '') or '') == 'ok' and bool(record.get('mtp_enabled')) and baseline_ok:
             current_tps = _record_float(record, 'tokens_per_sec')
-            current_pp = _record_float(record, 'prompt_tokens_per_sec')
+            current_prompt_workload_tps = _record_prompt_workload_tps(record)
             current_seconds = _record_float(record, 'seconds')
             current_memory = _record_int(record, 'peak_vram_used')
             record['decode_gain_vs_baseline'] = round(current_tps / baseline_tps, 4) if baseline_tps > 0 else 0.0
-            record['prefill_cost_vs_baseline'] = round(max(0.0, (baseline_pp - current_pp) / baseline_pp), 4) if baseline_pp > 0 and current_pp > 0 else 0.0
+            record['prefill_cost_vs_baseline'] = (
+                round(
+                    max(
+                        0.0,
+                        (baseline_prompt_workload_tps - current_prompt_workload_tps) / baseline_prompt_workload_tps,
+                    ),
+                    4,
+                )
+                if baseline_prompt_workload_tps > 0 and current_prompt_workload_tps > 0 else 0.0
+            )
             record['total_wall_gain_vs_baseline'] = round(baseline_seconds / current_seconds, 4) if baseline_seconds > 0 and current_seconds > 0 else 0.0
             record['memory_delta_vs_baseline'] = int(current_memory - baseline_memory)
         elif str(record.get('benchmark_phase', '') or '') == 'baseline_no_mtp' and str(record.get('status', '') or '') == 'ok':
@@ -9050,18 +9074,29 @@ def mtp_optimizer_profile_recommendations(records: Sequence[Dict[str, object]]) 
     if not candidates:
         return recommendations
     risk_rank = {'excellent': 0, 'good': 1, 'usable': 2, 'risky': 3}
-    recommendations['mtp_fast_chat'] = max(
-        candidates,
-        key=lambda item: (
-            str(item.get('mtp_risk_level', '') or '') != 'failed',
-            _record_float(item, 'tokens_per_sec'),
-            _record_float(item, 'accept_rate'),
-        ),
-    )
+    fast_candidates = [
+        item for item in candidates
+        if not baseline_ok or _record_float(item, 'decode_gain_vs_baseline') > 1.05
+    ]
+    if fast_candidates:
+        recommendations['mtp_fast_chat'] = max(
+            fast_candidates,
+            key=lambda item: (
+                str(item.get('mtp_risk_level', '') or '') != 'failed',
+                _record_float(item, 'tokens_per_sec'),
+                _record_float(item, 'accept_rate'),
+            ),
+        )
     safe_candidates = [
         item for item in candidates
         if str(item.get('mtp_risk_level', '') or '') in ('excellent', 'good', 'usable')
-        and (not baseline_ok or _record_float(item, 'prefill_cost_vs_baseline') <= 0.30)
+        and (
+            not baseline_ok
+            or (
+                _record_float(item, 'decode_gain_vs_baseline') > 1.0
+                and _record_float(item, 'prefill_cost_vs_baseline') <= 0.30
+            )
+        )
     ]
     if safe_candidates:
         recommendations['mtp_safe'] = min(

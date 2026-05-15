@@ -1207,8 +1207,12 @@ class AppConfig:
             return True, ''
         if not model_mtp_allowed(model):
             return False, 'MTP is disabled for this model (supports_mtp=no). Set supports_mtp=yes/auto or disable MTP.'
-        if model_has_mmproj_config(model):
+        features = detect_model_runtime_features(model)
+        if model_has_mmproj_config(model) or 'mmproj' in features or 'vision' in features:
             return False, 'MTP + mmproj/vision is currently unsupported/unsafe. Disable MTP or remove mmproj.'
+        support_setting = normalize_mtp_support(getattr(model, 'supports_mtp', 'auto'))
+        if support_setting == 'auto' and 'mtp_native' not in features and 'nextn_native' not in features:
+            return False, 'MTP capability is unknown for this model. Set supports_mtp=yes only if this GGUF is MTP-capable, or disable MTP.'
         try:
             capabilities = self.engine_capabilities()
         except Exception:
