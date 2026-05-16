@@ -41,6 +41,7 @@ from llama_tui.benchmark import (
     memory_guardrail_admission,
     model_and_runtime_profile_from_measured_profile,
     model_for_runtime_profile,
+    mtp_long_context_probe_request_timeout,
     max_context_probe_runtime_profiles,
     mtp_optimizer_profile_recommendations,
     parse_mtp_runtime_diagnostics,
@@ -1848,8 +1849,8 @@ class RuntimeProfileTests(unittest.TestCase):
             )
             model = ModelConfig(
                 id='mtp',
-                name='Generic MTP',
-                path='/cache/hub/models--owner--generic-MTP-GGUF/snapshots/abc/model.gguf',
+                name='Qwen NextN MTP',
+                path='/cache/hub/models--owner--Qwen-NextN-MTP-GGUF/snapshots/abc/model.gguf',
                 alias='mtp',
                 port=18080,
                 runtime='llama.cpp-mtp',
@@ -1883,31 +1884,12 @@ class RuntimeProfileTests(unittest.TestCase):
                 _total,
                 **kwargs,
             ):
-                self.assertEqual(objective, 'quick_sanity')
+                self.assertEqual(objective, 'fast_chat')
                 self.assertEqual(kwargs.get('benchmark_purpose'), 'mtp_acceptance')
                 self.assertEqual(kwargs.get('max_attempts'), 1)
                 phases.append(runtime_profile.benchmark_phase)
                 purposes.append(kwargs.get('benchmark_purpose'))
                 candidate = model_for_runtime_profile(base_model, runtime_profile)
-                if runtime_profile.benchmark_phase == 'baseline_no_mtp':
-                    detail = (
-                        'llama_memory_recurrent.cpp:173: '
-                        'GGML_ASSERT(rollback >= 1 && rollback <= (llama_pos) n_rs_seq) failed\n'
-                        'n_rs_seq = 0'
-                    )
-                    record = adaptive_record_from_candidate(
-                        candidate,
-                        objective,
-                        'not ready',
-                        detail=detail,
-                        engine='llama.cpp-mtp',
-                        benchmark_phase='baseline_no_mtp',
-                        benchmark_strategy_id='mtp_acceptance_matrix',
-                        benchmark_purpose='mtp_acceptance',
-                        runtime_no_warmup=True,
-                    )
-                    record.update(classify_benchmark_failure(detail))
-                    return False, True, [record], [], completed + 1
                 draft = runtime_profile.mtp_draft_n_max
                 record = adaptive_record_from_candidate(
                     candidate,
@@ -1947,7 +1929,7 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn('partial', msg)
-        self.assertEqual(phases, ['baseline_no_mtp', 'draft_n1', 'draft_n2', 'draft_n3'])
+        self.assertEqual(phases, ['draft_n1', 'draft_n2', 'draft_n3'])
         self.assertEqual(set(purposes), {'mtp_acceptance'})
         saved = app.models[0]
         self.assertEqual(saved.default_benchmark_status, 'partial')
@@ -1963,8 +1945,405 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(saved.measured_profiles['mtp_acceptance']['mtp_spec_type'], 'draft-mtp')
         self.assertEqual(saved.measured_profiles['mtp_baseline_no_spec']['status'], 'skipped_runtime_assert')
         self.assertTrue(any('MTP spec type selected from binary: draft-mtp' in str(item) for item in progress))
-        self.assertTrue(any('Baseline no-MTP skipped: recurrent/NextN runtime assert' in str(item) for item in progress))
+        self.assertTrue(any('Baseline no-MTP skipped before launch: recurrent/NextN model requires MTP' in str(item) for item in progress))
         self.assertFalse(any('smart bounded' in str(item) or 'long_context not ready' in str(item) for item in progress))
+
+    def test_mtp_acceptance_runner_filters_all_nextn_baseline_variants_before_launch(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_no_warmup=True,
+            spec_type_values=('none', 'draft-mtp'),
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+            supports_spec_draft_n_max=True,
+        )
+        baseline_names = (
+            'mtp_baseline',
+            'mtp_baseline_partial_ngl_13',
+            'mtp_baseline_cpu_moe_all',
+            'mtp_baseline_experts_cpu_override',
+        )
+        baseline_profiles = [
+            RuntimeProfile(
+                engine_id='llama.cpp-mtp',
+                name=name,
+                ctx_size=8192,
+                gpu_layers=13,
+                parallel=1,
+                kv_preset='default',
+                benchmark_strategy_id='mtp_acceptance_matrix',
+                benchmark_phase='baseline_no_mtp',
+            )
+            for name in baseline_names
+        ]
+        draft_profile = RuntimeProfile(
+            engine_id='llama.cpp-mtp',
+            name='mtp_fit_q8_draftq8_nommap_draft1_128k',
+            ctx_size=131072,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            fit=True,
+            fit_context=4096,
+            fit_target=1024,
+            no_mmap=True,
+            no_warmup=True,
+            mtp_enabled=True,
+            mtp_draft_n_max=1,
+            mtp_draft_kv_preset='q8_0/q8_0',
+            mtp_spec_type='draft-mtp',
+            benchmark_strategy_id='mtp_acceptance_matrix',
+            benchmark_phase='fit_q8_draftq8_draft_n1',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='Qwen NextN MTP',
+                path='/models/qwen-nextn-mtp.gguf',
+                alias='mtp',
+                port=18080,
+                runtime='llama.cpp-mtp',
+                ctx_min=8192,
+                ctx_max=131072,
+                supports_mtp='yes',
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+            strategy = select_benchmark_strategy(
+                'llama.cpp-mtp',
+                model,
+                hardware=hardware,
+                capabilities=caps,
+                objective='quick_sanity',
+                depth='fast',
+                model_size_bytes=4 * 1024**3,
+            )
+            launched = []
+
+            def fake_runtime_profile_with_retry(
+                _app,
+                base_model,
+                runtime_profile,
+                objective,
+                _progress,
+                _cancel_token,
+                completed,
+                _total,
+                **kwargs,
+            ):
+                launched.append(runtime_profile.name)
+                self.assertEqual(objective, 'mtp_long_context_probe')
+                self.assertEqual(kwargs.get('benchmark_purpose'), 'mtp_acceptance')
+                candidate = model_for_runtime_profile(base_model, runtime_profile)
+                record = adaptive_record_from_candidate(
+                    candidate,
+                    objective,
+                    'ok',
+                    tokens_per_sec=24.0,
+                    seconds=1.0,
+                    engine='llama.cpp-mtp',
+                    benchmark_phase=runtime_profile.benchmark_phase,
+                    benchmark_strategy_id='mtp_acceptance_matrix',
+                    benchmark_purpose='mtp_acceptance',
+                    mtp_enabled=True,
+                    mtp_draft_n_max=1,
+                    mtp_draft_kv_preset='q8_0/q8_0',
+                    spec_type='draft-mtp',
+                    runtime_no_warmup=True,
+                    no_mmap=True,
+                    runtime_fit=True,
+                    fit_target=1024,
+                )
+                record['accept_rate'] = 0.82
+                record['draft_tokens'] = 100
+                record['accepted_tokens'] = 82
+                return True, False, [record], [dict(record)], completed + 1
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=baseline_profiles + [draft_profile]), \
+                patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_profile_with_retry):
+                ok, msg = benchmark_mtp_acceptance_matrix_after_preflight(
+                    app,
+                    model,
+                    hardware,
+                    strategy,
+                    'run-mtp',
+                    'server_fast',
+                    '2026-05-14T00:00:00',
+                    depth='fast',
+                )
+
+        self.assertTrue(ok)
+        self.assertIn('partial', msg)
+        self.assertEqual(launched, ['mtp_fit_q8_draftq8_nommap_draft1_128k'])
+        self.assertFalse(any(name.startswith('mtp_baseline') for name in launched))
+        saved = app.models[0]
+        self.assertEqual(saved.last_benchmark_results[0]['status'], 'skipped_runtime_assert')
+        self.assertEqual(saved.last_benchmark_results[0]['failure_category'], 'BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN')
+        self.assertIn('mtp_acceptance', saved.measured_profiles)
+
+    def test_mtp_acceptance_fit_timeout_continues_to_remaining_candidates(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_no_warmup=True,
+            spec_type_values=('none', 'draft-mtp'),
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+            supports_spec_draft_n_max=True,
+        )
+        profiles = [
+            RuntimeProfile(
+                engine_id='llama.cpp-mtp',
+                name='mtp_fit_q8_draftq8_nommap_draft1_128k',
+                ctx_size=131072,
+                gpu_layers=None,
+                parallel=1,
+                kv_preset='q8_0/q8_0',
+                fit=True,
+                fit_context=4096,
+                fit_target=1024,
+                no_mmap=True,
+                no_warmup=True,
+                mtp_enabled=True,
+                mtp_draft_n_max=1,
+                mtp_draft_kv_preset='q8_0/q8_0',
+                mtp_spec_type='draft-mtp',
+                benchmark_strategy_id='mtp_acceptance_matrix',
+                benchmark_phase='fit_q8_draftq8_draft_n1',
+            ),
+            RuntimeProfile(
+                engine_id='llama.cpp-mtp',
+                name='mtp_fit_q8_draftq8_nommap_draft2_8k',
+                ctx_size=8192,
+                gpu_layers=None,
+                parallel=1,
+                kv_preset='q8_0/q8_0',
+                fit=True,
+                fit_context=4096,
+                fit_target=1024,
+                no_mmap=True,
+                no_warmup=True,
+                mtp_enabled=True,
+                mtp_draft_n_max=2,
+                mtp_draft_kv_preset='q8_0/q8_0',
+                mtp_spec_type='draft-mtp',
+                benchmark_strategy_id='mtp_acceptance_matrix',
+                benchmark_phase='fit_q8_draftq8_draft_n2',
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='Qwen NextN MTP',
+                path='/models/qwen-nextn-mtp.gguf',
+                alias='mtp',
+                port=18080,
+                runtime='llama.cpp-mtp',
+                ctx_min=8192,
+                ctx_max=131072,
+                supports_mtp='yes',
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+            strategy = select_benchmark_strategy(
+                'llama.cpp-mtp',
+                model,
+                hardware=hardware,
+                capabilities=caps,
+                objective='quick_sanity',
+                depth='fast',
+                model_size_bytes=4 * 1024**3,
+            )
+            objectives = {}
+
+            def fake_runtime_profile_with_retry(
+                _app,
+                base_model,
+                runtime_profile,
+                objective,
+                _progress,
+                _cancel_token,
+                completed,
+                _total,
+                **_kwargs,
+            ):
+                objectives[runtime_profile.name] = objective
+                candidate = model_for_runtime_profile(base_model, runtime_profile)
+                if runtime_profile.name.endswith('128k'):
+                    record = adaptive_record_from_candidate(
+                        candidate,
+                        objective,
+                        'benchmark failed',
+                        detail='request timed out',
+                        engine='llama.cpp-mtp',
+                        benchmark_phase=runtime_profile.benchmark_phase,
+                        benchmark_strategy_id='mtp_acceptance_matrix',
+                        benchmark_purpose='mtp_acceptance',
+                        mtp_enabled=True,
+                        mtp_draft_n_max=1,
+                        mtp_draft_kv_preset='q8_0/q8_0',
+                        spec_type='draft-mtp',
+                    )
+                    record.update(classify_benchmark_failure('request timed out', default_category='API_TIMEOUT'))
+                    return False, True, [record], [], completed + 1
+                record = adaptive_record_from_candidate(
+                    candidate,
+                    objective,
+                    'ok',
+                    tokens_per_sec=30.0,
+                    seconds=1.0,
+                    engine='llama.cpp-mtp',
+                    benchmark_phase=runtime_profile.benchmark_phase,
+                    benchmark_strategy_id='mtp_acceptance_matrix',
+                    benchmark_purpose='mtp_acceptance',
+                    mtp_enabled=True,
+                    mtp_draft_n_max=2,
+                    mtp_draft_kv_preset='q8_0/q8_0',
+                    spec_type='draft-mtp',
+                    runtime_fit=True,
+                    no_mmap=True,
+                )
+                record['accept_rate'] = 0.84
+                record['draft_tokens'] = 100
+                record['accepted_tokens'] = 84
+                return True, False, [record], [dict(record)], completed + 1
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=profiles), \
+                patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_profile_with_retry):
+                ok, msg = benchmark_mtp_acceptance_matrix_after_preflight(
+                    app,
+                    model,
+                    hardware,
+                    strategy,
+                    'run-mtp',
+                    'server_fast',
+                    '2026-05-14T00:00:00',
+                    depth='fast',
+                )
+
+        self.assertTrue(ok)
+        self.assertNotIn('baseline failed', msg.lower())
+        self.assertEqual(objectives['mtp_fit_q8_draftq8_nommap_draft1_128k'], 'mtp_long_context_probe')
+        self.assertEqual(objectives['mtp_fit_q8_draftq8_nommap_draft2_8k'], 'mtp_long_context_probe')
+        self.assertEqual(mtp_long_context_probe_request_timeout(131072), 90)
+        self.assertEqual(mtp_long_context_probe_request_timeout(8192), 60)
+        saved = app.models[0]
+        self.assertEqual(saved.default_benchmark_status, 'partial')
+        self.assertEqual(saved.measured_profiles['mtp_acceptance']['mtp_draft_n_max'], 2)
+
+    def test_mtp_acceptance_all_fit_timeouts_report_mtp_candidates_timed_out(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_no_warmup=True,
+            spec_type_values=('none', 'draft-mtp'),
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+            supports_spec_draft_n_max=True,
+        )
+        profile_item = RuntimeProfile(
+            engine_id='llama.cpp-mtp',
+            name='mtp_fit_q8_draftq8_nommap_draft1_128k',
+            ctx_size=131072,
+            gpu_layers=None,
+            parallel=1,
+            kv_preset='q8_0/q8_0',
+            fit=True,
+            fit_context=4096,
+            fit_target=1024,
+            no_mmap=True,
+            no_warmup=True,
+            mtp_enabled=True,
+            mtp_draft_n_max=1,
+            mtp_draft_kv_preset='q8_0/q8_0',
+            mtp_spec_type='draft-mtp',
+            benchmark_strategy_id='mtp_acceptance_matrix',
+            benchmark_phase='fit_q8_draftq8_draft_n1',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='Qwen NextN MTP',
+                path='/models/qwen-nextn-mtp.gguf',
+                alias='mtp',
+                port=18080,
+                runtime='llama.cpp-mtp',
+                ctx_min=8192,
+                ctx_max=131072,
+                supports_mtp='yes',
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+            strategy = select_benchmark_strategy(
+                'llama.cpp-mtp',
+                model,
+                hardware=hardware,
+                capabilities=caps,
+                objective='quick_sanity',
+                depth='fast',
+                model_size_bytes=4 * 1024**3,
+            )
+
+            def fake_runtime_profile_with_retry(
+                _app,
+                base_model,
+                runtime_profile,
+                objective,
+                _progress,
+                _cancel_token,
+                completed,
+                _total,
+                **_kwargs,
+            ):
+                candidate = model_for_runtime_profile(base_model, runtime_profile)
+                record = adaptive_record_from_candidate(
+                    candidate,
+                    objective,
+                    'benchmark failed',
+                    detail='request timed out',
+                    engine='llama.cpp-mtp',
+                    benchmark_phase=runtime_profile.benchmark_phase,
+                    benchmark_strategy_id='mtp_acceptance_matrix',
+                    benchmark_purpose='mtp_acceptance',
+                    mtp_enabled=True,
+                    mtp_draft_n_max=1,
+                    mtp_draft_kv_preset='q8_0/q8_0',
+                    spec_type='draft-mtp',
+                )
+                record.update(classify_benchmark_failure('request timed out', default_category='API_TIMEOUT'))
+                return False, True, [record], [], completed + 1
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.active_engine_runtime_profiles', return_value=[profile_item]), \
+                patch('llama_tui.benchmark.benchmark_runtime_profile_with_retry', side_effect=fake_runtime_profile_with_retry):
+                ok, msg = benchmark_mtp_acceptance_matrix_after_preflight(
+                    app,
+                    model,
+                    hardware,
+                    strategy,
+                    'run-mtp',
+                    'server_fast',
+                    '2026-05-14T00:00:00',
+                    depth='fast',
+                )
+
+        self.assertFalse(ok)
+        self.assertIn('MTP candidates timed out', msg)
 
     def test_mtp_optimizer_annotations_compare_candidates_to_baseline(self):
         records = [
@@ -5592,8 +5971,67 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual({8192, 32768, 65536, 131072}, {item.ctx_size for item in profiles if item.name.startswith('mtp_fit_q8_draftq8_nommap') and item.fit_target == 1024})
         for draft in (1, 2, 3):
             self.assertTrue(any(item.mtp_draft_n_max == draft and item.fit and item.kv_preset == 'q8_0/q8_0' for item in profiles))
-        self.assertIn('mtp_baseline', names)
+        self.assertNotIn('mtp_baseline', names)
         self.assertIn('mtp_draft_n1', names)
+
+    def test_mtp_runtime_profiles_emit_selected_draft_mtp_spec_type_for_every_mtp_profile(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_no_warmup=True,
+            supports_fit=True,
+            supports_fit_ctx=True,
+            supports_fit_target=True,
+            supports_ctk_ctv=True,
+            supports_spec_draft_n_max=True,
+            supports_spec_draft_type_kv=True,
+            supports_no_mmap=True,
+            spec_type_values=('none', 'draft-mtp'),
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='Generic native-mtp',
+                path='/models/generic-native-mtp.gguf',
+                alias='mtp',
+                port=18080,
+                runtime='llama.cpp-mtp',
+                ctx_min=8192,
+                ctx_max=131072,
+                supports_mtp='yes',
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=16 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='fast')
+                mtp_profiles = [item for item in profiles if item.mtp_enabled]
+                self.assertTrue(mtp_profiles)
+                for runtime_profile in mtp_profiles:
+                    candidate = model_for_runtime_profile(model, runtime_profile)
+                    launch_profile = build_benchmark_launch_profile(
+                        candidate,
+                        runtime_profile,
+                        caps,
+                        purpose='mtp_acceptance',
+                        depth='fast',
+                    )
+                    command = app.build_command(
+                        candidate,
+                        runtime_profile=runtime_profile,
+                        benchmark_profile=launch_profile,
+                    )
+                    spec_positions = [idx for idx, value in enumerate(command) if value == '--spec-type']
+                    self.assertEqual(len(spec_positions), 1, runtime_profile.name)
+                    self.assertEqual(command[spec_positions[0] + 1], 'draft-mtp', runtime_profile.name)
+                    self.assertNotIn('--spec-type mtp', ' '.join(command), runtime_profile.name)
 
     def test_moe_runtime_profiles_include_bounded_placement_candidates(self):
         caps = replace(

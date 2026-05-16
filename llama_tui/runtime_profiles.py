@@ -453,6 +453,7 @@ class RuntimeProfile:
     mtp_enabled: bool = False
     mtp_draft_n_max: int = 0
     mtp_draft_kv_preset: str = ''
+    mtp_spec_type: str = ''
     benchmark_strategy_id: str = ''
     benchmark_objectives: Tuple[str, ...] = field(default_factory=tuple)
     benchmark_phase: str = ''
@@ -1011,7 +1012,20 @@ def build_mtp_args(
             skipped_flags=(getattr(capabilities, 'spec_type_flag', '--spec-type') or '--spec-type',),
             blocked_reason='missing --spec-type',
         )
-    spec_type = mtp_spec_type_value(capabilities)
+    profile_spec_type = str(getattr(runtime_profile, 'mtp_spec_type', '') or '').strip().lower()
+    capability_spec_type = mtp_spec_type_value(capabilities)
+    capability_values = {
+        str(item or '').strip().lower()
+        for item in tuple(getattr(capabilities, 'spec_type_values', ()) or ())
+    }
+    profile_spec_allowed = bool(
+        profile_spec_type in MTP_SPEC_TYPE_VALUES
+        and (
+            profile_spec_type == capability_spec_type
+            or (capability_values and profile_spec_type in capability_values)
+        )
+    )
+    spec_type = profile_spec_type if profile_spec_allowed else capability_spec_type
     if not bool(getattr(capabilities, 'supports_mtp', False)) or not spec_type:
         return [], MtpArgDiagnostics(
             enabled=True,
