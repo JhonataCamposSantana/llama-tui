@@ -6008,20 +6008,22 @@ def runtime_record_context(
     effective_args = benchmark_effective_server_args(app, candidate, profile, benchmark_profile)
     if not command:
         command = shlex.join(effective_args) if effective_args else benchmark_command_preview(app, candidate, profile, benchmark_profile)
+    try:
+        runtime_engine_context = resolve_runtime_engine_context(app, model=candidate, runtime_profile=profile)
+    except Exception:
+        runtime_engine_context = None
     engine = ''
     server_bin = ''
-    if hasattr(app, 'active_engine_key_for_model'):
+    if runtime_engine_context is not None:
+        engine = runtime_engine_context.engine_id
+        server_bin = runtime_engine_context.command
+    if not engine and hasattr(app, 'active_engine_key_for_model'):
         try:
             engine = app.active_engine_key_for_model(candidate)
         except Exception:
             engine = ''
     if not engine and profile is not None:
         engine = profile.engine_id
-    if hasattr(app, 'runtime_server_command'):
-        try:
-            server_bin = app.runtime_server_command(str(getattr(candidate, 'runtime', 'llama.cpp') or 'llama.cpp'))
-        except Exception:
-            server_bin = ''
     runtime_log_path = ''
     if hasattr(app, 'logfile'):
         try:
@@ -6043,11 +6045,13 @@ def runtime_record_context(
     supported_cache_types: List[str] = []
     unsupported_launch_flags: List[str] = []
     profile_spec_type = str(getattr(profile, 'mtp_spec_type', '') or '').strip().lower() if profile is not None else ''
-    if hasattr(app, 'engine_capabilities'):
+    if runtime_engine_context is not None or hasattr(app, 'engine_capabilities'):
         try:
-            capabilities = resolve_runtime_engine_context(
-                app, model=candidate, runtime_profile=profile
-            ).capabilities
+            capabilities = (
+                runtime_engine_context.capabilities
+                if runtime_engine_context is not None
+                else resolve_runtime_engine_context(app, model=candidate, runtime_profile=profile).capabilities
+            )
             supported_cache_types = [str(item) for item in list(getattr(capabilities, 'supported_kv_modes', ()) or ())]
             capability_spec_type = mtp_spec_type_value(capabilities)
             capability_values = {

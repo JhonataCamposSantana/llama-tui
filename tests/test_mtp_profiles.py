@@ -2,9 +2,10 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from llama_tui.app import AppConfig
+from llama_tui.benchmark_strategies import select_benchmark_strategy
 from llama_tui.engines import (
     ENGINE_LLAMA_CPP,
     ENGINE_LLAMA_CPP_MTP,
@@ -300,6 +301,117 @@ class MtpScoringTests(unittest.TestCase):
         self.assertIn('mtp_long_context', recommendations)
         self.assertEqual(recommendations['mtp_safe']['mtp_draft_n_max'], 1)
         self.assertEqual(recommendations['mtp_long_context']['mtp_draft_n_max'], 1)
+
+
+class MtpStrategySelectionTests(unittest.TestCase):
+    def test_upstream_llama_cpp_with_draft_mtp_selects_mtp_strategy(self):
+        # A plain llama.cpp engine whose binary advertises draft-mtp must route
+        # an MTP-native model to the acceptance matrix strategy.
+        model = make_model(name='Generic native-mtp')
+        strategy = select_benchmark_strategy(
+            ENGINE_LLAMA_CPP,
+            model,
+            capabilities=mtp_caps(('none', 'draft-mtp')),
+            objective='quick_sanity',
+            depth='fast',
+        )
+        self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
+        self.assertEqual(strategy.engine_id, ENGINE_LLAMA_CPP)
+        self.assertEqual(strategy.blocked_reason, '')
+        self.assertIn('spec_type=draft-mtp', strategy.reason)
+
+    def test_llama_cpp_without_mtp_binary_does_not_select_mtp_strategy(self):
+        model = make_model(name='Generic native-mtp')
+        strategy = select_benchmark_strategy(
+            ENGINE_LLAMA_CPP,
+            model,
+            capabilities=plain_caps(),
+            objective='quick_sanity',
+            depth='fast',
+        )
+        self.assertNotEqual(strategy.id, 'mtp_acceptance_matrix')
+
+
+class MtpStartLaunchTests(unittest.TestCase):
+    def _setup(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        model_path = root / 'generic-native-mtp.gguf'
+        model_path.write_bytes(b'GGUF' + b'\0' * 64)
+        global_bin = root / 'llama-server'
+        global_bin.write_text('#!/bin/sh\n')
+        mtp_bin = root / 'mtp' / 'llama-server'
+        mtp_bin.parent.mkdir(parents=True, exist_ok=True)
+        mtp_bin.write_text('#!/bin/sh\n')
+        app = AppConfig(
+            root / 'models.json',
+            runtime_profile=make_runtime_profile(ENGINE_LLAMA_CPP, str(global_bin)),
+        )
+        model = ModelConfig(
+            id='mtp',
+            name='Generic native-mtp',
+            path=str(model_path),
+            alias='mtp',
+            port=18080,
+            supports_mtp='yes',
+            mtp_enabled=True,
+            mtp_draft_n_max=1,
+        )
+        mtp_profile = RuntimeProfile(
+            engine_id=ENGINE_LLAMA_CPP_MTP,
+            ctx_size=8192,
+            gpu_layers=None,
+            parallel=1,
+            mtp_enabled=True,
+            mtp_draft_n_max=1,
+        )
+        return app, model, mtp_profile, str(global_bin), str(mtp_bin)
+
+    def test_start_preflights_runtime_profile_binary_not_global(self):
+        # Global engine binary differs from the runtime profile's engine
+        # binary; start() must launch the runtime-profile binary and emit the
+        # advertised draft-mtp spec type.
+        app, model, mtp_profile, global_bin, mtp_bin = self._setup()
+        caps = mtp_caps(('none', 'draft-mtp'), fit=True)
+        launched = {}
+
+        class FakeProc:
+            pid = 4242
+
+        def fake_popen(cmd, *args, **kwargs):
+            launched['cmd'] = list(cmd)
+            return FakeProc()
+
+        with patch.dict('os.environ', {'LLAMA_CPP_MTP_PATH': mtp_bin}), \
+             patch.object(app, 'engine_capabilities', return_value=caps), \
+             patch.object(app, 'runtime_command_ready', return_value=(True, '')), \
+             patch.object(app, 'get_pid', return_value=None), \
+             patch('llama_tui.app.subprocess.Popen', side_effect=fake_popen):
+            ok, msg = app.start(model, runtime_profile=mtp_profile)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(launched.get('cmd', [None])[0], mtp_bin)
+        self.assertNotEqual(launched['cmd'][0], global_bin)
+        self.assertEqual(command_spec_type_value(launched['cmd']), 'draft-mtp')
+
+    def test_start_blocks_invalid_spec_type_before_subprocess(self):
+        app, model, mtp_profile, _global_bin, mtp_bin = self._setup()
+        caps = mtp_caps(('none', 'draft-mtp'), fit=True)
+        bad_command = [mtp_bin, '-m', model.path, '--spec-type', 'mtp', '--spec-draft-n-max', '1']
+        popen_calls = []
+
+        with patch.dict('os.environ', {'LLAMA_CPP_MTP_PATH': mtp_bin}), \
+             patch.object(app, 'engine_capabilities', return_value=caps), \
+             patch.object(app, 'runtime_command_ready', return_value=(True, '')), \
+             patch.object(app, 'get_pid', return_value=None), \
+             patch.object(app, 'build_command', return_value=bad_command), \
+             patch('llama_tui.app.subprocess.Popen', side_effect=lambda *a, **k: popen_calls.append(a) or MagicMock()):
+            ok, msg = app.start(model, runtime_profile=mtp_profile)
+
+        self.assertFalse(ok)
+        self.assertIn('INVALID_MTP_SPEC_TYPE', msg)
+        self.assertEqual(popen_calls, [])
 
 
 if __name__ == '__main__':

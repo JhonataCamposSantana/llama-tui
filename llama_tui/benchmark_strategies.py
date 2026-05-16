@@ -133,24 +133,34 @@ def select_benchmark_strategy(
             blocked_reason=blocked_reason,
         )
 
-    if engine == ENGINE_LLAMA_CPP_MTP:
-        mtp_spec_type = mtp_spec_type_value(capabilities)
-        spec_values = tuple(getattr(capabilities, 'spec_type_values', ()) or ()) if capabilities is not None else ()
-        mtp_capable_binary = (
-            bool(capabilities is not None)
-            and bool(getattr(capabilities, 'supports_spec_type', False))
-            and bool(getattr(capabilities, 'supports_mtp', False))
-            and bool(mtp_spec_type)
-            and bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
-        )
+    # MTP is a binary capability, not a dedicated engine. Select the MTP
+    # acceptance matrix for any llama.cpp-compatible engine whose binary
+    # advertises --spec-type (draft-mtp/mtp) + --spec-draft-n-max when the
+    # model is MTP-native. The legacy llama.cpp-mtp engine always routes here
+    # (and reports a blocked_reason when prerequisites are missing).
+    mtp_spec_type = mtp_spec_type_value(capabilities)
+    spec_values = tuple(getattr(capabilities, 'spec_type_values', ()) or ()) if capabilities is not None else ()
+    model_is_mtp = 'mtp_native' in features
+    mtp_capable_binary = (
+        bool(capabilities is not None)
+        and bool(getattr(capabilities, 'supports_spec_type', False))
+        and bool(getattr(capabilities, 'supports_mtp', False))
+        and bool(mtp_spec_type)
+        and bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
+    )
+    mtp_strategy_applies = (
+        engine == ENGINE_LLAMA_CPP_MTP
+        or (engine == ENGINE_LLAMA_CPP and model_is_mtp and mtp_capable_binary)
+    )
+    if mtp_strategy_applies:
         blocked_reason = ''
-        if 'mtp_native' not in features:
+        if not model_is_mtp:
             blocked_reason = 'model is not detected as MTP-native'
         elif not mtp_capable_binary:
             supported = ','.join(str(item) for item in spec_values) if spec_values else 'none'
             blocked_reason = (
-                'selected llama.cpp-mtp binary does not advertise a supported --spec-type '
-                f'value (mtp or draft-mtp) and --spec-draft-n-max; advertised spec types: {supported}'
+                'selected binary does not advertise a supported --spec-type '
+                f'value (draft-mtp or mtp) and --spec-draft-n-max; advertised spec types: {supported}'
             )
         return BenchmarkStrategy(
             id='mtp_acceptance_matrix',

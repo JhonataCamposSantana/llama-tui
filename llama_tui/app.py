@@ -2785,12 +2785,12 @@ class AppConfig:
         benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
     ) -> Tuple[bool, str]:
         runtime = getattr(model, 'runtime', 'llama.cpp')
-        engine_key = (
-            runtime_profile.engine_id
-            if runtime_profile is not None and getattr(runtime_profile, 'engine_id', '')
-            else self.active_engine_key_for_model(model)
-        )
-        command = self.runtime_server_command(runtime)
+        # Resolve the binary/capabilities for the profile actually being
+        # launched so preflight checks match build_command(), instead of
+        # preflighting the global runtime_server_command(runtime).
+        engine_context = resolve_runtime_engine_context(self, model=model, runtime_profile=runtime_profile)
+        engine_key = engine_context.engine_id
+        command = engine_context.command or self.runtime_server_command(runtime)
         if runtime == 'vllm':
             label = 'vLLM command'
         elif engine_key == 'buun':
@@ -2857,7 +2857,6 @@ class AppConfig:
                     f'{profile_msg} benchmark_profile={benchmark_profile.name} '
                     f'output={benchmark_profile.measurement_output}'
                 )
-        engine_context = resolve_runtime_engine_context(self, model=model, runtime_profile=runtime_profile)
         if engine_context.supports_mtp and model_mtp_enabled(model, runtime_profile):
             if int(profile.get('parallel', 1) or 1) != 1:
                 profile_msg = f'{profile_msg} MTP forced parallel=1'
