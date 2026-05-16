@@ -1889,6 +1889,11 @@ def benchmark_launch_profile_detail_lines(record: Dict[str, object]) -> List[str
     flash = str(record.get('flash_attn', '') or record.get('flash_attn_mode', '') or '-')
     fit = 'on' if bool(record.get('fit', record.get('runtime_fit', False))) else 'off'
     fit_context = int(record.get('fit_context', 0) or 0)
+    fit_target = int(record.get('fit_target', 0) or 0)
+    no_mmap = 'yes' if bool(record.get('no_mmap', record.get('runtime_no_mmap', False))) else 'no'
+    draft_kv = ''
+    if record.get('draft_ctk') or record.get('draft_ctv'):
+        draft_kv = f' draft_key={record.get("draft_ctk", "-") or "-"} draft_value={record.get("draft_ctv", "-") or "-"}'
     no_shift = 'yes' if bool(record.get('no_context_shift', False)) else 'no'
     sampling = (
         f'temp={record.get("temp", "-")} top_p={record.get("top_p", "-")} '
@@ -1928,7 +1933,10 @@ def benchmark_launch_profile_detail_lines(record: Dict[str, object]) -> List[str
         (
             f'  kv: key={kv_key} value={kv_value} flash={flash} fit={fit}'
             + (f' fit_ctx={fit_context}' if fit_context else '')
+            + (f' fit_target={fit_target}' if fit_target else '')
+            + f'{draft_kv}'
             + f' no_ctx_shift={no_shift}'
+            + f' no_mmap={no_mmap}'
         ),
         f'  placement: {placement} reasoning={reasoning or "-"}',
         f'  sampling: {sampling}',
@@ -2196,7 +2204,7 @@ def overview_items(
         ('Health', heading_attr),
         (f'Benchmark: {benchmark}', success_attr if benchmark == 'Fresh' else warning_attr),
         (f'Health: {health} / {health_reason}', health_attr),
-        (f'MTP: {mtp_state}', success_attr if mtp_state in ('ready', 'usable') else warning_attr if mtp_state in ('unknown', 'risky', 'testing') else error_attr if mtp_state in ('blocked', 'failed') else normal_attr),
+        (f'MTP: {mtp_state}', success_attr if mtp_state in ('ready', 'usable') else warning_attr if mtp_state in ('unknown', 'risky', 'risky acceptance', 'testing') else error_attr if mtp_state in ('blocked', 'failed', 'fit blocked', 'memory-bound') else normal_attr),
         (f'MoE recommendation: {moe_state}', warning_attr if moe_state == 'available, not applied' else normal_attr),
         ('', normal_attr),
         ('Recommendation', heading_attr),
@@ -3783,9 +3791,9 @@ def mtp_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = None)
         normalized = str(status or '').lower()
         if normalized in ('ready', 'usable', 'preferred', 'compatible'):
             return 'success'
-        if normalized in ('blocked', 'failed', 'unsupported'):
+        if normalized in ('blocked', 'failed', 'unsupported', 'fit blocked', 'memory-bound'):
             return 'error'
-        if normalized in ('unknown', 'risky', 'compatible_with_warning'):
+        if normalized in ('unknown', 'risky', 'risky acceptance', 'compatible_with_warning'):
             return 'warning'
         return 'muted'
 
@@ -3836,6 +3844,7 @@ def mtp_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = None)
         (f'--spec-draft-n-max included: {yn(report.launch.includes_spec_draft_n_max)}', 'success' if report.launch.includes_spec_draft_n_max else 'muted'),
         (f'--parallel/-np included: {yn(report.launch.includes_parallel)}', 'success' if report.launch.includes_parallel else 'warning'),
         (f'--no-warmup included: {yn(report.launch.includes_no_warmup)}', 'success' if report.launch.includes_no_warmup else 'muted'),
+        (f'--no-mmap included: {yn(report.launch.includes_no_mmap)}', 'success' if report.launch.includes_no_mmap else 'muted'),
         (f'cache flags included: {yn(report.launch.includes_cache_flags)}', 'success' if report.launch.includes_cache_flags else 'muted'),
         (f'command: {report.launch.command_preview or "-"}', 'normal' if report.launch.command_preview else 'warning'),
     ])

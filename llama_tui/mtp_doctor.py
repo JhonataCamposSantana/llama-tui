@@ -34,6 +34,7 @@ class MtpLaunchDiagnostics:
     includes_spec_draft_n_max: bool = False
     includes_parallel: bool = False
     includes_no_warmup: bool = False
+    includes_no_mmap: bool = False
     includes_cache_flags: bool = False
     warnings: Tuple[str, ...] = ()
     blocked_reason: str = ''
@@ -101,6 +102,83 @@ def _command_contains(tokens: Sequence[str], *flags: str) -> bool:
     return False
 
 
+def _command_value(tokens: Sequence[str], *flags: str) -> str:
+    lowered = [str(item or '').strip() for item in tokens]
+    flag_set = {str(flag or '').strip() for flag in flags if str(flag or '').strip()}
+    for idx, token in enumerate(lowered):
+        if token in flag_set and idx + 1 < len(lowered):
+            return lowered[idx + 1]
+        for flag in flag_set:
+            prefix = f'{flag}='
+            if token.startswith(prefix):
+                return token[len(prefix):]
+    return ''
+
+
+def _add_unique(items: list, text: str):
+    if text and text not in items:
+        items.append(text)
+
+
+def _mtp_profile_warnings(model: Any, runtime_profile: Any, command_tokens: Sequence[str]) -> Tuple[str, ...]:
+    warnings = []
+    cmd_has_fit = _command_contains(command_tokens, '-fit', '--fit')
+    cmd_has_ngl = _command_contains(command_tokens, '-ngl', '--n-gpu-layers')
+    if cmd_has_fit and cmd_has_ngl:
+        _add_unique(warnings, 'MTP fit was blocked because --n-gpu-layers was fixed. Use fit-assisted MTP profile.')
+    ctx_value = _command_value(command_tokens, '--ctx-size', '-c')
+    try:
+        ctx = int(ctx_value or getattr(runtime_profile, 'ctx_size', 0) or getattr(model, 'ctx', 0) or 0)
+    except Exception:
+        ctx = 0
+    key_kv = (_command_value(command_tokens, '-ctk', '--cache-type-k') or str(getattr(runtime_profile, 'kv_preset', '') or '')).strip().lower()
+    value_kv = (_command_value(command_tokens, '-ctv', '--cache-type-v') or key_kv).strip().lower()
+    if ctx >= 131072 and (key_kv in ('', 'default', 'f16') or value_kv in ('', 'default', 'f16')):
+        _add_unique(warnings, 'MTP 128k is using default/f16 KV; q8_0 target and draft KV may be required for this hardware.')
+    has_cpu_override = (
+        _command_contains(command_tokens, '-ot', '--override-tensor', '--override-tensors', '-cmoe', '--cpu-moe', '-ncmoe', '--n-cpu-moe')
+        or bool(getattr(runtime_profile, 'cpu_moe', False))
+        or int(getattr(runtime_profile, 'n_cpu_moe', 0) or 0) > 0
+        or bool(tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ()))
+    )
+    if has_cpu_override and not _command_contains(command_tokens, '--no-mmap'):
+        _add_unique(warnings, 'MTP model uses CPU tensor overrides with mmap enabled; --no-mmap may improve performance.')
+
+    profiles = dict(getattr(model, 'measured_profiles', {}) or {})
+    records = [dict(item) for item in list(getattr(model, 'last_benchmark_results', []) or []) if isinstance(item, dict)]
+    records.extend(dict(item) for item in profiles.values() if isinstance(item, dict))
+    for record in records:
+        category = str(record.get('failure_category', '') or '')
+        if category in ('FIXED_GPU_LAYERS_BLOCKED_FIT', 'FIXED_GPU_LAYERS_FIT_FAILED'):
+            _add_unique(warnings, 'MTP fit was blocked because --n-gpu-layers was fixed. Use fit-assisted MTP profile.')
+        warning = str(record.get('warning', '') or '')
+        runtime_warnings = {str(item) for item in list(record.get('runtime_warnings', []) or [])}
+        if warning == 'MMAP_CPU_OVERRIDE_SLOWPATH' or 'MMAP_CPU_OVERRIDE_SLOWPATH' in runtime_warnings:
+            _add_unique(warnings, 'MTP model uses CPU tensor overrides with mmap enabled; --no-mmap may improve performance.')
+        try:
+            acceptance = float(record.get('accept_rate', record.get('acceptance_rate', -1.0)) or -1.0)
+        except Exception:
+            acceptance = -1.0
+        if bool(record.get('mtp_enabled')) and 0.0 <= acceptance < 0.70:
+            _add_unique(warnings, 'Draft acceptance below 70%; this draft_n may be too aggressive.')
+        kv = str(record.get('kv_preset', '') or '').lower()
+        draft_kv = str(record.get('mtp_draft_kv_preset', '') or '').lower()
+        if (
+            bool(record.get('mtp_enabled'))
+            and str(record.get('status', '') or '') == 'ok'
+            and float(record.get('tokens_per_sec', 0.0) or 0.0) > 0.0
+            and acceptance >= 0.70
+            and bool(record.get('no_mmap', record.get('runtime_no_mmap', False)))
+            and (kv == 'q8_0/q8_0' or (str(record.get('ctk', '') or '').lower() == 'q8_0' and str(record.get('ctv', '') or '').lower() == 'q8_0'))
+            and (draft_kv == 'q8_0/q8_0' or (str(record.get('draft_ctk', '') or '').lower() == 'q8_0' and str(record.get('draft_ctv', '') or '').lower() == 'q8_0'))
+        ):
+            _add_unique(
+                warnings,
+                f'MTP fit-assisted q8/no-mmap profile is usable: {float(record.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s, {acceptance:.0%} acceptance.',
+            )
+    return tuple(warnings)
+
+
 def _build_launch_diagnostics(
     app: Any,
     model: Any,
@@ -129,6 +207,7 @@ def _build_launch_diagnostics(
     except Exception as exc:
         warnings.append(f'command preview unavailable: {str(exc).splitlines()[0]}')
     warnings.extend(mtp_arg_diagnostics.warnings)
+    warnings.extend(_mtp_profile_warnings(model, effective_profile, command_tokens))
     selected = mtp_arg_diagnostics.selected_spec_type or mtp_spec_type_value(capabilities)
     return MtpLaunchDiagnostics(
         selected_spec_type=selected,
@@ -140,6 +219,7 @@ def _build_launch_diagnostics(
         includes_spec_draft_n_max=_command_contains(command_tokens, '--spec-draft-n-max'),
         includes_parallel=_command_contains(command_tokens, '--parallel', '-np'),
         includes_no_warmup=_command_contains(command_tokens, '--no-warmup'),
+        includes_no_mmap=_command_contains(command_tokens, '--no-mmap'),
         includes_cache_flags=_command_contains(command_tokens, '--cache-type-k', '--cache-type-v', '-ctk', '-ctv'),
         warnings=tuple(warnings),
         blocked_reason=mtp_arg_diagnostics.blocked_reason or blocked_reason,
@@ -165,6 +245,19 @@ def _capability_block_reason(install: Any, capabilities: EngineCapabilities) -> 
 def _measured_mtp_status(model: Any) -> Tuple[str, str, str]:
     profiles: Dict[str, Any] = dict(getattr(model, 'measured_profiles', {}) or {})
     profile = dict(profiles.get('mtp_acceptance') or {})
+    records = [
+        dict(item) for item in list(getattr(model, 'last_benchmark_results', []) or [])
+        if isinstance(item, dict)
+    ]
+    records.extend(dict(item) for item in profiles.values() if isinstance(item, dict))
+    for item in records:
+        category = str(item.get('failure_category', '') or '').strip()
+        if category in ('FIXED_GPU_LAYERS_BLOCKED_FIT', 'FIXED_GPU_LAYERS_FIT_FAILED'):
+            return 'fit blocked', 'MTP fit was blocked because --n-gpu-layers was fixed.', 'Use fit-assisted MTP profile.'
+    for item in records:
+        category = str(item.get('failure_category', '') or '').strip()
+        if category in ('MEMORY_FIT_FAILED', 'CUDA_OOM_KV', 'CUDA_OOM_WEIGHTS', 'MEMORY_GUARDRAIL'):
+            return 'memory-bound', f'MTP profile hit {category}.', 'Try q8 target/draft KV, fit-assisted placement, and --no-mmap.'
     if not profile:
         return '', '', ''
     status = str(profile.get('status', '') or '').strip().lower()
@@ -179,7 +272,7 @@ def _measured_mtp_status(model: Any) -> Tuple[str, str, str]:
     if acceptance >= 0.75:
         return 'usable', f'MTP acceptance is usable at draft_n={draft or "-"} accept={acceptance:.0%}', 'Use the measured MTP profile or run MTP Optimizer for more workloads.'
     if acceptance >= 0.0:
-        return 'risky', f'MTP acceptance is low at draft_n={draft or "-"} accept={acceptance:.0%}', 'Keep MTP opt-in and run the MTP Optimizer before saving a profile.'
+        return 'risky acceptance', f'MTP acceptance is low at draft_n={draft or "-"} accept={acceptance:.0%}', 'Keep MTP opt-in and run the MTP Optimizer before saving a profile.'
     return 'usable', f'MTP acceptance has a usable {status} record', 'Review MTP Optimizer details before promoting the profile.'
 
 

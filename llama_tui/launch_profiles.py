@@ -247,7 +247,8 @@ def build_benchmark_launch_profile(
     reasoning_format = str(
         overrides.get('reasoning_format', getattr(runtime_profile, 'reasoning_format', '') if runtime_profile is not None else '') or ''
     ).strip().lower()
-    fit_target = str(overrides.get('fit_target', '') or '').strip()
+    runtime_fit_target = getattr(runtime_profile, 'fit_target', 0) if runtime_profile is not None else 0
+    fit_target = str(overrides.get('fit_target', runtime_fit_target or '') or '').strip()
     if purpose_key in ('moe_tuning', 'max_context_probe'):
         temp = 0.0
         top_p = None

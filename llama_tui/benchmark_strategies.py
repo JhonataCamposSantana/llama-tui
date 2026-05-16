@@ -158,10 +158,10 @@ def select_benchmark_strategy(
             objectives=('quick_sanity', 'fast_chat', 'experimental_lab'),
             phases=() if blocked_reason else (
                 _phase('baseline_no_mtp', 'server_openai_api', 'quick_sanity', 'Baseline without MTP speculative decoding', ('tg_tps', 'ttft_ms', 'tpot_ms'), 1, 180),
-                _phase('draft_acceptance', 'custom_mtp_probe', 'fast_chat', 'Draft n=1..3 acceptance-rate matrix', ('tg_tps', 'draft_tokens', 'accepted_tokens', 'accept_rate'), 3, 240),
+                _phase('draft_acceptance', 'custom_mtp_probe', 'fast_chat', 'Fit-assisted q8/no-mmap draft n=1..3 acceptance matrix', ('tg_tps', 'draft_tokens', 'accepted_tokens', 'accept_rate'), 18 if depth_key == 'fast' else 28, 240),
             ),
-            hard_budget_seconds=0 if blocked_reason else (8 * 60 if depth_key == 'fast' else 15 * 60),
-            max_candidates=0 if blocked_reason else 4,
+            hard_budget_seconds=0 if blocked_reason else (12 * 60 if depth_key == 'fast' else 24 * 60),
+            max_candidates=0 if blocked_reason else (20 if depth_key == 'fast' else 32),
             retry_policy='blocked' if blocked_reason else 'terminal_missing_flags_single_start_retry',
             reason=blocked_reason or f'MTP-capable GGUF uses optional no-MTP baseline plus draft acceptance-rate comparison; spec_type={mtp_spec_type}; force np=1 and block vision/mmproj',
             metric_groups=('tg_tps', 'draft_tokens', 'accepted_tokens', 'accept_rate', 'ttft_ms', 'tpot_ms'),

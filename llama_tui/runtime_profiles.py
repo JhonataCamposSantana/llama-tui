@@ -56,6 +56,9 @@ RUNTIME_TUNING_FLAGS = (
     '-fitc',
     '--fit-target',
     '-fitt',
+    '--cache-ram',
+    '--no-mmap',
+    '--mlock',
     '--warmup',
     '--no-warmup',
     '--temp',
@@ -86,6 +89,10 @@ RUNTIME_TUNING_FLAGS = (
     '-ot',
     '--spec-type',
     '--spec-draft-n-max',
+    '--spec-draft-type-k',
+    '--spec-draft-type-v',
+    '--cache-type-k-draft',
+    '--cache-type-v-draft',
 )
 
 
@@ -206,6 +213,9 @@ class EngineCapabilities:
     supports_fit: bool = False
     supports_fit_ctx: bool = False
     supports_fit_target: bool = False
+    supports_cache_ram: bool = True
+    supports_no_mmap: bool = False
+    supports_mlock: bool = False
     supports_no_warmup: bool = False
     supports_context_shift: bool = False
     supports_chat_template_kwargs: bool = False
@@ -230,11 +240,14 @@ class EngineCapabilities:
     mtp_spec_type: str = ''
     mtp_spec_type_value: str = ''
     supports_spec_draft_n_max: bool = False
+    supports_spec_draft_type_kv: bool = False
     cpu_moe_flag: str = '-cmoe'
     n_cpu_moe_flag: str = '-ncmoe'
     override_tensor_flag: str = '-ot'
     spec_type_flag: str = '--spec-type'
     spec_draft_n_max_flag: str = '--spec-draft-n-max'
+    spec_draft_type_k_flag: str = '--spec-draft-type-k'
+    spec_draft_type_v_flag: str = '--spec-draft-type-v'
     gpu_layers_flag: str = '--n-gpu-layers'
     supported_kv_modes: Tuple[str, ...] = ()
     help_text: str = ''
@@ -413,6 +426,9 @@ class RuntimeProfile:
     ubatch_size: int = 0
     fit: bool = False
     fit_context: int = 0
+    fit_target: int = 0
+    cache_ram: Optional[int] = None
+    no_mmap: bool = False
     no_warmup: bool = False
     extra_args: Tuple[str, ...] = field(default_factory=tuple)
     name: str = ''
@@ -436,6 +452,7 @@ class RuntimeProfile:
     reasoning_format: str = ''
     mtp_enabled: bool = False
     mtp_draft_n_max: int = 0
+    mtp_draft_kv_preset: str = ''
     benchmark_strategy_id: str = ''
     benchmark_objectives: Tuple[str, ...] = field(default_factory=tuple)
     benchmark_phase: str = ''
@@ -770,6 +787,9 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
     supports_fit = bool(re.search(r'(^|\s)--?fit(\s|,|$)', low) or defaults.supports_fit)
     supports_fit_ctx = ('-fitc' in low or '--fit-ctx' in low or defaults.supports_fit_ctx)
     supports_fit_target = ('-fitt' in low or '--fit-target' in low or defaults.supports_fit_target)
+    supports_cache_ram = ('--cache-ram' in low or defaults.supports_cache_ram)
+    supports_no_mmap = ('--no-mmap' in low or defaults.supports_no_mmap)
+    supports_mlock = ('--mlock' in low or defaults.supports_mlock)
     supports_no_warmup = ('--no-warmup' in low or defaults.supports_no_warmup)
     supports_context_shift = ('--context-shift' in low or '--no-context-shift' in low or defaults.supports_context_shift)
     supports_chat_template_kwargs = ('--chat-template-kwargs' in low or defaults.supports_chat_template_kwargs)
@@ -804,6 +824,19 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
     )
     supports_spec_type = '--spec-type' in low or defaults.supports_spec_type
     supports_spec_draft_n_max = '--spec-draft-n-max' in low or defaults.supports_spec_draft_n_max
+    has_draft_type_k = '--spec-draft-type-k' in low or '--cache-type-k-draft' in low
+    has_draft_type_v = '--spec-draft-type-v' in low or '--cache-type-v-draft' in low
+    supports_spec_draft_type_kv = (has_draft_type_k and has_draft_type_v) or defaults.supports_spec_draft_type_kv
+    spec_draft_type_k_flag = (
+        '--spec-draft-type-k' if '--spec-draft-type-k' in low
+        else '--cache-type-k-draft' if '--cache-type-k-draft' in low
+        else defaults.spec_draft_type_k_flag
+    )
+    spec_draft_type_v_flag = (
+        '--spec-draft-type-v' if '--spec-draft-type-v' in low
+        else '--cache-type-v-draft' if '--cache-type-v-draft' in low
+        else defaults.spec_draft_type_v_flag
+    )
     spec_type_values = parse_spec_type_values(text, defaults)
     mtp_spec_type = select_mtp_spec_type_value(spec_type_values, mtp_spec_type_value(defaults))
     supports_mtp = bool(supports_spec_type and mtp_spec_type) or defaults.supports_mtp
@@ -831,6 +864,9 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         supports_fit=supports_fit,
         supports_fit_ctx=supports_fit_ctx,
         supports_fit_target=supports_fit_target,
+        supports_cache_ram=supports_cache_ram,
+        supports_no_mmap=supports_no_mmap,
+        supports_mlock=supports_mlock,
         supports_no_warmup=supports_no_warmup,
         supports_context_shift=supports_context_shift,
         supports_chat_template_kwargs=supports_chat_template_kwargs,
@@ -855,11 +891,14 @@ def parse_engine_capabilities(help_text: str, engine_id: str = 'llama.cpp') -> E
         mtp_spec_type=mtp_spec_type,
         mtp_spec_type_value=mtp_spec_type,
         supports_spec_draft_n_max=supports_spec_draft_n_max,
+        supports_spec_draft_type_kv=supports_spec_draft_type_kv,
         cpu_moe_flag=cpu_moe_flag,
         n_cpu_moe_flag=n_cpu_moe_flag,
         override_tensor_flag=override_tensor_flag,
         spec_type_flag='--spec-type',
         spec_draft_n_max_flag='--spec-draft-n-max',
+        spec_draft_type_k_flag=spec_draft_type_k_flag,
+        spec_draft_type_v_flag=spec_draft_type_v_flag,
         gpu_layers_flag=gpu_layers_flag,
         supported_kv_modes=supported_kv_modes,
         help_text=text,
@@ -1003,6 +1042,26 @@ def build_mtp_args(
         getattr(capabilities, 'spec_draft_n_max_flag', '--spec-draft-n-max') or '--spec-draft-n-max',
         str(draft),
     ]
+    draft_kv_key, draft_kv_value = kv_modes_from_preset(str(getattr(runtime_profile, 'mtp_draft_kv_preset', '') or ''))
+    if draft_kv_key and draft_kv_value:
+        if getattr(capabilities, 'supports_spec_draft_type_kv', False):
+            args += [
+                getattr(capabilities, 'spec_draft_type_k_flag', '--spec-draft-type-k') or '--spec-draft-type-k',
+                draft_kv_key,
+                getattr(capabilities, 'spec_draft_type_v_flag', '--spec-draft-type-v') or '--spec-draft-type-v',
+                draft_kv_value,
+            ]
+        else:
+            return [], MtpArgDiagnostics(
+                enabled=True,
+                selected_spec_type=spec_type,
+                draft_n_max=draft,
+                skipped_flags=(
+                    getattr(capabilities, 'spec_draft_type_k_flag', '--spec-draft-type-k') or '--spec-draft-type-k',
+                    getattr(capabilities, 'spec_draft_type_v_flag', '--spec-draft-type-v') or '--spec-draft-type-v',
+                ),
+                blocked_reason='missing MTP draft KV cache flags',
+            )
     return args, MtpArgDiagnostics(
         enabled=True,
         selected_spec_type=spec_type,
@@ -1021,7 +1080,9 @@ def runtime_profile_extra_args(
     profile_extra_args = strip_runtime_tuning_args(runtime_profile.extra_args)
     args.extend(build_flash_attn_args(runtime_profile.flash_attn, capabilities))
     kv_key, kv_value = kv_modes_from_preset(runtime_profile.kv_preset)
-    if (engine.is_turboquant or engine.is_tq3) and kv_key and kv_value and capabilities.supports_ctk_ctv:
+    if engine.is_llama_cpp_mtp and kv_key and kv_value and capabilities.supports_ctk_ctv:
+        args += ['-ctk', kv_key, '-ctv', kv_value]
+    elif (engine.is_turboquant or engine.is_tq3) and kv_key and kv_value and capabilities.supports_ctk_ctv:
         args += ['-ctk', kv_key, '-ctv', kv_value]
     elif engine.supports_turbo_kv and is_turbo_kv_preset(runtime_profile.kv_preset):
         if capabilities.supports_ctk_ctv:
@@ -1036,6 +1097,9 @@ def runtime_profile_extra_args(
         args += ['-fit', 'on']
         if runtime_profile.fit_context > 0 and capabilities.supports_fit_ctx:
             args += ['-fitc', str(int(runtime_profile.fit_context))]
+    if bool(getattr(runtime_profile, 'no_mmap', False)):
+        if capabilities.supports_no_mmap:
+            args.append('--no-mmap')
     if runtime_profile.no_warmup and capabilities.supports_no_warmup:
         args.append('--no-warmup')
     if bool(getattr(runtime_profile, 'cpu_moe', False)) and capabilities.supports_cpu_moe:

@@ -816,6 +816,76 @@ class BrowserAndFormTests(unittest.TestCase):
 
         self.assertEqual(mtp_status_short(FakeApp(), model), 'usable')
 
+    def test_mtp_short_status_preserves_active_doctor_statuses(self):
+        model = ModelConfig(id='mtp', name='MTP Model', path='native-mtp.gguf', alias='mtp', port=18080)
+
+        class FakeApp:
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp-mtp'
+
+        for status in ('ready', 'unknown', 'blocked', 'failed', 'usable', 'risky'):
+            with self.subTest(status=status), patch(
+                'llama_tui.ui.mtp_status_for_model',
+                return_value=SimpleNamespace(status=status),
+            ):
+                self.assertEqual(mtp_status_short(FakeApp(), model), status)
+
+    def test_overview_items_show_blocked_mtp_status_with_error_attr(self):
+        model = ModelConfig(id='mtp', name='MTP Model', path='native-mtp.gguf', alias='mtp', port=18080)
+
+        class FakeApp:
+            def active_engine_key_for_model(self, _model):
+                return 'llama.cpp-mtp'
+
+            def model_fingerprint(self, _model):
+                return 'fp'
+
+        with patch('llama_tui.ui.mtp_status_for_model', return_value=SimpleNamespace(status='blocked')), \
+             patch('llama_tui.ui.build_model_row_summary', return_value={'health': 'OK', 'health_reason': 'ready'}), \
+             patch('llama_tui.ui.benchmark_strategy_for_app', return_value=None), \
+             patch(
+                 'llama_tui.ui.suggested_next_action',
+                 return_value=SimpleNamespace(label='Review MTP Doctor', key='', reason='MTP launch is blocked', severity='error'),
+             ):
+            items = overview_items(
+                FakeApp(),
+                model,
+                'STOPPED',
+                width=80,
+                success_attr=1,
+                warning_attr=2,
+                error_attr=3,
+                heading_attr=4,
+                normal_attr=0,
+            )
+
+        self.assertIn(('MTP: blocked', 3), items)
+
+    def test_active_engine_warning_line_joins_mtp_messages_once(self):
+        model = ModelConfig(
+            id='mtp',
+            name='MTP Model',
+            path='native-mtp.gguf',
+            alias='mtp',
+            port=18080,
+        )
+
+        class FakeApp:
+            def mtp_session_advisory(self, _model):
+                return 'MTP: n=2 (supported) Experimental'
+
+            def mtp_binary_warning(self, _model):
+                return 'MTP_FLAGS_NOT_FOUND: selected binary does not expose MTP flags.'
+
+        warning = active_engine_warning_line(FakeApp(), model)
+
+        self.assertEqual(
+            warning,
+            'MTP: n=2 (supported) Experimental | MTP_FLAGS_NOT_FOUND: selected binary does not expose MTP flags.',
+        )
+        self.assertEqual(warning.count('MTP: n=2 (supported) Experimental'), 1)
+        self.assertEqual(warning.count('MTP_FLAGS_NOT_FOUND'), 1)
+
     def test_suggested_next_action_guides_moe_and_apply_paths(self):
         class FakeApp:
             def model_fingerprint(self, _model):
@@ -920,6 +990,10 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn(' ENGINE ', browser_header_for_view('advanced', 120))
         self.assertIn('dense', line)
         self.assertNotIn('HEALTH', browser_header_for_view('advanced', 120))
+
+    def test_browser_headers_preserve_advanced_legacy_and_compact_mtp_column(self):
+        self.assertEqual(browser_header_for_view('advanced', 120), BROWSER_HEADER)
+        self.assertIn('MTP', browser_header_for_view('compact', 120))
 
     def test_machine_best_summary_includes_explanatory_reason(self):
         model = ModelConfig(id='balanced', name='Balanced', path='balanced.gguf', alias='balanced', port=18080)
@@ -2131,6 +2205,32 @@ class BenchmarkDashboardTests(unittest.TestCase):
         self.assertIn('120.00', text)
         self.assertIn('Failed', text)
         self.assertIn('hermes command', text)
+
+    def test_sparse_benchmark_ranking_rows_keep_current_headers(self):
+        server_run = {
+            'kind': 'server',
+            'records': [
+                {'status': 'ok'},
+                {'status': 'start failed', 'detail': 'missing fields'},
+            ],
+        }
+        agent_run = {
+            'kind': 'opencode',
+            'records': [
+                {'status': 'tests passed'},
+                {'status': 'tests failed', 'detail': 'missing fields'},
+            ],
+        }
+
+        server_lines = [line for line, _attr in benchmark_ranking_items(server_run, width=120)]
+        agent_lines = [line for line, _attr in benchmark_ranking_items(agent_run, width=120)]
+
+        self.assertIn('Rank Role                 Status         Tok/s', server_lines[0])
+        self.assertIn('Variant', server_lines[0])
+        self.assertIn('Rank Role               Status                 Score', agent_lines[0])
+        self.assertIn('Pass', agent_lines[0])
+        self.assertTrue(any('missing fields' in line for line in server_lines))
+        self.assertTrue(any('missing fields' in line for line in agent_lines))
 
     def test_server_ranking_table_stays_within_narrow_widths(self):
         run = {

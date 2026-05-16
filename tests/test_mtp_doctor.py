@@ -15,7 +15,7 @@ from llama_tui.ui import mtp_doctor_items
 def mtp_capabilities(spec_type: str = 'draft-mtp'):
     return replace(
         default_engine_capabilities(ENGINE_LLAMA_CPP_MTP),
-        help_text=f'--spec-type none,{spec_type}\n--spec-draft-n-max N\n--no-warmup\n--parallel N',
+        help_text=f'--spec-type none,{spec_type}\n--spec-draft-n-max N\n--no-warmup\n--parallel N\n-ctk TYPE -ctv TYPE --no-mmap',
         supports_spec_type=True,
         supports_mtp=True,
         spec_type_values=('none', spec_type),
@@ -24,6 +24,8 @@ def mtp_capabilities(spec_type: str = 'draft-mtp'):
         supports_spec_draft_n_max=True,
         supports_no_warmup=True,
         supports_parallel=True,
+        supports_ctk_ctv=True,
+        supports_no_mmap=True,
     )
 
 
@@ -213,6 +215,64 @@ class MtpDoctorTests(unittest.TestCase):
         self.assertIn('model allowed for MTP: yes', text)
         self.assertIn('--spec-type included: yes', text)
         self.assertIn('--spec-draft-n-max 3', text)
+
+    def test_doctor_warns_about_old_bad_mtp_profile_shapes_and_good_fit_profile(self):
+        app = self.make_app()
+        model = ModelConfig(
+            id='mtp',
+            name='MTP',
+            path='/models/native-mtp.gguf',
+            alias='mtp',
+            port=18080,
+            supports_mtp='yes',
+            mtp_enabled=True,
+            mtp_draft_n_max=3,
+            last_benchmark_results=[
+                {
+                    'status': 'start failed',
+                    'failure_category': 'FIXED_GPU_LAYERS_BLOCKED_FIT',
+                    'benchmark_phase': 'draft_n3',
+                    'mtp_enabled': True,
+                },
+                {
+                    'status': 'ok',
+                    'runtime_profile': 'mtp_fit_q8_draftq8_nommap_draft1_128k',
+                    'ctx': 131072,
+                    'kv_preset': 'q8_0/q8_0',
+                    'mtp_draft_kv_preset': 'q8_0/q8_0',
+                    'no_mmap': True,
+                    'mtp_enabled': True,
+                    'mtp_draft_n_max': 1,
+                    'tokens_per_sec': 31.25,
+                    'accept_rate': 0.7671,
+                },
+                {
+                    'status': 'ok',
+                    'mtp_enabled': True,
+                    'mtp_draft_n_max': 2,
+                    'accept_rate': 0.6453,
+                    'warning': 'MMAP_CPU_OVERRIDE_SLOWPATH',
+                },
+            ],
+        )
+        caps = mtp_capabilities('draft-mtp')
+        install = EngineInstall(
+            id=ENGINE_LLAMA_CPP_MTP,
+            resolved_command='/opt/mtp/bin/llama-server',
+            source='env:LLAMA_CPP_MTP_PATH',
+            exists=True,
+            executable=True,
+        )
+
+        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
+             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+             patch.object(app, 'engine_capabilities', return_value=caps):
+            text = '\n'.join(line for line, _kind in mtp_doctor_items(app, model))
+
+        self.assertIn('MTP fit was blocked because --n-gpu-layers was fixed', text)
+        self.assertIn('--no-mmap may improve performance', text)
+        self.assertIn('Draft acceptance below 70%', text)
+        self.assertIn('MTP fit-assisted q8/no-mmap profile is usable: 31.25 tok/s, 77% acceptance.', text)
 
 
 if __name__ == '__main__':

@@ -43,6 +43,7 @@ from llama_tui.benchmark import (
     model_for_runtime_profile,
     max_context_probe_runtime_profiles,
     mtp_optimizer_profile_recommendations,
+    parse_mtp_runtime_diagnostics,
     runtime_record_context,
     runtime_profile_memory_disable_key,
     runtime_profile_memory_skip_reason,
@@ -257,7 +258,9 @@ class RuntimeProfileTests(unittest.TestCase):
 
     def test_capability_parser_detects_mtp_speculative_flags(self):
         caps = parse_engine_capabilities(
-            'usage: llama-server --spec-type mtp --spec-draft-n-max N --parallel N',
+            'usage: llama-server --spec-type mtp --spec-draft-n-max N --parallel N '
+            '-fit on -fitt N -fitc N -ctk TYPE -ctv TYPE '
+            '--spec-draft-type-k TYPE --spec-draft-type-v TYPE --cache-ram N --no-mmap --no-warmup',
             engine_id='llama.cpp-mtp',
         )
 
@@ -267,6 +270,13 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(caps.mtp_spec_type, 'mtp')
         self.assertEqual(caps.mtp_spec_type_value, 'mtp')
         self.assertTrue(caps.supports_spec_draft_n_max)
+        self.assertTrue(caps.supports_spec_draft_type_kv)
+        self.assertTrue(caps.supports_fit)
+        self.assertTrue(caps.supports_fit_ctx)
+        self.assertTrue(caps.supports_fit_target)
+        self.assertTrue(caps.supports_ctk_ctv)
+        self.assertTrue(caps.supports_no_mmap)
+        self.assertTrue(caps.supports_cache_ram)
         self.assertTrue(caps.supports_parallel)
 
     def test_capability_parser_detects_draft_mtp_spec_type_dialect(self):
@@ -425,6 +435,33 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(diagnostics.enabled)
         self.assertEqual(diagnostics.blocked_reason, 'missing mtp/draft-mtp value')
         self.assertIn('--spec-type', diagnostics.skipped_flags)
+
+    def test_build_mtp_args_emits_q8_draft_kv_flags(self):
+        profile = RuntimeProfile(
+            engine_id='llama.cpp-mtp',
+            ctx_size=131072,
+            gpu_layers=None,
+            parallel=1,
+            mtp_enabled=True,
+            mtp_draft_n_max=1,
+            mtp_draft_kv_preset='q8_0/q8_0',
+        )
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            mtp_spec_type='draft-mtp',
+            supports_spec_draft_n_max=True,
+            supports_spec_draft_type_kv=True,
+        )
+
+        args, diagnostics = build_mtp_args(None, profile, caps)
+
+        self.assertEqual(args[args.index('--spec-type') + 1], 'draft-mtp')
+        self.assertEqual(args[args.index('--spec-draft-n-max') + 1], '1')
+        self.assertEqual(args[args.index('--spec-draft-type-k') + 1], 'q8_0')
+        self.assertEqual(args[args.index('--spec-draft-type-v') + 1], 'q8_0')
+        self.assertEqual(diagnostics.blocked_reason, '')
 
     def test_build_mtp_args_skips_non_mtp_engines(self):
         profile = RuntimeProfile(
@@ -1590,13 +1627,77 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
         self.assertEqual(cmd[cmd.index('-ctv') + 1], 'turbo4')
 
+    def test_mtp_fit_q8_nommap_runtime_profile_emits_manual_winner_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(id='mtp', name='MTP', path='$MODEL', alias='mtp', port=18080, threads=6)
+            profile = RuntimeProfile(
+                engine_id='llama.cpp-mtp',
+                name='mtp_fit_q8_draftq8_nommap_draft1_128k',
+                ctx_size=131072,
+                gpu_layers=None,
+                parallel=1,
+                kv_preset='q8_0/q8_0',
+                flash_attn='on',
+                batch_size=128,
+                ubatch_size=64,
+                fit=True,
+                fit_context=4096,
+                fit_target=1024,
+                cache_ram=0,
+                no_mmap=True,
+                no_warmup=True,
+                mtp_enabled=True,
+                mtp_draft_n_max=1,
+                mtp_draft_kv_preset='q8_0/q8_0',
+            )
+            caps = replace(
+                default_engine_capabilities('llama.cpp-mtp'),
+                supports_spec_type=True,
+                supports_mtp=True,
+                mtp_spec_type='draft-mtp',
+                supports_spec_draft_n_max=True,
+                supports_spec_draft_type_kv=True,
+                supports_ctk_ctv=True,
+                supports_fit=True,
+                supports_fit_ctx=True,
+                supports_fit_target=True,
+                supports_no_mmap=True,
+                supports_no_warmup=True,
+            )
+
+            with patch.object(app, 'engine_capabilities', return_value=caps):
+                cmd = app.build_command(model, runtime_profile=profile)
+
+        self.assertIn('--ctx-size', cmd)
+        self.assertEqual(cmd[cmd.index('--ctx-size') + 1], '131072')
+        self.assertNotIn('-ngl', cmd)
+        self.assertNotIn('--n-gpu-layers', cmd)
+        self.assertEqual(cmd[cmd.index('-fit') + 1], 'on')
+        self.assertEqual(cmd[cmd.index('-fitt') + 1], '1024')
+        self.assertEqual(cmd[cmd.index('-fitc') + 1], '4096')
+        self.assertEqual(cmd[cmd.index('-ctk') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('-ctv') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('--spec-type') + 1], 'draft-mtp')
+        self.assertEqual(cmd[cmd.index('--spec-draft-n-max') + 1], '1')
+        self.assertEqual(cmd[cmd.index('--spec-draft-type-k') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('--spec-draft-type-v') + 1], 'q8_0')
+        self.assertEqual(cmd[cmd.index('--cache-ram') + 1], '0')
+        self.assertIn('--no-mmap', cmd)
+        self.assertIn('--no-warmup', cmd)
+        self.assertEqual(cmd[cmd.index('--batch-size') + 1], '128')
+        self.assertEqual(cmd[cmd.index('--ubatch-size') + 1], '64')
+
     def test_failure_classification_names_actionable_startup_errors(self):
         cases = {
             'unknown value for --flash-attn: -ctk': 'CLI_INVALID',
             'cudaMalloc failed: out of memory while loading tensors': 'CUDA_OOM_WEIGHTS',
             'cudaMalloc failed: out of memory allocating KV cache': 'CUDA_OOM_KV',
             'K cache type turbo4 with block size 128 does not divide': 'KV_MODE_INCOMPATIBLE',
-            'failed to fit params to free device memory, n_gpu_layers already set by user to 21': 'FIXED_GPU_LAYERS_FIT_FAILED',
+            'failed to fit params to free device memory, n_gpu_layers already set by user to 21': 'FIXED_GPU_LAYERS_BLOCKED_FIT',
             'llama_params_fit_impl: projected to use 9879 MiB of device memory vs. 7665 MiB of free device memory; cannot meet free memory target of 1024 MiB': 'MEMORY_FIT_FAILED',
             'failed to allocate buffer for kv cache; failed to create context': 'CUDA_OOM_KV',
             'ggml-cpu/ops.cpp:4443: fatal error in ggml_compute_forward_scale': 'BUUN_CPU_WARMUP_ABORT',
@@ -1614,14 +1715,14 @@ class RuntimeProfileTests(unittest.TestCase):
             'ggml_backend_cuda_buffer_type_alloc_buffer: cudaMalloc failed: out of memory\n'
             'llama_model_load: failed to load model'
         )
-        cases[mixed_buun_fit_oom] = 'FIXED_GPU_LAYERS_FIT_FAILED'
+        cases[mixed_buun_fit_oom] = 'FIXED_GPU_LAYERS_BLOCKED_FIT'
         observed_fixed_fit_failure = (
             'llama_params_fit: failed to fit params to free device memory: '
             'n_gpu_layers already set by user to 18, abort\n'
             'ggml_backend_cuda_buffer_type_alloc_buffer: cudaMalloc failed: out of memory\n'
             'llama_model_load_from_file_impl: failed to load model'
         )
-        cases[observed_fixed_fit_failure] = 'FIXED_GPU_LAYERS_FIT_FAILED'
+        cases[observed_fixed_fit_failure] = 'FIXED_GPU_LAYERS_BLOCKED_FIT'
         observed_weight_oom = (
             'ggml_backend_cuda_buffer_type_alloc_buffer: allocating 512.00 MiB on device 0: '
             'cudaMalloc failed: out of memory\n'
@@ -1638,6 +1739,31 @@ class RuntimeProfileTests(unittest.TestCase):
         classified = classify_benchmark_failure(observed_weight_oom)
         self.assertIn('cudaMalloc failed', classified['failure_excerpt'])
         self.assertEqual(classified['failure_category'], 'CUDA_OOM_WEIGHTS')
+
+    def test_mtp_runtime_diagnostics_classify_fixed_ngl_and_mmap_slowpath(self):
+        fixed = parse_mtp_runtime_diagnostics(
+            'failed to fit params to free device memory: n_gpu_layers already set by user'
+        )
+        mmap = parse_mtp_runtime_diagnostics(
+            'tensor overrides to CPU are used with mmap enabled - consider using --no-mmap for better performance\n'
+            'llama_model_load: CPU_Mapped model buffer size = 7523.81 MiB\n'
+            'llama_model_load: CUDA_Host model buffer size = 128.50 MiB\n'
+            'llama_model_load: CUDA0 model buffer size = 5148.50 MiB\n'
+            'llama_print_timings: prompt eval time = 1200.00 ms / 512 tokens ( 2.34 ms per token, 426.67 tokens per second)\n'
+            'llama_print_timings: eval time = 4096.00 ms / 128 tokens ( 32.00 ms per token, 31.25 tokens per second)\n'
+            'draft acceptance rate = 76.71%'
+        )
+
+        self.assertEqual(fixed['failure_category'], 'FIXED_GPU_LAYERS_BLOCKED_FIT')
+        self.assertIn('fit-assisted', fixed['suggested_fix'])
+        self.assertEqual(mmap['warning'], 'MMAP_CPU_OVERRIDE_SLOWPATH')
+        self.assertIn('--no-mmap', mmap['recommendation'])
+        self.assertEqual(mmap['cpu_model_buffer_type'], 'CUDA_Host')
+        self.assertEqual(mmap['cpu_mapped_model_buffer_mib'], 7523.81)
+        self.assertEqual(mmap['cuda_host_model_buffer_mib'], 128.50)
+        self.assertEqual(mmap['cuda_model_buffer_mib'], 5148.50)
+        self.assertEqual(mmap['prompt_eval_tokens_per_sec'], 426.67)
+        self.assertEqual(mmap['eval_tokens_per_sec'], 31.25)
 
     def test_runtime_profile_retry_does_not_repeat_recurrent_engine_crash(self):
         crash = 'llama-memory-recurrent.cpp:173: GGML_ASSERT(rollback >= 1 && rollback <= n_rs_seq) failed'
@@ -1892,14 +2018,14 @@ class RuntimeProfileTests(unittest.TestCase):
         draft3 = next(item for item in annotated if item['benchmark_phase'] == 'draft_n3')
         recommendations = mtp_optimizer_profile_recommendations(annotated)
 
-        self.assertEqual(draft1['mtp_risk_level'], 'failed')
+        self.assertEqual(draft1['mtp_risk_level'], 'risky')
         self.assertEqual(draft2['decode_gain_vs_baseline'], 1.2)
         self.assertEqual(draft2['prefill_cost_vs_baseline'], 0.2)
         self.assertEqual(draft2['total_wall_gain_vs_baseline'], 1.25)
         self.assertEqual(draft2['memory_delta_vs_baseline'], 200)
         self.assertEqual(draft2['mtp_risk_level'], 'good')
         self.assertEqual(draft3['mtp_risk_level'], 'failed')
-        self.assertEqual(recommendations['mtp_fast_chat']['benchmark_phase'], 'draft_n2')
+        self.assertEqual(recommendations['mtp_fast_chat']['benchmark_phase'], 'draft_n1')
         self.assertEqual(recommendations['mtp_safe']['benchmark_phase'], 'draft_n2')
         self.assertEqual(recommendations['mtp_opencode_ready']['benchmark_phase'], 'draft_n2')
         self.assertIn('mtp_baseline_no_spec', recommendations)
@@ -2000,6 +2126,36 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('mtp_safe', recommendations)
         self.assertNotIn('mtp_opencode_ready', recommendations)
 
+    def test_mtp_optimizer_low_acceptance_promotes_no_mtp_winners(self):
+        records = [
+            {
+                'status': 'ok',
+                'benchmark_phase': 'baseline_no_mtp',
+                'mtp_enabled': False,
+                'tokens_per_sec': 10.0,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 10.0,
+            },
+            {
+                'status': 'ok',
+                'benchmark_phase': 'draft_n1',
+                'mtp_enabled': True,
+                'mtp_draft_n_max': 1,
+                'tokens_per_sec': 30.0,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 5.0,
+                'accept_rate': 0.55,
+            },
+        ]
+
+        annotated = annotate_mtp_optimizer_records(records, 'draft-mtp')
+        recommendations = mtp_optimizer_profile_recommendations(annotated)
+
+        draft = next(item for item in annotated if item['benchmark_phase'] == 'draft_n1')
+        self.assertEqual(draft['mtp_risk_level'], 'risky')
+        self.assertIn('mtp_fast_chat', recommendations)
+        self.assertNotIn('mtp_safe', recommendations)
+
     def test_mtp_optimizer_prompt_regression_blocks_safe_and_opencode_profiles(self):
         records = [
             {
@@ -2030,6 +2186,62 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(recommendations['mtp_fast_chat']['benchmark_phase'], 'draft_n3')
         self.assertNotIn('mtp_safe', recommendations)
         self.assertNotIn('mtp_opencode_ready', recommendations)
+
+    def test_mtp_optimizer_selects_manual_fit_q8_nommap_draft1_winner(self):
+        records = [
+            {
+                'status': 'ok',
+                'benchmark_phase': 'fit_q8_draftq8_draft_n1',
+                'runtime_profile': 'mtp_fit_q8_draftq8_nommap_draft1_128k',
+                'ctx': 131072,
+                'mtp_enabled': True,
+                'mtp_draft_n_max': 1,
+                'kv_preset': 'q8_0/q8_0',
+                'mtp_draft_kv_preset': 'q8_0/q8_0',
+                'no_mmap': True,
+                'tokens_per_sec': 31.25,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 5.0,
+                'accept_rate': 0.7671,
+            },
+            {
+                'status': 'ok',
+                'benchmark_phase': 'fit_q8_draftq8_draft_n2',
+                'runtime_profile': 'mtp_fit_q8_draftq8_mmap_draft2_128k',
+                'ctx': 131072,
+                'mtp_enabled': True,
+                'mtp_draft_n_max': 2,
+                'kv_preset': 'q8_0/q8_0',
+                'mtp_draft_kv_preset': 'q8_0/q8_0',
+                'tokens_per_sec': 26.91,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 5.0,
+                'accept_rate': 0.6453,
+            },
+            {
+                'status': 'ok',
+                'benchmark_phase': 'fit_q8_draftq8_draft_n3',
+                'runtime_profile': 'mtp_fit_q8_draftq8_mmap_draft3_128k',
+                'ctx': 131072,
+                'mtp_enabled': True,
+                'mtp_draft_n_max': 3,
+                'kv_preset': 'q8_0/q8_0',
+                'mtp_draft_kv_preset': 'q8_0/q8_0',
+                'tokens_per_sec': 23.27,
+                'prompt_workload_tokens_per_sec': 100.0,
+                'seconds': 5.0,
+                'accept_rate': 0.527,
+            },
+        ]
+
+        annotated = annotate_mtp_optimizer_records(records, 'draft-mtp')
+        recommendations = mtp_optimizer_profile_recommendations(annotated)
+        draft3 = next(item for item in annotated if item['mtp_draft_n_max'] == 3)
+
+        self.assertEqual(draft3['mtp_risk_level'], 'failed')
+        self.assertEqual(recommendations['mtp_safe']['mtp_draft_n_max'], 1)
+        self.assertEqual(recommendations['mtp_long_context']['runtime_profile'], 'mtp_fit_q8_draftq8_nommap_draft1_128k')
+        self.assertEqual(recommendations['mtp_fast_chat']['mtp_draft_n_max'], 1)
 
     def test_memory_guardrail_admission_skips_critical_memory(self):
         model = ModelConfig(id='m', name='M', path='/models/model.gguf', alias='m', port=18200, ctx=65536)
@@ -2816,7 +3028,9 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual([item[0] for item in calls], [128, 96])
         self.assertEqual(set(result['mtp_workloads']), {'decode_heavy', 'prompt_heavy'})
-        self.assertEqual(result['tokens_per_sec'], 32.0)
+        self.assertEqual(result['tokens_per_sec'], 33.0)
+        self.assertEqual(result['mtp_workloads']['decode_heavy']['first_sample_tokens_per_sec'], 31.0)
+        self.assertEqual(result['mtp_workloads']['decode_heavy']['steady_sample_tokens_per_sec'], 33.0)
         self.assertEqual(result['prompt_workload_tokens_per_sec'], 120.0)
         self.assertNotIn('prompt_tokens_per_sec', result)
         self.assertEqual(result['mtp_workloads']['prompt_heavy']['prompt_workload_tokens_per_sec'], 120.0)
@@ -5322,6 +5536,64 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual([item.benchmark_phase for item in profiles if item.mtp_enabled], ['draft_n1', 'draft_n2', 'draft_n3'])
         self.assertTrue(all(item.no_warmup for item in profiles))
         self.assertTrue(all(item.parallel == 1 for item in profiles))
+
+    def test_mtp_fit_profile_family_includes_long_context_q8_nommap_without_ngl(self):
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            supports_no_warmup=True,
+            supports_fit=True,
+            supports_fit_ctx=True,
+            supports_fit_target=True,
+            supports_ctk_ctv=True,
+            supports_spec_draft_n_max=True,
+            supports_spec_draft_type_kv=True,
+            supports_no_mmap=True,
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                Path(tmp) / 'models.json',
+                runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
+            )
+            model = ModelConfig(
+                id='mtp',
+                name='Qwen NextN MTP',
+                path='/models/Qwen3.6-35B-A3B-MTP-GGUF.gguf',
+                alias='mtp',
+                port=18080,
+                ctx_min=8192,
+                ctx_max=131072,
+                supports_mtp='yes',
+            )
+            hardware = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3)
+
+            with patch.object(app, 'engine_capabilities', return_value=caps), \
+                patch('llama_tui.benchmark.model_file_size', return_value=35 * 1024**3):
+                profiles = active_engine_runtime_profiles(app, model, hardware, depth='fast')
+
+        names = [item.name for item in profiles]
+        primary = next(item for item in profiles if item.name == 'mtp_fit_q8_draftq8_nommap_draft1_128k')
+        self.assertEqual(primary.ctx_size, 131072)
+        self.assertIsNone(primary.gpu_layers)
+        self.assertTrue(primary.fit)
+        self.assertEqual(primary.fit_context, 4096)
+        self.assertEqual(primary.fit_target, 1024)
+        self.assertEqual(primary.kv_preset, 'q8_0/q8_0')
+        self.assertEqual(primary.mtp_draft_kv_preset, 'q8_0/q8_0')
+        self.assertTrue(primary.no_mmap)
+        self.assertTrue(primary.no_warmup)
+        self.assertEqual(primary.cache_ram, 0)
+        self.assertEqual(primary.batch_size, 128)
+        self.assertEqual(primary.ubatch_size, 64)
+        self.assertEqual(primary.parallel, 1)
+        self.assertEqual({8192, 32768, 65536, 131072}, {item.ctx_size for item in profiles if item.name.startswith('mtp_fit_q8_draftq8_nommap') and item.fit_target == 1024})
+        for draft in (1, 2, 3):
+            self.assertTrue(any(item.mtp_draft_n_max == draft and item.fit and item.kv_preset == 'q8_0/q8_0' for item in profiles))
+        self.assertIn('mtp_baseline', names)
+        self.assertIn('mtp_draft_n1', names)
 
     def test_moe_runtime_profiles_include_bounded_placement_candidates(self):
         caps = replace(

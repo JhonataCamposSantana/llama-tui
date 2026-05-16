@@ -394,6 +394,7 @@ FAILURE_CATEGORIES = (
     'blocked_missing_capability',
     'MEMORY_GUARDRAIL',
     'MEMORY_FIT_FAILED',
+    'FIXED_GPU_LAYERS_BLOCKED_FIT',
     'FIXED_GPU_LAYERS_FIT_FAILED',
     'CUDA_OOM_WEIGHTS',
     'CUDA_OOM_KV',
@@ -588,9 +589,9 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         or re.search(r'n_gpu_layers.{0,80}set by user', low) is not None
     )
     if fixed_gpu_layer_failure:
-        category = 'FIXED_GPU_LAYERS_FIT_FAILED'
-        reason = detail or 'The fixed GPU-layer candidate could not fit current free device memory.'
-        suggested = 'Stop retrying fixed GPU-layer probes for this run; use fit/default/q8 fallbacks instead.'
+        category = 'FIXED_GPU_LAYERS_BLOCKED_FIT'
+        reason = detail or 'MTP fit was blocked because --n-gpu-layers was fixed.'
+        suggested = 'Use a fit-assisted MTP profile without fixed --n-gpu-layers.'
         terminal = True
     elif fit_memory_failure:
         category = 'MEMORY_FIT_FAILED'
@@ -885,7 +886,7 @@ def _runtime_profile_memory_shape(runtime_profile: RuntimeProfile) -> Tuple[str,
 
 def runtime_profile_memory_disable_key(record: Dict[str, object], runtime_profile: RuntimeProfile) -> Tuple[str, ...]:
     category = str(record.get('failure_category', '') or '')
-    if category in ('FIXED_GPU_LAYERS_FIT_FAILED',) or (
+    if category in ('FIXED_GPU_LAYERS_BLOCKED_FIT', 'FIXED_GPU_LAYERS_FIT_FAILED') or (
         category == 'CUDA_OOM_WEIGHTS' and getattr(runtime_profile, 'gpu_layers', None) is not None
     ):
         return ('fixed_ngl', str(getattr(runtime_profile, 'engine_id', '') or ''), _runtime_profile_placement_shape(runtime_profile))
@@ -1700,6 +1701,9 @@ def measured_profile_runtime_profile(
     replay_fields = (
         'runtime_fit',
         'fit_context',
+        'fit_target',
+        'runtime_cache_ram',
+        'runtime_no_mmap',
         'runtime_no_warmup',
         'gpu_layers_mode',
         'batch_size',
@@ -1714,6 +1718,9 @@ def measured_profile_runtime_profile(
         'reasoning_format',
         'mtp_enabled',
         'mtp_draft_n_max',
+        'mtp_draft_kv_preset',
+        'draft_ctk',
+        'draft_ctv',
         'spec_type',
     )
     has_replay_data = (
@@ -1722,6 +1729,9 @@ def measured_profile_runtime_profile(
             'engine_id',
             'runtime_profile',
             'fit',
+            'fit_target',
+            'cache_ram',
+            'no_mmap',
             'gpu_layers',
             'kv_preset',
             'placement_strategy',
@@ -1733,12 +1743,17 @@ def measured_profile_runtime_profile(
             'reasoning_format',
             'mtp_enabled',
             'mtp_draft_n_max',
+            'mtp_draft_kv_preset',
         ))
         or any(token in command_tokens for token in (
             '-fit',
             '--fit',
             '-fitc',
             '--fit-ctx',
+            '-fitt',
+            '--fit-target',
+            '--cache-ram',
+            '--no-mmap',
             '-ctk',
             '-ctv',
             '--cache-type-k',
@@ -1755,6 +1770,10 @@ def measured_profile_runtime_profile(
             '--reasoning-format',
             '--spec-type',
             '--spec-draft-n-max',
+            '--spec-draft-type-k',
+            '--spec-draft-type-v',
+            '--cache-type-k-draft',
+            '--cache-type-v-draft',
         ))
     )
     if not has_replay_data:
@@ -1798,11 +1817,31 @@ def measured_profile_runtime_profile(
     fit_context = _profile_int(profile, 'fit_context', int(fingerprint.get('fit_context', 0) or 0))
     if fit_context <= 0:
         fit_context = int(_command_flag_value(command_tokens, '-fitc', '--fit-ctx') or 0)
+    fit_target = _profile_int(profile, 'fit_target', int(fingerprint.get('fit_target', 0) or 0))
+    if fit_target <= 0:
+        fit_target = int(_command_flag_value(command_tokens, '-fitt', '--fit-target') or 0)
+
+    cache_ram_value = profile.get('runtime_cache_ram', fingerprint.get('cache_ram', None))
+    if cache_ram_value is None and 'cache_ram' in profile:
+        cache_ram_value = profile.get('cache_ram')
+    cache_ram: Optional[int]
+    try:
+        cache_ram = max(0, int(cache_ram_value)) if cache_ram_value is not None else None
+    except Exception:
+        cache_ram = None
+    command_cache_ram = _command_flag_value(command_tokens, '--cache-ram')
+    if command_cache_ram:
+        cache_ram = max(0, int(command_cache_ram))
 
     no_warmup = (
         _profile_bool(profile, 'runtime_no_warmup')
         or bool(fingerprint.get('no_warmup'))
         or _command_has_flag(command_tokens, '--no-warmup')
+    )
+    no_mmap = (
+        _profile_bool(profile, 'runtime_no_mmap')
+        or bool(fingerprint.get('no_mmap'))
+        or _command_has_flag(command_tokens, '--no-mmap')
     )
 
     batch_size = _profile_int(profile, 'batch_size', int(fingerprint.get('batch_size', 0) or 0))
@@ -1885,6 +1924,17 @@ def measured_profile_runtime_profile(
     mtp_draft_n_max = _profile_int(profile, 'mtp_draft_n_max', int(fingerprint.get('mtp_draft_n_max', 0) or 0))
     if mtp_draft_n_max <= 0:
         mtp_draft_n_max = int(_command_flag_value(command_tokens, '--spec-draft-n-max') or 0)
+    mtp_draft_kv_preset = str(profile.get('mtp_draft_kv_preset') or fingerprint.get('mtp_draft_kv_preset') or '').strip()
+    if not mtp_draft_kv_preset:
+        draft_key = (
+            _command_flag_value(command_tokens, '--spec-draft-type-k', '--cache-type-k-draft')
+            or str(profile.get('draft_ctk') or '')
+        )
+        draft_value = (
+            _command_flag_value(command_tokens, '--spec-draft-type-v', '--cache-type-v-draft')
+            or str(profile.get('draft_ctv') or '')
+        )
+        mtp_draft_kv_preset = f'{draft_key}/{draft_value}' if draft_key and draft_value else ''
     return RuntimeProfile(
         engine_id=engine,
         name=runtime_name or f'measured_{key}',
@@ -1897,6 +1947,9 @@ def measured_profile_runtime_profile(
         ubatch_size=max(0, int(ubatch_size or 0)),
         fit=bool(fit),
         fit_context=max(0, int(fit_context or 0)),
+        fit_target=max(0, int(fit_target or 0)),
+        cache_ram=cache_ram,
+        no_mmap=bool(no_mmap),
         no_warmup=bool(no_warmup),
         extra_args=tuple(str(item) for item in extra_args),
         kv_family=family,
@@ -1919,6 +1972,7 @@ def measured_profile_runtime_profile(
         reasoning_format=reasoning_format,
         mtp_enabled=bool(mtp_enabled),
         mtp_draft_n_max=clamp_mtp_draft(mtp_draft_n_max, default=3) if mtp_enabled else 0,
+        mtp_draft_kv_preset=mtp_draft_kv_preset,
     )
 
 
@@ -3729,12 +3783,21 @@ def _mtp_workload_result(name: str, bench: Dict[str, object]) -> Dict[str, objec
     prompt_tokens = int(bench.get('prompt_tokens', 0) or 0)
     completion_tokens = int(bench.get('completion_tokens', 0) or 0)
     prompt_workload_tps = round((prompt_tokens / elapsed) if elapsed > 0 else 0.0, 4)
+    sample_scores = [float(item) for item in list(bench.get('sample_tokens_per_sec', []) or []) if float(item or 0.0) > 0.0]
+    if len(sample_scores) == 2:
+        steady_tokens_per_sec = sample_scores[-1]
+    elif sample_scores:
+        steady_tokens_per_sec = statistics.median(sample_scores)
+    else:
+        steady_tokens_per_sec = float(bench.get('tokens_per_sec', 0.0) or 0.0)
     return {
         'name': name,
         'elapsed': round(elapsed, 4),
         'prompt_tokens': prompt_tokens,
         'completion_tokens': completion_tokens,
-        'tokens_per_sec': round(float(bench.get('tokens_per_sec', 0.0) or 0.0), 4),
+        'tokens_per_sec': round(float(steady_tokens_per_sec), 4),
+        'first_sample_tokens_per_sec': round(float(sample_scores[0]), 4) if sample_scores else 0.0,
+        'steady_sample_tokens_per_sec': round(float(steady_tokens_per_sec), 4),
         'prompt_workload_tokens_per_sec': prompt_workload_tps,
         'sample_count': int(bench.get('sample_count', 0) or 0),
         'sample_tokens_per_sec': list(bench.get('sample_tokens_per_sec', []) or []),
@@ -4203,6 +4266,9 @@ def adaptive_profile_dict(
         'flash_attn_mode',
         'fit',
         'fit_target',
+        'runtime_cache_ram',
+        'runtime_no_mmap',
+        'no_mmap',
         'no_context_shift',
         'cache_prompt',
         'cache_reuse',
@@ -4246,6 +4312,9 @@ def adaptive_profile_dict(
         'tensor_overrides',
         'mtp_enabled',
         'mtp_draft_n_max',
+        'mtp_draft_kv_preset',
+        'draft_ctk',
+        'draft_ctv',
         'spec_type',
         'rejection_reason',
         'selection_rejection_reason',
@@ -5799,6 +5868,9 @@ def adaptive_record_from_candidate(
     fit: bool = False,
     fit_context: int = 0,
     fit_target: str = '',
+    runtime_cache_ram: Optional[int] = None,
+    runtime_no_mmap: bool = False,
+    no_mmap: bool = False,
     runtime_no_warmup: bool = False,
     gpu_layers_mode: str = '',
     batch_size: int = 0,
@@ -5867,6 +5939,9 @@ def adaptive_record_from_candidate(
     benchmark_metric_group: str = '',
     mtp_enabled: bool = False,
     mtp_draft_n_max: int = 0,
+    mtp_draft_kv_preset: str = '',
+    draft_ctk: str = '',
+    draft_ctv: str = '',
     spec_type: str = '',
 ) -> Dict[str, object]:
     if not startup_result:
@@ -5960,6 +6035,9 @@ def adaptive_record_from_candidate(
         'fit': bool(fit or runtime_fit),
         'fit_context': int(fit_context or 0),
         'fit_target': fit_target,
+        'runtime_cache_ram': runtime_cache_ram,
+        'runtime_no_mmap': bool(runtime_no_mmap),
+        'no_mmap': bool(no_mmap or runtime_no_mmap),
         'runtime_no_warmup': bool(runtime_no_warmup),
         'batch_size': int(batch_size or 0),
         'ubatch_size': int(ubatch_size or 0),
@@ -5991,6 +6069,9 @@ def adaptive_record_from_candidate(
         'fit_assisted_moe_placement': bool(fit_assisted_moe_placement),
         'mtp_enabled': bool(mtp_enabled or getattr(candidate, 'mtp_enabled', False)),
         'mtp_draft_n_max': clamp_mtp_draft(mtp_draft_n_max or getattr(candidate, 'mtp_draft_n_max', 3), default=3),
+        'mtp_draft_kv_preset': mtp_draft_kv_preset,
+        'draft_ctk': draft_ctk,
+        'draft_ctv': draft_ctv,
         'spec_type': spec_type or ('mtp' if bool(mtp_enabled or getattr(candidate, 'mtp_enabled', False)) else ''),
         'startup_result': startup_result,
         'failure_category': failure_category,
@@ -6072,6 +6153,7 @@ def runtime_record_context(
             runtime_log_path = ''
     kv_preset = getattr(profile, 'kv_preset', '') if profile is not None else ''
     ctk, ctv = kv_modes_from_preset(kv_preset)
+    draft_ctk, draft_ctv = kv_modes_from_preset(getattr(profile, 'mtp_draft_kv_preset', '') if profile is not None else '')
     turbo_profile = turbo_kv_profile_for_preset(kv_preset)
     kv_family = getattr(profile, 'kv_family', '') if profile is not None else ''
     if not kv_family:
@@ -6131,6 +6213,10 @@ def runtime_record_context(
         'benchmark_metric_group': getattr(profile, 'benchmark_metric_group', '') if profile is not None else '',
         'runtime_fit': bool(getattr(profile, 'fit', False)) if profile is not None else False,
         'fit_context': int(getattr(profile, 'fit_context', 0) or 0) if profile is not None else 0,
+        'fit_target': int(getattr(profile, 'fit_target', 0) or 0) if profile is not None else 0,
+        'runtime_cache_ram': getattr(profile, 'cache_ram', None) if profile is not None else None,
+        'runtime_no_mmap': bool(getattr(profile, 'no_mmap', False)) if profile is not None else False,
+        'no_mmap': bool(getattr(profile, 'no_mmap', False)) if profile is not None else False,
         'runtime_no_warmup': bool(getattr(profile, 'no_warmup', False)) if profile is not None else False,
         'batch_size': int(getattr(profile, 'batch_size', 0) or 0) if profile is not None else 0,
         'ubatch_size': int(getattr(profile, 'ubatch_size', 0) or 0) if profile is not None else 0,
@@ -6152,6 +6238,9 @@ def runtime_record_context(
             if profile is not None and int(getattr(profile, 'mtp_draft_n_max', 0) or 0) > 0
             else clamp_mtp_draft(getattr(candidate, 'mtp_draft_n_max', 3), default=3)
         ),
+        'mtp_draft_kv_preset': getattr(profile, 'mtp_draft_kv_preset', '') if profile is not None else '',
+        'draft_ctk': draft_ctk,
+        'draft_ctv': draft_ctv,
         'spec_type': spec_type if ((profile is not None and bool(getattr(profile, 'mtp_enabled', False))) or bool(getattr(candidate, 'mtp_enabled', False))) else '',
         'gpu_layers_mode': (
             'fit' if profile is not None and getattr(profile, 'gpu_layers', None) is None and getattr(profile, 'fit', False)
@@ -6195,11 +6284,13 @@ def parse_mtp_acceptance_metrics(text: str) -> Dict[str, object]:
 
     draft_tokens = first_int((
         r'\bdraft(?:ed)?[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
+        r'\bgenerated[_\s-]*draft[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
         r'\bspec(?:ulative)?[_\s-]*draft(?:ed)?\s*[:=]\s*([0-9]+)',
         r'\bn[_\s-]*draft(?:ed)?\s*[:=]\s*([0-9]+)',
     ))
     accepted_tokens = first_int((
         r'\baccepted[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
+        r'\baccepted[_\s-]*draft[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
         r'\bspec(?:ulative)?[_\s-]*accepted\s*[:=]\s*([0-9]+)',
         r'\bn[_\s-]*accepted\s*[:=]\s*([0-9]+)',
     ))
@@ -6227,8 +6318,67 @@ def parse_mtp_acceptance_metrics(text: str) -> Dict[str, object]:
     return payload
 
 
+def parse_mtp_runtime_diagnostics(text: str) -> Dict[str, object]:
+    payload: Dict[str, object] = {}
+    source = str(text or '')
+    if not source:
+        return payload
+    low = source.lower()
+    if 'failed to fit params to free device memory' in low and 'n_gpu_layers already set by user' in low:
+        payload['failure_category'] = 'FIXED_GPU_LAYERS_BLOCKED_FIT'
+        payload['fit_failed_fixed_gpu_layers'] = True
+        payload['suggested_fix'] = 'Use a fit-assisted MTP profile without fixed --n-gpu-layers.'
+    if 'tensor overrides to cpu are used with mmap enabled' in low and 'no-mmap' in low:
+        payload['warning'] = 'MMAP_CPU_OVERRIDE_SLOWPATH'
+        payload['mmap_warning'] = True
+        payload['mmap_cpu_override_slowpath'] = True
+        payload['recommendation'] = 'Add --no-mmap for MTP profiles with CPU tensor overrides.'
+    for line in source.splitlines():
+        cpu_mapped = re.search(r'CPU_Mapped model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
+        if cpu_mapped:
+            payload['cpu_model_buffer_type'] = 'CPU_Mapped'
+            payload['cpu_mapped_model_buffer_mib'] = float(cpu_mapped.group(1))
+            continue
+        cuda_host = re.search(r'CUDA_Host model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
+        if cuda_host:
+            payload['cpu_model_buffer_type'] = 'CUDA_Host'
+            payload['cuda_host_model_buffer_mib'] = float(cuda_host.group(1))
+            continue
+        cuda_model = re.search(r'CUDA\d* model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
+        if cuda_model:
+            payload['cuda_model_buffer_mib'] = float(cuda_model.group(1))
+            continue
+        prompt_eval = re.search(
+            r'prompt eval time\s*=.*?/\s*\d+\s+tokens.*?,\s*([0-9.]+)\s+tokens per second',
+            line,
+            re.IGNORECASE,
+        )
+        if prompt_eval:
+            payload['prompt_eval_tokens_per_sec'] = float(prompt_eval.group(1))
+            continue
+        eval_time = re.search(
+            r'(?<!prompt )eval time\s*=.*?/\s*\d+\s+tokens.*?,\s*([0-9.]+)\s+tokens per second',
+            line,
+            re.IGNORECASE,
+        )
+        if eval_time:
+            payload['eval_tokens_per_sec'] = float(eval_time.group(1))
+            continue
+        vram_free = re.search(r'(?:final\s+)?(?:vram|cuda|device).*?free(?: memory)?\s*[:=]\s*([0-9.]+)\s*(GiB|MiB)', line, re.IGNORECASE)
+        if vram_free:
+            value = float(vram_free.group(1))
+            unit = vram_free.group(2).lower()
+            payload['final_vram_free_bytes'] = int(value * (1024 ** 3 if unit == 'gib' else 1024 ** 2))
+    return payload
+
+
 def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object]:
-    if not bool(record.get('mtp_enabled', False)) and str(record.get('spec_type', '') or '') not in ('mtp', 'draft-mtp'):
+    is_mtp_record = (
+        bool(record.get('mtp_enabled', False))
+        or str(record.get('spec_type', '') or '') in ('mtp', 'draft-mtp')
+        or str(record.get('engine', '') or '').strip().lower() == ENGINE_LLAMA_CPP_MTP
+    )
+    if not is_mtp_record:
         return record
     log_path = str(record.get('runtime_log_path', '') or '')
     text = ''
@@ -6238,11 +6388,29 @@ def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object
         except Exception:
             text = ''
     metrics = parse_mtp_acceptance_metrics(text)
+    diagnostics = parse_mtp_runtime_diagnostics(text)
     if metrics:
         record.update(metrics)
         record['mtp_acceptance_source'] = 'runtime_log'
     else:
         record['mtp_acceptance_source'] = 'not_reported'
+    if diagnostics:
+        warning = str(diagnostics.pop('warning', '') or '')
+        recommendation = str(diagnostics.pop('recommendation', '') or '')
+        category = str(diagnostics.get('failure_category', '') or '')
+        if category and str(record.get('status', '') or '') != 'ok':
+            record['failure_category'] = category
+            record['failure_reason'] = record.get('failure_reason') or 'MTP fit was blocked because --n-gpu-layers was fixed.'
+            record['suggested_fix'] = record.get('suggested_fix') or diagnostics.get('suggested_fix', '')
+        record.update(diagnostics)
+        if warning:
+            warnings = [str(item) for item in list(record.get('runtime_warnings', []) or [])]
+            if warning not in warnings:
+                warnings.append(warning)
+            record['runtime_warnings'] = warnings
+            record['warning'] = warning
+        if recommendation:
+            record['runtime_recommendation'] = recommendation
     return record
 
 
@@ -7415,6 +7583,9 @@ def dedupe_runtime_profiles(runtime_profiles: List[RuntimeProfile]) -> List[Runt
             profile.ctx_size,
             profile.gpu_layers,
             profile.kv_preset,
+            profile.fit_target,
+            profile.cache_ram,
+            profile.no_mmap,
             profile.placement_strategy,
             profile.cpu_moe,
             profile.n_cpu_moe,
@@ -7422,6 +7593,9 @@ def dedupe_runtime_profiles(runtime_profiles: List[RuntimeProfile]) -> List[Runt
             profile.reasoning,
             profile.reasoning_budget,
             profile.reasoning_format,
+            profile.mtp_enabled,
+            profile.mtp_draft_n_max,
+            profile.mtp_draft_kv_preset,
         )
         if key in seen:
             continue
@@ -7879,6 +8053,9 @@ def active_engine_runtime_profiles(
         kv_profile=None,
         fit: bool = False,
         fit_context: int = 0,
+        fit_target: int = 0,
+        cache_ram: Optional[int] = None,
+        no_mmap: bool = False,
         no_warmup: bool = False,
         fit_discovery_phase: str = '',
         viable_ngl: int = 0,
@@ -7886,6 +8063,7 @@ def active_engine_runtime_profiles(
         placement: Optional[MoePlacementCandidate] = None,
         mtp_enabled: bool = False,
         mtp_draft_n_max: int = 0,
+        mtp_draft_kv_preset: str = '',
         benchmark_phase: str = '',
         benchmark_metric_group: str = '',
     ):
@@ -7913,10 +8091,14 @@ def active_engine_runtime_profiles(
             kv_preset,
             bool(fit),
             int(fit_context or 0),
+            int(fit_target or 0),
+            cache_ram,
+            bool(no_mmap),
             bool(no_warmup),
             placement_key(effective_placement),
             bool(mtp_enabled),
             int(mtp_draft_n_max or 0),
+            mtp_draft_kv_preset,
         )
         if key in seen:
             return
@@ -7925,6 +8107,13 @@ def active_engine_runtime_profiles(
             family = 'turbo' if any(mode.startswith('turbo') for mode in kv_modes_from_preset(kv_preset)) else 'cache'
         else:
             family = 'cache' if kv_preset and kv_preset != 'default' else 'default'
+        if fit:
+            if engine == ENGINE_LLAMA_CPP_MTP:
+                fit_context_value = max(256, min(ctx, int(fit_context or 4096)))
+            else:
+                fit_context_value = max(ctx_min, min(ctx, int(fit_context or ctx_min)))
+        else:
+            fit_context_value = 0
         profile_item = RuntimeProfile(
             engine_id=engine,
             name=name,
@@ -7936,7 +8125,10 @@ def active_engine_runtime_profiles(
             batch_size=batch,
             ubatch_size=ubatch,
             fit=bool(fit),
-            fit_context=max(ctx_min, min(ctx, int(fit_context or ctx_min))) if fit else 0,
+            fit_context=fit_context_value,
+            fit_target=max(0, int(fit_target or 0)),
+            cache_ram=cache_ram if cache_ram is None else max(0, int(cache_ram or 0)),
+            no_mmap=bool(no_mmap),
             no_warmup=bool(no_warmup),
             kv_family=family,
             kv_quality_tier=getattr(kv_profile, 'quality_tier', '') if kv_profile is not None else '',
@@ -7952,6 +8144,7 @@ def active_engine_runtime_profiles(
             viable_ngl_source=viable_ngl_source,
             mtp_enabled=bool(mtp_enabled),
             mtp_draft_n_max=clamp_mtp_draft(mtp_draft_n_max, default=3) if mtp_enabled else 0,
+            mtp_draft_kv_preset=mtp_draft_kv_preset if mtp_enabled else '',
         )
         profiles.append(apply_placement(profile_item, effective_placement))
 
@@ -8055,6 +8248,60 @@ def active_engine_runtime_profiles(
             or str(getattr(model, 'supports_mtp', 'auto') or 'auto').strip().lower() == 'yes'
             or mtp_support_auto_hint(model)
         ):
+            fit_family_ready = bool(
+                has_gpu
+                and getattr(capabilities, 'supports_fit', False)
+                and getattr(capabilities, 'supports_fit_ctx', False)
+                and getattr(capabilities, 'supports_fit_target', False)
+                and getattr(capabilities, 'supports_ctk_ctv', False)
+                and getattr(capabilities, 'supports_spec_draft_type_kv', False)
+                and getattr(capabilities, 'supports_no_mmap', False)
+            )
+            if fit_family_ready:
+                ctx_candidates = [
+                    ctx for ctx in (8192, 32768, 65536, 131072)
+                    if ctx >= ctx_min and ctx <= ctx_max
+                ]
+                if not ctx_candidates:
+                    ctx_candidates = [max(ctx_min, min(ctx_max, 8192))]
+                primary_ctx = 131072 if 131072 in ctx_candidates else max(ctx_candidates)
+                no_mmap_supported = bool(getattr(capabilities, 'supports_no_mmap', False))
+
+                def add_mtp_fit_candidate(ctx: int, draft: int, fit_target: int = 1024, no_mmap: bool = True):
+                    suffix = f'{ctx // 1024}k' if ctx % 1024 == 0 else str(ctx)
+                    target_suffix = '' if int(fit_target or 0) == 1024 else f'_fitt{int(fit_target)}'
+                    mmap_suffix = '_nommap' if no_mmap else '_mmap'
+                    add(
+                        f'mtp_fit_q8_draftq8{mmap_suffix}_draft{draft}_{suffix}{target_suffix}',
+                        ctx,
+                        None,
+                        'q8_0/q8_0',
+                        batch=128,
+                        ubatch=64,
+                        fit=True,
+                        fit_context=4096,
+                        fit_target=fit_target,
+                        cache_ram=0,
+                        no_mmap=no_mmap and no_mmap_supported,
+                        no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
+                        mtp_enabled=True,
+                        mtp_draft_n_max=draft,
+                        mtp_draft_kv_preset='q8_0/q8_0',
+                        benchmark_phase=f'fit_q8_draftq8_draft_n{draft}',
+                        benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,draft_tokens,accepted_tokens,accept_rate,startup_status,fit,memory',
+                    )
+
+                add_mtp_fit_candidate(primary_ctx, 1, 1024, True)
+                for ctx in ctx_candidates:
+                    for draft in MTP_DRAFT_VALUES:
+                        if ctx == primary_ctx and draft == 1:
+                            continue
+                        add_mtp_fit_candidate(ctx, draft, 1024, True)
+                for fit_target in (1536, 2048):
+                    add_mtp_fit_candidate(primary_ctx, 1, fit_target, True)
+                if no_mmap_supported:
+                    add_mtp_fit_candidate(primary_ctx, 1, 1024, False)
+                    add_mtp_fit_candidate(primary_ctx, 2, 1024, False)
             for draft in MTP_DRAFT_VALUES:
                 add(
                     f'mtp_draft_n{draft}',
@@ -8361,6 +8608,8 @@ def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfil
     candidate.ctx = max(1, int(runtime_profile.ctx_size or candidate.ctx))
     candidate.ngl = int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else candidate.ngl)
     candidate.parallel = max(1, int(runtime_profile.parallel or 1))
+    if getattr(runtime_profile, 'cache_ram', None) is not None:
+        candidate.cache_ram = max(0, int(getattr(runtime_profile, 'cache_ram') or 0))
     candidate.flash_attn = str(runtime_profile.flash_attn or 'on').strip().lower() != 'off'
     candidate.moe_placement_strategy = str(getattr(runtime_profile, 'placement_strategy', '') or '')
     candidate.cpu_moe = bool(getattr(runtime_profile, 'cpu_moe', False))
@@ -8433,6 +8682,9 @@ def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: 
         'ubatch_size': int(runtime_profile.ubatch_size or 0),
         'fit': bool(runtime_profile.fit),
         'fit_context': int(runtime_profile.fit_context or 0),
+        'fit_target': int(getattr(runtime_profile, 'fit_target', 0) or 0),
+        'cache_ram': getattr(runtime_profile, 'cache_ram', None),
+        'no_mmap': bool(getattr(runtime_profile, 'no_mmap', False)),
         'no_warmup': bool(runtime_profile.no_warmup),
         'fit_discovery_phase': str(getattr(runtime_profile, 'fit_discovery_phase', '') or ''),
         'viable_ngl': int(getattr(runtime_profile, 'viable_ngl', 0) or 0),
@@ -8445,6 +8697,7 @@ def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: 
         'reasoning_format': str(getattr(runtime_profile, 'reasoning_format', '') or ''),
         'mtp_enabled': bool(getattr(runtime_profile, 'mtp_enabled', False)),
         'mtp_draft_n_max': int(getattr(runtime_profile, 'mtp_draft_n_max', 0) or 0),
+        'mtp_draft_kv_preset': str(getattr(runtime_profile, 'mtp_draft_kv_preset', '') or ''),
         'extra_args': list(runtime_profile.extra_args or ()),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
@@ -8727,6 +8980,7 @@ def benchmark_exhaustive_candidate_with_retry(
             'CLI_INVALID',
             'MEMORY_GUARDRAIL',
             'MEMORY_FIT_FAILED',
+            'FIXED_GPU_LAYERS_BLOCKED_FIT',
             'FIXED_GPU_LAYERS_FIT_FAILED',
             'CUDA_OOM_WEIGHTS',
             'CUDA_OOM_KV',
@@ -8851,6 +9105,7 @@ def benchmark_runtime_profile_with_retry(
             'CLI_INVALID',
             'MEMORY_GUARDRAIL',
             'MEMORY_FIT_FAILED',
+            'FIXED_GPU_LAYERS_BLOCKED_FIT',
             'FIXED_GPU_LAYERS_FIT_FAILED',
             'CUDA_OOM_WEIGHTS',
             'CUDA_OOM_KV',
@@ -8986,7 +9241,9 @@ def _mtp_candidate_risk(record: Dict[str, object], baseline: Dict[str, object]) 
         return 'risky', 'acceptance rate was not reported by the runtime log'
     accept_rate = _record_float(record, 'accept_rate')
     if accept_rate < 0.60:
-        return 'failed', f'accept_rate {accept_rate:.0%} is below 60%'
+        if _record_int(record, 'mtp_draft_n_max') >= 3:
+            return 'failed', f'draft_n=3 accept_rate {accept_rate:.0%} is below 60%'
+        return 'risky', f'accept_rate {accept_rate:.0%} is below 70%'
     if accept_rate < 0.70:
         return 'risky', f'accept_rate {accept_rate:.0%} is below 70%'
     prefill_cost = _record_float(record, 'prefill_cost_vs_baseline')
@@ -9074,19 +9331,54 @@ def mtp_optimizer_profile_recommendations(records: Sequence[Dict[str, object]]) 
     if not candidates:
         return recommendations
     risk_rank = {'excellent': 0, 'good': 1, 'usable': 2, 'risky': 3}
+
+    def safer_within_ten_percent(items: Sequence[Dict[str, object]]) -> Dict[str, object]:
+        if not items:
+            return {}
+        fastest = max(items, key=lambda item: (_record_float(item, 'tokens_per_sec'), _record_float(item, 'accept_rate')))
+        fastest_tps = _record_float(fastest, 'tokens_per_sec')
+        fastest_accept = _record_float(fastest, 'accept_rate')
+        safer = [
+            item for item in items
+            if item is not fastest
+            and _record_float(item, 'tokens_per_sec') >= fastest_tps * 0.90
+            and _record_float(item, 'accept_rate') >= fastest_accept + 0.05
+            and risk_rank.get(str(item.get('mtp_risk_level', '') or ''), 9) < risk_rank.get(str(fastest.get('mtp_risk_level', '') or ''), 9)
+        ]
+        if safer:
+            return max(
+                safer,
+                key=lambda item: (
+                    -risk_rank.get(str(item.get('mtp_risk_level', '') or ''), 9),
+                    _record_float(item, 'accept_rate'),
+                    _record_float(item, 'tokens_per_sec'),
+                ),
+            )
+        return fastest
+
+    def q8_no_mmap_score(item: Dict[str, object]) -> Tuple[int, int, int]:
+        kv = str(item.get('kv_preset', '') or '').strip().lower()
+        draft_kv = str(item.get('mtp_draft_kv_preset', '') or '').strip().lower()
+        target_q8 = kv == 'q8_0/q8_0' or (
+            str(item.get('ctk', '') or '').strip().lower() == 'q8_0'
+            and str(item.get('ctv', '') or '').strip().lower() == 'q8_0'
+        )
+        draft_q8 = draft_kv == 'q8_0/q8_0' or (
+            str(item.get('draft_ctk', '') or '').strip().lower() == 'q8_0'
+            and str(item.get('draft_ctv', '') or '').strip().lower() == 'q8_0'
+        )
+        return (
+            1 if target_q8 else 0,
+            1 if draft_q8 else 0,
+            1 if bool(item.get('no_mmap', item.get('runtime_no_mmap', False))) else 0,
+        )
+
     fast_candidates = [
         item for item in candidates
         if not baseline_ok or _record_float(item, 'decode_gain_vs_baseline') > 1.05
     ]
     if fast_candidates:
-        recommendations['mtp_fast_chat'] = max(
-            fast_candidates,
-            key=lambda item: (
-                str(item.get('mtp_risk_level', '') or '') != 'failed',
-                _record_float(item, 'tokens_per_sec'),
-                _record_float(item, 'accept_rate'),
-            ),
-        )
+        recommendations['mtp_fast_chat'] = safer_within_ten_percent(fast_candidates)
     safe_candidates = [
         item for item in candidates
         if str(item.get('mtp_risk_level', '') or '') in ('excellent', 'good', 'usable')
@@ -9099,15 +9391,26 @@ def mtp_optimizer_profile_recommendations(records: Sequence[Dict[str, object]]) 
         )
     ]
     if safe_candidates:
-        recommendations['mtp_safe'] = min(
+        recommendations['mtp_safe'] = max(
             safe_candidates,
             key=lambda item: (
-                risk_rank.get(str(item.get('mtp_risk_level', '') or ''), 9),
-                _record_int(item, 'mtp_draft_n_max') if _record_int(item, 'mtp_draft_n_max') > 0 else 99,
-                -_record_float(item, 'accept_rate'),
+                -risk_rank.get(str(item.get('mtp_risk_level', '') or ''), 9),
+                _record_float(item, 'accept_rate'),
+                -(_record_int(item, 'mtp_draft_n_max') if _record_int(item, 'mtp_draft_n_max') > 0 else 99),
+                _record_float(item, 'tokens_per_sec'),
             ),
         )
-        recommendations['mtp_long_context'] = dict(recommendations['mtp_safe'])
+        recommendations['mtp_long_context'] = max(
+            safe_candidates,
+            key=lambda item: (
+                _record_int(item, 'ctx') >= 131072,
+                _record_int(item, 'ctx'),
+                *q8_no_mmap_score(item),
+                _record_int(item, 'gpu_memory_free') or _record_int(item, 'final_vram_free_bytes'),
+                _record_float(item, 'accept_rate'),
+                _record_float(item, 'tokens_per_sec'),
+            ),
+        )
     opencode_candidates = [
         item for item in safe_candidates
         if baseline_ok
@@ -11013,6 +11316,7 @@ def benchmark_moe_placement_tuning(
                 'CUDA_OOM_KV',
                 'MEMORY_GUARDRAIL',
                 'MEMORY_FIT_FAILED',
+                'FIXED_GPU_LAYERS_BLOCKED_FIT',
                 'FIXED_GPU_LAYERS_FIT_FAILED',
                 'ENGINE_RUNTIME_CRASH',
                 'BASELINE_NOT_SUPPORTED_FOR_RECURRENT_NEXTN',

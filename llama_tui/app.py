@@ -2685,6 +2685,9 @@ class AppConfig:
                 parallel_value = int(runtime_profile.parallel or parallel_value)
             if ngl_override is None and runtime_profile.gpu_layers is not None:
                 ngl_value = int(runtime_profile.gpu_layers if runtime_profile.gpu_layers is not None else ngl_value)
+        cache_ram_value = int(getattr(model, 'cache_ram', 0) or 0)
+        if runtime_profile is not None and getattr(runtime_profile, 'cache_ram', None) is not None:
+            cache_ram_value = max(0, int(getattr(runtime_profile, 'cache_ram') or 0))
         omit_gpu_layers = runtime_profile is not None and runtime_profile.gpu_layers is None
         if runtime == 'vllm':
             cmd = self.command_prefix(self.vllm_command) + [
@@ -2732,7 +2735,7 @@ class AppConfig:
         if capabilities.supports_parallel:
             cmd += ['--parallel', str(parallel_value)]
         cmd += [
-            '--cache-ram', str(model.cache_ram),
+            '--cache-ram', str(cache_ram_value),
             '--temp', str(launch_profile.temp),
         ]
         if model.jinja or self.continue_tool_use_launch_required(model):

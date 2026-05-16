@@ -407,6 +407,7 @@ def unsafe_failure_category(category: str) -> bool:
         'CUDA_OOM_KV',
         'MEMORY_GUARDRAIL',
         'MEMORY_FIT_FAILED',
+        'FIXED_GPU_LAYERS_BLOCKED_FIT',
         'FIXED_GPU_LAYERS_FIT_FAILED',
     }
 
