@@ -2,7 +2,11 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence, Tuple
 
-from .engines import ENGINE_LLAMA_CPP_MTP, resolve_engine_install
+from .engines import (
+    ENGINE_VLLM,
+    engine_display_name,
+    resolve_runtime_engine_context,
+)
 from .model_compat import detect_model_runtime_features, engine_supports_model
 from .mtp import (
     clamp_mtp_draft,
@@ -12,7 +16,7 @@ from .mtp import (
     model_mtp_draft_n_max,
     normalize_mtp_support,
 )
-from .runtime_profiles import EngineCapabilities, build_mtp_args, detect_engine_capabilities, mtp_spec_type_value
+from .runtime_profiles import EngineCapabilities, build_mtp_args, mtp_spec_type_value
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,10 @@ class MtpDoctorReport:
     supports_no_warmup: bool
     supports_parallel: bool
     supports_cache_flags: bool
+    supports_draft_kv: bool
+    supports_fit: bool
+    supports_no_mmap: bool
+    supports_cache_ram: bool
     model_id: str
     model_name: str
     model_path: str
@@ -74,21 +82,6 @@ class MtpDoctorReport:
     next_action: str
     risk_level: str
     launch: MtpLaunchDiagnostics
-
-
-def _safe_capabilities(command: str) -> EngineCapabilities:
-    try:
-        return detect_engine_capabilities(command, ENGINE_LLAMA_CPP_MTP)
-    except Exception:
-        return EngineCapabilities()
-
-
-def _active_engine(app: Any, model: Any) -> str:
-    try:
-        return str(app.active_engine_key_for_model(model) or '')
-    except Exception:
-        runtime_profile = getattr(app, 'runtime_profile', None)
-        return str(getattr(runtime_profile, 'engine_id', '') or getattr(runtime_profile, 'engine', '') or '')
 
 
 def _command_contains(tokens: Sequence[str], *flags: str) -> bool:
@@ -277,10 +270,15 @@ def _measured_mtp_status(model: Any) -> Tuple[str, str, str]:
 
 
 def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -> MtpDoctorReport:
-    install = resolve_engine_install(app, ENGINE_LLAMA_CPP_MTP)
-    command = str(getattr(install, 'resolved_command', '') or '')
-    capabilities = _safe_capabilities(command)
-    selected_spec = mtp_spec_type_value(capabilities)
+    # MTP is a capability of whichever llama.cpp-compatible binary is resolved
+    # for this launch, not a property of one dedicated engine. Resolve the
+    # actual engine/binary/capabilities instead of assuming llama.cpp-mtp.
+    engine_context = resolve_runtime_engine_context(app, model=model, runtime_profile=runtime_profile)
+    engine_id = engine_context.engine_id
+    install = engine_context.install
+    command = engine_context.command
+    capabilities = engine_context.capabilities
+    selected_spec = engine_context.selected_mtp_spec_type
     features = tuple(sorted(detect_model_runtime_features(model)))
     support_setting = normalize_mtp_support(getattr(model, 'supports_mtp', 'auto'))
     mtp_enabled = model_mtp_enabled(model, runtime_profile)
@@ -291,18 +289,18 @@ def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -
         and not mmproj
         and (support_setting == 'yes' or 'mtp_native' in features or 'nextn_native' in features)
     )
-    compatibility = engine_supports_model(ENGINE_LLAMA_CPP_MTP, model, capabilities)
-    active_engine = _active_engine(app, model)
+    compatibility = engine_supports_model(engine_id, model, capabilities)
+    model_runtime = str(getattr(model, 'runtime', '') or '').strip().lower()
     cap_reason = _capability_block_reason(install, capabilities)
 
     launch_status = 'ready'
     reason = 'MTP launch prerequisites are ready.'
     next_action = 'Run MTP Optimizer before promoting an MTP profile.'
     risk_level = 'info'
-    if active_engine != ENGINE_LLAMA_CPP_MTP:
+    if engine_id == ENGINE_VLLM or model_runtime == ENGINE_VLLM:
         launch_status = 'off'
-        reason = f'active engine is {active_engine or "unknown"}, not llama.cpp-mtp'
-        next_action = 'Select the llama.cpp-mtp engine to test MTP.'
+        reason = f'active engine is {engine_display_name(engine_id)}; MTP requires a llama.cpp-compatible binary'
+        next_action = 'Select a llama.cpp-compatible engine to test MTP.'
         risk_level = 'muted'
     elif support_setting == 'no':
         launch_status = 'blocked'
@@ -326,7 +324,7 @@ def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -
     elif cap_reason:
         launch_status = 'failed' if cap_reason in ('binary not found', 'binary not executable', 'help output unavailable') else 'blocked'
         reason = cap_reason
-        next_action = 'Build/select a llama.cpp MTP binary that advertises --spec-type mtp/draft-mtp and --spec-draft-n-max.'
+        next_action = 'Build or select a llama.cpp-compatible binary that advertises --spec-type draft-mtp and --spec-draft-n-max.'
         risk_level = 'block'
     elif not mtp_enabled:
         measured_status, measured_reason, measured_action = _measured_mtp_status(model)
@@ -355,7 +353,7 @@ def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -
 
     launch = _build_launch_diagnostics(app, model, runtime_profile, capabilities, cap_reason)
     return MtpDoctorReport(
-        engine_id=ENGINE_LLAMA_CPP_MTP,
+        engine_id=engine_id,
         binary_command=command,
         binary_source=str(getattr(install, 'source', '') or ''),
         binary_exists=bool(getattr(install, 'exists', False)),
@@ -371,6 +369,10 @@ def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -
         supports_no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
         supports_parallel=bool(getattr(capabilities, 'supports_parallel', False)),
         supports_cache_flags=bool(getattr(capabilities, 'supports_cache_type_kv', False) or getattr(capabilities, 'supports_ctk_ctv', False)),
+        supports_draft_kv=bool(getattr(capabilities, 'supports_spec_draft_type_kv', False)),
+        supports_fit=bool(getattr(capabilities, 'supports_fit', False)),
+        supports_no_mmap=bool(getattr(capabilities, 'supports_no_mmap', False)),
+        supports_cache_ram=bool(getattr(capabilities, 'supports_cache_ram', False)),
         model_id=str(getattr(model, 'id', '') or ''),
         model_name=str(getattr(model, 'name', '') or ''),
         model_path=str(getattr(model, 'path', '') or ''),

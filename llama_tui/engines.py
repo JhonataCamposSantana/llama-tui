@@ -3,7 +3,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .constants import DEFAULT_LLAMA_SERVER, DEFAULT_VLLM_COMMAND
 from .runtime_profiles import (
@@ -60,6 +60,28 @@ class EngineHealth:
     status: str
     summary: str
     warnings: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RuntimeEngineContext:
+    """Resolved view of which binary a launch/benchmark will actually use.
+
+    MTP is modelled as a capability of the resolved binary rather than a
+    dedicated engine, so callers should consult ``capabilities`` /
+    ``selected_mtp_spec_type`` instead of comparing ``engine_id`` against
+    ``llama.cpp-mtp``.
+    """
+
+    engine_id: str
+    install: EngineInstall
+    command: str
+    source: str
+    exists: bool
+    executable: bool
+    capabilities: EngineCapabilities
+    selected_mtp_spec_type: str
+    supports_mtp: bool
+    diagnostics: Tuple[str, ...] = ()
 
 
 def get_engine_definitions() -> Dict[str, EngineDefinition]:
@@ -412,3 +434,90 @@ def get_engine_health(config, engine_id: str) -> EngineHealth:
     if warnings:
         return EngineHealth(install.id, 'WARN', warnings[0], warnings)
     return EngineHealth(install.id, 'OK', f'{engine_display_name(install.id)} ready', [])
+
+
+def _engine_capabilities_for_install(app, engine_id: str, install: EngineInstall) -> EngineCapabilities:
+    command = str(getattr(install, 'resolved_command', '') or '')
+    getter = getattr(app, 'engine_capabilities', None)
+    if callable(getter):
+        try:
+            return getter(server_bin=command, engine_id=engine_id)
+        except TypeError:
+            try:
+                return getter()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return detect_engine_capabilities(install)
+
+
+def resolve_runtime_engine_context(app, model=None, runtime_profile=None) -> RuntimeEngineContext:
+    """Resolve the engine, binary and capabilities for a launch/benchmark.
+
+    Resolution order for the engine id:
+      1. ``runtime_profile.engine_id`` when a runtime profile is supplied;
+      2. ``app.active_engine_key_for_model(model)`` when a model is supplied;
+      3. the app's global runtime profile as a last resort.
+
+    Capabilities always come from the actually-resolved binary, never from a
+    different engine's global state.
+    """
+    diagnostics: List[str] = []
+    engine_id = ''
+    if runtime_profile is not None:
+        raw = str(
+            getattr(runtime_profile, 'engine_id', '')
+            or getattr(runtime_profile, 'engine', '')
+            or ''
+        )
+        if raw:
+            engine_id = normalize_engine_id(raw)
+            diagnostics.append(f'engine from runtime_profile: {engine_id}')
+    if not engine_id and model is not None and hasattr(app, 'active_engine_key_for_model'):
+        try:
+            resolved = str(app.active_engine_key_for_model(model) or '')
+        except Exception as exc:  # pragma: no cover - defensive
+            resolved = ''
+            diagnostics.append(f'active_engine_key_for_model failed: {exc}')
+        if resolved:
+            engine_id = normalize_engine_id(resolved)
+            diagnostics.append(f'engine from active_engine_key_for_model: {engine_id}')
+    if not engine_id:
+        global_profile = getattr(app, 'runtime_profile', None)
+        engine_id = normalize_engine_id(
+            str(
+                getattr(global_profile, 'engine_id', '')
+                or getattr(global_profile, 'engine', '')
+                or ENGINE_LLAMA_CPP
+            )
+        )
+        diagnostics.append(f'engine fallback to app.runtime_profile: {engine_id}')
+
+    install = resolve_engine_install(app, engine_id)
+    capabilities = _engine_capabilities_for_install(app, engine_id, install)
+    spec_type = mtp_spec_type_value(capabilities)
+    supports_mtp = bool(
+        getattr(capabilities, 'supports_spec_type', False)
+        and spec_type
+        and getattr(capabilities, 'supports_spec_draft_n_max', False)
+    )
+    if spec_type:
+        diagnostics.append(f'selected mtp spec type: {spec_type}')
+    elif bool(getattr(capabilities, 'supports_spec_type', False)):
+        diagnostics.append('binary advertises --spec-type but no mtp/draft-mtp value')
+    else:
+        diagnostics.append('binary does not advertise --spec-type')
+
+    return RuntimeEngineContext(
+        engine_id=engine_id,
+        install=install,
+        command=str(getattr(install, 'resolved_command', '') or ''),
+        source=str(getattr(install, 'source', '') or ''),
+        exists=bool(getattr(install, 'exists', False)),
+        executable=bool(getattr(install, 'executable', False)),
+        capabilities=capabilities,
+        selected_mtp_spec_type=spec_type,
+        supports_mtp=supports_mtp,
+        diagnostics=tuple(diagnostics),
+    )

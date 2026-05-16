@@ -34,6 +34,7 @@ from .engines import (
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     resolve_engine_install,
+    resolve_runtime_engine_context,
 )
 from .gguf import architecture_label, extra_arg_value, gguf_layer_count, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
@@ -6044,7 +6045,9 @@ def runtime_record_context(
     profile_spec_type = str(getattr(profile, 'mtp_spec_type', '') or '').strip().lower() if profile is not None else ''
     if hasattr(app, 'engine_capabilities'):
         try:
-            capabilities = app.engine_capabilities()
+            capabilities = resolve_runtime_engine_context(
+                app, model=candidate, runtime_profile=profile
+            ).capabilities
             supported_cache_types = [str(item) for item in list(getattr(capabilities, 'supported_kv_modes', ()) or ())]
             capability_spec_type = mtp_spec_type_value(capabilities)
             capability_values = {
@@ -6319,7 +6322,9 @@ def benchmark_adaptive_candidate(
     process_snapshots: Dict[str, Dict[str, object]] = {'before': current_process_pressure_payload()}
     before_hw = app.hardware_profile(refresh=True)
     try:
-        detected_capabilities = app.engine_capabilities()
+        detected_capabilities = resolve_runtime_engine_context(
+            app, model=candidate, runtime_profile=runtime_profile
+        ).capabilities
     except Exception:
         detected_capabilities = None
     launch_profile = benchmark_profile or build_benchmark_launch_profile(
@@ -8005,7 +8010,7 @@ def active_engine_runtime_profiles(
         else:
             family = 'cache' if kv_preset and kv_preset != 'default' else 'default'
         if fit:
-            if engine == ENGINE_LLAMA_CPP_MTP:
+            if engine == ENGINE_LLAMA_CPP_MTP or mtp_enabled:
                 fit_context_value = max(256, min(ctx, int(fit_context or 4096)))
             else:
                 fit_context_value = max(ctx_min, min(ctx, int(fit_context or ctx_min)))
@@ -8120,34 +8125,28 @@ def active_engine_runtime_profiles(
                 no_warmup=capabilities.supports_no_warmup,
             )
 
-    if engine == ENGINE_LLAMA_CPP_MTP:
-        mtp_ngl = 999 if fits_gpu else partial_ngl
+    # MTP is a binary capability, not a dedicated engine: generate the MTP
+    # benchmark family for any llama.cpp-compatible binary that advertises the
+    # speculative MTP flags when the model is MTP-native / NextN-capable.
+    if engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP):
         mtp_spec_type = mtp_spec_type_value(capabilities)
-        recurrent_mtp_required = _model_has_nextn_or_recurrent_features(model)
-        if not recurrent_mtp_required:
-            add(
-                'mtp_baseline',
-                base_ctx,
-                mtp_ngl,
-                'default',
-                batch=128,
-                ubatch=64,
-                no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
-                mtp_enabled=False,
-                benchmark_phase='baseline_no_mtp',
-                benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,startup_status',
-            )
-        supports_mtp = bool(
+        mtp_binary_ready = bool(
             getattr(capabilities, 'supports_spec_type', False)
             and getattr(capabilities, 'supports_mtp', False)
             and mtp_spec_type
             and getattr(capabilities, 'supports_spec_draft_n_max', False)
         )
-        if supports_mtp and model_mtp_allowed(model) and (
-            bool(getattr(model, 'mtp_enabled', False))
-            or str(getattr(model, 'supports_mtp', 'auto') or 'auto').strip().lower() == 'yes'
-            or mtp_support_auto_hint(model)
-        ):
+        recurrent_mtp_required = _model_has_nextn_or_recurrent_features(model)
+        mtp_model_ready = bool(
+            model_mtp_allowed(model)
+            and (
+                bool(getattr(model, 'mtp_enabled', False))
+                or str(getattr(model, 'supports_mtp', 'auto') or 'auto').strip().lower() == 'yes'
+                or mtp_support_auto_hint(model)
+                or recurrent_mtp_required
+            )
+        )
+        if mtp_binary_ready and mtp_model_ready:
             fit_family_ready = bool(
                 has_gpu
                 and getattr(capabilities, 'supports_fit', False)
@@ -8157,6 +8156,24 @@ def active_engine_runtime_profiles(
                 and getattr(capabilities, 'supports_spec_draft_type_kv', False)
                 and getattr(capabilities, 'supports_no_mmap', False)
             )
+            # A no-MTP baseline is only valid for non-recurrent models. NextN /
+            # recurrent GGUFs crash without MTP-initialised recurrent state, so
+            # the baseline is skipped as expected for those models.
+            if not recurrent_mtp_required:
+                add(
+                    'mtp_baseline',
+                    base_ctx,
+                    None,
+                    'default',
+                    batch=128,
+                    ubatch=64,
+                    fit=bool(getattr(capabilities, 'supports_fit', False)),
+                    fit_context=4096 if getattr(capabilities, 'supports_fit_ctx', False) else 0,
+                    no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
+                    mtp_enabled=False,
+                    benchmark_phase='baseline_no_mtp',
+                    benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,startup_status',
+                )
             if fit_family_ready:
                 ctx_candidates = [
                     ctx for ctx in (8192, 32768, 65536, 131072)
@@ -8165,7 +8182,6 @@ def active_engine_runtime_profiles(
                 if not ctx_candidates:
                     ctx_candidates = [max(ctx_min, min(ctx_max, 8192))]
                 primary_ctx = 131072 if 131072 in ctx_candidates else max(ctx_candidates)
-                no_mmap_supported = bool(getattr(capabilities, 'supports_no_mmap', False))
 
                 def add_mtp_fit_candidate(ctx: int, draft: int, fit_target: int = 1024, no_mmap: bool = True):
                     suffix = f'{ctx // 1024}k' if ctx % 1024 == 0 else str(ctx)
@@ -8182,7 +8198,7 @@ def active_engine_runtime_profiles(
                         fit_context=4096,
                         fit_target=fit_target,
                         cache_ram=0,
-                        no_mmap=no_mmap and no_mmap_supported,
+                        no_mmap=no_mmap,
                         no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
                         mtp_enabled=True,
                         mtp_draft_n_max=draft,
@@ -8200,25 +8216,9 @@ def active_engine_runtime_profiles(
                         add_mtp_fit_candidate(ctx, draft, 1024, True)
                 for fit_target in (1536, 2048):
                     add_mtp_fit_candidate(primary_ctx, 1, fit_target, True)
-                if no_mmap_supported:
-                    add_mtp_fit_candidate(primary_ctx, 1, 1024, False)
-                    add_mtp_fit_candidate(primary_ctx, 2, 1024, False)
-            for draft in MTP_DRAFT_VALUES:
-                add(
-                    f'mtp_draft_n{draft}',
-                    base_ctx,
-                    mtp_ngl,
-                    'default',
-                    batch=128,
-                    ubatch=64,
-                    no_warmup=bool(getattr(capabilities, 'supports_no_warmup', False)),
-                    mtp_enabled=True,
-                    mtp_draft_n_max=draft,
-                    mtp_spec_type=mtp_spec_type,
-                    benchmark_phase=f'draft_n{draft}',
-                    benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,draft_tokens,accepted_tokens,accept_rate,startup_status',
-                )
-        return finalized_profiles()
+                add_mtp_fit_candidate(primary_ctx, 1, 1024, False)
+                add_mtp_fit_candidate(primary_ctx, 2, 1024, False)
+            return finalized_profiles()
 
     if engine == 'tq3':
         baseline_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/q8_0'), None)
@@ -8938,7 +8938,9 @@ def benchmark_runtime_profile_with_retry(
         candidate = model_for_runtime_profile(base_model, runtime_profile)
         profile_fingerprint = runtime_profile_config_fingerprint(candidate, runtime_profile)
         try:
-            capabilities = app.engine_capabilities()
+            capabilities = resolve_runtime_engine_context(
+                app, model=candidate, runtime_profile=runtime_profile
+            ).capabilities
         except Exception:
             capabilities = None
         launch_profile = build_benchmark_launch_profile(
@@ -9433,7 +9435,7 @@ def benchmark_frontier_probe_candidate(
 ) -> Tuple[Dict[str, object], bool]:
     check_cancelled(cancel_token)
     try:
-        capabilities = app.engine_capabilities()
+        capabilities = resolve_runtime_engine_context(app, model=candidate).capabilities
     except Exception:
         capabilities = None
     launch_profile = build_benchmark_launch_profile(
@@ -10143,7 +10145,7 @@ def _moe_tuning_layer_count(model: ModelConfig) -> int:
 
 def _moe_tuning_capabilities(app, runtime_profile: RuntimeProfile):
     try:
-        return app.engine_capabilities()
+        return resolve_runtime_engine_context(app, runtime_profile=runtime_profile).capabilities
     except Exception:
         return default_engine_capabilities(str(getattr(runtime_profile, 'engine_id', '') or 'llama.cpp'))
 

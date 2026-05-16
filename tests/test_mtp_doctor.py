@@ -5,10 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from llama_tui.app import AppConfig
-from llama_tui.engines import ENGINE_LLAMA_CPP_MTP, EngineInstall
+from llama_tui.engines import ENGINE_LLAMA_CPP_MTP, EngineInstall, RuntimeEngineContext
 from llama_tui.models import ModelConfig
 from llama_tui.mtp_doctor import build_mtp_doctor_report, mtp_status_for_model
-from llama_tui.runtime_profiles import default_engine_capabilities, make_runtime_profile
+from llama_tui.runtime_profiles import default_engine_capabilities, make_runtime_profile, mtp_spec_type_value
 from llama_tui.ui import mtp_doctor_items
 
 
@@ -26,6 +26,26 @@ def mtp_capabilities(spec_type: str = 'draft-mtp'):
         supports_parallel=True,
         supports_ctk_ctv=True,
         supports_no_mmap=True,
+    )
+
+
+def mtp_context(caps, install, engine_id: str = ENGINE_LLAMA_CPP_MTP):
+    spec_type = mtp_spec_type_value(caps)
+    return RuntimeEngineContext(
+        engine_id=engine_id,
+        install=install,
+        command=str(install.resolved_command or ''),
+        source=str(install.source or ''),
+        exists=bool(install.exists),
+        executable=bool(install.executable),
+        capabilities=caps,
+        selected_mtp_spec_type=spec_type,
+        supports_mtp=bool(
+            getattr(caps, 'supports_spec_type', False)
+            and spec_type
+            and getattr(caps, 'supports_spec_draft_n_max', False)
+        ),
+        diagnostics=(),
     )
 
 
@@ -63,8 +83,7 @@ class MtpDoctorTests(unittest.TestCase):
             checked_paths=['/opt/mtp/bin/llama-server'],
         )
 
-        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
-             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+        with patch('llama_tui.mtp_doctor.resolve_runtime_engine_context', return_value=mtp_context(caps, install)), \
              patch.object(app, 'engine_capabilities', return_value=caps):
             report = build_mtp_doctor_report(app, model)
             summary = mtp_status_for_model(app, model)
@@ -110,8 +129,7 @@ class MtpDoctorTests(unittest.TestCase):
             executable=True,
         )
 
-        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
-             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+        with patch('llama_tui.mtp_doctor.resolve_runtime_engine_context', return_value=mtp_context(caps, install)), \
              patch.object(app, 'engine_capabilities', return_value=caps):
             report = build_mtp_doctor_report(app, model)
 
@@ -120,7 +138,7 @@ class MtpDoctorTests(unittest.TestCase):
         self.assertEqual(report.launch.blocked_reason, 'missing mtp/draft-mtp value')
         self.assertIn('--spec-type', report.launch.skipped_flags)
         self.assertFalse(report.launch.includes_spec_type)
-        self.assertIn('Build/select a llama.cpp MTP binary', report.next_action)
+        self.assertIn('Build or select a llama.cpp-compatible binary', report.next_action)
 
     def test_doctor_marks_generic_auto_model_as_unknown(self):
         app = self.make_app()
@@ -142,8 +160,7 @@ class MtpDoctorTests(unittest.TestCase):
             executable=True,
         )
 
-        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
-             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+        with patch('llama_tui.mtp_doctor.resolve_runtime_engine_context', return_value=mtp_context(caps, install)), \
              patch.object(app, 'engine_capabilities', return_value=caps):
             report = build_mtp_doctor_report(app, model)
 
@@ -171,8 +188,7 @@ class MtpDoctorTests(unittest.TestCase):
             executable=True,
         )
 
-        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
-             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+        with patch('llama_tui.mtp_doctor.resolve_runtime_engine_context', return_value=mtp_context(caps, install)), \
              patch.object(app, 'engine_capabilities', return_value=caps):
             report = build_mtp_doctor_report(app, model)
             launch_ok, launch_msg = app.validate_mtp_launch(model)
@@ -205,8 +221,7 @@ class MtpDoctorTests(unittest.TestCase):
             executable=True,
         )
 
-        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
-             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+        with patch('llama_tui.mtp_doctor.resolve_runtime_engine_context', return_value=mtp_context(caps, install)), \
              patch.object(app, 'engine_capabilities', return_value=caps):
             text = '\n'.join(line for line, _kind in mtp_doctor_items(app, model))
 
@@ -264,8 +279,7 @@ class MtpDoctorTests(unittest.TestCase):
             executable=True,
         )
 
-        with patch('llama_tui.mtp_doctor.resolve_engine_install', return_value=install), \
-             patch('llama_tui.mtp_doctor.detect_engine_capabilities', return_value=caps), \
+        with patch('llama_tui.mtp_doctor.resolve_runtime_engine_context', return_value=mtp_context(caps, install)), \
              patch.object(app, 'engine_capabilities', return_value=caps):
             text = '\n'.join(line for line, _kind in mtp_doctor_items(app, model))
 

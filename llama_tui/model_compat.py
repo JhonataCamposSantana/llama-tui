@@ -285,9 +285,14 @@ def engine_supports_model(
 
     if engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN):
         if 'mtp_native' in features:
+            # MTP is a binary capability: an MTP-native GGUF runs accelerated on
+            # any llama.cpp-compatible binary that advertises the speculative MTP
+            # flags, not only on the legacy llama.cpp-mtp engine alias.
+            if capabilities is not None and bool(getattr(capabilities, 'supports_mtp', False)) and mtp_spec_type_value(capabilities):
+                return _result('preferred', 'MTP-capable GGUF on a binary that advertises MTP', 'info', features)
             return _result(
                 'compatible_with_warning',
-                f'MTP-capable GGUF may load on {engine}, but MTP acceleration requires llama.cpp-mtp',
+                f'MTP-capable GGUF will load on {engine}; MTP acceleration needs a binary that advertises --spec-type draft-mtp',
                 'warn',
                 features,
             )

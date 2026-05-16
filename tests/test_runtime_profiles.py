@@ -297,7 +297,7 @@ class RuntimeProfileTests(unittest.TestCase):
     def test_capability_parser_handles_realistic_mtp_spec_type_formats(self):
         cases = [
             ('--spec-type [none|mtp|ngram-simple]\n--spec-draft-n-max N', 'mtp'),
-            ('--spec-type VALUE\n  allowed values: none, mtp, draft-mtp, ngram-simple\n--spec-draft-n-max N', 'mtp'),
+            ('--spec-type VALUE\n  allowed values: none, mtp, draft-mtp, ngram-simple\n--spec-draft-n-max N', 'draft-mtp'),
             ('--spec-type VALUE\n  allowed values: none, draft-mtp\n--spec-draft-n-max N', 'draft-mtp'),
             ('--spec-type VALUE\n  allowed values: none, mtp\n--spec-draft-n-max N', 'mtp'),
             ('--spec-type <none|draft-mtp|ngram-simple>\n--spec-draft-n-max N', 'draft-mtp'),
@@ -464,7 +464,9 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(args[args.index('--spec-draft-type-v') + 1], 'q8_0')
         self.assertEqual(diagnostics.blocked_reason, '')
 
-    def test_build_mtp_args_skips_non_mtp_engines(self):
+    def test_build_mtp_args_works_for_any_mtp_capable_engine(self):
+        # MTP is a binary capability: build_mtp_args must emit speculative flags
+        # for a plain llama.cpp engine when the binary advertises MTP support.
         profile = RuntimeProfile(
             engine_id='llama.cpp',
             ctx_size=2048,
@@ -474,10 +476,34 @@ class RuntimeProfileTests(unittest.TestCase):
             mtp_draft_n_max=2,
         )
         caps = replace(
-            default_engine_capabilities('llama.cpp-mtp'),
+            default_engine_capabilities('llama.cpp'),
             supports_spec_type=True,
             supports_mtp=True,
-            mtp_spec_type='mtp',
+            spec_type_values=('none', 'draft-mtp'),
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+            supports_spec_draft_n_max=True,
+        )
+
+        args, diagnostics = build_mtp_args(None, profile, caps)
+
+        self.assertEqual(args, ['--spec-type', 'draft-mtp', '--spec-draft-n-max', '2'])
+        self.assertTrue(diagnostics.enabled)
+        self.assertEqual(diagnostics.selected_spec_type, 'draft-mtp')
+
+    def test_build_mtp_args_skips_when_mtp_disabled(self):
+        profile = RuntimeProfile(
+            engine_id='llama.cpp',
+            ctx_size=2048,
+            gpu_layers=13,
+            parallel=1,
+            mtp_enabled=False,
+        )
+        caps = replace(
+            default_engine_capabilities('llama.cpp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            mtp_spec_type='draft-mtp',
             supports_spec_draft_n_max=True,
         )
 
@@ -485,7 +511,7 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertEqual(args, [])
         self.assertFalse(diagnostics.enabled)
-        self.assertIn('engine_not_llama.cpp-mtp', diagnostics.skipped_flags)
+        self.assertIn('mtp_disabled', diagnostics.skipped_flags)
 
     def test_capability_parser_detects_turboquant_cache_types(self):
         caps = parse_engine_capabilities(
@@ -1837,6 +1863,12 @@ class RuntimeProfileTests(unittest.TestCase):
             supports_spec_type=True,
             supports_mtp=True,
             supports_no_warmup=True,
+            supports_fit=True,
+            supports_fit_ctx=True,
+            supports_fit_target=True,
+            supports_ctk_ctv=True,
+            supports_spec_draft_type_kv=True,
+            supports_no_mmap=True,
             spec_type_values=('none', 'draft-mtp'),
             mtp_spec_type='draft-mtp',
             mtp_spec_type_value='draft-mtp',
@@ -1871,6 +1903,7 @@ class RuntimeProfileTests(unittest.TestCase):
             )
             phases = []
             purposes = []
+            drafts = []
             progress = []
 
             def fake_runtime_profile_with_retry(
@@ -1884,13 +1917,13 @@ class RuntimeProfileTests(unittest.TestCase):
                 _total,
                 **kwargs,
             ):
-                self.assertEqual(objective, 'fast_chat')
                 self.assertEqual(kwargs.get('benchmark_purpose'), 'mtp_acceptance')
                 self.assertEqual(kwargs.get('max_attempts'), 1)
                 phases.append(runtime_profile.benchmark_phase)
                 purposes.append(kwargs.get('benchmark_purpose'))
                 candidate = model_for_runtime_profile(base_model, runtime_profile)
                 draft = runtime_profile.mtp_draft_n_max
+                drafts.append(draft)
                 record = adaptive_record_from_candidate(
                     candidate,
                     objective,
@@ -1929,7 +1962,9 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn('partial', msg)
-        self.assertEqual(phases, ['draft_n1', 'draft_n2', 'draft_n3'])
+        self.assertTrue(phases)
+        self.assertTrue(all(phase.startswith('fit_q8_draftq8_draft_n') for phase in phases))
+        self.assertEqual({1, 2, 3}, set(drafts))
         self.assertEqual(set(purposes), {'mtp_acceptance'})
         saved = app.models[0]
         self.assertEqual(saved.default_benchmark_status, 'partial')
@@ -5879,14 +5914,19 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertTrue(any(int(item.ctx_size or 0) >= model.ctx_min for item in reasoning_off))
         self.assertFalse(any(item.reasoning == 'off' for item in unsupported_profiles))
 
-    def test_mtp_runtime_profiles_include_baseline_and_draft_matrix(self):
+    def test_mtp_runtime_profiles_drop_legacy_fixed_ngl_profiles(self):
+        # When the binary cannot do the fit/q8/no-mmap family the legacy
+        # fixed-NGL MTP profiles are dropped entirely; only a fit-assisted
+        # no-MTP baseline remains for a non-recurrent model.
         caps = replace(
             default_engine_capabilities('llama.cpp-mtp'),
             supports_spec_type=True,
             supports_mtp=True,
             supports_no_warmup=True,
-            mtp_spec_type='mtp',
-            mtp_spec_type_value='mtp',
+            supports_fit=True,
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+            spec_type_values=('none', 'draft-mtp'),
             supports_spec_draft_n_max=True,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -5911,9 +5951,12 @@ class RuntimeProfileTests(unittest.TestCase):
 
         names = [item.name for item in profiles]
         self.assertIn('mtp_baseline', names)
-        self.assertEqual([item.mtp_draft_n_max for item in profiles if item.mtp_enabled], [1, 2, 3])
-        self.assertEqual([item.benchmark_phase for item in profiles if item.mtp_enabled], ['draft_n1', 'draft_n2', 'draft_n3'])
-        self.assertTrue(all(item.no_warmup for item in profiles))
+        # No legacy fixed-NGL MTP candidates without the full fit family.
+        self.assertFalse(any(item.mtp_enabled for item in profiles))
+        self.assertFalse(any(name.startswith('mtp_draft_n') for name in names))
+        baseline = next(item for item in profiles if item.benchmark_phase == 'baseline_no_mtp')
+        self.assertIsNone(baseline.gpu_layers)
+        self.assertFalse(baseline.mtp_enabled)
         self.assertTrue(all(item.parallel == 1 for item in profiles))
 
     def test_mtp_fit_profile_family_includes_long_context_q8_nommap_without_ngl(self):
@@ -5972,7 +6015,9 @@ class RuntimeProfileTests(unittest.TestCase):
         for draft in (1, 2, 3):
             self.assertTrue(any(item.mtp_draft_n_max == draft and item.fit and item.kv_preset == 'q8_0/q8_0' for item in profiles))
         self.assertNotIn('mtp_baseline', names)
-        self.assertIn('mtp_draft_n1', names)
+        # Legacy fixed-NGL MTP profiles are no longer generated.
+        self.assertFalse(any(name.startswith('mtp_draft_n') for name in names))
+        self.assertFalse(any((item.benchmark_phase or '').startswith('draft_n') for item in profiles))
 
     def test_mtp_runtime_profiles_emit_selected_draft_mtp_spec_type_for_every_mtp_profile(self):
         caps = replace(

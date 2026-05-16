@@ -42,6 +42,7 @@ from .engines import (
     normalize_engine_id,
     mtp_binary_warning as engine_mtp_binary_warning,
     resolve_engine_install,
+    resolve_runtime_engine_context,
     tq3_binary_warning as engine_tq3_binary_warning,
     turboquant_binary_warning as engine_turboquant_binary_warning,
 )
@@ -105,6 +106,7 @@ from .runtime_profiles import (
     make_runtime_profile,
     mtp_spec_type_value,
     runtime_profile_extra_args,
+    validate_mtp_command,
 )
 from .textutil import compact_message, important_log_excerpt
 
@@ -888,11 +890,27 @@ class AppConfig:
             return str(resolve_engine_install(self, self.runtime_profile.engine).resolved_command or self.runtime_profile.server_command or self.llama_server)
         return runtime
 
-    def engine_capabilities(self, engine_profile: Optional[EngineProfile] = None) -> EngineCapabilities:
-        profile = engine_profile or self.runtime_profile
-        key = f'{profile.engine_id}:{profile.server_bin}'
+    def engine_capabilities(
+        self,
+        engine_profile: Optional[EngineProfile] = None,
+        *,
+        server_bin: Optional[str] = None,
+        engine_id: Optional[str] = None,
+    ) -> EngineCapabilities:
+        if server_bin is not None or engine_id is not None:
+            resolved_engine = engine_id or (
+                engine_profile.engine_id if engine_profile is not None else self.runtime_profile.engine_id
+            )
+            resolved_bin = server_bin if server_bin is not None else (
+                engine_profile.server_bin if engine_profile is not None else self.runtime_profile.server_bin
+            )
+        else:
+            profile = engine_profile or self.runtime_profile
+            resolved_engine = profile.engine_id
+            resolved_bin = profile.server_bin
+        key = f'{resolved_engine}:{resolved_bin}'
         if key not in self._engine_capability_cache:
-            self._engine_capability_cache[key] = detect_engine_capabilities(profile.server_bin, profile.engine_id)
+            self._engine_capability_cache[key] = detect_engine_capabilities(resolved_bin, resolved_engine)
         return self._engine_capability_cache[key]
 
     def runtime_profile_from_model(
@@ -1019,8 +1037,11 @@ class AppConfig:
             cpu_moe=cpu_moe,
             n_cpu_moe=n_cpu_moe,
             tensor_overrides=tuple(tensor_overrides),
-            mtp_enabled=bool(getattr(model, 'mtp_enabled', False)) if engine_id == ENGINE_LLAMA_CPP_MTP else False,
-            mtp_draft_n_max=clamp_mtp_draft(getattr(model, 'mtp_draft_n_max', 3), default=3) if engine_id == ENGINE_LLAMA_CPP_MTP else 0,
+            mtp_enabled=bool(getattr(model, 'mtp_enabled', False)),
+            mtp_draft_n_max=(
+                clamp_mtp_draft(getattr(model, 'mtp_draft_n_max', 3), default=3)
+                if bool(getattr(model, 'mtp_enabled', False)) else 0
+            ),
         )
 
     def runtime_indicator(self) -> str:
@@ -1200,8 +1221,9 @@ class AppConfig:
         model: ModelConfig,
         runtime_profile: Optional[RuntimeProfile] = None,
     ) -> Tuple[bool, str]:
-        if self.active_engine_key_for_model(model) != ENGINE_LLAMA_CPP_MTP:
-            return True, ''
+        # MTP validation is capability-driven: it applies whenever the launch
+        # profile opts into MTP, regardless of which llama.cpp-compatible engine
+        # is selected.
         enabled = model_mtp_enabled(model, runtime_profile)
         if not enabled:
             return True, ''
@@ -1214,7 +1236,9 @@ class AppConfig:
         if support_setting == 'auto' and 'mtp_native' not in features and 'nextn_native' not in features:
             return False, 'MTP capability is unknown for this model. Set supports_mtp=yes only if this GGUF is MTP-capable, or disable MTP.'
         try:
-            capabilities = self.engine_capabilities()
+            capabilities = resolve_runtime_engine_context(
+                self, model=model, runtime_profile=runtime_profile
+            ).capabilities
         except Exception:
             capabilities = EngineCapabilities()
         if not (
@@ -2702,8 +2726,12 @@ class AppConfig:
             cmd += model.extra_args
             return cmd
 
-        engine_profile = self.runtime_profile
-        capabilities = self.engine_capabilities(engine_profile)
+        engine_context = resolve_runtime_engine_context(self, model=model, runtime_profile=runtime_profile)
+        capabilities = engine_context.capabilities
+        if engine_context.engine_id == self.runtime_profile.engine_id:
+            engine_profile = self.runtime_profile
+        else:
+            engine_profile = make_runtime_profile(engine_context.engine_id, self.llama_server)
         measured_runtime = self.runtime_profile_from_model(
             model,
             ctx_value,
@@ -2711,7 +2739,7 @@ class AppConfig:
             ngl_value,
             runtime_profile=runtime_profile,
         )
-        if self.active_engine_key_for_model(model) == ENGINE_LLAMA_CPP_MTP and model_mtp_enabled(model, measured_runtime):
+        if engine_context.supports_mtp and model_mtp_enabled(model, measured_runtime):
             parallel_value = 1
             measured_runtime = replace(measured_runtime, parallel=1)
         launch_profile = benchmark_profile or build_benchmark_launch_profile(
@@ -2721,7 +2749,7 @@ class AppConfig:
             purpose='serve_default',
             depth='full',
         )
-        cmd = self.command_prefix(self.runtime_server_command('llama.cpp')) + [
+        cmd = self.command_prefix(engine_context.command or self.runtime_server_command(runtime)) + [
             '-m', model.path,
             '--alias', model.alias,
             '--host', model.host,
@@ -2829,7 +2857,8 @@ class AppConfig:
                     f'{profile_msg} benchmark_profile={benchmark_profile.name} '
                     f'output={benchmark_profile.measurement_output}'
                 )
-        if self.active_engine_key_for_model(model) == ENGINE_LLAMA_CPP_MTP and model_mtp_enabled(model, runtime_profile):
+        engine_context = resolve_runtime_engine_context(self, model=model, runtime_profile=runtime_profile)
+        if engine_context.supports_mtp and model_mtp_enabled(model, runtime_profile):
             if int(profile.get('parallel', 1) or 1) != 1:
                 profile_msg = f'{profile_msg} MTP forced parallel=1'
             profile['parallel'] = 1
@@ -2845,6 +2874,10 @@ class AppConfig:
             runtime_profile=runtime_profile,
             benchmark_profile=benchmark_profile,
         )
+        spec_ok, spec_msg = validate_mtp_command(command, engine_context.capabilities)
+        if not spec_ok:
+            self.append_log(model.id, f'launch blocked: {spec_msg}')
+            return False, spec_msg
         env = os.environ.copy()
         env['LLAMA_TUI_MODEL_ID'] = model.id
         env['LLAMA_TUI_OWNER_PID'] = str(os.getpid())

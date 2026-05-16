@@ -699,11 +699,14 @@ def parse_spec_type_values(help_text: str, defaults: Optional[EngineCapabilities
 
 
 def select_mtp_spec_type_value(spec_type_values: Sequence[str], default_value: str = '') -> str:
+    # Upstream llama.cpp advertises `draft-mtp`; the older fork dialect used `mtp`.
+    # Prefer `draft-mtp` whenever the binary advertises it, and only fall back to
+    # the legacy `mtp` value when that is the sole speculative MTP dialect offered.
     values = {str(item or '').strip().lower() for item in (spec_type_values or ())}
-    if 'mtp' in values:
-        return 'mtp'
     if 'draft-mtp' in values:
         return 'draft-mtp'
+    if 'mtp' in values:
+        return 'mtp'
     default_text = str(default_value or '').strip().lower()
     return default_text if default_text in MTP_SPEC_TYPE_VALUES else ''
 
@@ -720,6 +723,44 @@ def mtp_spec_type_value(capabilities: Optional[EngineCapabilities]) -> str:
         or ''
     ).strip().lower() if capabilities is not None else ''
     return value if value in MTP_SPEC_TYPE_VALUES else ''
+
+
+def command_spec_type_value(command_tokens: Sequence[object]) -> str:
+    """Return the last --spec-type value present in a built command, lowercased."""
+    tokens = [str(item or '') for item in (command_tokens or [])]
+    value = ''
+    for index, token in enumerate(tokens):
+        if token == '--spec-type' and index + 1 < len(tokens):
+            value = tokens[index + 1].strip().lower()
+        elif token.startswith('--spec-type='):
+            value = token.split('=', 1)[1].strip().lower()
+    return value
+
+
+def validate_mtp_command(
+    command_tokens: Sequence[object],
+    capabilities: Optional[EngineCapabilities],
+) -> Tuple[bool, str]:
+    """Reject a launch command whose --spec-type value the binary does not advertise.
+
+    Returns (ok, error). When the binary's speculative types are unknown (help
+    could not be parsed) the command is allowed through so a missing --help does
+    not block otherwise-valid launches.
+    """
+    requested = command_spec_type_value(command_tokens)
+    if not requested or requested == 'none':
+        return True, ''
+    advertised = {
+        str(item or '').strip().lower()
+        for item in (getattr(capabilities, 'spec_type_values', ()) or ())
+        if str(item or '').strip()
+    }
+    if not advertised:
+        return True, ''
+    if requested in advertised:
+        return True, ''
+    supported = ', '.join(sorted(advertised))
+    return False, f'INVALID_MTP_SPEC_TYPE: requested {requested}, binary supports {supported}'
 
 
 def parse_supported_kv_modes(help_text: str, engine_id: str, defaults: EngineCapabilities) -> Tuple[str, ...]:
@@ -1001,9 +1042,9 @@ def build_mtp_args(
 ) -> Tuple[List[str], MtpArgDiagnostics]:
     if runtime_profile is None:
         return [], MtpArgDiagnostics(skipped_flags=('runtime_profile_missing',))
-    engine_id = str(getattr(runtime_profile, 'engine_id', '') or '').strip().lower()
-    if engine_id != 'llama.cpp-mtp':
-        return [], MtpArgDiagnostics(skipped_flags=('engine_not_llama.cpp-mtp',))
+    # MTP is a binary capability, not a dedicated engine: any llama.cpp-compatible
+    # binary that advertises the speculative MTP flags can run it. Gate purely on
+    # the runtime profile opting in and on the resolved binary capabilities below.
     if not bool(getattr(runtime_profile, 'mtp_enabled', False)):
         return [], MtpArgDiagnostics(skipped_flags=('mtp_disabled',))
     if not bool(getattr(capabilities, 'supports_spec_type', False)):
@@ -1092,9 +1133,10 @@ def runtime_profile_extra_args(
 ) -> List[str]:
     args = strip_runtime_tuning_args(existing_args)
     profile_extra_args = strip_runtime_tuning_args(runtime_profile.extra_args)
+    mtp_enabled = bool(getattr(runtime_profile, 'mtp_enabled', False))
     args.extend(build_flash_attn_args(runtime_profile.flash_attn, capabilities))
     kv_key, kv_value = kv_modes_from_preset(runtime_profile.kv_preset)
-    if engine.is_llama_cpp_mtp and kv_key and kv_value and capabilities.supports_ctk_ctv:
+    if (engine.is_llama_cpp_mtp or mtp_enabled) and kv_key and kv_value and capabilities.supports_ctk_ctv:
         args += ['-ctk', kv_key, '-ctv', kv_value]
     elif (engine.is_turboquant or engine.is_tq3) and kv_key and kv_value and capabilities.supports_ctk_ctv:
         args += ['-ctk', kv_key, '-ctv', kv_value]
@@ -1125,7 +1167,7 @@ def runtime_profile_extra_args(
             value = str(override or '').strip()
             if value:
                 args += [capabilities.override_tensor_flag or '-ot', value]
-    if engine.is_llama_cpp_mtp:
+    if mtp_enabled:
         mtp_args, _mtp_diagnostics = build_mtp_args(None, runtime_profile, capabilities)
         args += mtp_args
     args.extend(str(item) for item in profile_extra_args)

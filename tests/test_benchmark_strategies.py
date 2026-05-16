@@ -205,14 +205,29 @@ class BenchmarkStrategyTests(unittest.TestCase):
             Path('/tmp/llama-tui-test-strategy.json'),
             runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
         )
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
-        app.engine_capabilities = lambda: caps
+        caps = replace(
+            default_engine_capabilities('llama.cpp-mtp'),
+            supports_spec_type=True,
+            supports_mtp=True,
+            mtp_spec_type='draft-mtp',
+            mtp_spec_type_value='draft-mtp',
+            spec_type_values=('none', 'draft-mtp'),
+            supports_spec_draft_n_max=True,
+            supports_no_warmup=True,
+            supports_fit=True,
+            supports_fit_ctx=True,
+            supports_fit_target=True,
+            supports_ctk_ctv=True,
+            supports_spec_draft_type_kv=True,
+            supports_no_mmap=True,
+        )
+        app.engine_capabilities = lambda *a, **k: caps
 
         profiles = active_engine_runtime_profiles(app, model, HardwareProfile(gpu_memory_total=8 * 1024 ** 3, gpu_memory_free=6 * 1024 ** 3), depth='fast')
 
         self.assertGreaterEqual(len(profiles), 4)
         self.assertTrue(all(item.benchmark_strategy_id == 'mtp_acceptance_matrix' for item in profiles))
-        self.assertIn('draft_n1', {item.benchmark_phase for item in profiles})
+        self.assertIn('fit_q8_draftq8_draft_n1', {item.benchmark_phase for item in profiles})
 
     def test_parse_mtp_acceptance_metrics(self):
         metrics = parse_mtp_acceptance_metrics('draft_tokens: 120 accepted_tokens: 90 acceptance_rate: 75%')
