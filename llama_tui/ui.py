@@ -4682,7 +4682,9 @@ def tui(stdscr, app: AppConfig):
                 lambda progress, token, model=model: start_model_with_progress(app, model, progress=progress, cancel_token=token),
             )
 
-    while True:
+    def drain_action_queue():
+        nonlocal message, try_status, try_error, try_thread, last_refresh
+        nonlocal try_response_index, action_thread, action_token
         while True:
             try:
                 queued_event = action_queue.get_nowait()
@@ -4774,6 +4776,9 @@ def tui(stdscr, app: AppConfig):
                 action_token = None
                 last_refresh = 0.0
                 invalidate_machine_summary()
+
+    while True:
+        drain_action_queue()
 
         now = time.time()
         if now - last_refresh > REFRESH_SECONDS:
