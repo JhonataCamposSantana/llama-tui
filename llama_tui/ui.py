@@ -92,6 +92,7 @@ from .ui_models import (
 )
 from .ui_benchmark import (
     FULL_SUITE_STAGES,
+    LEADERBOARD_SORT_KEYS,
     MTP_SUITE_STAGES,
     benchmark_leaderboard_lines,
     benchmark_plan_lines,
@@ -4031,6 +4032,7 @@ def tui(stdscr, app: AppConfig):
     error_history: List[str] = []
     right_tab_by_view: Dict[str, str] = {}
     right_tab_scrolls: Dict[str, int] = {}
+    leaderboard_sort = LEADERBOARD_SORT_KEYS[0]
     right_tab_scroll_total = 0
     right_tab_scroll_rows = 1
     last_refresh = 0.0
@@ -5537,10 +5539,13 @@ def tui(stdscr, app: AppConfig):
                                 'muted': colors['muted'],
                                 'normal': curses.A_NORMAL,
                             }
-                            right_items.append(('engine leaderboard:', colors['accent'] | curses.A_BOLD))
+                            right_items.append((
+                                f'engine leaderboard (sort: {leaderboard_sort} · [s] cycle):',
+                                colors['accent'] | curses.A_BOLD,
+                            ))
                             right_items.extend(
                                 (text, lb_attr.get(kind, curses.A_NORMAL))
-                                for text, kind in benchmark_leaderboard_lines(model)
+                                for text, kind in benchmark_leaderboard_lines(model, leaderboard_sort)
                             )
                             right_items.append(('', curses.A_NORMAL))
                         run = {
@@ -5715,6 +5720,8 @@ def tui(stdscr, app: AppConfig):
                 footer = '[Esc] details  A Apply All  M MoE  P Profile  E Export  R Results'
             else:
                 footer = '[Esc] details  [F] fast  [R] results  [W] wiki  Tab/] next  [A] abort'
+            if right_active_tab == 'results':
+                footer += '  [s] sort leaderboard'
             footer2 = '[Up/Down/PgUp/PgDn/Home/End] scroll right tab.'
         elif view_mode == 'results':
             model = active_detail_model()
@@ -5764,6 +5771,11 @@ def tui(stdscr, app: AppConfig):
         if key == ord('?'):
             show_help_overlay(stdscr, colors)
             message = 'Help closed.'
+            continue
+        if key == ord('s') and view_mode == 'benchmark' and right_active_tab == 'results':
+            idx = LEADERBOARD_SORT_KEYS.index(leaderboard_sort) if leaderboard_sort in LEADERBOARD_SORT_KEYS else 0
+            leaderboard_sort = LEADERBOARD_SORT_KEYS[(idx + 1) % len(LEADERBOARD_SORT_KEYS)]
+            message = f'Leaderboard sort: {leaderboard_sort}.'
             continue
         if view_mode == 'detail' and right_tabs and key in (ord('C'), ord('c'), ord('L')):
             target_tab = 'logs' if key == ord('L') else 'command'
