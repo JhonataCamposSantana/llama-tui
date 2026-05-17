@@ -139,6 +139,9 @@ def _replace_profile(
     cpu_moe: bool = False,
     n_cpu_moe: int = 0,
     tensor_overrides: Sequence[str] = (),
+    fit: Optional[bool] = None,
+    fit_context: Optional[int] = None,
+    no_mmap: Optional[bool] = None,
 ) -> RuntimeProfile:
     return RuntimeProfile(
         engine_id=baseline.engine_id,
@@ -149,8 +152,11 @@ def _replace_profile(
         flash_attn=baseline.flash_attn,
         batch_size=baseline.batch_size,
         ubatch_size=baseline.ubatch_size,
-        fit=baseline.fit,
-        fit_context=baseline.fit_context,
+        fit=baseline.fit if fit is None else bool(fit),
+        fit_context=baseline.fit_context if fit_context is None else max(0, int(fit_context)),
+        fit_target=baseline.fit_target,
+        cache_ram=baseline.cache_ram,
+        no_mmap=baseline.no_mmap if no_mmap is None else bool(no_mmap),
         no_warmup=baseline.no_warmup,
         extra_args=baseline.extra_args,
         name=name,
@@ -182,7 +188,9 @@ def _replace_profile(
 
 
 def _conservative_moe_gpu_layers(baseline: RuntimeProfile, full_gpu_plausible: bool) -> Optional[int]:
-    return 999 if full_gpu_plausible else baseline.gpu_layers
+    # Never force ngl=999 for MoE placement candidates: it aborts fit and OOMs
+    # large MoE models. Keep the current ngl as a conservative bounded value.
+    return baseline.gpu_layers
 
 
 def generate_moe_tuning_candidates(
@@ -206,18 +214,39 @@ def generate_moe_tuning_candidates(
         and not small_gpu
         and gpu_free > target_vram_headroom_bytes(profile) * 2
     )
-    moe_candidate_gpu_layers = _conservative_moe_gpu_layers(baseline, full_gpu_plausible)
+    # Fit-capable binaries should let llama.cpp size the offload via -fit on
+    # instead of a fixed ngl=999, which OOMs large MoE models. CPU-offload
+    # candidates also disable mmap to avoid the CPU-override mmap slowpath.
+    fit_capable = bool(
+        getattr(capabilities, 'supports_fit', False)
+        and getattr(capabilities, 'supports_fit_ctx', False)
+    )
+    no_mmap_supported = bool(getattr(capabilities, 'supports_no_mmap', False))
+    moe_candidate_gpu_layers = None if fit_capable else _conservative_moe_gpu_layers(baseline, full_gpu_plausible)
+    moe_fit = True if fit_capable else None
+    moe_fit_context = (baseline.fit_context or 4096) if fit_capable else None
+
+    def _cpu_offload(cpu_moe_flag: bool, n_cpu_moe_val: int, overrides: Sequence[str]) -> bool:
+        return bool(cpu_moe_flag) or int(n_cpu_moe_val or 0) > 0 or bool(tuple(overrides or ()))
+
+    def _no_mmap_for(cpu_offload: bool) -> Optional[bool]:
+        return (True if no_mmap_supported else False) if cpu_offload else None
+
+    baseline_offload = _cpu_offload(baseline.cpu_moe, baseline.n_cpu_moe, baseline.tensor_overrides)
     candidates: List[TuningCandidate] = [
         TuningCandidate(
             name='baseline_current',
             runtime_profile=_replace_profile(
                 baseline,
                 'baseline_current',
-                baseline.gpu_layers,
+                None if fit_capable else baseline.gpu_layers,
                 baseline.placement_strategy,
                 baseline.cpu_moe,
                 baseline.n_cpu_moe,
                 baseline.tensor_overrides,
+                fit=moe_fit,
+                fit_context=moe_fit_context,
+                no_mmap=_no_mmap_for(baseline_offload),
             ),
             source='baseline',
             risk='baseline',
@@ -233,10 +262,13 @@ def generate_moe_tuning_candidates(
                 moe_candidate_gpu_layers,
                 'cpu_moe_all',
                 cpu_moe=True,
+                fit=moe_fit,
+                fit_context=moe_fit_context,
+                no_mmap=_no_mmap_for(True),
             ),
             source='coarse',
             risk='safe',
-            expected_effect='all MoE experts on CPU',
+            expected_effect='all MoE experts on CPU (no-mmap)',
         ))
     if bool(getattr(capabilities, 'supports_n_cpu_moe', False)) and layer_count > 0:
         for value in generate_n_cpu_moe_ladder(layer_count, small_gpu=small_gpu):
@@ -250,6 +282,9 @@ def generate_moe_tuning_candidates(
                     moe_candidate_gpu_layers,
                     f'n_cpu_moe_{value}',
                     n_cpu_moe=value,
+                    fit=moe_fit,
+                    fit_context=moe_fit_context,
+                    no_mmap=_no_mmap_for(True),
                 ),
                 source='coarse',
                 risk='safe' if small_gpu and value >= max(1, int(layer_count * 0.5)) else 'normal',
@@ -261,8 +296,10 @@ def generate_moe_tuning_candidates(
             runtime_profile=_replace_profile(
                 baseline,
                 'full_gpu_no_moe',
-                999,
+                None if fit_capable else 999,
                 'full_gpu_no_moe',
+                fit=moe_fit,
+                fit_context=moe_fit_context,
             ),
             source='coarse',
             risk='aggressive',
@@ -277,10 +314,13 @@ def generate_moe_tuning_candidates(
                 moe_candidate_gpu_layers,
                 'experts_cpu_override',
                 tensor_overrides=(EXPERTS_CPU_OVERRIDE,),
+                fit=moe_fit,
+                fit_context=moe_fit_context,
+                no_mmap=_no_mmap_for(True),
             ),
             source='coarse',
             risk='experimental',
-            expected_effect='expert tensors routed to CPU by override pattern',
+            expected_effect='expert tensors routed to CPU by override pattern (no-mmap)',
         ))
 
     seen = set()

@@ -816,22 +816,30 @@ class BrowserAndFormTests(unittest.TestCase):
 
         self.assertEqual(mtp_status_short(FakeApp(), model), 'usable')
 
-    def test_mtp_short_status_preserves_active_doctor_statuses(self):
-        model = ModelConfig(id='mtp', name='MTP Model', path='native-mtp.gguf', alias='mtp', port=18080)
-
+    def test_mtp_short_status_is_capability_driven(self):
+        # MTP status is derived from measured results + binary capability,
+        # never from the engine name being llama.cpp-mtp.
         class FakeApp:
             def active_engine_key_for_model(self, _model):
                 return 'llama.cpp-mtp'
 
-        for status in ('ready', 'unknown', 'blocked', 'failed', 'usable', 'risky'):
-            with self.subTest(status=status), patch(
-                'llama_tui.ui.mtp_status_for_model',
-                return_value=SimpleNamespace(status=status),
-            ):
-                self.assertEqual(mtp_status_short(FakeApp(), model), status)
+        disabled = ModelConfig(id='mtp', name='MTP Model', path='native-mtp.gguf', alias='mtp', port=18080, supports_mtp='no')
+        self.assertEqual(mtp_status_short(FakeApp(), disabled), 'unsupported')
+
+        plain = ModelConfig(id='plain', name='Plain', path='plain.gguf', alias='plain', port=18081, supports_mtp='auto')
+        self.assertEqual(mtp_status_short(FakeApp(), plain), 'off')
+
+        for risk, expected in (('good', 'usable'), ('risky', 'risky')):
+            with self.subTest(risk=risk):
+                model = ModelConfig(id='mtp', name='MTP Model', path='native-mtp.gguf', alias='mtp', port=18080, supports_mtp='yes')
+                model.measured_profiles = {'mtp_acceptance': {'status': 'ok', 'mtp_risk_level': risk}}
+                self.assertEqual(mtp_status_short(FakeApp(), model), expected)
 
     def test_overview_items_show_blocked_mtp_status_with_error_attr(self):
-        model = ModelConfig(id='mtp', name='MTP Model', path='native-mtp.gguf', alias='mtp', port=18080)
+        model = ModelConfig(id='mtp', name='MTP Model', path='native-mtp.gguf', alias='mtp', port=18080, supports_mtp='yes')
+        # A failed measured MTP run resolves to a 'blocked' status regardless
+        # of engine name.
+        model.measured_profiles = {'mtp_acceptance': {'status': 'failed'}}
 
         class FakeApp:
             def active_engine_key_for_model(self, _model):
@@ -840,8 +848,7 @@ class BrowserAndFormTests(unittest.TestCase):
             def model_fingerprint(self, _model):
                 return 'fp'
 
-        with patch('llama_tui.ui.mtp_status_for_model', return_value=SimpleNamespace(status='blocked')), \
-             patch('llama_tui.ui.build_model_row_summary', return_value={'health': 'OK', 'health_reason': 'ready'}), \
+        with patch('llama_tui.ui.build_model_row_summary', return_value={'health': 'OK', 'health_reason': 'ready'}), \
              patch('llama_tui.ui.benchmark_strategy_for_app', return_value=None), \
              patch(
                  'llama_tui.ui.suggested_next_action',
@@ -970,10 +977,13 @@ class BrowserAndFormTests(unittest.TestCase):
 
         text = '\n'.join(line for line, _attr in overview_items(FakeApp(), model, 'STOPPED', width=80))
 
-        self.assertIn('Model', text)
+        # Cockpit card sections.
+        self.assertIn('Runtime', text)
+        self.assertIn('Performance', text)
         self.assertIn('Health', text)
-        self.assertIn('Recommendation', text)
-        self.assertIn('Suggested next step:', text)
+        self.assertIn('Actions', text)
+        self.assertIn('Recent benchmark', text)
+        self.assertIn('Suggested:', text)
         self.assertIn('[B] Benchmark Menu', text)
         self.assertNotIn('/very/long/tiny.gguf', text)
         self.assertNotIn('command preview', text.lower())

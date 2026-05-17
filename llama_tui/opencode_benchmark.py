@@ -33,6 +33,7 @@ from .benchmark import (
     workflow_cache_ram_profile_from_record,
     workflow_cache_ram_record_fields,
     workflow_cache_ram_selection_key,
+    workflow_memory_pressure_constrained,
 )
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .hardware import HardwareProfile, read_meminfo_bytes
@@ -377,6 +378,10 @@ def opencode_candidate_models(model: ModelConfig, profile) -> List[Tuple[str, st
     candidates: List[Tuple[str, str, ModelConfig, str]] = []
     seen = set()
     observed_floor = max(0, int(observed_opencode_context_floor(model) or 0))
+    # Under medium/high memory pressure, prune aggressive long-context probes
+    # (e.g. 131072) so OpenCode tests 65536 first and avoids guardrail OOMs.
+    memory_constrained = workflow_memory_pressure_constrained(profile)
+    pressure_ctx_cap = 65536
 
     def add(label: str, tier: str, candidate: ModelConfig, detail: str):
         slot = ctx_per_slot(candidate)
@@ -424,6 +429,9 @@ def opencode_candidate_models(model: ModelConfig, profile) -> List[Tuple[str, st
                 max(ctx_min, min(upper, 32768)),
             ]))
         points = sorted(set(points))
+        if memory_constrained:
+            capped = [point for point in points if point <= pressure_ctx_cap]
+            points = capped or [min(points)]
         for ctx in points:
             candidate = configure_adaptive_candidate(model, profile, OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE, ctx, 1, variant)
             label = OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE if variant == 'default' else f'{OPENCODE_DYNAMIC_CANDIDATE_OBJECTIVE}_{variant}'
@@ -1545,7 +1553,18 @@ def benchmark_opencode_workflow(
         recorded_model.last_opencode_benchmark_seconds = 0.0
         recorded_model.last_opencode_benchmark_profile = f'failed: {summary}'
         app.add_or_update(recorded_model)
-        msg = f'❌ opencode workflow benchmark failed: {summary}'
+        # Prefer a Hermes-passing profile as the fallback when OpenCode cannot
+        # be benchmarked (typically memory pressure, not a model defect).
+        hermes_score = float(getattr(model, 'last_hermes_benchmark_score', 0.0) or 0.0)
+        fallback = ''
+        if hermes_score > 0:
+            hermes_profile = str(getattr(model, 'last_hermes_benchmark_profile', '') or '').strip()
+            fallback = (
+                ' Fallback: use the Hermes-passing profile'
+                + (f' ({hermes_profile})' if hermes_profile else '')
+                + ' until OpenCode can be benchmarked with more memory headroom.'
+            )
+        msg = f'❌ opencode workflow benchmark failed: {summary}.{fallback}'
         if progress:
             progress(msg)
         emit_benchmark_event(

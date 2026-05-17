@@ -434,3 +434,87 @@ def benchmark_ranking_items(
 
 def benchmark_ranking_rows(run: Dict[str, object]) -> List[str]:
     return [line for line, _attr in benchmark_ranking_items(run)]
+
+
+def benchmark_plan_summary_lines(
+    engine: str,
+    binary: str,
+    capability_summary: Sequence[str],
+    candidate_names: Sequence[str],
+    skipped: Sequence[Tuple[str, str]] = (),
+    strategy_id: str = '',
+) -> List[Tuple[str, str]]:
+    """Build the benchmark plan preview as ``(text, kind)`` lines.
+
+    Pure/string-only so it is unit testable without an app or curses.
+    """
+    lines: List[Tuple[str, str]] = [('Benchmark Plan', 'heading')]
+    lines.append((f'Engine: {engine or "-"}', 'normal'))
+    lines.append((f'Binary: {binary or "-"}', 'muted'))
+    if strategy_id:
+        lines.append((f'Strategy: {strategy_id}', 'normal'))
+    lines.append(('', 'normal'))
+    lines.append(('Detected capabilities', 'heading'))
+    caps = list(capability_summary or [])
+    for cap in (caps or ['none detected']):
+        lines.append((f'- {cap}', 'normal' if caps else 'warning'))
+    lines.append(('', 'normal'))
+    names = [str(item) for item in (candidate_names or []) if str(item or '').strip()]
+    lines.append((f'Generated candidates: {len(names)}', 'success' if names else 'warning'))
+    important = [n for n in names if any(tag in n.lower() for tag in ('mtp', 'baseline', 'fit'))]
+    shown = (important or names)[:8]
+    for name in shown:
+        lines.append((f'  - {name}', 'normal'))
+    if len(names) > len(shown):
+        lines.append((f'  ... +{len(names) - len(shown)} more', 'muted'))
+    skipped_list = list(skipped or [])
+    if skipped_list:
+        lines.append(('', 'normal'))
+        lines.append(('Skipped', 'heading'))
+        for name, reason in skipped_list:
+            lines.append((f'  - {name}: {compact_message(str(reason))}', 'warning'))
+    return lines
+
+
+def benchmark_plan_lines(app, model, depth: str = 'fast') -> List[Tuple[str, str]]:
+    """Resolve engine/binary/capabilities/candidates and format a plan preview."""
+    from .benchmark import active_engine_runtime_profiles, benchmark_strategy_for_app
+    from .engines import resolve_runtime_engine_context
+
+    try:
+        context = resolve_runtime_engine_context(app, model=model)
+    except Exception:
+        context = None
+    engine = str(getattr(context, 'engine_id', '') or '')
+    binary = str(getattr(context, 'command', '') or '')
+    caps = getattr(context, 'capabilities', None)
+    cap_summary: List[str] = []
+    if caps is not None:
+        if getattr(caps, 'supports_spec_type', False):
+            cap_summary.append(f'--spec-type ({getattr(context, "selected_mtp_spec_type", "") or "none"})')
+        if getattr(caps, 'supports_spec_draft_n_max', False):
+            cap_summary.append('--spec-draft-n-max')
+        if getattr(caps, 'supports_fit', False):
+            cap_summary.append('fit')
+        if getattr(caps, 'supports_no_mmap', False):
+            cap_summary.append('--no-mmap')
+        if getattr(caps, 'supports_ctk_ctv', False):
+            cap_summary.append('-ctk/-ctv')
+        cap_summary.append('MTP capable: ' + ('yes' if getattr(context, 'supports_mtp', False) else 'no'))
+    strategy_id = ''
+    skipped: List[Tuple[str, str]] = []
+    try:
+        strategy = benchmark_strategy_for_app(app, model, depth=depth, objective='quick_sanity')
+        strategy_id = str(getattr(strategy, 'id', '') or '')
+        if getattr(strategy, 'blocked_reason', ''):
+            skipped.append((strategy_id or 'strategy', str(strategy.blocked_reason)))
+    except Exception:
+        pass
+    candidate_names: List[str] = []
+    try:
+        hardware = app.hardware_profile()
+        profiles = active_engine_runtime_profiles(app, model, hardware, depth=depth)
+        candidate_names = [str(getattr(p, 'name', '') or '') for p in profiles]
+    except Exception:
+        candidate_names = []
+    return benchmark_plan_summary_lines(engine, binary, cap_summary, candidate_names, skipped, strategy_id)

@@ -5081,6 +5081,23 @@ def _cache_ram_variant_name(value: int) -> str:
     return f'cache_ram_{max(0, int(value or 0))}'
 
 
+def workflow_memory_pressure_constrained(profile: Optional[HardwareProfile]) -> bool:
+    """True when VRAM/RAM headroom is medium/high pressure for workflow benchmarks.
+
+    Used to prune aggressive workflow candidates (large context, large
+    cache_ram) that would otherwise trip the memory guardrail.
+    """
+    if profile is None:
+        return False
+    gpu_free = int(getattr(profile, 'gpu_memory_free', 0) or 0)
+    ram_avail = int(getattr(profile, 'memory_available', 0) or 0)
+    if 0 < gpu_free < 4 * 1024 ** 3:
+        return True
+    if 0 < ram_avail < 6 * 1024 ** 3:
+        return True
+    return False
+
+
 def expand_workflow_cache_ram_candidates(
     candidates: Sequence[Tuple[object, ...]],
     profile: Optional[HardwareProfile] = None,
@@ -5089,6 +5106,7 @@ def expand_workflow_cache_ram_candidates(
 ) -> List[Tuple[object, ...]]:
     expanded: List[Tuple[object, ...]] = []
     seen = set()
+    memory_constrained = workflow_memory_pressure_constrained(profile)
     for index, item in enumerate(list(candidates or [])):
         if len(item) < 4 or not isinstance(item[2], ModelConfig):
             if item not in expanded:
@@ -5097,6 +5115,12 @@ def expand_workflow_cache_ram_candidates(
         label, tier, model, detail, *rest = item
         values = workflow_cache_ram_values(model, profile) if index < max_base_candidates else [_cache_ram_mib(model)]
         current = _cache_ram_mib(model)
+        if memory_constrained:
+            # Under medium/high memory pressure, do not expand large cache_ram
+            # variants (1024/2048 MiB) -- keep small/current values only.
+            values = [value for value in values if int(value or 0) < 1024 or int(value or 0) == current]
+            if not values:
+                values = [current]
         for value in values:
             variant_model = model_with_cache_ram_variant(model, value)
             if value == current:
@@ -7971,24 +7995,28 @@ def active_engine_runtime_profiles(
         mtp_spec_type: str = '',
         benchmark_phase: str = '',
         benchmark_metric_group: str = '',
+        allow_moe_overlay: bool = True,
     ):
         ctx = max(ctx_min, min(ctx_max, int(ctx or base_ctx)))
         ngl_key = 'fit' if ngl is None else int(ngl)
         effective_placement = placement
-        if effective_placement is None and saved_placement is not None and context_profile_placements:
-            profile_key = moe_profile_key_for_context(ctx)
-            payload = context_profile_placements.get(profile_key)
-            if payload is None and profile_key == 'hermes_ready':
-                payload = context_profile_placements.get('long_context')
-            if payload is None:
-                payload = context_profile_placements.get('auto')
-            effective_placement = moe_placement_candidate_from_payload(payload or {})
-        if effective_placement is None:
-            if bool(fit) and ngl is None:
-                if has_locked_moe_placement():
+        # Clean MTP candidates opt out of MoE placement overlay so a MoE
+        # overlay failure cannot make the clean MTP path look failed.
+        if allow_moe_overlay:
+            if effective_placement is None and saved_placement is not None and context_profile_placements:
+                profile_key = moe_profile_key_for_context(ctx)
+                payload = context_profile_placements.get(profile_key)
+                if payload is None and profile_key == 'hermes_ready':
+                    payload = context_profile_placements.get('long_context')
+                if payload is None:
+                    payload = context_profile_placements.get('auto')
+                effective_placement = moe_placement_candidate_from_payload(payload or {})
+            if effective_placement is None:
+                if bool(fit) and ngl is None:
+                    if has_locked_moe_placement():
+                        effective_placement = baseline_placement
+                else:
                     effective_placement = baseline_placement
-            else:
-                effective_placement = baseline_placement
         key = (
             name,
             ctx,
@@ -8187,10 +8215,17 @@ def active_engine_runtime_profiles(
                     ctx_candidates = [max(ctx_min, min(ctx_max, 8192))]
                 primary_ctx = 131072 if 131072 in ctx_candidates else max(ctx_candidates)
 
-                def add_mtp_fit_candidate(ctx: int, draft: int, fit_target: int = 1024, no_mmap: bool = True):
+                def add_mtp_fit_candidate(
+                    ctx: int,
+                    draft: int,
+                    fit_target: int = 1024,
+                    no_mmap: bool = True,
+                    moe_overlay: bool = False,
+                ):
                     suffix = f'{ctx // 1024}k' if ctx % 1024 == 0 else str(ctx)
                     target_suffix = '' if int(fit_target or 0) == 1024 else f'_fitt{int(fit_target)}'
                     mmap_suffix = '_nommap' if no_mmap else '_mmap'
+                    phase = f'fit_q8_draftq8{"_moe" if moe_overlay else ""}_draft_n{draft}'
                     add(
                         f'mtp_fit_q8_draftq8{mmap_suffix}_draft{draft}_{suffix}{target_suffix}',
                         ctx,
@@ -8208,10 +8243,12 @@ def active_engine_runtime_profiles(
                         mtp_draft_n_max=draft,
                         mtp_draft_kv_preset='q8_0/q8_0',
                         mtp_spec_type=mtp_spec_type,
-                        benchmark_phase=f'fit_q8_draftq8_draft_n{draft}',
+                        benchmark_phase=phase,
                         benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,draft_tokens,accepted_tokens,accept_rate,startup_status,fit,memory',
+                        allow_moe_overlay=moe_overlay,
                     )
 
+                # Phase 1: clean MTP fit/q8/no-mmap candidates, no MoE overlay.
                 add_mtp_fit_candidate(primary_ctx, 1, 1024, True)
                 for ctx in ctx_candidates:
                     for draft in MTP_DRAFT_VALUES:
@@ -8222,6 +8259,15 @@ def active_engine_runtime_profiles(
                     add_mtp_fit_candidate(primary_ctx, 1, fit_target, True)
                 add_mtp_fit_candidate(primary_ctx, 1, 1024, False)
                 add_mtp_fit_candidate(primary_ctx, 2, 1024, False)
+                # Phase 2: MTP + MoE overlay, only for MoE models with a
+                # locked/saved placement. Kept small and clearly separate so
+                # an overlay failure never collapses the clean MTP phase.
+                if moe and (has_locked_moe_placement() or (saved_placement is not None and context_profile_placements)):
+                    add_mtp_fit_candidate(primary_ctx, 1, 1024, True, moe_overlay=True)
+                    for draft in MTP_DRAFT_VALUES:
+                        if draft == 1:
+                            continue
+                        add_mtp_fit_candidate(primary_ctx, draft, 1024, True, moe_overlay=True)
             return finalized_profiles()
 
     if engine == 'tq3':
@@ -9334,11 +9380,42 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
         item for item in records
         if str(item.get('status', '') or '') == 'ok' and bool(item.get('mtp_enabled'))
     ]
+
+    def _mtp_metrics_observed(item: Dict[str, object]) -> bool:
+        if not bool(item.get('mtp_enabled')):
+            return False
+        try:
+            accept = float(item.get('accept_rate', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            accept = 0.0
+        try:
+            draft_tokens = int(item.get('draft_tokens', 0) or 0)
+            accepted_tokens = int(item.get('accepted_tokens', 0) or 0)
+        except (TypeError, ValueError):
+            draft_tokens = accepted_tokens = 0
+        return accept > 0.0 or draft_tokens > 0 or accepted_tokens > 0
+
+    # A draft-mtp candidate that produced acceptance metrics before a memory
+    # guardrail / timeout stopped it is a partial success, not a failure.
+    partial_mtp = [
+        item for item in records
+        if str(item.get('status', '') or '') not in ('ok', 'partial')
+        and _mtp_metrics_observed(item)
+    ]
+    for item in partial_mtp:
+        item['status'] = 'partial'
+        item['mtp_partial'] = True
+        item.setdefault('partial_reason', 'memory_guardrail_or_timeout')
+        if not str(item.get('failure_reason', '') or ''):
+            item['failure_reason'] = 'memory_guardrail_or_timeout'
+
     if best and baseline_skipped:
         run_status = 'partial'
     elif best and len(draft_successes) >= len(draft_profiles):
         run_status = 'complete'
     elif best:
+        run_status = 'partial'
+    elif partial_mtp:
         run_status = 'partial'
     elif cli_invalid:
         run_status = 'failed_terminal'
@@ -9387,6 +9464,16 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
             f'{float(best.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s, '
             f'accept_rate={float(best.get("accept_rate", 0.0) or 0.0):.2%}, '
             f'status={run_status}{baseline_note} | {sync_msg}'
+        )
+        event_name = 'benchmark_done'
+        ok_result = True
+    elif partial_mtp:
+        observed = max(partial_mtp, key=lambda item: float(item.get('accept_rate', 0.0) or 0.0))
+        accept = float(observed.get('accept_rate', 0.0) or 0.0)
+        msg = (
+            '⚠ MTP acceptance partial: draft-mtp initialised and produced acceptance '
+            f'metrics (best observed accept_rate={accept:.2%}) before a memory guardrail '
+            f'or timeout stopped the candidate; rerun with more headroom | {sync_msg}'
         )
         event_name = 'benchmark_done'
         ok_result = True

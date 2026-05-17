@@ -50,9 +50,50 @@ from .mtp_doctor import build_mtp_doctor_report, mtp_status_for_model
 from .opencode_benchmark import benchmark_opencode_workflow
 from .optimize import apply_best_optimization, model_is_moe, select_best_tier
 from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, wrap_display_lines
+from .ui_components import (
+    draw_badge,
+    draw_box,
+    draw_card,
+    draw_key_hint_bar,
+    draw_section_title,
+    draw_status_chip,
+    safe_addch,
+    safe_addstr,
+    truncate,
+    wrap_card_lines,
+)
+from .ui_theme import health_style, kind_style, mtp_style, state_chip_style, style as theme_style
+from .ui_models import (
+    BENCHMARK_FRESHNESS_LABELS,
+    BROWSER_HEADER,
+    BROWSER_VIEW_OPTIONS,
+    _measured_profile_for_recommendation,
+    _profile_context,
+    active_engine_binary,
+    active_engine_key,
+    active_engine_short,
+    active_engine_warning_line,
+    benchmark_freshness_display,
+    benchmark_freshness_label,
+    benchmark_freshness_short,
+    browser_header_for_view,
+    browser_model_line,
+    browser_model_line_for_view,
+    build_model_row_summary,
+    compact_browser_header,
+    compact_browser_model_line,
+    format_engine_badge,
+    format_model_health,
+    format_model_recommendation,
+    format_model_state,
+    mtp_status_from_measured,
+    mtp_status_short,
+    status_symbol,
+)
 from .ui_benchmark import (
     FULL_SUITE_STAGES,
     MTP_SUITE_STAGES,
+    benchmark_plan_lines,
     _status_attr_for_record,
     _table_row,
     _table_rule,
@@ -117,7 +158,6 @@ TRY_TRANSCRIPT_SCROLL_KEYS = {
 BENCHMARK_FEED_LIMIT = 80
 BENCHMARK_RECORD_LIMIT = 120
 BENCHMARK_COMMAND_LIMIT = 12
-BROWSER_HEADER = ' ID              PRT  ST        BN    RLS  ENGINE     QNT      TQ  ARCH   NAME'
 FLEET_BROWSER_HEADER = ' MODEL                         STATE    PICK         CTX     TOK/S   ENGINE      HEALTH'
 HEADER_DASHBOARD_MIN_WIDTH = 124
 HEADER_DASHBOARD_MIN_PANEL_WIDTH = 42
@@ -198,7 +238,6 @@ SORT_OPTIONS = [
     ('port', 'Port'),
 ]
 DETAIL_DENSITY_OPTIONS = [('simple', 'Simple'), ('advanced', 'Advanced')]
-BROWSER_VIEW_OPTIONS = [('compact', 'Compact'), ('advanced', 'Advanced')]
 FILTER_RUNTIME_OPTIONS = [
     ('all', 'All runtimes'),
     ('llama.cpp', 'llama.cpp'),
@@ -234,14 +273,6 @@ FILTER_COMPATIBILITY_OPTIONS = [
     ('all', 'All models'),
     ('tq3_native', 'TQ3 native'),
 ]
-BENCHMARK_FRESHNESS_LABELS = {
-    'fresh': 'Fresh',
-    'stale': 'Stale',
-    'missing': 'Missing',
-    'failed': 'Failed',
-    'pending': 'Pending',
-    'running': 'Running',
-}
 
 
 def profile_label(value: str) -> str:
@@ -289,280 +320,38 @@ def browser_view_label(value: str) -> str:
     return dict(BROWSER_VIEW_OPTIONS).get(normalized, 'Compact')
 
 
-def benchmark_freshness_label(app: AppConfig, model: ModelConfig) -> str:
-    if benchmark_profile_is_fresh(app, model):
-        return 'fresh'
-    status = (getattr(model, 'default_benchmark_status', '') or '').strip().lower()
-    if status in ('running', 'failed', 'pending', 'aborted'):
-        return 'failed' if status == 'aborted' else status
-    if status == 'done':
-        return 'stale'
-    if float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0:
-        return 'stale'
-    return 'missing'
 
 
-def benchmark_freshness_short(app: AppConfig, model: ModelConfig) -> str:
-    mapping = {
-        'fresh': 'FRSH',
-        'stale': 'STAL',
-        'missing': 'MISS',
-        'failed': 'FAIL',
-        'pending': 'PEND',
-        'running': 'RUN',
-    }
-    return mapping.get(benchmark_freshness_label(app, model), 'MISS')
 
 
-def format_model_state(status: str) -> str:
-    normalized = str(status or '').strip().upper()
-    if normalized == 'READY':
-        return 'running'
-    if normalized in ('LOADING', 'STARTING'):
-        return 'starting'
-    if normalized == 'ERROR':
-        return 'error'
-    return 'stopped'
 
 
-def format_engine_badge(engine_id: str, narrow: bool = False) -> str:
-    normalized = str(engine_id or '').strip().lower()
-    if normalized == 'turboquant':
-        return 'TQ' if narrow else 'TurboQuant+'
-    if normalized == 'tq3':
-        return 'TQ3'
-    if normalized == 'llama.cpp-mtp':
-        return 'MTP' if narrow else 'llama.cpp MTP'
-    if normalized == 'buun':
-        return 'Buun'
-    if normalized == 'vllm':
-        return 'vLLM'
-    if normalized == 'llama.cpp':
-        return 'llama' if narrow else 'llama.cpp'
-    return '?' if narrow else 'Unknown'
 
 
-def _measured_profile_for_recommendation(model: ModelConfig) -> Tuple[str, Dict[str, object]]:
-    for key in ('opencode_ready', 'fast_chat', 'long_context', 'auto'):
-        profile = get_measured_profile(model, key)
-        if profile:
-            return key, profile
-    return '', {}
 
 
-def format_model_recommendation(app: AppConfig, model: ModelConfig) -> str:
-    if benchmark_profile_is_fresh(app, model):
-        key, _profile = _measured_profile_for_recommendation(model)
-        labels = {
-            'opencode_ready': 'OpenCode',
-            'fast_chat': 'Fast Chat',
-            'long_context': 'Long Ctx',
-            'auto': 'Auto',
-        }
-        if key:
-            return labels.get(key, profile_label(key))
-    if (getattr(model, 'optimize_mode', '') or '').strip().lower() == 'manual':
-        return 'Manual'
-    return 'Needs Bench'
 
 
-def _profile_context(profile: Dict[str, object]) -> int:
-    for key in ('ctx_per_slot', 'ctx'):
-        try:
-            value = int(profile.get(key, 0) or 0)
-        except Exception:
-            value = 0
-        if value > 0:
-            return value
-    return 0
 
 
-def format_model_health(app: AppConfig, model: ModelConfig, status: str = 'STOPPED') -> Tuple[str, str]:
-    try:
-        valid_target, target_reason = app.validate_model_target(model)
-    except Exception:
-        valid_target, target_reason = True, ''
-    if not valid_target:
-        return 'FAIL', target_reason
-
-    try:
-        engine_command = app.active_runtime_binary_for_model(model)
-        engine_exists = app.command_exists(engine_command)
-    except Exception:
-        engine_command, engine_exists = '', True
-    if not engine_exists:
-        return 'FAIL', f'engine missing: {engine_command or "-"}'
-
-    verification = (getattr(model, 'verification_status', '') or '').strip().lower()
-    if verification == 'failed':
-        return 'FAIL', getattr(model, 'verification_summary', '') or 'verification failed'
-
-    freshness = benchmark_freshness_label(app, model)
-    if freshness == 'failed' and not _measured_profile_for_recommendation(model)[1]:
-        return 'FAIL', 'last benchmark failed'
-    if freshness == 'stale':
-        return 'STALE', 'benchmark stale'
-
-    try:
-        engine = active_engine_key(app, model)
-        capabilities = app.engine_capabilities()
-        if engine != 'vllm' and not str(getattr(capabilities, 'help_text', '') or '').strip():
-            return 'WARN', 'engine capabilities unknown'
-    except Exception:
-        pass
-
-    warning = active_engine_warning_line(app, model)
-    if warning:
-        return 'WARN', warning
-
-    arch = (getattr(model, 'architecture_type', '') or '').strip().lower()
-    if arch in ('', 'unknown'):
-        return 'WARN', 'metadata unknown'
-    if not _measured_profile_for_recommendation(model)[1]:
-        return 'WARN', 'no measured profile'
-    return 'OK', 'ready'
 
 
-def build_model_row_summary(app: AppConfig, model: ModelConfig, status: str = 'STOPPED') -> Dict[str, object]:
-    recommendation = format_model_recommendation(app, model)
-    _key, measured = _measured_profile_for_recommendation(model)
-    measured_ctx = _profile_context(measured)
-    ctx = measured_ctx or context_per_slot(model)
-    try:
-        tok_s = float(measured.get('tokens_per_sec', getattr(model, 'last_benchmark_tokens_per_sec', 0.0)) or 0.0)
-    except Exception:
-        tok_s = 0.0
-    engine_id = active_engine_key(app, model)
-    health, health_reason = format_model_health(app, model, status)
-    return {
-        'display_name': getattr(model, 'name', '') or getattr(model, 'id', '') or '-',
-        'state': format_model_state(status),
-        'pick': recommendation,
-        'ctx': ctx,
-        'tokens_per_sec': tok_s,
-        'engine': format_engine_badge(engine_id),
-        'health': health,
-        'health_reason': health_reason,
-        'mtp': mtp_status_short(app, model),
-    }
 
 
-def compact_browser_header(left_w: int) -> str:
-    return compact_browser_model_line(None, None, '', '', left_w, header=True)
 
 
-def compact_browser_model_line(
-    app: Optional[AppConfig],
-    model: Optional[ModelConfig],
-    status: str,
-    machine_pick_id: str,
-    left_w: int,
-    header: bool = False,
-) -> str:
-    name_w = max(12, int(left_w or 80) - 62)
-    if header:
-        return (
-            f' {"MODEL":{name_w}} {"STATE":8} {"PICK":11} '
-            f'{"CTX":>7} {"TOK/S":>7} {"ENGINE":11} {"MTP":7} {"HEALTH":6}'
-        )
-    assert app is not None and model is not None
-    summary = build_model_row_summary(app, model, status)
-    display_name = str(summary['display_name'])
-    if getattr(model, 'favorite', False) and name_w >= 14:
-        display_name = '* ' + display_name
-    if model.id == machine_pick_id and name_w >= 15:
-        display_name = f'{display_name} BEST'
-    ctx = int(summary.get('ctx', 0) or 0)
-    ctx_text = str(ctx) if ctx > 0 else '-'
-    tok_s = float(summary.get('tokens_per_sec', 0.0) or 0.0)
-    tok_text = f'{tok_s:.1f}' if tok_s > 0 else '-'
-    return (
-        f' {ellipsize(display_name, name_w):{name_w}} '
-        f'{str(summary["state"])[:8]:8} '
-        f'{str(summary["pick"])[:11]:11} '
-        f'{ctx_text:>7} {tok_text:>7} '
-        f'{str(summary["engine"])[:11]:11} '
-        f'{str(summary.get("mtp", "off"))[:7]:7} '
-        f'{str(summary["health"])[:6]:6}'
-    )
 
 
-def browser_header_for_view(browser_view: str, left_w: int) -> str:
-    if normalize_choice(browser_view, tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact') == 'advanced':
-        return BROWSER_HEADER
-    return compact_browser_header(left_w)
 
 
-def browser_model_line_for_view(
-    app: AppConfig,
-    model: ModelConfig,
-    status: str,
-    machine_pick_id: str,
-    left_w: int,
-    browser_view: str,
-) -> str:
-    if normalize_choice(browser_view, tuple(key for key, _label in BROWSER_VIEW_OPTIONS), 'compact') == 'advanced':
-        return browser_model_line(app, model, status, machine_pick_id, left_w)
-    return compact_browser_model_line(app, model, status, machine_pick_id, left_w)
 
 
-def browser_model_line(
-    app: AppConfig,
-    model: ModelConfig,
-    status: str,
-    machine_pick_id: str,
-    left_w: int,
-) -> str:
-    roles = app.role_badges(model.id)
-    engine = active_engine_short(app, model)[:10]
-    quant = extract_quant(model)[:8]
-    tq = (tq3_short(model) if active_engine_key(app, model) == 'tq3' else turboquant_short(model))[:3]
-    model_type = classify_model_type(model)[:6]
-    freshness = benchmark_freshness_short(app, model)
-    name_col_width = max(10, left_w - 79)
-    favorite_prefix = '★ ' if getattr(model, 'favorite', False) and name_col_width >= 14 else ''
-    best_badge = ' BEST' if model.id == machine_pick_id and name_col_width >= 15 else ''
-    display_name = favorite_prefix + (model.name or model.id)
-    display_name = display_name[: max(1, name_col_width - len(best_badge))] + best_badge
-    return (
-        f' {model.id[:14]:14} {model.port:4}  {status_symbol(status)} {status[:6]:6}  '
-        f'{freshness:4}  {roles:3}  {engine:10} {quant:8} {tq:3} {model_type:6} {display_name}'
-    )
 
 
-def active_engine_key(app: AppConfig, model: ModelConfig) -> str:
-    try:
-        return str(app.active_engine_key_for_model(model) or '')
-    except Exception:
-        return str(getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp')
 
 
-def active_engine_short(app: AppConfig, model: ModelConfig) -> str:
-    engine = active_engine_key(app, model)
-    if engine == 'buun':
-        return 'buun'
-    if engine == 'turboquant':
-        return 'turboquant'
-    if engine == 'tq3':
-        return 'tq3'
-    if engine == 'llama.cpp-mtp':
-        return 'llama.cpp-mtp'
-    if engine == 'vllm':
-        return 'vLLM'
-    return engine or display_runtime(model)
 
 
-def active_engine_binary(app: AppConfig, model: ModelConfig) -> str:
-    try:
-        return str(app.active_runtime_binary_for_model(model) or '')
-    except Exception:
-        runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
-        if runtime == 'vllm':
-            return str(getattr(app, 'vllm_command', '') or '')
-        try:
-            return str(app.runtime_server_command(runtime) or '')
-        except Exception:
-            return ''
 
 
 def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
@@ -594,29 +383,6 @@ def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
     return f'key={key_mode or "-"} value={value_mode or "-"}'
 
 
-def mtp_status_short(app: Optional[AppConfig], model: ModelConfig) -> str:
-    if app is None:
-        return 'off'
-    measured = dict((getattr(model, 'measured_profiles', {}) or {}).get('mtp_acceptance') or {})
-    try:
-        engine = active_engine_key(app, model)
-    except Exception:
-        engine = ''
-    if engine == 'llama.cpp-mtp':
-        try:
-            return str(mtp_status_for_model(app, model).status or 'unknown')
-        except Exception:
-            return 'unknown'
-    if measured:
-        status = str(measured.get('status', '') or '').strip().lower()
-        risk = str(measured.get('mtp_risk_level', '') or '').strip().lower()
-        if status in ('ok', 'complete', 'partial') and risk in ('excellent', 'good', 'usable'):
-            return 'usable'
-        if status in ('ok', 'complete', 'partial') and risk == 'risky':
-            return 'risky'
-        if status:
-            return 'failed' if status not in ('ok', 'complete', 'partial') else 'testing'
-    return 'off'
 
 
 def runtime_engine_source_line(app: AppConfig, model: ModelConfig) -> str:
@@ -667,24 +433,6 @@ def active_engine_badge_kind(app: AppConfig, model: Optional[ModelConfig] = None
     return 'engine'
 
 
-def active_engine_warning_line(app: AppConfig, model: ModelConfig) -> str:
-    messages = []
-    for name in (
-        'turboquant_session_advisory',
-        'turboquant_binary_warning',
-        'tq3_session_advisory',
-        'tq3_binary_warning',
-        'tq3_launch_diagnostic',
-        'mtp_session_advisory',
-        'mtp_binary_warning',
-    ):
-        try:
-            value = str(getattr(app, name)(model) or '')
-        except Exception:
-            value = ''
-        if value:
-            messages.append(value)
-    return ' | '.join(messages)
 
 
 def active_engine_warning_attr(message: str, colors: Dict[str, int]) -> int:
@@ -694,8 +442,6 @@ def active_engine_warning_attr(message: str, colors: Dict[str, int]) -> int:
     return colors['warning']
 
 
-def benchmark_freshness_display(app: AppConfig, model: ModelConfig) -> str:
-    return BENCHMARK_FRESHNESS_LABELS.get(benchmark_freshness_label(app, model), 'Missing')
 
 
 def turboquant_status_kind(model: ModelConfig, buun_session: bool = False, turboquant_session: bool = False) -> str:
@@ -2053,50 +1799,82 @@ def overview_items(
     detail_text = compact_message(str(detail or ''))
     if detail_text and status != 'STOPPED':
         status_text = f'{status_text} ({detail_text})'
+    measured_pick = str(row_summary.get('pick', '-') or '-')
+    measured_ctx = int(row_summary.get('ctx', 0) or 0)
+    measured_tps = float(row_summary.get('tokens_per_sec', 0.0) or 0.0)
+    mtp_attr = (
+        success_attr if mtp_state in ('ready', 'usable', 'capable')
+        else warning_attr if mtp_state in ('unknown', 'risky', 'testing')
+        else error_attr if mtp_state in ('blocked', 'failed')
+        else normal_attr
+    )
+    # Card-style cockpit layout: Runtime / Performance / Health / Actions /
+    # Recent benchmark. The renderer treats heading_attr rows as card titles.
     items: List[Tuple[str, int]] = [
-        ('Model', heading_attr),
+        ('Runtime', heading_attr),
         (f'Name: {model.name or model.id}', normal_attr),
-        (f'Type: {model_type}', normal_attr),
-        (f'Quant: {extract_quant(model) or "-"}', normal_attr),
+        (f'Type: {model_type}   Quant: {extract_quant(model) or "-"}', normal_attr),
         (f'Engine: {engine}', normal_attr),
-        *( [(f'Engine visibility: hidden - {compact_message(visibility_reason)}', warning_attr)] if not visible else [] ),
-        *( [(f'Engine launch: blocked - {compact_message(compatibility_reason)}', warning_attr)] if visible and not compatible else [] ),
-        *( [(
-            f'Engine visibility: warning - {compact_message(visibility_reason)}',
-            warning_attr,
-        )] if visible and compatible and visibility_status == 'compatible_with_warning' else [] ),
-        *( [(
-            f'Engine launch: warning - {compact_message(compatibility_reason)}',
-            warning_attr,
-        )] if visible and compatible and compatibility_status == 'compatible_with_warning' else [] ),
-        *(
-            [(
-                f'Benchmark strategy: {strategy.id}'
-                + (f' blocked - {compact_message(strategy.blocked_reason)}' if getattr(strategy, 'blocked_reason', '') else ''),
-                warning_attr if getattr(strategy, 'blocked_reason', '') else normal_attr,
-            )]
-            if strategy is not None else []
-        ),
         (f'Status: {status_text}', success_attr if str(status).upper() == 'READY' else error_attr if str(status).upper() == 'ERROR' else normal_attr),
+    ]
+    if not visible:
+        items.append((f'Engine visibility: hidden - {compact_message(visibility_reason)}', warning_attr))
+    if visible and not compatible:
+        items.append((f'Engine launch: blocked - {compact_message(compatibility_reason)}', warning_attr))
+    if visible and compatible and visibility_status == 'compatible_with_warning':
+        items.append((f'Engine visibility: warning - {compact_message(visibility_reason)}', warning_attr))
+    if visible and compatible and compatibility_status == 'compatible_with_warning':
+        items.append((f'Engine launch: warning - {compact_message(compatibility_reason)}', warning_attr))
+
+    items.extend([
+        ('', normal_attr),
+        ('Performance', heading_attr),
+        (f'Profile: {measured_pick}', normal_attr),
+        (f'Throughput: {measured_tps:.1f} tok/s' if measured_tps > 0 else 'Throughput: not measured', success_attr if measured_tps > 0 else warning_attr),
+        (f'Context: {measured_ctx}' if measured_ctx > 0 else 'Context: -', normal_attr),
+        (f'MoE placement: {moe_state}', warning_attr if moe_state == 'available, not applied' else normal_attr),
+    ])
+    if strategy is not None:
+        items.append((
+            f'Benchmark strategy: {strategy.id}'
+            + (f' (blocked: {compact_message(strategy.blocked_reason)})' if getattr(strategy, 'blocked_reason', '') else ''),
+            warning_attr if getattr(strategy, 'blocked_reason', '') else normal_attr,
+        ))
+
+    items.extend([
         ('', normal_attr),
         ('Health', heading_attr),
-        (f'Benchmark: {benchmark}', success_attr if benchmark == 'Fresh' else warning_attr),
         (f'Health: {health} / {health_reason}', health_attr),
-        (f'MTP: {mtp_state}', success_attr if mtp_state in ('ready', 'usable') else warning_attr if mtp_state in ('unknown', 'risky', 'risky acceptance', 'testing') else error_attr if mtp_state in ('blocked', 'failed', 'fit blocked', 'memory-bound') else normal_attr),
-        (f'MoE recommendation: {moe_state}', warning_attr if moe_state == 'available, not applied' else normal_attr),
+        (f'MTP: {mtp_state}', mtp_attr),
+        (f'Benchmark freshness: {benchmark}', success_attr if benchmark == 'Fresh' else warning_attr),
         ('', normal_attr),
-        ('Recommendation', heading_attr),
-        (f'Suggested next step: {action.label}', severity_attr),
-        (f'Why: {ellipsize(action.reason, max(40, int(width or 120) - 5))}', normal_attr),
-        ('', normal_attr),
-        ('Primary actions', heading_attr),
+        ('Actions', heading_attr),
+        (f'Suggested: {action.label}', severity_attr),
+        (f'Why: {ellipsize(action.reason, max(40, int(width or 120) - 6))}', normal_attr),
         ('[B] Benchmark Menu', normal_attr),
-    ]
+    ])
     if action.key == 'A' or (has_moe_recommendation(model) and not moe_recommendation_applied(model)):
         items.append(('[A] Apply MoE Recommendation', warning_attr))
     items.extend([
-        ('[T] Try / Launch', normal_attr),
-        ('[R] Results', normal_attr),
+        ('[T] Try / Launch   [R] Results   [?] Help', normal_attr),
+    ])
+
+    last_status = str(getattr(model, 'default_benchmark_status', '') or '').strip() or '-'
+    last_at = str(getattr(model, 'default_benchmark_at', '') or '').strip()
+    last_profile = str(getattr(model, 'last_benchmark_profile', '') or '').strip()
+    last_tps = float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0)
+    items.extend([
+        ('', normal_attr),
+        ('Recent benchmark', heading_attr),
+        (
+            f'Last run: {last_status}' + (f' ({last_at})' if last_at else ''),
+            success_attr if last_status.lower() in ('done', 'complete', 'partial') else warning_attr if last_status != '-' else normal_attr,
+        ),
+        (
+            f'Result: {last_tps:.1f} tok/s' + (f' / {last_profile}' if last_profile else '')
+            if last_tps > 0 else 'Result: no measured throughput yet',
+            normal_attr if last_tps > 0 else warning_attr,
+        ),
     ])
     return items
 
@@ -3209,7 +2987,9 @@ def help_overlay_lines() -> List[str]:
         'B opens the Benchmark Menu. F/N/O/H remain advanced benchmark shortcuts.',
         '',
         'Power tools',
-        ': opens a compact command palette. g/c/G export OpenCode, Continue, and Hermes configs.',
+        '? opens this help. : opens the command palette (start/stop, benchmark, MTP Doctor,',
+        'benchmark plan preview, apply measured profile, open logs, export OpenCode).',
+        'g/c/G export OpenCode, Continue, and Hermes configs.',
         'Y verifies the selected model. y runs benchmark-proof verification for stale or missing models.',
         'The Config Doctor checks runtime commands, export paths, terminal launcher, and proof status.',
         'z applies the auto profile. R opens results or rankings depending on the view.',
@@ -3490,6 +3270,45 @@ def show_mtp_doctor_overlay(stdscr, colors, app: AppConfig, active_model: Option
         stdscr.nodelay(True)
 
 
+def show_benchmark_plan_overlay(stdscr, colors, app: AppConfig, active_model: Optional[ModelConfig] = None):
+    if active_model is None:
+        return
+    h, w = stdscr.getmaxyx()
+    box_w = min(112, max(64, w - 8))
+    box_h = min(max(12, h - 6), 26)
+    if h < 12 or w < 66:
+        return
+    box_x = max(2, (w - box_w) // 2)
+    box_y = max(2, (h - box_h) // 2)
+    modal = curses.newwin(box_h, box_w, box_y, box_x)
+    modal.keypad(True)
+    content_h = max(1, box_h - 4)
+    items = []
+    for text, kind in benchmark_plan_lines(app, active_model, depth='fast'):
+        attr = kind_style(colors, kind)
+        items.extend((line, attr) for line in wrap_display_item_lines(text, box_w - 4))
+    scroll = 0
+    stdscr.nodelay(False)
+    try:
+        while True:
+            visible, scroll, _older, _newer, _total = scrollable_pane_item_view(items, box_w - 4, content_h, scroll)
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, 'Benchmark Plan Preview', colors['accent'] | curses.A_BOLD, colors['accent'])
+            for idx, (line, attr) in enumerate(visible):
+                safe_addstr(modal, 2 + idx, 2, line[: box_w - 4], attr)
+            safe_addstr(modal, box_h - 2, 2, '[PgUp/PgDn] scroll  [Esc/q] close'[: box_w - 4], colors['muted'])
+            modal.refresh()
+            key = modal.getch()
+            if key in (27, ord('q')):
+                return
+            action = RIGHT_PANE_SCROLL_KEYS.get(key, '')
+            if action:
+                scroll = adjust_scroll_offset(scroll, action, len(items), content_h)
+    finally:
+        stdscr.touchwin()
+        stdscr.nodelay(True)
+
+
 def show_config_doctor_overlay(stdscr, colors, app: AppConfig, active_model: Optional[ModelConfig] = None):
     h, w = stdscr.getmaxyx()
     box_w = min(108, max(62, w - 8))
@@ -3749,6 +3568,12 @@ def command_palette_options(app: Optional[AppConfig] = None, model: Optional[Mod
         ('a', 'Verify all benchmark proof', 'verify_all'),
         ('!', 'Config Doctor...', 'config_doctor'),
         ('t', 'MTP Doctor...', 'mtp_doctor'),
+        ('s', 'Start / stop selected model', 'start_stop'),
+        ('j', 'Launch / Try selected model', 'launch'),
+        ('b', 'Benchmark selected model', 'benchmark_menu'),
+        ('e', 'Benchmark plan preview...', 'benchmark_plan'),
+        ('z', 'Apply measured profile', 'apply_profile'),
+        ('l', 'Open logs', 'open_logs'),
         ('q', 'Cancel', 'cancel'),
     ]
 
@@ -3936,20 +3761,6 @@ def show_benchmark_wiki(stdscr, colors):
         stdscr.nodelay(True)
 
 
-def safe_addch(stdscr, y: int, x: int, ch, attr: int = 0):
-    try:
-        stdscr.addch(y, x, ch, attr)
-    except curses.error:
-        pass
-
-
-def safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0):
-    try:
-        stdscr.addstr(y, x, text, attr)
-    except curses.error:
-        pass
-
-
 def draw_scrollable_items(
     stdscr,
     y: int,
@@ -4077,21 +3888,6 @@ def draw_header_config_box(
         safe_addstr(stdscr, y + 2 + idx, x + 2, ellipsize(str(line), width), attr)
 
 
-def draw_box(stdscr, y: int, x: int, h: int, w: int, title: str, title_attr: int = curses.A_BOLD, border_attr: int = 0):
-    if h < 2 or w < 4:
-        return
-    safe_addstr(stdscr, y, x + 2, f' {title} ', title_attr)
-    for i in range(x, x + w):
-        safe_addch(stdscr, y + 1, i, curses.ACS_HLINE, border_attr)
-    for i in range(y + 1, y + h):
-        safe_addch(stdscr, i, x, curses.ACS_VLINE, border_attr)
-        safe_addch(stdscr, i, x + w - 1, curses.ACS_VLINE, border_attr)
-    safe_addch(stdscr, y + 1, x, curses.ACS_ULCORNER, border_attr)
-    safe_addch(stdscr, y + 1, x + w - 1, curses.ACS_URCORNER, border_attr)
-    safe_addch(stdscr, y + h, x, curses.ACS_LLCORNER, border_attr)
-    safe_addch(stdscr, y + h, x + w - 1, curses.ACS_LRCORNER, border_attr)
-    for i in range(x + 1, x + w - 1):
-        safe_addch(stdscr, y + h, i, curses.ACS_HLINE, border_attr)
 def init_colors():
     palette = {
         'default': 0,
@@ -4145,15 +3941,6 @@ def status_attr(colors, status: str):
         'ERROR': colors['error'] | curses.A_BOLD,
     }
     return mapping.get(status, colors['accent'])
-def status_symbol(status: str) -> str:
-    symbols = {
-        'READY': '●',
-        'LOADING': '◐',
-        'STARTING': '◔',
-        'STOPPED': '○',
-        'ERROR': '✖',
-    }
-    return symbols.get(status, '·')
 def chip_attr(colors, label: str):
     mapping = {
         'READY': colors['chip_ready'] | curses.A_BOLD,
@@ -5933,9 +5720,22 @@ def tui(stdscr, app: AppConfig):
                 'export_hermes': ord('G'),
                 'verify_selected': ord('Y'),
                 'verify_all': ord('y'),
+                'start_stop': ord('l'),
+                'launch': ord('T'),
+                'benchmark_menu': ord('B'),
+                'apply_profile': ord('z'),
+                'open_logs': ord('L'),
             }
             if str(action or '').startswith('disabled:'):
                 message = str(action).split(':', 2)[-1] or 'Action unavailable.'
+                continue
+            if action == 'benchmark_plan':
+                model = active_detail_model() or selected_model()
+                if model is None:
+                    message = 'No model selected for benchmark plan preview.'
+                    continue
+                show_benchmark_plan_overlay(stdscr, colors, app, model)
+                message = 'Benchmark plan preview closed.'
                 continue
             if action in palette_keys:
                 key = palette_keys[action]
