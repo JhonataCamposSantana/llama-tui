@@ -136,6 +136,13 @@ def _mtp_profile_warnings(model: Any, runtime_profile: Any, command_tokens: Sequ
     )
     if has_cpu_override and not _command_contains(command_tokens, '--no-mmap'):
         _add_unique(warnings, 'MTP model uses CPU tensor overrides with mmap enabled; --no-mmap may improve performance.')
+    if has_cpu_override:
+        _add_unique(
+            warnings,
+            'MTP decode gain is memory-bandwidth-limited when MoE experts are '
+            'CPU-offloaded; expect a modest gain, not the large speedups seen '
+            'on GPU-resident setups.',
+        )
 
     profiles = dict(getattr(model, 'measured_profiles', {}) or {})
     records = [dict(item) for item in list(getattr(model, 'last_benchmark_results', []) or []) if isinstance(item, dict)]

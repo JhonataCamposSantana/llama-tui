@@ -2271,8 +2271,9 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('baseline failed', msg.lower())
         self.assertEqual(objectives['mtp_fit_q8_draftq8_nommap_draft1_128k'], 'mtp_long_context_probe')
         self.assertEqual(objectives['mtp_fit_q8_draftq8_nommap_draft2_8k'], 'mtp_long_context_probe')
-        self.assertEqual(mtp_long_context_probe_request_timeout(131072), 90)
-        self.assertEqual(mtp_long_context_probe_request_timeout(8192), 60)
+        self.assertEqual(mtp_long_context_probe_request_timeout(131072), 180)
+        self.assertEqual(mtp_long_context_probe_request_timeout(32768), 120)
+        self.assertEqual(mtp_long_context_probe_request_timeout(8192), 75)
         saved = app.models[0]
         self.assertEqual(saved.default_benchmark_status, 'partial')
         self.assertEqual(saved.measured_profiles['mtp_acceptance']['mtp_draft_n_max'], 2)

@@ -35,8 +35,8 @@ MTP_PROMPT_HEAVY_PROMPTS = (
     + 'and the recommended next action.',
 )
 MTP_WORKLOAD_OUTPUT_CAPS = {
-    'decode_heavy': {'fast': 128, 'full': 256},
-    'prompt_heavy': {'fast': 96, 'full': 160},
+    'decode_heavy': {'fast': 128, 'full': 160},
+    'prompt_heavy': {'fast': 96, 'full': 112},
 }
 
 
@@ -181,11 +181,27 @@ def benchmark_mtp_optimizer_workloads(
     }
 
 
+# Minimum draft tokens for an acceptance sample to be treated as reliable.
+# A handful of tokens at 100% acceptance is noise, not a result.
+MTP_MIN_RELIABLE_DRAFT_TOKENS = 32
+
+
+def _mtp_record_draft_tokens(item: Dict[str, object]) -> int:
+    try:
+        return int(item.get('draft_tokens', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def best_mtp_acceptance_record(records: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    # A partial candidate (timed out / guardrail-stopped after producing
+    # acceptance metrics) is still a usable winner -- include it, but rank
+    # completed `ok` runs and reliable-size samples first so a tiny 100%
+    # sample never wins over a real measurement.
     candidates = [
         dict(item)
         for item in records
-        if str(item.get('status', '') or '') == 'ok'
+        if str(item.get('status', '') or '') in ('ok', 'partial')
         and bool(item.get('mtp_enabled'))
         and str(item.get('mtp_risk_level', '') or 'usable') != 'failed'
     ]
@@ -194,11 +210,45 @@ def best_mtp_acceptance_record(records: Sequence[Dict[str, object]]) -> Dict[str
     return max(
         candidates,
         key=lambda item: (
+            1 if str(item.get('status', '') or '') == 'ok' else 0,
+            1 if _mtp_record_draft_tokens(item) >= MTP_MIN_RELIABLE_DRAFT_TOKENS else 0,
             float(item.get('accept_rate', 0.0) or 0.0),
             float(item.get('tokens_per_sec', 0.0) or 0.0),
             int(item.get('mtp_draft_n_max', 0) or 0),
         ),
     )
+
+
+def weighted_mtp_accept_rate(
+    records: Sequence[Dict[str, object]],
+) -> Tuple[float, int, int]:
+    """Token-weighted acceptance over MTP records with reliable sample sizes.
+
+    Returns ``(accept_rate, total_draft_tokens, sample_count)``. Records with
+    fewer than ``MTP_MIN_RELIABLE_DRAFT_TOKENS`` draft tokens are skipped so a
+    few tokens at 100% acceptance cannot dominate the reported figure.
+    """
+    total_gen = 0
+    total_acc = 0
+    samples = 0
+    for item in records:
+        if not bool(item.get('mtp_enabled')):
+            continue
+        gen = _mtp_record_draft_tokens(item)
+        if gen < MTP_MIN_RELIABLE_DRAFT_TOKENS:
+            continue
+        try:
+            acc = int(item.get('accepted_tokens', 0) or 0)
+        except (TypeError, ValueError):
+            acc = 0
+        if acc <= 0:
+            acc = int(round(_record_float(item, 'accept_rate') * gen))
+        total_gen += gen
+        total_acc += min(max(acc, 0), gen)
+        samples += 1
+    if total_gen <= 0:
+        return 0.0, 0, 0
+    return round(total_acc / total_gen, 4), total_gen, samples
 
 
 def _record_float(record: Dict[str, object], key: str) -> float:
@@ -213,6 +263,22 @@ def _record_int(record: Dict[str, object], key: str) -> int:
         return int(record.get(key, 0) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _record_decode_tps(record: Dict[str, object]) -> float:
+    """Decode rate for MTP scoring: server-truth /metrics value when available.
+
+    Falls back to the recorded ``decode_tokens_per_sec`` then the client-side
+    ``tokens_per_sec``. The client number conflates long-context prefill into
+    decode, so it is the least trustworthy for MTP gain comparisons.
+    """
+    server = _record_float(record, 'server_decode_tokens_per_sec')
+    if server > 0:
+        return server
+    decode = _record_float(record, 'decode_tokens_per_sec')
+    if decode > 0:
+        return decode
+    return _record_float(record, 'tokens_per_sec')
 
 
 def _mtp_baseline_record(records: Sequence[Dict[str, object]]) -> Dict[str, object]:
@@ -268,7 +334,7 @@ def annotate_mtp_optimizer_records(records: Sequence[Dict[str, object]], spec_ty
     mutable = [dict(item) for item in records]
     baseline = _mtp_baseline_record(mutable)
     baseline_ok = bool(baseline and str(baseline.get('status', '') or '') == 'ok')
-    baseline_tps = _record_float(baseline, 'tokens_per_sec') if baseline_ok else 0.0
+    baseline_tps = _record_decode_tps(baseline) if baseline_ok else 0.0
     baseline_prompt_workload_tps = _record_prompt_workload_tps(baseline) if baseline_ok else 0.0
     baseline_seconds = _record_float(baseline, 'seconds') if baseline_ok else 0.0
     baseline_memory = _record_int(baseline, 'peak_vram_used') if baseline_ok else 0
@@ -286,7 +352,7 @@ def annotate_mtp_optimizer_records(records: Sequence[Dict[str, object]], spec_ty
         record['final_command'] = str(record.get('command') or record.get('effective_server_command') or '')
         record['baseline_profile_id'] = baseline_id
         if str(record.get('status', '') or '') == 'ok' and bool(record.get('mtp_enabled')) and baseline_ok:
-            current_tps = _record_float(record, 'tokens_per_sec')
+            current_tps = _record_decode_tps(record)
             current_prompt_workload_tps = _record_prompt_workload_tps(record)
             current_seconds = _record_float(record, 'seconds')
             current_memory = _record_int(record, 'peak_vram_used')

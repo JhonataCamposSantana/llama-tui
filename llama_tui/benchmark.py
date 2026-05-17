@@ -24,6 +24,7 @@ from .benchmark_mtp import (
     best_mtp_acceptance_record,
     mtp_optimizer_profile_recommendations,
     mtp_optimizer_workload_specs,
+    weighted_mtp_accept_rate,
 )
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .discovery import extract_quant
@@ -6217,12 +6218,55 @@ def apply_failure_context(record: Dict[str, object], detail: str, default_catego
     return record
 
 
+_DRAFT_MTP_STAT_RE = re.compile(
+    r'statistics\s+draft-mtp:.*?#gen\s+drafts?\s*=\s*([0-9]+)'
+    r'.*?#acc\s+drafts?\s*=\s*([0-9]+)',
+    re.IGNORECASE,
+)
+
+
+def _draft_mtp_session_totals(text: str) -> List[Tuple[int, int]]:
+    """Return ``[(gen_drafts, acc_drafts), ...]`` -- one entry per server session.
+
+    llama.cpp prints ``statistics draft-mtp: ... #gen drafts = N, #acc drafts = M``
+    with counters that are cumulative within a server session and reset to a
+    fresh count when a new server starts. Each session therefore contributes its
+    final (largest) cumulative line; a drop in ``#gen drafts`` marks a reset.
+    """
+    sessions: List[Tuple[int, int]] = []
+    prev_gen = -1
+    last: Optional[Tuple[int, int]] = None
+    for match in _DRAFT_MTP_STAT_RE.finditer(text or ''):
+        gen = int(match.group(1))
+        acc = int(match.group(2))
+        if gen < prev_gen and last is not None:
+            sessions.append(last)
+        last = (gen, acc)
+        prev_gen = gen
+    if last is not None:
+        sessions.append(last)
+    return sessions
+
+
 def parse_mtp_acceptance_metrics(text: str) -> Dict[str, object]:
     payload: Dict[str, object] = {}
     source = str(text or '')
     if not source:
         return payload
     low = source.lower()
+
+    # Preferred path: llama.cpp's own `statistics draft-mtp:` lines. Use the
+    # most recent server session (this candidate's launch); the run-summary
+    # layer down-weights tiny samples by draft_tokens.
+    sessions = _draft_mtp_session_totals(source)
+    if sessions:
+        gen, acc = sessions[-1]
+        if gen > 0:
+            payload['draft_tokens'] = gen
+            payload['accepted_tokens'] = min(acc, gen)
+            payload['accept_rate'] = round(max(0.0, min(1.0, acc / gen)), 4)
+            payload['mtp_acceptance_sessions'] = len(sessions)
+            return payload
 
     def first_int(patterns: Sequence[str]) -> int:
         for pattern in patterns:
@@ -6336,7 +6380,9 @@ def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object
     text = ''
     if log_path:
         try:
-            text = Path(log_path).read_text(encoding='utf-8', errors='replace')[-8000:]
+            # Read a wide tail so every `statistics draft-mtp:` line for the
+            # candidate's server session is captured, not just the last few.
+            text = Path(log_path).read_text(encoding='utf-8', errors='replace')[-40000:]
         except Exception:
             text = ''
     metrics = parse_mtp_acceptance_metrics(text)
@@ -6649,9 +6695,16 @@ def benchmark_adaptive_candidate(
             )
             if server_metrics:
                 record['server_prompt_tokens_per_sec'] = round(float(server_metrics.get('prompt_tokens_per_sec', 0.0) or 0.0), 4)
-                record['server_decode_tokens_per_sec'] = round(float(server_metrics.get('decode_tokens_per_sec', 0.0) or 0.0), 4)
+                server_decode = round(float(server_metrics.get('decode_tokens_per_sec', 0.0) or 0.0), 4)
+                record['server_decode_tokens_per_sec'] = server_decode
                 record['kv_cache_usage_ratio'] = round(float(server_metrics.get('kv_cache_usage_ratio', 0.0) or 0.0), 4)
                 record['requests_deferred'] = int(server_metrics.get('requests_deferred', 0) or 0)
+                # Prefer server-truth decode rate as the decode metric. The
+                # client-side `tokens_per_sec` conflates a slow long-context
+                # prefill into decode and badly understates MTP; `decode_tokens_
+                # _per_sec` is what scoring reads, so override it here.
+                if server_decode > 0:
+                    record['decode_tokens_per_sec'] = server_decode
         # Thermal honesty + small-sample percentile spread.
         peak_temp = max(
             int(getattr(snap, 'gpu_temperature', 0) or 0),
@@ -9285,9 +9338,11 @@ def mtp_long_context_probe_request_timeout(ctx_size: int) -> int:
     except (TypeError, ValueError):
         ctx = 0
     if ctx >= 65_536:
-        return 90
+        return 180
+    if ctx >= 32_768:
+        return 120
     if ctx >= 8_192:
-        return 60
+        return 75
     return BENCHMARK_SAMPLE_TIMEOUT
 
 
@@ -9464,7 +9519,6 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
         return False, msg
 
     records = annotate_mtp_optimizer_records(records, mtp_spec)
-    best = best_mtp_acceptance_record(records)
     baseline_skipped = any(str(item.get('status', '') or '') == 'skipped_runtime_assert' for item in records)
     cli_invalid = any(str(item.get('failure_category', '') or '') == 'CLI_INVALID' for item in records)
     draft_profiles = [item for item in runtime_profiles if bool(getattr(item, 'mtp_enabled', False))]
@@ -9497,9 +9551,18 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
     for item in partial_mtp:
         item['status'] = 'partial'
         item['mtp_partial'] = True
+        item['partial_mtp_candidate'] = True
         item.setdefault('partial_reason', 'memory_guardrail_or_timeout')
         if not str(item.get('failure_reason', '') or ''):
             item['failure_reason'] = 'memory_guardrail_or_timeout'
+        # A partial candidate that produced acceptance metrics is lower
+        # confidence, not failed -- keep it eligible as a winner.
+        if str(item.get('mtp_risk_level', '') or '') == 'failed':
+            item['mtp_risk_level'] = 'risky'
+
+    # Resolve the winner only after partials are reclassified, so a candidate
+    # that timed out after producing metrics can still win.
+    best = best_mtp_acceptance_record(records)
 
     if best and baseline_skipped:
         run_status = 'partial'
@@ -9517,8 +9580,17 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
     ended_at = datetime.now().isoformat(timespec='seconds')
     winners = dict(getattr(model, 'measured_profiles', {}) or {})
     winners.update(mtp_optimizer_profile_recommendations(records))
+    best_is_partial = bool(best) and (
+        str(best.get('status', '') or '') == 'partial' or bool(best.get('mtp_partial'))
+    )
     if best:
-        winners['mtp_acceptance'] = dict(best)
+        winner_entry = dict(best)
+        if best_is_partial:
+            winner_entry['partial_mtp_candidate'] = True
+            winner_entry.setdefault(
+                'partial_reason', best.get('partial_reason') or 'memory_guardrail_or_timeout'
+            )
+        winners['mtp_acceptance'] = winner_entry
     saved = ModelConfig(**asdict(model))
     saved.last_benchmark_results = records
     saved.measured_profiles = winners
@@ -9526,11 +9598,17 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
     saved.default_benchmark_at = ended_at
     saved.default_benchmark_status = run_status
     if best:
-        saved.last_benchmark_tokens_per_sec = round(float(best.get('tokens_per_sec', 0.0) or 0.0), 2)
+        # MTP headline = server-truth decode rate, not the client-side number
+        # that conflates long-context prefill into decode.
+        best_decode_tps = float(
+            best.get('decode_tokens_per_sec', best.get('tokens_per_sec', 0.0)) or 0.0
+        )
+        saved.last_benchmark_tokens_per_sec = round(best_decode_tps, 2)
         saved.last_benchmark_seconds = round(float(best.get('seconds', 0.0) or 0.0), 2)
         saved.last_benchmark_profile = (
-            f'mtp_acceptance draft_n={best.get("mtp_draft_n_max")} '
-            f'{saved.last_benchmark_tokens_per_sec:.2f} tok/s '
+            f'mtp_acceptance{" partial" if best_is_partial else ""} '
+            f'draft_n={best.get("mtp_draft_n_max")} '
+            f'{saved.last_benchmark_tokens_per_sec:.2f} tok/s decode '
             f'accept={float(best.get("accept_rate", 0.0) or 0.0):.2%} '
             f'ctx={best.get("ctx")} {hardware}'
         )
@@ -9551,20 +9629,37 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
         else:
             prefix = '⚠ MTP acceptance partial'
         baseline_note = '; baseline no-MTP skipped as expected for recurrent/NextN' if baseline_skipped else ''
+        # Report a token-weighted acceptance over the whole run, never a
+        # single tiny-sample maximum.
+        weighted_rate, weighted_draft, weighted_samples = weighted_mtp_accept_rate(records)
+        if weighted_samples:
+            accept_summary = (
+                f'accept_rate={weighted_rate:.2%} '
+                f'(token-weighted over {weighted_draft} draft tokens, {weighted_samples} sample(s))'
+            )
+        else:
+            accept_summary = (
+                f'accept_rate={float(best.get("accept_rate", 0.0) or 0.0):.2%} '
+                '(small sample, low confidence)'
+            )
         msg = (
             f'{prefix}: best draft_n={best.get("mtp_draft_n_max")} '
-            f'{float(best.get("tokens_per_sec", 0.0) or 0.0):.2f} tok/s, '
-            f'accept_rate={float(best.get("accept_rate", 0.0) or 0.0):.2%}, '
+            f'{best_decode_tps:.2f} tok/s decode, '
+            f'{accept_summary}, '
             f'status={run_status}{baseline_note} | {sync_msg}'
         )
         event_name = 'benchmark_done'
         ok_result = True
     elif partial_mtp:
-        observed = max(partial_mtp, key=lambda item: float(item.get('accept_rate', 0.0) or 0.0))
-        accept = float(observed.get('accept_rate', 0.0) or 0.0)
+        weighted_rate, weighted_draft, weighted_samples = weighted_mtp_accept_rate(partial_mtp)
+        accept_note = (
+            f'token-weighted accept_rate={weighted_rate:.2%} over {weighted_draft} draft tokens'
+            if weighted_samples
+            else 'acceptance sample too small to estimate reliably'
+        )
         msg = (
             '⚠ MTP acceptance partial: draft-mtp initialised and produced acceptance '
-            f'metrics (best observed accept_rate={accept:.2%}) before a memory guardrail '
+            f'metrics ({accept_note}) before a memory guardrail '
             f'or timeout stopped the candidate; rerun with more headroom | {sync_msg}'
         )
         event_name = 'benchmark_done'
@@ -10563,18 +10658,37 @@ def generate_context_moe_validation_candidates(
     candidates: List[TuningCandidate] = []
     winner_payload = profile_moe_placement(winner)
     winner_candidate = moe_placement_candidate_from_payload(winner_payload)
+    # The winner's `ngl` field carries a 999 sentinel even when it actually ran
+    # fit-assisted (`-fit on`, no fixed --n-gpu-layers). Treat ngl as a real
+    # fixed layer count only when the winner did NOT use fit; otherwise keep
+    # context validation fit-assisted so large MoE buckets are not pinned to
+    # --n-gpu-layers 999.
+    winner_used_fit = (
+        bool(winner.get('fit', False))
+        or str(winner.get('gpu_layers_mode', '') or '').strip().lower() == 'fit'
+        or str(winner.get('moe_placement_mode', '') or '').strip().lower() == 'fit_only'
+    )
     try:
         winner_gpu_layers = int(winner.get('ngl', 0) or 0)
     except Exception:
         winner_gpu_layers = 0
-    validation_gpu_layers = winner_gpu_layers if winner_gpu_layers > 0 else baseline.gpu_layers
+    if winner_used_fit:
+        validation_gpu_layers = None
+        validation_fit = True
+    elif winner_gpu_layers > 0:
+        validation_gpu_layers = winner_gpu_layers
+        validation_fit = bool(getattr(baseline, 'fit', False))
+    else:
+        validation_gpu_layers = baseline.gpu_layers
+        validation_fit = bool(getattr(baseline, 'fit', False))
     if winner_candidate is not None:
         candidates.append(TuningCandidate(
             name=f'{bucket_key}_{winner_candidate.name}',
             runtime_profile=replace(
                 baseline,
                 name=f'{bucket_key}_{winner_candidate.name}',
-                gpu_layers=baseline.gpu_layers,
+                gpu_layers=validation_gpu_layers,
+                fit=validation_fit,
                 placement_strategy=winner_candidate.name,
                 cpu_moe=winner_candidate.cpu_moe,
                 n_cpu_moe=winner_candidate.n_cpu_moe,
@@ -10598,6 +10712,7 @@ def generate_context_moe_validation_candidates(
                     baseline,
                     name=name,
                     gpu_layers=validation_gpu_layers,
+                    fit=validation_fit,
                     placement_strategy=f'n_cpu_moe_{value}',
                     n_cpu_moe=value,
                     cpu_moe=False,
@@ -10616,6 +10731,7 @@ def generate_context_moe_validation_candidates(
                 baseline,
                 name=name,
                 gpu_layers=validation_gpu_layers,
+                fit=validation_fit,
                 placement_strategy='cpu_moe_all',
                 cpu_moe=True,
                 n_cpu_moe=0,
