@@ -2776,6 +2776,14 @@ class AppConfig:
         )
         profile_args, _unsupported_flags = benchmark_profile_server_args(launch_profile, capabilities)
         cmd += profile_args
+        # Enable the Prometheus /metrics endpoint for benchmark launches so the
+        # suite can scrape server-truth prefill/decode rates. Gated on the
+        # binary advertising --metrics so older forks are never sent a flag
+        # they would reject.
+        if benchmark_profile is not None and engine_context.engine_id != ENGINE_VLLM:
+            help_text = str(getattr(capabilities, 'help_text', '') or '').lower()
+            if '--metrics' in help_text and '--metrics' not in cmd:
+                cmd.append('--metrics')
         return cmd
 
     def start(

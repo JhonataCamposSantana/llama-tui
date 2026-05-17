@@ -2,6 +2,7 @@ from typing import Dict, List, Sequence, Tuple
 
 from .benchmark import record_matches_profile
 from .textutil import compact_message, ellipsize, wrap_display_lines
+from .ui_components import gauge_bar, sparkline
 
 
 SERVER_WINNER_LABELS = {
@@ -518,3 +519,115 @@ def benchmark_plan_lines(app, model, depth: str = 'fast') -> List[Tuple[str, str
     except Exception:
         candidate_names = []
     return benchmark_plan_summary_lines(engine, binary, cap_summary, candidate_names, skipped, strategy_id)
+
+
+LEADERBOARD_SORT_KEYS = ('tps', 'ctx', 'vram', 'mtp')
+
+
+def build_engine_leaderboard(model, sort_key: str = 'tps') -> List[Dict[str, object]]:
+    """Aggregate per-engine benchmark results for a model into sortable rows.
+
+    Reads ``model.engine_benchmark_store`` (per-engine saved payloads). Pure
+    over stored data -- runs no benchmarks -- so it is unit testable.
+    """
+    store = dict(getattr(model, 'engine_benchmark_store', {}) or {})
+    rows: List[Dict[str, object]] = []
+    for engine_key, raw in store.items():
+        payload = dict(raw or {})
+        measured = dict(payload.get('measured_profiles', {}) or {})
+        best: Dict[str, object] = {}
+        for key in ('auto', 'fast_chat', 'opencode_ready', 'long_context'):
+            prof = measured.get(key)
+            if isinstance(prof, dict) and prof:
+                if not best or float(prof.get('tokens_per_sec', 0.0) or 0.0) > float(best.get('tokens_per_sec', 0.0) or 0.0):
+                    best = prof
+        mtp = dict(measured.get('mtp_acceptance', {}) or {})
+        tps = float(payload.get('last_benchmark_tokens_per_sec', 0.0) or 0.0)
+        if tps <= 0.0:
+            tps = float(best.get('tokens_per_sec', 0.0) or 0.0)
+        ctx = int(best.get('ctx_per_slot', best.get('ctx', 0)) or 0)
+        vram = int(best.get('peak_vram_used', best.get('peak_vram_bytes', 0)) or 0)
+        accept = float(mtp.get('accept_rate', 0.0) or 0.0)
+        status = str(payload.get('default_benchmark_status', '') or '').strip()
+        has_data = bool(tps > 0.0 or measured or payload.get('benchmark_runs'))
+        rows.append({
+            'engine': str(engine_key),
+            'tokens_per_sec': round(tps, 2),
+            'ctx': ctx,
+            'peak_vram_used': vram,
+            'accept_rate': round(accept, 4),
+            'kv_cache_usage_ratio': round(float(best.get('kv_cache_usage_ratio', 0.0) or 0.0), 4),
+            'thermal_throttled': bool(best.get('thermal_throttled', False)),
+            'status': status or ('ok' if has_data else 'no benchmark'),
+            'has_data': has_data,
+        })
+    key = sort_key if sort_key in LEADERBOARD_SORT_KEYS else 'tps'
+    field = {'tps': 'tokens_per_sec', 'ctx': 'ctx', 'vram': 'peak_vram_used', 'mtp': 'accept_rate'}[key]
+    rows.sort(key=lambda row: (bool(row['has_data']), float(row.get(field, 0) or 0)), reverse=True)
+    return rows
+
+
+def build_benchmark_cockpit_items(state: Dict[str, object], width: int = 60) -> List[Tuple[str, str]]:
+    """Build live cockpit panel lines from ``benchmark_state['live']`` ring buffers.
+
+    Returns ``List[(text, kind)]``. Pure -- testable with a plain dict.
+    """
+    live = dict((state or {}).get('live', {}) or {})
+    spark_w = max(8, min(40, int(width or 60) - 24))
+    items: List[Tuple[str, str]] = []
+    tps = [float(v) for v in (live.get('tps', []) or [])]
+    cur_tps = tps[-1] if tps else 0.0
+    items.append((f'tok/s {cur_tps:7.1f}  {sparkline(tps, spark_w)}', 'success' if cur_tps > 0 else 'muted'))
+    vram_used = [float(v) for v in (live.get('vram_used', []) or [])]
+    vram_total = [float(v) for v in (live.get('vram_total', []) or [])]
+    if vram_used and vram_total and vram_total[-1] > 0:
+        frac = vram_used[-1] / vram_total[-1]
+        items.append((f'VRAM         {gauge_bar(frac, spark_w)} {frac * 100:3.0f}%',
+                       'warning' if frac > 0.9 else 'normal'))
+    temps = [float(v) for v in (live.get('gpu_temp', []) or [])]
+    cur_temp = temps[-1] if temps else 0.0
+    if cur_temp > 0:
+        throttled = bool(live.get('thermal_throttled'))
+        kind = 'error' if throttled else 'warning' if cur_temp >= 83 else 'normal'
+        label = f'temp {cur_temp:5.0f}C {gauge_bar(min(1.0, cur_temp / 100.0), spark_w)}'
+        if throttled:
+            label += '  THROTTLE'
+        items.append((label, kind))
+    if len(items) == 1 and cur_tps <= 0:
+        return [('waiting for live samples...', 'muted')]
+    return items
+
+
+def benchmark_leaderboard_lines(model, sort_key: str = 'tps') -> List[Tuple[str, str]]:
+    """Format the per-engine leaderboard into ``(text, kind)`` display rows.
+
+    Pure -- builds on build_engine_leaderboard so it is unit testable. The
+    fastest engine with data is marked ``success``; a ``*`` flags an engine
+    whose best run observed thermal throttling.
+    """
+    rows = build_engine_leaderboard(model, sort_key)
+    if not rows:
+        return [('no per-engine benchmark data yet', 'muted')]
+    lines: List[Tuple[str, str]] = [
+        (f'{"engine":<14}{"tok/s":>9}{"ctx":>8}{"VRAM":>8}{"MTP":>7}', 'heading'),
+    ]
+    for index, row in enumerate(rows):
+        engine = str(row.get('engine', '') or '')[:13]
+        if not row.get('has_data'):
+            lines.append((f'{engine:<14}{"-":>9}{"-":>8}{"-":>8}{"-":>7}', 'muted'))
+            continue
+        tps = float(row.get('tokens_per_sec', 0.0) or 0.0)
+        ctx = int(row.get('ctx', 0) or 0)
+        vram = int(row.get('peak_vram_used', 0) or 0)
+        accept = float(row.get('accept_rate', 0.0) or 0.0)
+        ctx_text = f'{ctx // 1024}k' if ctx >= 1024 else (str(ctx) if ctx else '-')
+        vram_text = f'{vram / (1024 ** 3):.1f}G' if vram else '-'
+        mtp_text = f'{accept * 100:.0f}%' if accept > 0 else '-'
+        marker = '*' if row.get('thermal_throttled') else ''
+        lines.append((
+            f'{engine:<14}{tps:>9.1f}{ctx_text:>8}{vram_text:>8}{mtp_text:>7}{marker}',
+            'success' if index == 0 else 'normal',
+        ))
+    if any(row.get('thermal_throttled') for row in rows):
+        lines.append(('* thermal throttling observed during best run', 'warning'))
+    return lines

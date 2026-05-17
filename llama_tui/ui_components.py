@@ -128,3 +128,38 @@ def draw_card(
     body_rows = max(0, h - 3)
     for idx, (text, kind) in enumerate(wrap_card_lines(lines, inner_w)[:body_rows]):
         safe_addstr(stdscr, y + 2 + idx, x + 2, text, kind_style(colors, kind))
+
+
+_SPARK_CHARS = '▁▂▃▄▅▆▇█'
+
+
+def sparkline(values: Sequence[float], width: int) -> str:
+    """Render a numeric series as a fixed-width Unicode block sparkline.
+
+    Pure/string-only so it is unit testable. Right-aligned to the most recent
+    ``width`` samples; a flat series renders as a mid-height band.
+    """
+    width = max(0, int(width or 0))
+    nums = [float(v) for v in (values or []) if v is not None]
+    if not nums or width <= 0:
+        return ' ' * width
+    series = nums[-width:]
+    lo, hi = min(series), max(series)
+    span = hi - lo
+    if span <= 0:
+        return _SPARK_CHARS[len(_SPARK_CHARS) // 2] * len(series)
+    cells = []
+    for value in series:
+        idx = int(round((value - lo) / span * (len(_SPARK_CHARS) - 1)))
+        cells.append(_SPARK_CHARS[max(0, min(len(_SPARK_CHARS) - 1, idx))])
+    return ''.join(cells)
+
+
+def gauge_bar(fraction: float, width: int) -> str:
+    """Return a ``[||||    ]`` style bar of the given inner width. Pure."""
+    width = max(0, int(width or 0))
+    if width <= 0:
+        return ''
+    frac = max(0.0, min(1.0, float(fraction or 0.0)))
+    filled = int(round(frac * width))
+    return '[' + ('|' * filled) + (' ' * (width - filled)) + ']'

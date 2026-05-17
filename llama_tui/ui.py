@@ -93,7 +93,9 @@ from .ui_models import (
 from .ui_benchmark import (
     FULL_SUITE_STAGES,
     MTP_SUITE_STAGES,
+    benchmark_leaderboard_lines,
     benchmark_plan_lines,
+    build_benchmark_cockpit_items,
     _status_attr_for_record,
     _table_row,
     _table_rule,
@@ -158,6 +160,7 @@ TRY_TRANSCRIPT_SCROLL_KEYS = {
 BENCHMARK_FEED_LIMIT = 80
 BENCHMARK_RECORD_LIMIT = 120
 BENCHMARK_COMMAND_LIMIT = 12
+BENCHMARK_LIVE_LIMIT = 60
 FLEET_BROWSER_HEADER = ' MODEL                         STATE    PICK         CTX     TOK/S   ENGINE      HEALTH'
 HEADER_DASHBOARD_MIN_WIDTH = 124
 HEADER_DASHBOARD_MIN_PANEL_WIDTH = 42
@@ -1117,6 +1120,11 @@ def build_benchmark_progress_items(
             ('', normal_attr),
             ('latest result: waiting for first row', normal_attr),
         ])
+    cockpit = build_benchmark_cockpit_items(state, width)
+    if cockpit:
+        items.append(('', normal_attr))
+        items.append(('live cockpit:', accent_attr))
+        items.extend((text, normal_attr) for text, _kind in cockpit)
     return items
 
 
@@ -1397,6 +1405,13 @@ def new_benchmark_run_state(
         'commands': [],
         'current_command': '',
         'errors': [],
+        'live': {
+            'tps': [],
+            'vram_used': [],
+            'vram_total': [],
+            'gpu_temp': [],
+            'thermal_throttled': False,
+        },
     }
 
 
@@ -2177,6 +2192,51 @@ def machine_gap_items(
     return items
 
 
+def refresh_benchmark_live(state: Dict[str, object]) -> Dict[str, object]:
+    """Rebuild the live cockpit ring buffers from the run's benchmark records.
+
+    Idempotent: the telemetry series are derived straight from state['records']
+    so repeated reduce calls never double-count a candidate.
+    """
+    records = [item for item in list(state.get('records', []) or []) if isinstance(item, dict)]
+    tps: List[float] = []
+    vram_used: List[int] = []
+    vram_total: List[int] = []
+    gpu_temp: List[int] = []
+    throttled = False
+    for record in records:
+        try:
+            value = float(record.get('tokens_per_sec', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0.0:
+            tps.append(round(value, 2))
+        try:
+            used = int(record.get('peak_vram_used', record.get('peak_vram_bytes', 0)) or 0)
+            total = int(record.get('gpu_memory_total', 0) or 0)
+        except (TypeError, ValueError):
+            used = total = 0
+        if used > 0 and total > 0:
+            vram_used.append(used)
+            vram_total.append(total)
+        try:
+            temp = int(record.get('gpu_temp_peak', 0) or 0)
+        except (TypeError, ValueError):
+            temp = 0
+        if temp > 0:
+            gpu_temp.append(temp)
+        if bool(record.get('thermal_throttled', False)):
+            throttled = True
+    state['live'] = {
+        'tps': tps[-BENCHMARK_LIVE_LIMIT:],
+        'vram_used': vram_used[-BENCHMARK_LIVE_LIMIT:],
+        'vram_total': vram_total[-BENCHMARK_LIVE_LIMIT:],
+        'gpu_temp': gpu_temp[-BENCHMARK_LIVE_LIMIT:],
+        'thermal_throttled': throttled,
+    }
+    return state
+
+
 def reduce_benchmark_event(
     state: Dict[str, object],
     payload: Dict[str, object],
@@ -2240,6 +2300,7 @@ def reduce_benchmark_event(
         records = list(state.get('records', []) or [])
         records.append(dict(payload.get('record') or {}))
         state['records'] = records[-BENCHMARK_RECORD_LIMIT:]
+    refresh_benchmark_live(state)
     if isinstance(payload.get('recommendations'), dict):
         state['recommendations'] = dict(payload.get('recommendations') or {})
     if isinstance(payload.get('warnings'), list):
@@ -5467,12 +5528,27 @@ def tui(stdscr, app: AppConfig):
                             normal_attr=curses.A_NORMAL,
                         )
                     else:
+                        right_items = []
+                        if getattr(model, 'engine_benchmark_store', {}) or {}:
+                            lb_attr = {
+                                'heading': colors['accent'] | curses.A_BOLD,
+                                'success': colors['success'] | curses.A_BOLD,
+                                'warning': colors['warning'],
+                                'muted': colors['muted'],
+                                'normal': curses.A_NORMAL,
+                            }
+                            right_items.append(('engine leaderboard:', colors['accent'] | curses.A_BOLD))
+                            right_items.extend(
+                                (text, lb_attr.get(kind, curses.A_NORMAL))
+                                for text, kind in benchmark_leaderboard_lines(model)
+                            )
+                            right_items.append(('', curses.A_NORMAL))
                         run = {
                             'kind': str(benchmark_state.get('run_kind') or ''),
                             'records': records,
                             'winners': {},
                         }
-                        right_items = benchmark_ranking_items(
+                        right_items.extend(benchmark_ranking_items(
                             run,
                             width=right_content_w,
                             success_attr=colors['success'] | curses.A_BOLD,
@@ -5480,7 +5556,7 @@ def tui(stdscr, app: AppConfig):
                             error_attr=colors['error'],
                             heading_attr=colors['accent'] | curses.A_BOLD,
                             normal_attr=curses.A_NORMAL,
-                        )
+                        ))
                 elif right_active_tab == 'commands':
                     right_items = [
                         (line, colors['warning'] if kind == 'current' and benchmark_state.get('active') else colors['muted'])

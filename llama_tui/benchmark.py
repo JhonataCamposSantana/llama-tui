@@ -65,6 +65,7 @@ from .optimize import (
     select_best_tier,
 )
 from .provenance import parse_hf_cache_provenance
+from .server_metrics import engine_supports_metrics, scrape_llama_server_metrics
 from .runtime_profiles import (
     RuntimeProfile,
     TurboKvProfile,
@@ -3689,6 +3690,31 @@ def benchmark_completion(
         'tokens_per_sec': completion_tokens / elapsed,
         'text': text,
     }
+def percentile_summary(values: Sequence[float]) -> Dict[str, float]:
+    """Min/median/p95/p99/max of a small sample list (e.g. per-sample tok/s).
+
+    With 2-3 samples p95/p99 collapse to the max -- an honest, documented limit
+    of small-sample percentiles.
+    """
+    cleaned = sorted(float(value) for value in (values or []) if value is not None)
+    if not cleaned:
+        return {'min': 0.0, 'p50': 0.0, 'p95': 0.0, 'p99': 0.0, 'max': 0.0}
+
+    def at(pct: float) -> float:
+        if len(cleaned) == 1:
+            return cleaned[0]
+        idx = int(round((pct / 100.0) * (len(cleaned) - 1)))
+        return cleaned[max(0, min(len(cleaned) - 1, idx))]
+
+    return {
+        'min': round(cleaned[0], 4),
+        'p50': round(at(50), 4),
+        'p95': round(at(95), 4),
+        'p99': round(at(99), 4),
+        'max': round(cleaned[-1], 4),
+    }
+
+
 def benchmark_completion_suite(
     model: ModelConfig,
     max_tokens: int = BENCHMARK_SAMPLE_TOKENS,
@@ -3726,6 +3752,7 @@ def benchmark_completion_suite(
     completion_tokens = sum(int(sample['completion_tokens']) for sample in samples)
     prompt_tokens = sum(int(sample['prompt_tokens']) for sample in samples)
     texts = [str(sample.get('text', '') or '') for sample in samples]
+    percentiles = percentile_summary(scores)
     return True, {
         'elapsed': elapsed,
         'completion_tokens': completion_tokens,
@@ -3734,6 +3761,11 @@ def benchmark_completion_suite(
         'prompt_tokens_per_sec': prompt_tokens / elapsed if elapsed > 0 else 0.0,
         'sample_tokens_per_sec': scores,
         'sample_count': len(samples),
+        'tps_p50': percentiles['p50'],
+        'tps_p95': percentiles['p95'],
+        'tps_p99': percentiles['p99'],
+        'tps_min': percentiles['min'],
+        'tps_max': percentiles['max'],
         'error': '; '.join(failures),
         'texts': texts,
     }
@@ -6607,6 +6639,33 @@ def benchmark_adaptive_candidate(
             record['mtp_workloads'] = dict(mtp_workloads or {})
             record['mtp_workload_names'] = sorted(record['mtp_workloads'])
             record['mtp_workload_count'] = len(record['mtp_workloads'])
+        # Server-truth prefill vs decode rates from the llama-server /metrics
+        # endpoint, scraped while the candidate server is still up.
+        record_engine = str(runtime_context.get('engine', '') or '')
+        if engine_supports_metrics(record_engine):
+            server_metrics = scrape_llama_server_metrics(
+                str(getattr(candidate, 'host', '') or '127.0.0.1'),
+                int(getattr(candidate, 'port', 0) or 0),
+            )
+            if server_metrics:
+                record['server_prompt_tokens_per_sec'] = round(float(server_metrics.get('prompt_tokens_per_sec', 0.0) or 0.0), 4)
+                record['server_decode_tokens_per_sec'] = round(float(server_metrics.get('decode_tokens_per_sec', 0.0) or 0.0), 4)
+                record['kv_cache_usage_ratio'] = round(float(server_metrics.get('kv_cache_usage_ratio', 0.0) or 0.0), 4)
+                record['requests_deferred'] = int(server_metrics.get('requests_deferred', 0) or 0)
+        # Thermal honesty + small-sample percentile spread.
+        peak_temp = max(
+            int(getattr(snap, 'gpu_temperature', 0) or 0),
+            int(getattr(before_hw, 'gpu_temperature', 0) or 0),
+        )
+        if peak_temp > 0:
+            record['gpu_temp_peak'] = peak_temp
+        if bool(getattr(snap, 'gpu_throttle_active', False)) or bool(getattr(before_hw, 'gpu_throttle_active', False)):
+            record['thermal_throttled'] = True
+        if int(bench.get('sample_count', 0) or 0) < 2:
+            record['low_confidence'] = True
+        for pct_key in ('tps_p50', 'tps_p95', 'tps_p99', 'tps_min', 'tps_max'):
+            if pct_key in bench:
+                record[pct_key] = round(float(bench.get(pct_key, 0.0) or 0.0), 4)
         apply_memory_guardrail_record(record, state=guardrail_state)
         enrich_fit_discovery_metadata(record, app, candidate, runtime_profile, success=True)
         enrich_mtp_acceptance_metrics(record)
@@ -8084,7 +8143,10 @@ def active_engine_runtime_profiles(
         profiles.append(apply_placement(profile_item, effective_placement))
 
     def fit_context_for(ctx: int) -> int:
-        return min(int(ctx or base_ctx), max(ctx_min, 4096))
+        # Scale the fit probe context with the target context instead of
+        # pinning it at 4096 -- a 256k target needs a larger fit window.
+        target = int(ctx or base_ctx)
+        return min(target, max(ctx_min, 4096, target // 8))
 
     def fit_growth_contexts() -> Tuple[int, ...]:
         available = [ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max]
@@ -8207,6 +8269,8 @@ def active_engine_runtime_profiles(
                     benchmark_metric_group='tg_tps,ttft_ms,tpot_ms,startup_status',
                 )
             if fit_family_ready:
+                # Canonical MTP fit ctx ladder; 131072 is included only when
+                # the model's ctx_max reaches it.
                 ctx_candidates = [
                     ctx for ctx in (8192, 32768, 65536, 131072)
                     if ctx >= ctx_min and ctx <= ctx_max
@@ -8292,6 +8356,21 @@ def active_engine_runtime_profiles(
                     ubatch=64,
                     kv_profile=baseline_profile,
                     benchmark_phase='context_probe',
+                )
+            # Probe TQ3 KV-compression presets for MoE too, not just the
+            # q8_0 baseline -- the MoE path used to be a single candidate.
+            for kv_profile in turbo_profiles:
+                if kv_profile.kv_preset == baseline_kv:
+                    continue
+                add(
+                    f'moe_kv_compression_probe_{kv_profile.name_slug}',
+                    base_ctx,
+                    partial_ngl,
+                    kv_profile.kv_preset,
+                    batch=128,
+                    ubatch=64,
+                    kv_profile=kv_profile,
+                    benchmark_phase='kv_experiment',
                 )
             return finalized_profiles()
 
@@ -8405,6 +8484,19 @@ def active_engine_runtime_profiles(
                 kv_profile=kv_profile,
                 benchmark_phase='kv_compression',
             )
+        # Re-probe the KV-compression ladder at a second (mid) context so
+        # compression behaviour is not characterised only at base_ctx.
+        mid_ctx = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
+        if mid_ctx:
+            for kv_profile in turbo_profiles:
+                add(
+                    f'kv_compression_probe_{mid_ctx}_{kv_profile.name_slug}',
+                    mid_ctx,
+                    partial_ngl,
+                    kv_profile.kv_preset,
+                    kv_profile=kv_profile,
+                    benchmark_phase='kv_compression',
+                )
         if benchmark_depth == 'full':
             sweep_kv = preferred_profile.kv_preset if preferred_profile is not None else baseline_kv
             if fits_gpu:

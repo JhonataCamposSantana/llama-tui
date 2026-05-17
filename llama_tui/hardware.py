@@ -17,6 +17,8 @@ class HardwareProfile:
     gpu_memory_total: int = 0
     gpu_memory_free: int = 0
     gpu_error: str = ''
+    gpu_temperature: int = 0
+    gpu_throttle_active: bool = False
 
     def has_usable_gpu(self) -> bool:
         return self.gpu_memory_free > 0
@@ -400,10 +402,53 @@ def probe_nvidia_gpu() -> Tuple[str, int, int, str]:
             best_total = total
             best_free = free
     return best_name, best_total, best_free, ''
+def probe_nvidia_gpu_thermal() -> Tuple[int, bool]:
+    """Return (gpu_temperature_celsius, thermal_throttle_active).
+
+    Queried separately from probe_nvidia_gpu() so an unsupported throttle-reason
+    field can never break the memory probe. Returns (0, False) on any failure.
+    """
+    nvidia_smi = shutil.which('nvidia-smi')
+    if not nvidia_smi:
+        return 0, False
+    try:
+        result = subprocess.run(
+            [
+                nvidia_smi,
+                '--query-gpu=temperature.gpu,clocks_throttle_reasons.hw_thermal_slowdown,'
+                'clocks_throttle_reasons.sw_thermal_slowdown',
+                '--format=csv,noheader,nounits',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return 0, False
+    if result.returncode != 0:
+        return 0, False
+    best_temp = 0
+    throttle = False
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(',')]
+        if not parts or not parts[0]:
+            continue
+        try:
+            best_temp = max(best_temp, int(float(parts[0])))
+        except ValueError:
+            continue
+        for reason in parts[1:]:
+            low = reason.lower()
+            if 'active' in low and 'not active' not in low:
+                throttle = True
+    return best_temp, throttle
+
+
 def benchmark_current_hardware() -> HardwareProfile:
     logical, physical = detect_cpu_counts()
     mem = read_meminfo_bytes()
     gpu_name, gpu_total, gpu_free, gpu_error = probe_nvidia_gpu()
+    gpu_temp, gpu_throttle = probe_nvidia_gpu_thermal()
     return HardwareProfile(
         cpu_logical=logical,
         cpu_physical=physical,
@@ -413,4 +458,6 @@ def benchmark_current_hardware() -> HardwareProfile:
         gpu_memory_total=gpu_total,
         gpu_memory_free=gpu_free,
         gpu_error=gpu_error,
+        gpu_temperature=gpu_temp,
+        gpu_throttle_active=gpu_throttle,
     )
