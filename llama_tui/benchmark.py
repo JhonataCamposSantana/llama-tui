@@ -7200,6 +7200,9 @@ def tq3_raw_presearch_case_total(runtime_profiles: List[RuntimeProfile], depth: 
     return len(_tq3_raw_runtime_profiles(runtime_profiles, depth)) * len(TQ3_RAW_BENCH_CASES)
 
 
+RAW_BENCH_DETERMINISTIC_SEED = 42
+
+
 def tq3_llama_bench_command(
     llama_bench_bin: str,
     model: ModelConfig,
@@ -7213,6 +7216,7 @@ def tq3_llama_bench_command(
         '-m', str(getattr(model, 'path', '') or ''),
         '-p', str(int(prompt_tokens)),
         '-n', str(int(generated_tokens)),
+        '--seed', str(RAW_BENCH_DETERMINISTIC_SEED),
     ]
     if runtime_profile.gpu_layers is not None:
         cmd += ['-ngl', str(int(runtime_profile.gpu_layers))]
