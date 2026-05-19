@@ -110,29 +110,66 @@ TENSOR_MOE_PATTERNS = (
     re.compile(r'(?:^|\.|_)gate_inp(?:\.|_|$)', re.IGNORECASE),
 )
 
-GGML_TYPE_SIZE = {
-    0: 4.0,       # F32
-    1: 2.0,       # F16
-    2: 0.5625,    # Q4_0
-    3: 0.625,     # Q4_1
-    6: 1.0625,    # Q8_0
-    7: 0.6875,    # Q5_0
-    8: 0.75,      # Q5_1
-    9: 0.8125,    # Q6_K
-    10: 0.5625,   # Q4_K
-    11: 0.625,    # Q5_K
-    12: 0.4375,   # Q3_K
-    13: 0.3125,   # Q2_K
-    14: 0.5625,   # IQ4_NL
-    15: 0.5,      # IQ4_XS
-    16: 1.0,      # I8
-    17: 0.5,      # I4
-    18: 0.25,     # I2
-    19: 0.125,    # I1
-    20: 2.0,      # BF16
-    44: 0.5,      # TQ3_1S
-    46: 0.5,      # TQ3_4S
-}
+# (type_id, bytes_per_element, ggml_type_name). Type ids match the upstream
+# llama.cpp ``ggml_type`` enum in ``ggml/include/ggml.h``. Bytes-per-element is
+# derived from each quant's block size (32 elements for legacy Q-quants, 256
+# for K- and I-quants). The previous version of this table had labels and
+# values misaligned against the modern enum, which inflated weight estimates
+# for K-quant and Q8 models by 30-50%; see audit finding #3.
+_GGML_TYPE_TABLE = (
+    (0,  4.0,        'F32'),
+    (1,  2.0,        'F16'),
+    (2,  0.5625,     'Q4_0'),       # 18 bytes / 32 elements
+    (3,  0.625,      'Q4_1'),       # 20 / 32
+    (6,  0.6875,     'Q5_0'),       # 22 / 32
+    (7,  0.75,       'Q5_1'),       # 24 / 32
+    (8,  1.0625,     'Q8_0'),       # 34 / 32
+    (9,  1.125,      'Q8_1'),       # 36 / 32
+    (10, 0.328125,   'Q2_K'),       # 84 / 256
+    (11, 0.4296875,  'Q3_K'),       # 110 / 256
+    (12, 0.5625,     'Q4_K'),       # 144 / 256
+    (13, 0.6875,     'Q5_K'),       # 176 / 256
+    (14, 0.8203125,  'Q6_K'),       # 210 / 256
+    (15, 1.140625,   'Q8_K'),       # 292 / 256 (internal)
+    (16, 0.2578125,  'IQ2_XXS'),    # 66 / 256
+    (17, 0.2890625,  'IQ2_XS'),     # 74 / 256
+    (18, 0.3828125,  'IQ3_XXS'),    # 98 / 256
+    (19, 0.1953125,  'IQ1_S'),      # 50 / 256
+    (20, 0.5625,     'IQ4_NL'),     # 18 / 32
+    (21, 0.4296875,  'IQ3_S'),      # 110 / 256
+    (22, 0.3203125,  'IQ2_S'),      # 82 / 256
+    (23, 0.53125,    'IQ4_XS'),     # 136 / 256
+    (24, 1.0,        'I8'),
+    (25, 2.0,        'I16'),
+    (26, 4.0,        'I32'),
+    (27, 8.0,        'I64'),
+    (28, 8.0,        'F64'),
+    (29, 0.21875,    'IQ1_M'),      # 56 / 256
+    (30, 2.0,        'BF16'),
+    (34, 0.2109375,  'TQ1_0'),      # 54 / 256
+    (35, 0.2578125,  'TQ2_0'),      # 66 / 256
+    (36, 0.5625,     'IQ4_NL_4_4'), # ARM-optimized repack of IQ4_NL
+    (37, 0.5625,     'IQ4_NL_4_8'),
+    (38, 0.5625,     'IQ4_NL_8_8'),
+    (39, 0.5625,     'MXFP4'),      # 9 bytes / 16 elements
+    # Project-specific quants used by the TQ3 fork. Keep these aligned with
+    # the fork's ggml_type assignments; the byte sizes are approximate.
+    (44, 0.5,        'TQ3_1S'),
+    (46, 0.5,        'TQ3_4S'),
+)
+
+GGML_TYPE_SIZE = {type_id: bpe for type_id, bpe, _name in _GGML_TYPE_TABLE}
+GGML_TYPE_NAME = {type_id: name for type_id, _bpe, name in _GGML_TYPE_TABLE}
+
+# Unknown tensor types encountered during this process lifetime. Useful for
+# logging/diagnostics so the UI can flag "estimates may be off" without
+# spamming a warning for every tensor.
+_UNKNOWN_GGML_TYPES_SEEN: set = set()
+
+
+def unknown_ggml_types_seen() -> tuple:
+    """Return a sorted tuple of unrecognised ``ggml_type`` ids seen so far."""
+    return tuple(sorted(_UNKNOWN_GGML_TYPES_SEEN))
 
 def _read_exact(file_obj, size: int) -> bytes:
     data = file_obj.read(size)
@@ -368,8 +405,15 @@ def _estimated_tensor_payload_bytes(descriptor: Dict[str, object]) -> int:
     except Exception:
         elements = 0
     try:
-        type_size = GGML_TYPE_SIZE.get(int(descriptor.get('type', 0) or 0), 2.0)
-    except Exception:
+        type_id = int(descriptor.get('type', 0) or 0)
+    except (TypeError, ValueError):
+        type_id = 0
+    type_size = GGML_TYPE_SIZE.get(type_id)
+    if type_size is None:
+        # Conservative fallback for unknown ggml_type ids — F16-equivalent so
+        # estimates lean over-provisioned rather than under. Recorded for
+        # diagnostics so the UI can flag "unknown quant".
+        _UNKNOWN_GGML_TYPES_SEEN.add(type_id)
         type_size = 2.0
     return max(0, int(elements * type_size))
 
