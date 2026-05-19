@@ -279,6 +279,33 @@ FILTER_COMPATIBILITY_OPTIONS = [
 ]
 
 
+def shutdown_workers(*tokens_and_threads, join_timeout: float = 2.0) -> None:
+    """Cancel cancel-tokens and join daemon worker threads on tui() exit.
+
+    Accepts an interleaved list of ``CancelToken`` / ``threading.Thread`` /
+    ``None`` values; cancels every token, then joins every live thread with
+    ``join_timeout``. Exceptions during cancel/join are swallowed since this
+    runs on the shutdown path and there is nowhere useful to report them.
+    """
+    for item in tokens_and_threads:
+        if item is None:
+            continue
+        cancel = getattr(item, 'cancel', None)
+        if callable(cancel):
+            try:
+                cancel('tui shutdown')
+            except Exception:
+                pass
+    for item in tokens_and_threads:
+        if item is None:
+            continue
+        if isinstance(item, threading.Thread) and item.is_alive():
+            try:
+                item.join(timeout=join_timeout)
+            except Exception:
+                pass
+
+
 def profile_label(value: str) -> str:
     raw = (value or '').strip()
     key = raw.lower()
@@ -6378,3 +6405,9 @@ def tui(stdscr, app: AppConfig):
             model = active_detail_model() or selected_model()
             app.set_role('plan', model.id, sync_exports=True)
             message = f'{model.id} set as plan model.'
+
+    # Worker thread shutdown — see audit finding #5. Cancel any in-flight
+    # action/try tokens and join the daemon threads so cleanup_managed_processes
+    # in main.py doesn't race with subprocess work that's still posting to the
+    # action queue.
+    shutdown_workers(action_token, action_thread, try_token, try_thread)

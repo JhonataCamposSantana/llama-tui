@@ -1,10 +1,14 @@
 import curses
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from llama_tui.app import AppConfig
+from llama_tui.control import CancelToken
 from llama_tui.models import ModelConfig
+from llama_tui.ui import shutdown_workers
 from llama_tui.ui_benchmark import benchmark_plan_summary_lines
 from llama_tui.ui_components import truncate, wrap_card_lines
 from llama_tui.ui_models import (
@@ -159,6 +163,30 @@ class BenchmarkPlanLineTests(unittest.TestCase):
         text = '\n'.join(line for line, _kind in lines)
         self.assertIn('Generated candidates: 0', text)
         self.assertIn('none detected', text)
+
+
+class ShutdownWorkersTests(unittest.TestCase):
+    def test_cancels_tokens_and_joins_live_threads(self):
+        token = CancelToken()
+        stopper = threading.Event()
+
+        def runner():
+            while not stopper.is_set() and not token.is_cancelled():
+                time.sleep(0.01)
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        try:
+            shutdown_workers(token, thread, join_timeout=1.0)
+            self.assertTrue(token.is_cancelled())
+            self.assertFalse(thread.is_alive())
+        finally:
+            stopper.set()
+            thread.join(timeout=1.0)
+
+    def test_none_entries_are_tolerated(self):
+        # Should not raise when no tokens or threads are active.
+        shutdown_workers(None, None, join_timeout=0.1)
 
 
 if __name__ == '__main__':
