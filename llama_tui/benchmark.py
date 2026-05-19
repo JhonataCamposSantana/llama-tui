@@ -9640,16 +9640,21 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
         baseline_note = '; baseline no-MTP skipped as expected for recurrent/NextN' if baseline_skipped else ''
         # Report a token-weighted acceptance over the whole run, never a
         # single tiny-sample maximum.
-        weighted_rate, weighted_draft, weighted_samples = weighted_mtp_accept_rate(records)
-        if weighted_samples:
+        weighted_rate, weighted_draft, weighted_samples, weighted_reliability = weighted_mtp_accept_rate(records)
+        if weighted_samples and weighted_reliability == 'reliable':
             accept_summary = (
                 f'accept_rate={weighted_rate:.2%} '
                 f'(token-weighted over {weighted_draft} draft tokens, {weighted_samples} sample(s))'
             )
+        elif weighted_samples and weighted_reliability == 'sparse':
+            accept_summary = (
+                f'accept_rate={weighted_rate:.2%} '
+                f'(sparse sample: {weighted_draft} draft tokens across {weighted_samples} run(s), low confidence)'
+            )
         else:
             accept_summary = (
                 f'accept_rate={float(best.get("accept_rate", 0.0) or 0.0):.2%} '
-                '(small sample, low confidence)'
+                '(no acceptance samples available)'
             )
         msg = (
             f'{prefix}: best draft_n={best.get("mtp_draft_n_max")} '
@@ -9660,12 +9665,17 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
         event_name = 'benchmark_done'
         ok_result = True
     elif partial_mtp:
-        weighted_rate, weighted_draft, weighted_samples = weighted_mtp_accept_rate(partial_mtp)
-        accept_note = (
-            f'token-weighted accept_rate={weighted_rate:.2%} over {weighted_draft} draft tokens'
-            if weighted_samples
-            else 'acceptance sample too small to estimate reliably'
-        )
+        weighted_rate, weighted_draft, weighted_samples, weighted_reliability = weighted_mtp_accept_rate(partial_mtp)
+        if weighted_samples and weighted_reliability == 'reliable':
+            accept_note = (
+                f'token-weighted accept_rate={weighted_rate:.2%} over {weighted_draft} draft tokens'
+            )
+        elif weighted_samples and weighted_reliability == 'sparse':
+            accept_note = (
+                f'token-weighted accept_rate={weighted_rate:.2%} over {weighted_draft} sparse draft tokens (low confidence)'
+            )
+        else:
+            accept_note = 'no acceptance samples available'
         msg = (
             '⚠ MTP acceptance partial: draft-mtp initialised and produced acceptance '
             f'metrics ({accept_note}) before a memory guardrail '

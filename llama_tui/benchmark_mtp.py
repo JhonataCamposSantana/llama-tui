@@ -221,21 +221,32 @@ def best_mtp_acceptance_record(records: Sequence[Dict[str, object]]) -> Dict[str
 
 def weighted_mtp_accept_rate(
     records: Sequence[Dict[str, object]],
-) -> Tuple[float, int, int]:
-    """Token-weighted acceptance over MTP records with reliable sample sizes.
+) -> Tuple[float, int, int, str]:
+    """Token-weighted MTP acceptance with a reliability tag.
 
-    Returns ``(accept_rate, total_draft_tokens, sample_count)``. Records with
-    fewer than ``MTP_MIN_RELIABLE_DRAFT_TOKENS`` draft tokens are skipped so a
-    few tokens at 100% acceptance cannot dominate the reported figure.
+    Returns ``(accept_rate, total_draft_tokens, sample_count, reliability)``
+    where ``reliability`` is one of:
+
+    - ``'reliable'`` — at least one record met ``MTP_MIN_RELIABLE_DRAFT_TOKENS``
+      and only those records were included; tiny samples were excluded so they
+      could not dominate.
+    - ``'sparse'`` — no record met the threshold but at least one tiny MTP
+      sample was available. The rate is still computed from the tiny samples
+      instead of silently returning zero, so the selector can down-weight the
+      result rather than treat it as missing data.
+    - ``'none'`` — no MTP-enabled records with positive draft tokens at all.
     """
-    total_gen = 0
-    total_acc = 0
-    samples = 0
+    reliable_gen = 0
+    reliable_acc = 0
+    reliable_samples = 0
+    sparse_gen = 0
+    sparse_acc = 0
+    sparse_samples = 0
     for item in records:
         if not bool(item.get('mtp_enabled')):
             continue
         gen = _mtp_record_draft_tokens(item)
-        if gen < MTP_MIN_RELIABLE_DRAFT_TOKENS:
+        if gen <= 0:
             continue
         try:
             acc = int(item.get('accepted_tokens', 0) or 0)
@@ -243,12 +254,20 @@ def weighted_mtp_accept_rate(
             acc = 0
         if acc <= 0:
             acc = int(round(_record_float(item, 'accept_rate') * gen))
-        total_gen += gen
-        total_acc += min(max(acc, 0), gen)
-        samples += 1
-    if total_gen <= 0:
-        return 0.0, 0, 0
-    return round(total_acc / total_gen, 4), total_gen, samples
+        acc = min(max(acc, 0), gen)
+        if gen >= MTP_MIN_RELIABLE_DRAFT_TOKENS:
+            reliable_gen += gen
+            reliable_acc += acc
+            reliable_samples += 1
+        else:
+            sparse_gen += gen
+            sparse_acc += acc
+            sparse_samples += 1
+    if reliable_gen > 0:
+        return round(reliable_acc / reliable_gen, 4), reliable_gen, reliable_samples, 'reliable'
+    if sparse_gen > 0:
+        return round(sparse_acc / sparse_gen, 4), sparse_gen, sparse_samples, 'sparse'
+    return 0.0, 0, 0, 'none'
 
 
 def _record_float(record: Dict[str, object], key: str) -> float:

@@ -59,22 +59,32 @@ class Fix2AcceptanceParsingTests(unittest.TestCase):
         self.assertEqual(parsed['draft_tokens'], 1153)
         self.assertEqual(parsed['accept_rate'], round(906 / 1153, 4))
 
-    def test_weighted_accept_rate_ignores_tiny_samples(self):
-        rate, total, samples = weighted_mtp_accept_rate([
+    def test_weighted_accept_rate_prefers_reliable_samples(self):
+        rate, total, samples, reliability = weighted_mtp_accept_rate([
             {'mtp_enabled': True, 'draft_tokens': 1153, 'accepted_tokens': 906},
             {'mtp_enabled': True, 'draft_tokens': 7, 'accepted_tokens': 7},
         ])
         self.assertEqual(samples, 1)
         self.assertEqual(total, 1153)
         self.assertEqual(rate, round(906 / 1153, 4))
+        self.assertEqual(reliability, 'reliable')
 
-    def test_weighted_accept_rate_empty_when_all_tiny(self):
-        self.assertEqual(
-            weighted_mtp_accept_rate([
-                {'mtp_enabled': True, 'draft_tokens': 7, 'accepted_tokens': 7},
-            ]),
-            (0.0, 0, 0),
-        )
+    def test_weighted_accept_rate_falls_back_to_sparse_samples(self):
+        rate, total, samples, reliability = weighted_mtp_accept_rate([
+            {'mtp_enabled': True, 'draft_tokens': 7, 'accepted_tokens': 7},
+        ])
+        self.assertEqual(samples, 1)
+        self.assertEqual(total, 7)
+        self.assertEqual(rate, 1.0)
+        self.assertEqual(reliability, 'sparse')
+
+    def test_weighted_accept_rate_none_when_no_samples(self):
+        rate, total, samples, reliability = weighted_mtp_accept_rate([
+            {'mtp_enabled': False, 'draft_tokens': 100, 'accepted_tokens': 80},
+            {'mtp_enabled': True, 'draft_tokens': 0, 'accepted_tokens': 0},
+        ])
+        self.assertEqual((rate, total, samples), (0.0, 0, 0))
+        self.assertEqual(reliability, 'none')
 
 
 class Fix4PartialWinnerTests(unittest.TestCase):
