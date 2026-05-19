@@ -434,51 +434,47 @@ def release_engine_session_lock(lock_path: Path):
             pass
 
 
-def validate_buun_kv_args(args):
-    if args.engine != 'buun':
+_KV_ENGINE_RULES = (
+    ('buun', BUUN_KV_MODES, 'buun'),
+    ('turboquant', TURBOQUANT_KV_MODES, 'TurboQuant+'),
+    ('tq3', TQ3_KV_MODES, 'llama.cpp-tq3'),
+)
+
+
+def _validate_kv_args_for(args, engine_id, allowed_modes, engine_label):
+    if args.engine != engine_id:
         return
     for flag, value in (
         ('--kv', args.kv),
         ('--kv-key', args.kv_key),
         ('--kv-value', args.kv_value),
     ):
-        if value and value not in BUUN_KV_MODES:
-            raise SystemExit(f'Unsupported {flag} "{value}". Supported buun modes: {", ".join(BUUN_KV_MODES)}')
+        if value and value not in allowed_modes:
+            raise SystemExit(
+                f'Unsupported {flag} "{value}". Supported {engine_label} modes: {", ".join(allowed_modes)}'
+            )
+
+
+def validate_buun_kv_args(args):
+    _validate_kv_args_for(args, 'buun', BUUN_KV_MODES, 'buun')
 
 
 def validate_turboquant_kv_args(args):
-    if args.engine != 'turboquant':
-        return
-    for flag, value in (
-        ('--kv', args.kv),
-        ('--kv-key', args.kv_key),
-        ('--kv-value', args.kv_value),
-    ):
-        if value and value not in TURBOQUANT_KV_MODES:
-            raise SystemExit(
-                f'Unsupported {flag} "{value}". Supported TurboQuant+ modes: {", ".join(TURBOQUANT_KV_MODES)}'
-            )
+    _validate_kv_args_for(args, 'turboquant', TURBOQUANT_KV_MODES, 'TurboQuant+')
 
 
 def validate_tq3_kv_args(args):
-    if args.engine != 'tq3':
-        return
-    for flag, value in (
-        ('--kv', args.kv),
-        ('--kv-key', args.kv_key),
-        ('--kv-value', args.kv_value),
-    ):
-        if value and value not in TQ3_KV_MODES:
-            raise SystemExit(
-                f'Unsupported {flag} "{value}". Supported llama.cpp-tq3 modes: {", ".join(TQ3_KV_MODES)}'
-            )
+    _validate_kv_args_for(args, 'tq3', TQ3_KV_MODES, 'llama.cpp-tq3')
+
+
+def validate_kv_args(args):
+    for engine_id, modes, label in _KV_ENGINE_RULES:
+        _validate_kv_args_for(args, engine_id, modes, label)
 
 
 def main():
     args = build_cli_parser().parse_args()
-    validate_buun_kv_args(args)
-    validate_turboquant_kv_args(args)
-    validate_tq3_kv_args(args)
+    validate_kv_args(args)
     config_path = Path(args.config_path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_bootstrap_files(config_path)
