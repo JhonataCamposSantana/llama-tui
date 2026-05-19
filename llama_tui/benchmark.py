@@ -6689,9 +6689,14 @@ def benchmark_adaptive_candidate(
         # endpoint, scraped while the candidate server is still up.
         record_engine = str(runtime_context.get('engine', '') or '')
         if engine_supports_metrics(record_engine):
+            def _record_metrics_scrape_error(error_cls, message):
+                record.setdefault('server_metrics_scrape_warnings', []).append(
+                    f'{error_cls}: {message}'
+                )
             server_metrics = scrape_llama_server_metrics(
                 str(getattr(candidate, 'host', '') or '127.0.0.1'),
                 int(getattr(candidate, 'port', 0) or 0),
+                on_error=_record_metrics_scrape_error,
             )
             if server_metrics:
                 record['server_prompt_tokens_per_sec'] = round(float(server_metrics.get('prompt_tokens_per_sec', 0.0) or 0.0), 4)

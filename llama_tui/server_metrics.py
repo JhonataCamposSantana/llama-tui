@@ -9,7 +9,7 @@ the endpoint is absent, so a build without ``--metrics`` never breaks a run.
 
 import urllib.error
 import urllib.request
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional, Set, Tuple
 
 
 # Prometheus metric name -> friendly key in the returned dict.
@@ -68,15 +68,27 @@ def _metrics_host(host: str) -> str:
     return normalized
 
 
+_SCRAPE_ERROR_SEEN: Set[Tuple[str, int, str]] = set()
+
+
+def reset_scrape_error_log() -> None:
+    """Clear the per-(host, port, error_class) error dedup cache. Test helper."""
+    _SCRAPE_ERROR_SEEN.clear()
+
+
 def scrape_llama_server_metrics(
     host: str,
     port: int,
     timeout: float = 2.0,
+    on_error: Optional[Callable[[str, str], None]] = None,
 ) -> Optional[Dict[str, float]]:
     """GET ``http://{host}:{port}/metrics`` and parse it; ``None`` on any failure.
 
     A ``None`` result lets every caller degrade gracefully when the server was
-    not built/launched with ``--metrics`` or is unreachable.
+    not built/launched with ``--metrics`` or is unreachable. When ``on_error``
+    is provided, it is invoked at most once per (host, port, exception class)
+    with ``(error_class_name, message)`` so callers can surface transient
+    failures (timeout, refused) without spamming the user.
     """
     try:
         port_num = int(port)
@@ -84,13 +96,22 @@ def scrape_llama_server_metrics(
         return None
     if port_num <= 0:
         return None
-    url = f'http://{_metrics_host(host)}:{port_num}/metrics'
+    host_norm = _metrics_host(host)
+    url = f'http://{host_norm}:{port_num}/metrics'
     try:
         with urllib.request.urlopen(url, timeout=max(0.1, float(timeout))) as response:
             if getattr(response, 'status', 200) not in (200, None):
                 return None
             body = response.read().decode('utf-8', errors='replace')
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        if on_error is not None:
+            key = (host_norm, port_num, type(exc).__name__)
+            if key not in _SCRAPE_ERROR_SEEN:
+                _SCRAPE_ERROR_SEEN.add(key)
+                try:
+                    on_error(type(exc).__name__, str(exc))
+                except Exception:
+                    pass
         return None
     parsed = parse_prometheus_metrics(body)
     return parsed or None

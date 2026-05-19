@@ -9,6 +9,7 @@ from llama_tui.models import ModelConfig
 from llama_tui.server_metrics import (
     engine_supports_metrics,
     parse_prometheus_metrics,
+    reset_scrape_error_log,
     scrape_llama_server_metrics,
 )
 from llama_tui.ui import (
@@ -88,6 +89,23 @@ class ServerMetricsTests(unittest.TestCase):
             side_effect=urllib.error.URLError('refused'),
         ):
             self.assertIsNone(scrape_llama_server_metrics('127.0.0.1', 8080))
+
+    def test_scrape_error_callback_fires_once_per_host_port_error_class(self):
+        reset_scrape_error_log()
+        seen = []
+
+        def on_error(cls, message):
+            seen.append((cls, message))
+
+        with patch(
+            'llama_tui.server_metrics.urllib.request.urlopen',
+            side_effect=urllib.error.URLError('refused'),
+        ):
+            scrape_llama_server_metrics('127.0.0.1', 8181, on_error=on_error)
+            scrape_llama_server_metrics('127.0.0.1', 8181, on_error=on_error)
+            scrape_llama_server_metrics('127.0.0.1', 8182, on_error=on_error)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0][0], 'URLError')
 
 
 class ThermalProbeTests(unittest.TestCase):
