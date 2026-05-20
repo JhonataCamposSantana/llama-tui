@@ -1170,6 +1170,30 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertGreater(min(failures), max(successes))
         self.assertGreater(len(probed), 3)
 
+    def test_adaptive_context_search_respects_deadline_expired(self):
+        probed = []
+
+        def probe(ctx):
+            probed.append(ctx)
+            return True
+
+        # Deadline expires after the first probe completes.
+        def expired():
+            return len(probed) >= 1
+
+        successes, failures = adaptive_context_search(
+            2048,
+            20000,
+            probe,
+            max_probes=10,
+            deadline_expired=expired,
+        )
+
+        # Only the first probe should have run before deadline aborted the search.
+        self.assertEqual(len(probed), 1)
+        self.assertEqual(successes, [2048])
+        self.assertEqual(failures, [])
+
     def test_exhaustive_context_ladder_uses_tiered_steps(self):
         self.assertEqual(exhaustive_context_ladder(2048, 8192), [2048, 4096, 6144, 8192])
         self.assertEqual(

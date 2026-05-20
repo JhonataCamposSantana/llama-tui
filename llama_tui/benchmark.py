@@ -3059,12 +3059,24 @@ def adaptive_context_search(
     ctx_upper: int,
     probe: Callable[[int], bool],
     max_probes: int = ADAPTIVE_MAX_CONTEXT_PROBES,
+    deadline_expired: Optional[Callable[[], bool]] = None,
 ) -> Tuple[List[int], List[int]]:
+    """Search the largest working context size via exponential growth then
+    binary refinement and gap-filling.
+
+    ``deadline_expired``, when provided, is checked before every probe and
+    between each refinement step. If it returns True, the search exits early
+    with whatever successes/failures were collected — this prevents a single
+    long-context candidate from consuming the entire global benchmark budget.
+    """
     ctx_min = round_context(max(256, ctx_min))
     ctx_upper = max(ctx_min, round_context_down(ctx_upper))
     successes: List[int] = []
     failures: List[int] = []
     seen = set()
+
+    def _out_of_time() -> bool:
+        return bool(deadline_expired and deadline_expired())
 
     def run_probe(value: int) -> bool:
         value = max(ctx_min, min(ctx_upper, round_context(value)))
@@ -3079,6 +3091,8 @@ def adaptive_context_search(
     last_success = 0
     first_failure = 0
     while len(seen) < max_probes:
+        if _out_of_time():
+            return sorted(set(successes)), sorted(set(failures))
         ok = run_probe(current)
         if ok:
             last_success = current
@@ -3090,6 +3104,8 @@ def adaptive_context_search(
         break
 
     if last_success and not first_failure and last_success < ctx_upper and len(seen) < max_probes:
+        if _out_of_time():
+            return sorted(set(successes)), sorted(set(failures))
         if run_probe(ctx_upper):
             last_success = ctx_upper
         else:
@@ -3099,7 +3115,7 @@ def adaptive_context_search(
         low = min(last_success, first_failure)
         high = max(last_success, first_failure)
         for _ in range(ADAPTIVE_BINARY_STEPS):
-            if len(seen) >= max_probes:
+            if len(seen) >= max_probes or _out_of_time():
                 break
             midpoint = round_context((low + high) // 2)
             if midpoint <= low or midpoint >= high:
@@ -3110,6 +3126,8 @@ def adaptive_context_search(
                 high = midpoint
 
     while len(seen) < max_probes and len(successes) >= 2:
+        if _out_of_time():
+            break
         ordered = sorted(set(successes))
         gaps = [(ordered[idx + 1] - ordered[idx], ordered[idx], ordered[idx + 1]) for idx in range(len(ordered) - 1)]
         gaps = [gap for gap in sorted(gaps, reverse=True) if gap[0] > ADAPTIVE_CONTEXT_ROUNDING * 2]
@@ -6904,7 +6922,13 @@ def adaptive_benchmark_candidates(
                 app.stop(candidate, managed_only=True)
                 sleep_with_cancel(0.25, cancel_token)
 
-        successes, _failures = adaptive_context_search(ctx_min, upper, probe, max_probes=ADAPTIVE_MAX_CONTEXT_PROBES)
+        successes, _failures = adaptive_context_search(
+            ctx_min,
+            upper,
+            probe,
+            max_probes=ADAPTIVE_MAX_CONTEXT_PROBES,
+            deadline_expired=lambda: time.monotonic() >= deadline,
+        )
         contexts_by_variant[variant] = successes or [ctx_min]
 
     candidates: List[Tuple[str, ModelConfig, str]] = []
