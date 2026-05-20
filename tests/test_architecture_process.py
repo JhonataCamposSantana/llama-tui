@@ -1,6 +1,7 @@
 import struct
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -404,7 +405,7 @@ class OptimizerProcessPressureTests(unittest.TestCase):
                 low_layers = choose_gpu_layers_for_profile(model, profile, 'moderate')
             with patch('llama_tui.optimize.benchmark_current_process_pressure', return_value=high):
                 high_layers = choose_gpu_layers_for_profile(model, profile, 'moderate')
-                candidate = ModelConfig(**model.__dict__)
+                candidate = replace(model)
                 apply_optimization_preset(candidate, 'tokens_per_sec', tier='extreme', profile=profile)
 
         self.assertLess(high_layers, low_layers)

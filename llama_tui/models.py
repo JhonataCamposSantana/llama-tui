@@ -8,7 +8,7 @@ HERMES_DEFAULT_MIN_CONTEXT_TOKENS = 65536
 HERMES_LEGACY_DEFAULT_MIN_CONTEXT_TOKENS = 64000
 
 
-@dataclass
+@dataclass(slots=True)
 class ModelConfig:
     id: str
     name: str
