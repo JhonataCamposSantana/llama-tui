@@ -11,6 +11,36 @@ from .textutil import ellipsize
 from .ui_theme import kind_style, style
 
 
+# Kind -> leading symbol mapping for status-coloured lines. Audit finding
+# #16: status chips in the MTP Doctor / Benchmark Plan / similar overlays
+# previously relied on color alone to distinguish success/warning/error.
+# Prefixing a small ASCII-safe glyph keeps the signal visible on dumb
+# terminals, in screenshots, and for color-blind users.
+KIND_STATUS_SYMBOLS: Dict[str, str] = {
+    'success': '✓',
+    'error': '✗',
+    'warning': '⚠',
+    'muted': '·',
+}
+
+
+def kind_status_symbol(kind: str) -> str:
+    """Return a one-character glyph for ``kind``, or '' for heading/normal."""
+    return KIND_STATUS_SYMBOLS.get(str(kind or '').strip().lower(), '')
+
+
+def kind_status_prefix(text: str, kind: str) -> str:
+    """Prepend a kind-derived symbol to ``text`` when one applies.
+
+    Headings and plain ``normal`` lines pass through unchanged so layout
+    is preserved.
+    """
+    symbol = kind_status_symbol(kind)
+    if not symbol:
+        return text
+    return f'{symbol} {text}'
+
+
 def safe_addch(stdscr, y: int, x: int, ch, attr: int = 0):
     try:
         stdscr.addch(y, x, ch, attr)

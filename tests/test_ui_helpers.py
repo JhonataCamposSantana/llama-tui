@@ -10,7 +10,12 @@ from llama_tui.control import CancelToken
 from llama_tui.models import ModelConfig
 from llama_tui.ui import shutdown_workers
 from llama_tui.ui_benchmark import benchmark_plan_summary_lines
-from llama_tui.ui_components import truncate, wrap_card_lines
+from llama_tui.ui_components import (
+    kind_status_prefix,
+    kind_status_symbol,
+    truncate,
+    wrap_card_lines,
+)
 from llama_tui.ui_models import (
     build_model_row_summary,
     format_engine_badge,
@@ -163,6 +168,28 @@ class BenchmarkPlanLineTests(unittest.TestCase):
         text = '\n'.join(line for line, _kind in lines)
         self.assertIn('Generated candidates: 0', text)
         self.assertIn('none detected', text)
+
+
+class KindStatusSymbolTests(unittest.TestCase):
+    def test_symbol_per_known_kind(self):
+        self.assertEqual(kind_status_symbol('success'), '✓')
+        self.assertEqual(kind_status_symbol('error'), '✗')
+        self.assertEqual(kind_status_symbol('warning'), '⚠')
+        self.assertEqual(kind_status_symbol('muted'), '·')
+
+    def test_no_symbol_for_heading_or_normal(self):
+        self.assertEqual(kind_status_symbol('heading'), '')
+        self.assertEqual(kind_status_symbol('normal'), '')
+        self.assertEqual(kind_status_symbol(''), '')
+        self.assertEqual(kind_status_symbol(None), '')
+
+    def test_prefix_prepends_glyph_and_space(self):
+        self.assertEqual(kind_status_prefix('--spec-type included: yes', 'success'), '✓ --spec-type included: yes')
+        self.assertEqual(kind_status_prefix('--spec-type included: no', 'error'), '✗ --spec-type included: no')
+
+    def test_prefix_passes_through_for_headings(self):
+        self.assertEqual(kind_status_prefix('MTP Capability Probe', 'heading'), 'MTP Capability Probe')
+        self.assertEqual(kind_status_prefix('plain text', 'normal'), 'plain text')
 
 
 class ShutdownWorkersTests(unittest.TestCase):

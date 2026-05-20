@@ -57,6 +57,7 @@ from .ui_components import (
     draw_key_hint_bar,
     draw_section_title,
     draw_status_chip,
+    kind_status_prefix,
     safe_addch,
     safe_addstr,
     truncate,
@@ -3336,7 +3337,8 @@ def show_mtp_doctor_overlay(stdscr, colors, app: AppConfig, active_model: Option
             else colors['muted'] if kind == 'muted'
             else curses.A_NORMAL
         )
-        items.extend((line, attr) for line in wrap_display_item_lines(text, box_w - 4))
+        display_text = kind_status_prefix(text, kind)
+        items.extend((line, attr) for line in wrap_display_item_lines(display_text, box_w - 4))
     scroll = 0
     stdscr.nodelay(False)
     try:
@@ -3375,7 +3377,8 @@ def show_benchmark_plan_overlay(stdscr, colors, app: AppConfig, active_model: Op
     items = []
     for text, kind in benchmark_plan_lines(app, active_model, depth='fast'):
         attr = kind_style(colors, kind)
-        items.extend((line, attr) for line in wrap_display_item_lines(text, box_w - 4))
+        display_text = kind_status_prefix(text, kind)
+        items.extend((line, attr) for line in wrap_display_item_lines(display_text, box_w - 4))
     scroll = 0
     stdscr.nodelay(False)
     try:
