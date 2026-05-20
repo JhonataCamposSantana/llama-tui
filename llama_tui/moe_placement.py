@@ -59,13 +59,33 @@ def _candidate_limit(tier: str, small_gpu: bool = False) -> int:
 
 
 def _partial_ngl_ladder(layer_count: int) -> List[int]:
+    """Candidate ladder for partial GPU offload (-ngl N).
+
+    The legacy ladder hardcoded (8, 12, 13, 16, 20) which was tuned for
+    ~32-layer models. Modern MoE shapes are much bigger — DeepSeek-V3
+    has 61 layers, Qwen3-30B-A3B has 48 — so we now parametrize on
+    ``layer_count``: small absolute floors plus fractional steps
+    (1/4, 1/3, 1/2) of the model so users on small-VRAM setups still
+    get meaningful coverage. When the layer count is unknown the
+    legacy values are kept as a conservative fallback.
+    """
+    if layer_count <= 0:
+        return [8, 12, 13, 16, 20]
+    ceiling = max(1, int(layer_count))
+    raw = [
+        8,
+        12,
+        16,
+        max(1, ceiling // 4),
+        max(1, ceiling // 3),
+        max(1, ceiling // 2),
+    ]
     values: List[int] = []
-    ceiling = max(1, int(layer_count or 0)) if layer_count > 0 else 999
-    for value in (8, 12, 13, 16, 20):
+    for value in raw:
         clamped = max(1, min(ceiling, int(value)))
         if clamped not in values:
             values.append(clamped)
-    return values
+    return sorted(values)
 
 
 def _tq3_small_gpu_candidates(
