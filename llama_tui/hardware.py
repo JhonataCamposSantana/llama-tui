@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -520,6 +521,133 @@ def probe_amd_rocm_gpu() -> Tuple[str, int, int, str]:
     return best_name, best_total, best_free, ''
 
 
+# Apple's Metal driver on M-series typically caps the GPU "Recommended Max
+# Working Set Size" near 75% of unified memory. Reading that exact value
+# requires a Swift/Objective-C call into MTLDevice; we approximate with the
+# fraction so the optimizer at least routes through the GPU code path
+# instead of going CPU-only on every macOS launch. Callers that need the
+# real ceiling can override by setting LLAMA_TUI_APPLE_METAL_FRACTION.
+APPLE_METAL_WORKING_SET_FRACTION = 0.75
+
+
+def _sysctl_bytes(key: str) -> int:
+    sysctl = shutil.which('sysctl')
+    if not sysctl:
+        return 0
+    try:
+        result = subprocess.run(
+            [sysctl, '-n', key],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if result.returncode != 0:
+        return 0
+    try:
+        return int((result.stdout or '').strip())
+    except ValueError:
+        return 0
+
+
+def _sysctl_text(key: str) -> str:
+    sysctl = shutil.which('sysctl')
+    if not sysctl:
+        return ''
+    try:
+        result = subprocess.run(
+            [sysctl, '-n', key],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    if result.returncode != 0:
+        return ''
+    return (result.stdout or '').strip()
+
+
+def _apple_metal_fraction() -> float:
+    raw = os.environ.get('LLAMA_TUI_APPLE_METAL_FRACTION', '').strip()
+    if not raw:
+        return APPLE_METAL_WORKING_SET_FRACTION
+    try:
+        value = float(raw)
+    except ValueError:
+        return APPLE_METAL_WORKING_SET_FRACTION
+    # Keep the fraction physical: at least a tiny sliver, never above 1.0.
+    return max(0.05, min(1.0, value))
+
+
+def _vm_stat_free_bytes() -> int:
+    vm_stat = shutil.which('vm_stat')
+    if not vm_stat:
+        return 0
+    try:
+        result = subprocess.run(
+            [vm_stat],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if result.returncode != 0:
+        return 0
+    page_size = 4096
+    free_pages = 0
+    speculative_pages = 0
+    for line in (result.stdout or '').splitlines():
+        if 'page size of' in line:
+            for token in line.split():
+                token = token.strip('.,()')
+                if token.isdigit():
+                    page_size = int(token)
+                    break
+            continue
+        label, sep, value = line.partition(':')
+        if not sep:
+            continue
+        digits = value.strip().rstrip('.').replace(',', '')
+        if not digits.isdigit():
+            continue
+        if label.strip().lower() == 'pages free':
+            free_pages = int(digits)
+        elif label.strip().lower() == 'pages speculative':
+            speculative_pages = int(digits)
+    return (free_pages + speculative_pages) * page_size
+
+
+def probe_apple_silicon_gpu() -> Tuple[str, int, int, str]:
+    """Return ``(name, memory_total_bytes, memory_free_bytes, error)`` for
+    Apple Silicon Macs.
+
+    M-series Macs use unified memory: there is no separate VRAM pool. We
+    report the Metal "recommended working set" fraction of system memory so
+    the optimizer can size GPU offload against a realistic ceiling instead
+    of falling through to CPU-only. The caller should still subtract the
+    weight footprint from the same system_memory budget — both pools alias
+    the same physical RAM.
+    """
+    if sys.platform != 'darwin':
+        return '', 0, 0, ''
+    total_ram = _sysctl_bytes('hw.memsize')
+    if total_ram <= 0:
+        return '', 0, 0, ''
+    free_ram = _vm_stat_free_bytes()
+    if free_ram <= 0:
+        # vm_stat absent or unparseable — fall back to a conservative
+        # "half free" estimate so the GPU path is still picked.
+        free_ram = total_ram // 2
+    name = _sysctl_text('machdep.cpu.brand_string') or 'Apple Silicon GPU'
+    fraction = _apple_metal_fraction()
+    gpu_total = int(total_ram * fraction)
+    gpu_free = int(min(free_ram, total_ram) * fraction)
+    return name, gpu_total, gpu_free, ''
+
+
 def probe_nvidia_gpu_thermal() -> Tuple[int, bool]:
     """Return (gpu_temperature_celsius, thermal_throttle_active).
 
@@ -580,6 +708,16 @@ def benchmark_current_hardware() -> HardwareProfile:
             gpu_error = ''
         elif amd_error and not gpu_error:
             gpu_error = amd_error
+    if gpu_total <= 0 and gpu_free <= 0:
+        # On macOS Apple Silicon there is no nvidia-smi/rocm-smi; report
+        # Metal's recommended working-set fraction of unified memory so the
+        # optimizer routes through the GPU path instead of going CPU-only.
+        apple_name, apple_total, apple_free, apple_error = probe_apple_silicon_gpu()
+        if apple_total > 0 or apple_free > 0:
+            gpu_name, gpu_total, gpu_free = apple_name, apple_total, apple_free
+            gpu_error = ''
+        elif apple_error and not gpu_error:
+            gpu_error = apple_error
     gpu_temp, gpu_throttle = probe_nvidia_gpu_thermal()
     return HardwareProfile(
         cpu_logical=logical,

@@ -1,3 +1,4 @@
+import os
 import tempfile
 import types
 import unittest
@@ -5,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from llama_tui.hardware import (
+    APPLE_METAL_WORKING_SET_FRACTION,
     _compact_cmdline,
     _known_process_bucket,
     _read_loadavg,
@@ -12,6 +14,7 @@ from llama_tui.hardware import (
     bytes_to_gib,
     clamp_memory_to_cgroup,
     probe_amd_rocm_gpu,
+    probe_apple_silicon_gpu,
     read_cgroup_memory_limits,
 )
 
@@ -144,6 +147,87 @@ class ProbeAmdRocmGpuTests(unittest.TestCase):
             name, total, free, error = probe_amd_rocm_gpu()
         self.assertEqual((name, total, free), ('', 0, 0))
         self.assertIn('boom', error)
+
+
+class ProbeAppleSiliconGpuTests(unittest.TestCase):
+    _VM_STAT_OUTPUT = (
+        'Mach Virtual Memory Statistics: (page size of 16384 bytes)\n'
+        'Pages free:                               65536.\n'
+        'Pages active:                           1000000.\n'
+        'Pages speculative:                         4096.\n'
+    )
+
+    def _which_factory(self):
+        # Route shutil.which by command name so sysctl and vm_stat resolve to
+        # distinct paths; the subprocess dispatcher uses cmd[0] to pick the
+        # canned response.
+        def fake_which(name):
+            if name == 'sysctl':
+                return '/usr/sbin/sysctl'
+            if name == 'vm_stat':
+                return '/usr/bin/vm_stat'
+            return None
+        return fake_which
+
+    def _sysctl_factory(self, mapping):
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0].endswith('sysctl'):
+                key = cmd[-1]
+                value = mapping.get(key, '')
+                return types.SimpleNamespace(returncode=0, stdout=str(value) + '\n', stderr='')
+            if cmd[0].endswith('vm_stat'):
+                return types.SimpleNamespace(returncode=0, stdout=self._VM_STAT_OUTPUT, stderr='')
+            return types.SimpleNamespace(returncode=1, stdout='', stderr='unhandled')
+        return fake_run
+
+    def test_returns_empty_on_non_darwin(self):
+        with patch('llama_tui.hardware.sys.platform', 'linux'):
+            self.assertEqual(probe_apple_silicon_gpu(), ('', 0, 0, ''))
+
+    def test_apple_silicon_reports_metal_working_set_fraction(self):
+        total_ram = 32 * 1024**3
+        mapping = {
+            'hw.memsize': total_ram,
+            'machdep.cpu.brand_string': 'Apple M2 Pro',
+        }
+        free_pages = (65536 + 4096) * 16384  # vm_stat free+speculative * 16k page
+        with patch('llama_tui.hardware.sys.platform', 'darwin'), \
+                patch('llama_tui.hardware.shutil.which', side_effect=self._which_factory()), \
+                patch('llama_tui.hardware.subprocess.run', side_effect=self._sysctl_factory(mapping)):
+            name, gpu_total, gpu_free, error = probe_apple_silicon_gpu()
+        expected_total = int(total_ram * APPLE_METAL_WORKING_SET_FRACTION)
+        expected_free = int(min(free_pages, total_ram) * APPLE_METAL_WORKING_SET_FRACTION)
+        self.assertEqual(name, 'Apple M2 Pro')
+        self.assertEqual(gpu_total, expected_total)
+        self.assertEqual(gpu_free, expected_free)
+        self.assertEqual(error, '')
+
+    def test_apple_silicon_env_override_replaces_fraction(self):
+        total_ram = 16 * 1024**3
+        mapping = {
+            'hw.memsize': total_ram,
+            'machdep.cpu.brand_string': 'Apple M1',
+        }
+        prev = os.environ.get('LLAMA_TUI_APPLE_METAL_FRACTION')
+        try:
+            os.environ['LLAMA_TUI_APPLE_METAL_FRACTION'] = '0.5'
+            with patch('llama_tui.hardware.sys.platform', 'darwin'), \
+                    patch('llama_tui.hardware.shutil.which', side_effect=self._which_factory()), \
+                    patch('llama_tui.hardware.subprocess.run', side_effect=self._sysctl_factory(mapping)):
+                _name, gpu_total, _gpu_free, _error = probe_apple_silicon_gpu()
+            self.assertEqual(gpu_total, total_ram // 2)
+        finally:
+            if prev is None:
+                os.environ.pop('LLAMA_TUI_APPLE_METAL_FRACTION', None)
+            else:
+                os.environ['LLAMA_TUI_APPLE_METAL_FRACTION'] = prev
+
+    def test_apple_silicon_returns_empty_when_memsize_unknown(self):
+        mapping = {'hw.memsize': ''}
+        with patch('llama_tui.hardware.sys.platform', 'darwin'), \
+                patch('llama_tui.hardware.shutil.which', side_effect=self._which_factory()), \
+                patch('llama_tui.hardware.subprocess.run', side_effect=self._sysctl_factory(mapping)):
+            self.assertEqual(probe_apple_silicon_gpu(), ('', 0, 0, ''))
 
 
 if __name__ == '__main__':
