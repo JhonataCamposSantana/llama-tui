@@ -459,6 +459,67 @@ def probe_nvidia_gpu() -> Tuple[str, int, int, str]:
             best_total = total
             best_free = free
     return best_name, best_total, best_free, ''
+def probe_amd_rocm_gpu() -> Tuple[str, int, int, str]:
+    """Return ``(name, memory_total_bytes, memory_free_bytes, error)`` from
+    ``rocm-smi``. Mirrors :func:`probe_nvidia_gpu` so AMD ROCm hosts get the
+    same ``HardwareProfile`` shape as NVIDIA hosts. Returns empty/zero values
+    when rocm-smi is unavailable or fails — the caller treats that as "no GPU
+    of this kind detected" and may try other backends.
+    """
+    rocm_smi = shutil.which('rocm-smi')
+    if not rocm_smi:
+        return '', 0, 0, ''
+    try:
+        result = subprocess.run(
+            [rocm_smi, '--showmeminfo', 'vram', '--showproductname', '--csv'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception as exc:
+        return '', 0, 0, f'rocm-smi failed: {exc}'
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or '').strip().splitlines()
+        return '', 0, 0, detail[0] if detail else 'rocm-smi failed'
+    best_name = ''
+    best_total = 0
+    best_free = 0
+    # rocm-smi --csv emits one header row then one row per device. We look up
+    # columns by header name so column-order changes in future ROCm releases
+    # do not silently mis-map values.
+    rows = [line for line in result.stdout.splitlines() if line.strip()]
+    if not rows:
+        return '', 0, 0, ''
+    header_parts = [part.strip() for part in rows[0].split(',')]
+    def column(row_parts: List[str], *candidates: str) -> str:
+        for candidate in candidates:
+            try:
+                idx = header_parts.index(candidate)
+            except ValueError:
+                continue
+            if idx < len(row_parts):
+                return row_parts[idx].strip()
+        return ''
+    for line in rows[1:]:
+        parts = [part.strip() for part in line.split(',')]
+        if len(parts) < 2:
+            continue
+        total_raw = column(parts, 'VRAM Total Memory (B)', 'VRAM Total (B)')
+        used_raw = column(parts, 'VRAM Total Used Memory (B)', 'VRAM Used (B)')
+        name_raw = column(parts, 'Card series', 'Card model', 'Card SKU', 'GPU')
+        try:
+            total = int(total_raw)
+            used = int(used_raw)
+        except (TypeError, ValueError):
+            continue
+        free = max(0, total - used)
+        if free > best_free:
+            best_name = name_raw or 'AMD GPU'
+            best_total = total
+            best_free = free
+    return best_name, best_total, best_free, ''
+
+
 def probe_nvidia_gpu_thermal() -> Tuple[int, bool]:
     """Return (gpu_temperature_celsius, thermal_throttle_active).
 
@@ -509,6 +570,16 @@ def benchmark_current_hardware() -> HardwareProfile:
         mem.get('MemAvailable', 0),
     )
     gpu_name, gpu_total, gpu_free, gpu_error = probe_nvidia_gpu()
+    if gpu_total <= 0 and gpu_free <= 0:
+        # Fall back to ROCm so AMD users get a populated HardwareProfile.
+        # nvidia-smi takes precedence on hosts that have both because the
+        # llama.cpp CUDA path is still the dominant deployment target.
+        amd_name, amd_total, amd_free, amd_error = probe_amd_rocm_gpu()
+        if amd_total > 0 or amd_free > 0:
+            gpu_name, gpu_total, gpu_free = amd_name, amd_total, amd_free
+            gpu_error = ''
+        elif amd_error and not gpu_error:
+            gpu_error = amd_error
     gpu_temp, gpu_throttle = probe_nvidia_gpu_thermal()
     return HardwareProfile(
         cpu_logical=logical,

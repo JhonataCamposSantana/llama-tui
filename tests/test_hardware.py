@@ -1,6 +1,8 @@
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from llama_tui.hardware import (
     _compact_cmdline,
@@ -9,6 +11,7 @@ from llama_tui.hardware import (
     _read_process_stat,
     bytes_to_gib,
     clamp_memory_to_cgroup,
+    probe_amd_rocm_gpu,
     read_cgroup_memory_limits,
 )
 
@@ -105,6 +108,42 @@ class CgroupMemoryTests(unittest.TestCase):
             total, available = clamp_memory_to_cgroup(64 * 1024**3, 50 * 1024**3, root)
             self.assertEqual(total, 64 * 1024**3)
             self.assertEqual(available, 50 * 1024**3)
+
+
+class ProbeAmdRocmGpuTests(unittest.TestCase):
+    _SAMPLE_CSV = (
+        'device,Card series,VRAM Total Memory (B),VRAM Total Used Memory (B)\n'
+        'card0,Radeon RX 7900 XTX,25757220864,2147483648\n'
+    )
+
+    def test_returns_empty_when_rocm_smi_missing(self):
+        with patch('llama_tui.hardware.shutil.which', return_value=None):
+            self.assertEqual(probe_amd_rocm_gpu(), ('', 0, 0, ''))
+
+    def test_parses_csv_into_total_and_free(self):
+        fake = types.SimpleNamespace(returncode=0, stdout=self._SAMPLE_CSV, stderr='')
+        with patch('llama_tui.hardware.shutil.which', return_value='/usr/bin/rocm-smi'), \
+                patch('llama_tui.hardware.subprocess.run', return_value=fake):
+            name, total, free, error = probe_amd_rocm_gpu()
+        self.assertEqual(name, 'Radeon RX 7900 XTX')
+        self.assertEqual(total, 25757220864)
+        self.assertEqual(free, 25757220864 - 2147483648)
+        self.assertEqual(error, '')
+
+    def test_returns_error_message_on_nonzero_exit(self):
+        fake = types.SimpleNamespace(returncode=1, stdout='', stderr='rocm-smi: no devices\n')
+        with patch('llama_tui.hardware.shutil.which', return_value='/usr/bin/rocm-smi'), \
+                patch('llama_tui.hardware.subprocess.run', return_value=fake):
+            name, total, free, error = probe_amd_rocm_gpu()
+        self.assertEqual((name, total, free), ('', 0, 0))
+        self.assertIn('no devices', error)
+
+    def test_subprocess_exception_is_surfaced_as_error(self):
+        with patch('llama_tui.hardware.shutil.which', return_value='/usr/bin/rocm-smi'), \
+                patch('llama_tui.hardware.subprocess.run', side_effect=OSError('boom')):
+            name, total, free, error = probe_amd_rocm_gpu()
+        self.assertEqual((name, total, free), ('', 0, 0))
+        self.assertIn('boom', error)
 
 
 if __name__ == '__main__':
