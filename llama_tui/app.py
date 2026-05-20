@@ -27,6 +27,13 @@ from .constants import (
     DEFAULT_MODEL_PORT,
     DEFAULT_VLLM_COMMAND,
 )
+from .runtime_paths import (
+    legacy_logfile,
+    legacy_pid_metadata_file,
+    legacy_pidfile,
+    runtime_artifact_dir,
+    runtime_artifact_path,
+)
 from .benchmark_store import (
     ENGINE_BENCHMARK_FIELDS,
     apply_benchmark_payload,
@@ -774,22 +781,24 @@ class AppConfig:
             return self.active_engine_key_for_model(model)
         return (self.runtime_profile.engine or 'llama.cpp').strip() or 'llama.cpp'
 
+    # Pure runtime-path helpers live in runtime_paths.py now. The thin
+    # wrappers below resolve the engine key off the model registry first,
+    # then defer to the module-level functions.
     def _runtime_artifact_dir(self, engine_key: str) -> Path:
-        slug = ''.join(ch if ch.isalnum() or ch in ('-', '_', '.') else '_' for ch in str(engine_key or 'llama.cpp'))
-        return CACHE_DIR / 'runtime' / (slug or 'llama.cpp')
+        return runtime_artifact_dir(engine_key)
 
     def runtime_artifact_path(self, model_id: str, suffix: str, engine_key: Optional[str] = None) -> Path:
         engine = self._runtime_artifact_engine_for_model_id(model_id, engine_key)
-        return self._runtime_artifact_dir(engine) / f'{model_id}{suffix}'
+        return runtime_artifact_path(model_id, suffix, engine)
 
     def legacy_pidfile(self, model_id: str) -> Path:
-        return CACHE_DIR / f'{model_id}.pid'
+        return legacy_pidfile(model_id)
 
     def legacy_pid_metadata_file(self, model_id: str) -> Path:
-        return CACHE_DIR / f'{model_id}.pid.json'
+        return legacy_pid_metadata_file(model_id)
 
     def legacy_logfile(self, model_id: str) -> Path:
-        return CACHE_DIR / f'{model_id}.log'
+        return legacy_logfile(model_id)
 
     def pidfile(self, model_id: str, engine_key: Optional[str] = None) -> Path:
         return self.runtime_artifact_path(model_id, '.pid', engine_key)

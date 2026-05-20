@@ -1398,7 +1398,12 @@ class RuntimeProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model = ModelConfig(id='m', name='M', path='/models/m.gguf', alias='m', port=18080)
-            with patch('llama_tui.app.CACHE_DIR', root):
+            # Patch the canonical CACHE_DIR so the runtime_paths helpers (which
+            # look it up via the constants module) see the temp root; the
+            # legacy app.CACHE_DIR patch is kept for the few app.py call sites
+            # that still bind the name locally.
+            with patch('llama_tui.constants.CACHE_DIR', root), \
+                    patch('llama_tui.app.CACHE_DIR', root):
                 llama_app = AppConfig(root / 'llama.json')
                 llama_app.models = [model]
                 buun_app = AppConfig(
