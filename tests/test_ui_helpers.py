@@ -9,6 +9,7 @@ from llama_tui.app import AppConfig
 from llama_tui.control import CancelToken
 from llama_tui.models import ModelConfig
 from llama_tui.ui import shutdown_workers
+from llama_tui.ui_action_runner import ActionRunner
 from llama_tui.ui_benchmark import benchmark_plan_summary_lines
 from llama_tui.ui_components import (
     kind_status_prefix,
@@ -214,6 +215,47 @@ class ShutdownWorkersTests(unittest.TestCase):
     def test_none_entries_are_tolerated(self):
         # Should not raise when no tokens or threads are active.
         shutdown_workers(None, None, join_timeout=0.1)
+
+
+class ActionRunnerTests(unittest.TestCase):
+    def test_default_is_idle(self):
+        runner = ActionRunner()
+        self.assertFalse(runner.is_running())
+        self.assertIsNone(runner.thread)
+        self.assertIsNone(runner.token)
+
+    def test_is_running_tracks_thread_lifecycle(self):
+        runner = ActionRunner()
+        stopper = threading.Event()
+
+        def loop():
+            while not stopper.is_set():
+                time.sleep(0.01)
+
+        runner.token = CancelToken()
+        runner.thread = threading.Thread(target=loop, daemon=True)
+        runner.thread.start()
+        try:
+            self.assertTrue(runner.is_running())
+        finally:
+            stopper.set()
+            runner.thread.join(timeout=1.0)
+        self.assertFalse(runner.is_running())
+
+    def test_cancel_is_safe_when_token_none(self):
+        # No exception, no side effect — used on the shutdown path.
+        ActionRunner().cancel('shutdown')
+
+    def test_cancel_calls_token(self):
+        runner = ActionRunner(token=CancelToken())
+        runner.cancel('user requested abort')
+        self.assertTrue(runner.token.is_cancelled())
+
+    def test_reset_clears_both_slots(self):
+        runner = ActionRunner(thread=threading.Thread(target=lambda: None), token=CancelToken())
+        runner.reset()
+        self.assertIsNone(runner.thread)
+        self.assertIsNone(runner.token)
 
 
 if __name__ == '__main__':

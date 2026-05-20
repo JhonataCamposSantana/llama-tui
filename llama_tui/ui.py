@@ -40,6 +40,7 @@ from .benchmark import (
 from .chat import stream_chat_events
 from .constants import DEFAULT_HOST, DEFAULT_MODEL_PORT, LOGO, REFRESH_SECONDS
 from .control import CancelToken, CancelledError
+from .ui_action_runner import ActionRunner
 from .discovery import classify_model_type, display_offload, display_runtime, extract_quant
 from .gguf import architecture_detail, tq3_detail, tq3_short, turboquant_detail, turboquant_short
 from .hermes_benchmark import benchmark_hermes_workflow
@@ -4067,11 +4068,15 @@ def tui(stdscr, app: AppConfig):
     right_tab_scroll_rows = 1
     last_refresh = 0.0
     statuses: Dict[str, Tuple[str, str]] = {}
-    action_thread: Optional[threading.Thread] = None
-    action_token: Optional[CancelToken] = None
+    # Two background-worker slots (audit finding #8 step 1): the main
+    # benchmark/action thread and the try-out chat thread. Each pair owns
+    # one CancelToken and one Thread; ActionRunner collapses what used to
+    # be four separate closure-locals into two named slots so the helpers
+    # below can mutate `action.thread = ...` / `action.token = ...` without
+    # needing four `nonlocal` declarations apiece.
+    action = ActionRunner()
     action_queue: Queue = Queue()
-    try_thread: Optional[threading.Thread] = None
-    try_token: Optional[CancelToken] = None
+    try_ = ActionRunner()
     try_session = 0
     try_messages: List[Dict[str, str]] = []
     try_input = ''
@@ -4144,7 +4149,7 @@ def tui(stdscr, app: AppConfig):
             del error_history[:-BENCHMARK_FEED_LIMIT]
 
     def action_running() -> bool:
-        return action_thread is not None and action_thread.is_alive()
+        return action.is_running()
 
     def current_browser_models() -> List[ModelConfig]:
         return browser_models(
@@ -4182,12 +4187,12 @@ def tui(stdscr, app: AppConfig):
         done_event: str = 'done',
         run_kind: str = '',
     ):
-        nonlocal action_thread, action_token, message, view_mode, detail_model_id, benchmark_state
+        nonlocal message, view_mode, detail_model_id, benchmark_state
         if action_running():
             message = '⏳ Another optimization is still running. Watch the log window for progress.'
             return
         token = CancelToken()
-        action_token = token
+        action.token = token
         if run_kind:
             reset_right_tabs('benchmark')
             view_mode = 'benchmark'
@@ -4244,8 +4249,8 @@ def tui(stdscr, app: AppConfig):
                 ))
             action_queue.put((done_event, compact_message(result)))
 
-        action_thread = threading.Thread(target=runner, daemon=True)
-        action_thread.start()
+        action.thread = threading.Thread(target=runner, daemon=True)
+        action.thread.start()
         if run_kind:
             message = f'⏳ {label} started for {model.id}. Benchmark dashboard is open.'
         else:
@@ -4453,7 +4458,7 @@ def tui(stdscr, app: AppConfig):
         show_benchmark_hint(model)
 
     def open_try_view(model: ModelConfig):
-        nonlocal view_mode, detail_model_id, message, try_thread, try_token, try_session, try_input_scroll, try_transcript_scroll
+        nonlocal view_mode, detail_model_id, message, try_session, try_input_scroll, try_transcript_scroll
         nonlocal try_messages, try_input, try_status, try_error, try_response_index, try_launched_model_id
         if action_running():
             message = '⏳ Wait for the current launch or benchmark before opening Try it out.'
@@ -4472,7 +4477,7 @@ def tui(stdscr, app: AppConfig):
         try_response_index = None
         try_launched_model_id = ''
         clear_try_live_metrics(try_live_metrics)
-        try_token = CancelToken()
+        try_.token = CancelToken()
         status, detail = app.health(model)
         if status == 'READY':
             try_status = 'ready'
@@ -4481,7 +4486,7 @@ def tui(stdscr, app: AppConfig):
 
         try_status = 'starting'
         message = f'{model.id}: starting try-out server...'
-        token = try_token
+        token = try_.token
         will_launch = not (status in ('LOADING', 'STARTING') or app.get_pid(model))
         if will_launch:
             try_launched_model_id = model.id
@@ -4504,8 +4509,8 @@ def tui(stdscr, app: AppConfig):
             except Exception as exc:
                 action_queue.put(('try_error', f'try-out start failed: {exc}', session))
 
-        try_thread = threading.Thread(target=runner, daemon=True)
-        try_thread.start()
+        try_.thread = threading.Thread(target=runner, daemon=True)
+        try_.thread.start()
 
     def open_results_view(model: ModelConfig):
         nonlocal view_mode, detail_model_id, message, results_run_index
@@ -4531,7 +4536,7 @@ def tui(stdscr, app: AppConfig):
         )
 
     def start_try_chat_send():
-        nonlocal message, try_thread, try_token, try_input, try_input_scroll, try_status, try_error, try_response_index, try_messages, try_transcript_scroll
+        nonlocal message, try_input, try_input_scroll, try_status, try_error, try_response_index, try_messages, try_transcript_scroll
         if view_mode != 'try':
             return
         model = active_detail_model()
@@ -4540,15 +4545,15 @@ def tui(stdscr, app: AppConfig):
         if try_status != 'ready':
             message = f'{model.id}: wait until the try-out server is ready.'
             return
-        if try_thread is not None and try_thread.is_alive():
+        if try_.is_running():
             message = f'{model.id}: response is still streaming.'
             return
         prompt = try_input.strip()
         if not prompt:
             return
-        if try_token is None:
-            try_token = CancelToken()
-        token = try_token
+        if try_.token is None:
+            try_.token = CancelToken()
+        token = try_.token
         session = try_session
         reset_try_live_metrics(try_live_metrics)
         try_messages.append({'role': 'user', 'content': prompt})
@@ -4580,15 +4585,14 @@ def tui(stdscr, app: AppConfig):
             except Exception as exc:
                 action_queue.put(('chat_error', compact_message(str(exc)), session))
 
-        try_thread = threading.Thread(target=runner, daemon=True)
-        try_thread.start()
+        try_.thread = threading.Thread(target=runner, daemon=True)
+        try_.thread.start()
 
     def exit_try_view():
-        nonlocal view_mode, message, last_refresh, try_thread, try_token, try_session, try_input, try_input_scroll, try_transcript_scroll
+        nonlocal view_mode, message, last_refresh, try_session, try_input, try_input_scroll, try_transcript_scroll
         nonlocal try_status, try_error, try_response_index, try_launched_model_id
         model = active_detail_model()
-        if try_token is not None:
-            try_token.cancel('leaving try-out')
+        try_.cancel('leaving try-out')
         try_session += 1
         stop_msg = 'no model selected'
         if model:
@@ -4602,8 +4606,7 @@ def tui(stdscr, app: AppConfig):
             message = 'Try-out closed.'
         reset_right_tabs('detail')
         view_mode = 'detail'
-        try_thread = None
-        try_token = None
+        try_.reset()
         try_input = ''
         try_input_scroll = 0
         try_transcript_scroll = 0
@@ -4713,8 +4716,8 @@ def tui(stdscr, app: AppConfig):
             )
 
     def drain_action_queue():
-        nonlocal message, try_status, try_error, try_thread, last_refresh
-        nonlocal try_response_index, action_thread, action_token
+        nonlocal message, try_status, try_error, last_refresh
+        nonlocal try_response_index
         while True:
             try:
                 queued_event = action_queue.get_nowait()
@@ -4732,14 +4735,14 @@ def tui(stdscr, app: AppConfig):
                 if event == 'try_ready':
                     try_status = 'ready'
                     try_error = ''
-                    try_thread = None
+                    try_.thread = None
                     message = text or f'{detail_model_id}: try-out ready.'
                     last_refresh = 0.0
                     continue
                 if event == 'try_error':
                     try_status = 'error'
                     try_error = text or 'try-out failed'
-                    try_thread = None
+                    try_.thread = None
                     message = f'❌ {try_error}'
                     remember_error(message)
                     continue
@@ -4770,7 +4773,7 @@ def tui(stdscr, app: AppConfig):
                             try_messages[try_response_index]['final_notice'] = ''
                     try_status = 'ready'
                     try_response_index = None
-                    try_thread = None
+                    try_.thread = None
                     message = f'{detail_model_id}: response complete.'
                     continue
                 if event == 'chat_error':
@@ -4785,7 +4788,7 @@ def tui(stdscr, app: AppConfig):
                         else:
                             try_messages[try_response_index]['content'] = f'[error] {try_error}'
                     try_response_index = None
-                    try_thread = None
+                    try_.thread = None
                     message = f'❌ {try_error}'
                     remember_error(message)
                     continue
@@ -4802,8 +4805,7 @@ def tui(stdscr, app: AppConfig):
                 remember_error(text)
             message = text
             if event in ('done', 'stack_done', 'benchmark_done'):
-                action_thread = None
-                action_token = None
+                action.reset()
                 last_refresh = 0.0
                 invalidate_machine_summary()
 
@@ -6019,8 +6021,7 @@ def tui(stdscr, app: AppConfig):
                 continue
             continue
         if action_running() and key == ord('A'):
-            if action_token is not None:
-                action_token.cancel('user requested abort')
+            action.cancel('user requested abort')
             message = '⏳ Aborting active action and cleaning up managed processes...'
             continue
         if key == ord('A') and view_mode in ('detail', 'benchmark', 'results') and app.models:
@@ -6429,4 +6430,4 @@ def tui(stdscr, app: AppConfig):
     # action/try tokens and join the daemon threads so cleanup_managed_processes
     # in main.py doesn't race with subprocess work that's still posting to the
     # action queue.
-    shutdown_workers(action_token, action_thread, try_token, try_thread)
+    shutdown_workers(action.token, action.thread, try_.token, try_.thread)
