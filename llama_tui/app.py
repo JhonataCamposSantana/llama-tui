@@ -33,6 +33,14 @@ from .config_io import (
     write_config_dict,
 )
 from .model_loader import VERIFICATION_STATUSES, load_model_from_payload
+from .process_supervisor import (
+    pid_alive,
+    pid_cmdline_parts,
+    proc_state,
+    process_group_pids,
+    reap_pid,
+    send_signal,
+)
 from .runtime_paths import (
     legacy_logfile,
     legacy_pid_metadata_file,
@@ -2246,36 +2254,19 @@ class AppConfig:
 
         return discovered, notes
 
+    # Pure /proc probes moved to process_supervisor.py; thin wrappers
+    # keep subclass / test-patch shapes intact.
     def _proc_state(self, pid: int) -> Optional[str]:
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            end = stat.rfind(")")
-            if end == -1:
-                return None
-            rest = stat[end + 2:].split()
-            return rest[0] if rest else None
-        except Exception:
-            return None
+        return proc_state(pid)
 
     def _pid_looks_like_runtime(self, pid: int, runtime: str) -> bool:
-        return self._command_matches_runtime(self._pid_cmdline_parts(pid), runtime)
+        return self._command_matches_runtime(pid_cmdline_parts(pid), runtime)
 
     def _pid_alive(self, pid: int, include_zombie: bool = False) -> bool:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        state = self._proc_state(pid)
-        if not include_zombie and state in ('Z', 'X'):
-            return False
-        return True
+        return pid_alive(pid, include_zombie=include_zombie)
 
     def _pid_cmdline_parts(self, pid: int) -> List[str]:
-        try:
-            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-            return [p.decode(errors='ignore') for p in raw.split(b'\x00') if p]
-        except Exception:
-            return []
+        return pid_cmdline_parts(pid)
 
     def _pid_looks_like_any_runtime(self, pid: int) -> bool:
         parts = self._pid_cmdline_parts(pid)
@@ -2378,33 +2369,10 @@ class AppConfig:
             return False
 
     def _process_group_pids(self, pgid: int) -> List[int]:
-        pids = []
-        for proc_dir in Path('/proc').iterdir():
-            if not proc_dir.name.isdigit():
-                continue
-            try:
-                pid = int(proc_dir.name)
-                if os.getpgid(pid) != pgid:
-                    continue
-                if self._proc_state(pid) in ('Z', 'X'):
-                    continue
-                pids.append(pid)
-            except Exception:
-                continue
-        return pids
+        return process_group_pids(pgid)
 
     def _reap_pid(self, pid: int):
-        try:
-            while True:
-                reaped, _status = os.waitpid(pid, os.WNOHANG)
-                if reaped == 0:
-                    break
-                if reaped == pid:
-                    break
-        except ChildProcessError:
-            pass
-        except OSError:
-            pass
+        reap_pid(pid)
 
     def _process_gone(self, pid: int, pgid: Optional[int]) -> bool:
         self._reap_pid(pid)
@@ -2413,17 +2381,7 @@ class AppConfig:
         return not self._pid_alive(pid)
 
     def _send_signal(self, pid: int, sig: signal.Signals | int, use_group: bool) -> Tuple[Optional[int], bool]:
-        pgid: Optional[int] = None
-        if use_group:
-            try:
-                pgid = os.getpgid(pid)
-            except OSError:
-                pgid = None
-            if pgid is not None and pgid != os.getpgrp():
-                os.killpg(pgid, sig)
-                return pgid, True
-        os.kill(pid, sig)
-        return pgid, False
+        return send_signal(pid, sig, use_group)
 
     def terminate_process_group(self, pid: int, grace_seconds: float = 3.0) -> Tuple[bool, str]:
         if not pid:
