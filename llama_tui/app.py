@@ -27,6 +27,11 @@ from .constants import (
     DEFAULT_MODEL_PORT,
     DEFAULT_VLLM_COMMAND,
 )
+from .config_io import (
+    archive_broken_config_file,
+    serialize_app_state,
+    write_config_dict,
+)
 from .model_loader import VERIFICATION_STATUSES, load_model_from_payload
 from .runtime_paths import (
     legacy_logfile,
@@ -471,21 +476,7 @@ class AppConfig:
         if self._benchmark_views_active:
             self._persist_engine_benchmark_views()
         self._normalize_model_ranks()
-        data = {
-            'llama_server': self.llama_server,
-            'vllm_command': self.vllm_command,
-            'hf_cache_root': self.hf_cache_root,
-            'llmfit_cache_root': self.llmfit_cache_root,
-            'llm_models_cache_root': self.llm_models_cache_root,
-            'lm_studio_model_roots': self.lm_studio_model_roots,
-            'opencode': asdict(self.opencode),
-            'continue': asdict(self.continue_settings),
-            'hermes': asdict(self.hermes),
-            'ui': asdict(self.ui),
-            'models': [asdict(m) for m in self.models],
-        }
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+        write_config_dict(self.config_path, serialize_app_state(self))
 
     # Per-engine benchmark payload helpers moved to benchmark_store.py;
     # these thin wrappers keep the existing call-site shape so subclasses
@@ -551,17 +542,7 @@ class AppConfig:
             self.save()
 
     def _archive_broken_config_file(self) -> Optional[Path]:
-        if not self.config_path.exists():
-            return None
-        backup_dir = CONFIG_DIR / 'backups'
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        backup_path = backup_dir / f'{self.config_path.stem}.broken.{stamp}{self.config_path.suffix}'
-        try:
-            shutil.copy2(self.config_path, backup_path)
-        except OSError:
-            return None
-        return backup_path
+        return archive_broken_config_file(self.config_path, CONFIG_DIR / 'backups')
 
     def _load_settings(self, cls, raw: object, current, label: str):
         payload = dataclass_payload(cls, raw) if isinstance(raw, dict) else {}
