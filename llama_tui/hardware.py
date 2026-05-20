@@ -80,6 +80,63 @@ def read_meminfo_bytes() -> Dict[str, int]:
     return values
 
 
+def read_cgroup_memory_limits(
+    cgroup_root: Path = Path('/sys/fs/cgroup'),
+) -> Dict[str, int]:
+    """Return ``{'max': bytes, 'current': bytes}`` from cgroups v2, or ``{}``.
+
+    Inside a Docker/Distrobox/systemd-slice container the kernel still serves
+    the host's ``/proc/meminfo``, so a 64 GiB host with a 4 GiB cgroup cap
+    looks like 64 GiB to ``read_meminfo_bytes`` and the optimizer happily
+    plans for memory that will be killed by the cgroup OOM. Reading
+    ``memory.max`` / ``memory.current`` gives the real limit. ``memory.max``
+    is either a byte count or the literal string ``max`` (unlimited).
+    Cgroups v1 (legacy ``memory.limit_in_bytes``) is intentionally not
+    supported; it predates llama-tui's deployment targets.
+    """
+    out: Dict[str, int] = {}
+    max_path = cgroup_root / 'memory.max'
+    current_path = cgroup_root / 'memory.current'
+    try:
+        max_raw = max_path.read_text(encoding='utf-8', errors='replace').strip()
+    except OSError:
+        return out
+    if max_raw and max_raw.lower() != 'max':
+        try:
+            out['max'] = int(max_raw)
+        except ValueError:
+            pass
+    try:
+        current_raw = current_path.read_text(encoding='utf-8', errors='replace').strip()
+        out['current'] = int(current_raw)
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def clamp_memory_to_cgroup(
+    memory_total: int,
+    memory_available: int,
+    cgroup_root: Path = Path('/sys/fs/cgroup'),
+) -> Tuple[int, int]:
+    """Clamp ``(memory_total, memory_available)`` against the cgroup v2 limit.
+
+    Returns the pair unchanged when no cgroup limit is in effect.
+    """
+    limits = read_cgroup_memory_limits(cgroup_root)
+    cap = int(limits.get('max', 0) or 0)
+    if cap <= 0:
+        return memory_total, memory_available
+    bounded_total = min(memory_total, cap) if memory_total > 0 else cap
+    used = int(limits.get('current', 0) or 0)
+    cgroup_available = max(0, cap - used)
+    if memory_available > 0:
+        bounded_available = min(memory_available, cgroup_available)
+    else:
+        bounded_available = cgroup_available
+    return bounded_total, bounded_available
+
+
 KNOWN_PROCESS_PATTERNS = {
     'browser': ('chrome', 'chromium', 'firefox', 'brave', 'vivaldi', 'edge'),
     'ide': ('code', 'codium', 'cursor', 'pycharm', 'idea', 'webstorm', 'zed'),
@@ -447,13 +504,17 @@ def probe_nvidia_gpu_thermal() -> Tuple[int, bool]:
 def benchmark_current_hardware() -> HardwareProfile:
     logical, physical = detect_cpu_counts()
     mem = read_meminfo_bytes()
+    memory_total, memory_available = clamp_memory_to_cgroup(
+        mem.get('MemTotal', 0),
+        mem.get('MemAvailable', 0),
+    )
     gpu_name, gpu_total, gpu_free, gpu_error = probe_nvidia_gpu()
     gpu_temp, gpu_throttle = probe_nvidia_gpu_thermal()
     return HardwareProfile(
         cpu_logical=logical,
         cpu_physical=physical,
-        memory_total=mem.get('MemTotal', 0),
-        memory_available=mem.get('MemAvailable', 0),
+        memory_total=memory_total,
+        memory_available=memory_available,
         gpu_name=gpu_name,
         gpu_memory_total=gpu_total,
         gpu_memory_free=gpu_free,

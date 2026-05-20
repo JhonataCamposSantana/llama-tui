@@ -8,6 +8,8 @@ from llama_tui.hardware import (
     _read_loadavg,
     _read_process_stat,
     bytes_to_gib,
+    clamp_memory_to_cgroup,
+    read_cgroup_memory_limits,
 )
 
 
@@ -60,6 +62,49 @@ class ReadLoadavgTests(unittest.TestCase):
 
     def test_missing_file_returns_zeros(self):
         self.assertEqual(_read_loadavg(Path('/no/such/dir')), (0.0, 0.0, 0.0, 0, 0))
+
+
+class CgroupMemoryTests(unittest.TestCase):
+    def _write_cgroup(self, root: Path, max_value: str, current_value: str = '0'):
+        (root / 'memory.max').write_text(max_value)
+        (root / 'memory.current').write_text(current_value)
+
+    def test_read_cgroup_max_and_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_cgroup(root, '4294967296', '1073741824')
+            limits = read_cgroup_memory_limits(root)
+            self.assertEqual(limits['max'], 4294967296)
+            self.assertEqual(limits['current'], 1073741824)
+
+    def test_max_literal_means_unlimited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_cgroup(root, 'max', '0')
+            limits = read_cgroup_memory_limits(root)
+            self.assertNotIn('max', limits)
+            self.assertEqual(limits['current'], 0)
+
+    def test_missing_cgroup_returns_empty(self):
+        self.assertEqual(read_cgroup_memory_limits(Path('/no/such/cgroup/root')), {})
+
+    def test_clamp_caps_host_memory_to_cgroup_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_cgroup(root, '4294967296', '1073741824')  # 4 GiB cap, 1 GiB used
+            host_total = 64 * 1024**3
+            host_avail = 50 * 1024**3
+            total, available = clamp_memory_to_cgroup(host_total, host_avail, root)
+            self.assertEqual(total, 4294967296)
+            self.assertEqual(available, 4294967296 - 1073741824)
+
+    def test_clamp_passthrough_when_no_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_cgroup(root, 'max', '0')
+            total, available = clamp_memory_to_cgroup(64 * 1024**3, 50 * 1024**3, root)
+            self.assertEqual(total, 64 * 1024**3)
+            self.assertEqual(available, 50 * 1024**3)
 
 
 if __name__ == '__main__':
