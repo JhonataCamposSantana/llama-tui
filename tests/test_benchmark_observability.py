@@ -128,6 +128,14 @@ class BenchmarkBudgetEnvOverrideTests(unittest.TestCase):
             else:
                 os.environ['LLAMA_TUI_FAKE_BUDGET'] = prev
 
+    def test_timeout_constants_have_clamping_minimums(self):
+        # BENCHMARK_SAMPLE_TIMEOUT and BENCHMARK_READY_TIMEOUT must not be
+        # below 10s — anything lower causes false-negative benchmark
+        # failures on slow machines.
+        from llama_tui.benchmark import BENCHMARK_SAMPLE_TIMEOUT, BENCHMARK_READY_TIMEOUT
+        self.assertGreaterEqual(BENCHMARK_SAMPLE_TIMEOUT, 10)
+        self.assertGreaterEqual(BENCHMARK_READY_TIMEOUT, 10)
+
 
 class ThermalProbeTests(unittest.TestCase):
     def test_returns_zero_when_nvidia_smi_missing(self):
