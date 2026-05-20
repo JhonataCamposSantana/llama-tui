@@ -95,6 +95,17 @@ def ellipsize(text: str, width: int) -> str:
     return text[: width - 3] + '...'
 def compact_message(text: str) -> str:
     return ' | '.join(part.strip() for part in str(text).splitlines() if part.strip())
+def concise_failure(text: str, limit: int = 320) -> str:
+    """Compact a multi-line failure detail and cap it with an ellipsis.
+
+    Lives here (not benchmark.py) because it is reused across benchmark,
+    hermes, classification, and UI code paths — anywhere a long stderr or
+    log tail needs to render as a single line.
+    """
+    message = compact_message(text)
+    if len(message) <= limit:
+        return message
+    return message[: max(0, limit - 3)] + '...'
 def is_error_message(text: str) -> bool:
     low = compact_message(text).lower()
     if not low:
