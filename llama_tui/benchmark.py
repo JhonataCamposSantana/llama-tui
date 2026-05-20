@@ -290,7 +290,7 @@ def app_active_engine_key(app, model: ModelConfig) -> str:
     if hasattr(app, 'active_engine_key_for_model'):
         try:
             return str(app.active_engine_key_for_model(model) or '')
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError):
             pass
     profile = getattr(app, 'runtime_profile', None)
     engine = str(getattr(profile, 'engine_id', '') or getattr(profile, 'engine', '') or '').strip()
@@ -310,15 +310,15 @@ def benchmark_strategy_for_app(
     if profile is None and hasattr(app, 'hardware_profile'):
         try:
             profile = app.hardware_profile(refresh=False)
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError):
             profile = None
     try:
         capabilities = app.engine_capabilities()
-    except Exception:
+    except (AttributeError, TypeError, OSError, ValueError, subprocess.SubprocessError):
         capabilities = None
     try:
         size = int(model_file_size(model) or 0)
-    except Exception:
+    except (TypeError, ValueError, OSError):
         size = 0
     return select_benchmark_strategy(
         app_active_engine_key(app, model),
@@ -370,7 +370,7 @@ def emit_benchmark_strategy_diagnostics(
     for line in lines:
         try:
             append_model_log(app, model, line)
-        except Exception:
+        except (AttributeError, TypeError, OSError):
             pass
         if progress:
             progress(line)
@@ -494,7 +494,7 @@ def benchmark_command_preview(
             runtime_profile=runtime_profile,
             benchmark_profile=benchmark_profile,
         )])
-    except Exception:
+    except (AttributeError, TypeError, ValueError, OSError):
         return ''
 
 
@@ -513,7 +513,7 @@ def benchmark_effective_server_args(
                 benchmark_profile=benchmark_profile,
             )
         ]
-    except Exception:
+    except (AttributeError, TypeError, ValueError, OSError):
         return []
 
 
@@ -531,7 +531,7 @@ def infer_fit_selected_ngl(text: str) -> Tuple[int, str, str]:
             continue
         try:
             return max(0, int(match.group(1))), source, excerpt
-        except Exception:
+        except (TypeError, ValueError):
             continue
     return 0, 'unknown', excerpt
 
@@ -541,13 +541,13 @@ def runtime_log_text_for_record(app: AppConfig, candidate: ModelConfig, max_line
         lines = app._runtime_log_after_last_launch(candidate, max_lines=max_lines)
         if lines:
             return '\n'.join(str(line) for line in lines)
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         pass
     try:
         path = app.logfile(candidate.id)
         if path.exists():
             return '\n'.join(path.read_text(errors='replace').splitlines()[-max_lines:])
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         pass
     return ''
 
@@ -562,7 +562,7 @@ def enrich_fit_discovery_metadata(
     if hasattr(app, 'logfile'):
         try:
             record['runtime_log_path'] = str(app.logfile(candidate.id))
-        except Exception:
+        except (AttributeError, TypeError, OSError):
             pass
     if runtime_profile is None:
         if str(record.get('status', '') or '') not in ('ok', 'probe ok'):
@@ -607,7 +607,7 @@ def previous_usable_measured_profiles(app, model: ModelConfig) -> Dict[str, Dict
     if hasattr(app, 'get_model'):
         try:
             current = app.get_model(model.id)
-        except Exception:
+        except (AttributeError, TypeError, OSError):
             current = None
         if current is not None:
             sources.append(current)
@@ -629,7 +629,7 @@ def failed_benchmark_model_state(
     if hasattr(app, 'get_model'):
         try:
             source = app.get_model(model.id) or model
-        except Exception:
+        except (AttributeError, TypeError, OSError):
             source = model
     saved = ModelConfig(**asdict(source))
     previous = previous_usable_measured_profiles(app, model)
@@ -652,7 +652,7 @@ def preserved_profiles_message(prefix: str, records: List[Dict[str, object]]) ->
 def _call_model_health(app, model: ModelConfig) -> Tuple[str, str]:
     try:
         return app.health(model)
-    except Exception as exc:
+    except (AttributeError, TypeError, OSError, ValueError, subprocess.SubprocessError) as exc:
         return 'UNKNOWN', str(exc)
 
 
@@ -671,7 +671,7 @@ def _known_llama_pressure(payload: Dict[str, object]) -> str:
     if isinstance(known, dict):
         try:
             count = int(known.get('llama', 0) or 0)
-        except Exception:
+        except (TypeError, ValueError):
             count = 0
     if count <= 0:
         return ''
@@ -689,12 +689,12 @@ def benchmark_preflight_cleanup(
     check_cancelled(cancel_token)
     try:
         active_engine = app.active_engine_key_for_model(model) if hasattr(app, 'active_engine_key_for_model') else ''
-    except Exception:
+    except (AttributeError, TypeError, OSError, ValueError):
         active_engine = ''
     if hasattr(app, 'active_engine_model_compatibility'):
         try:
             compatible, compatibility_msg = app.active_engine_model_compatibility(model)
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError):
             compatible, compatibility_msg = True, ''
         if not compatible:
             return False, f'❌ benchmark preflight blocked: {compatibility_msg}'
