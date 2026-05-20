@@ -1194,6 +1194,61 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
         self.assertEqual(successes, [2048])
         self.assertEqual(failures, [])
 
+    def test_adaptive_context_search_model_always_succeeds(self):
+        # When every probe succeeds the search should reach ctx_upper and
+        # never record a failure. Audit finding #23 edge case.
+        probed = []
+
+        def probe(ctx):
+            probed.append(ctx)
+            return True
+
+        successes, failures = adaptive_context_search(2048, 32768, probe, max_probes=12)
+        self.assertTrue(successes)
+        self.assertEqual(failures, [])
+        self.assertEqual(max(successes), 32768)
+
+    def test_adaptive_context_search_model_always_fails(self):
+        # When every probe fails the search should record at most a single
+        # failure (the smallest tried context) and no successes. The search
+        # exits the exponential-growth loop on the first failure.
+        probed = []
+
+        def probe(ctx):
+            probed.append(ctx)
+            return False
+
+        successes, failures = adaptive_context_search(2048, 32768, probe, max_probes=12)
+        self.assertEqual(successes, [])
+        self.assertEqual(failures, [2048])
+
+    def test_adaptive_context_search_first_probe_fails_then_lower_succeeds(self):
+        # Smallest probe fails outright — the search records the failure
+        # and returns without any successes.
+        probed = []
+
+        def probe(ctx):
+            probed.append(ctx)
+            return False
+
+        successes, failures = adaptive_context_search(8192, 16384, probe, max_probes=12)
+        self.assertEqual(successes, [])
+        self.assertEqual(failures, [8192])
+
+    def test_adaptive_context_search_handles_single_success_then_failure(self):
+        # ctx_min works, the next exponential step fails — search returns
+        # one success and one failure.
+        probed = []
+
+        def probe(ctx):
+            probed.append(ctx)
+            return ctx <= 2048
+
+        successes, failures = adaptive_context_search(2048, 32768, probe, max_probes=12)
+        self.assertEqual(successes, [2048])
+        self.assertTrue(failures)
+        self.assertGreater(min(failures), 2048)
+
     def test_exhaustive_context_ladder_uses_tiered_steps(self):
         self.assertEqual(exhaustive_context_ladder(2048, 8192), [2048, 4096, 6144, 8192])
         self.assertEqual(
