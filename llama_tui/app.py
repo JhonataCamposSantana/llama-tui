@@ -27,6 +27,15 @@ from .constants import (
     DEFAULT_MODEL_PORT,
     DEFAULT_VLLM_COMMAND,
 )
+from .benchmark_store import (
+    ENGINE_BENCHMARK_FIELDS,
+    apply_benchmark_payload,
+    benchmark_payload_for_model,
+    canonical_legacy_engine_key,
+    copy_benchmark_value,
+    default_engine_benchmark_payload,
+    has_benchmark_payload,
+)
 from .discovery import (
     detected_model_from_path,
     display_runtime,
@@ -152,17 +161,8 @@ CONTINUE_MANAGED_BEGIN = '  # BEGIN llama-tui managed models'
 CONTINUE_MANAGED_END = '  # END llama-tui managed models'
 CONTINUE_MERGE_MODES = ('preserve_sections', 'managed_file')
 VERIFICATION_STATUSES = ('unknown', 'running', 'passed', 'warning', 'failed', 'needs_benchmark')
-ENGINE_BENCHMARK_FIELDS = (
-    'last_benchmark_tokens_per_sec',
-    'last_benchmark_seconds',
-    'last_benchmark_profile',
-    'last_benchmark_results',
-    'measured_profiles',
-    'benchmark_runs',
-    'benchmark_fingerprint',
-    'default_benchmark_status',
-    'default_benchmark_at',
-)
+# ENGINE_BENCHMARK_FIELDS moved to benchmark_store.py and re-imported below
+# for the few internal call sites that read it.
 
 
 def terminal_command_for_launcher(launcher: str, title: str, cwd: Path, shell_cmd: str) -> List[str]:
@@ -479,18 +479,11 @@ class AppConfig:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
 
+    # Per-engine benchmark payload helpers moved to benchmark_store.py;
+    # these thin wrappers keep the existing call-site shape so subclasses
+    # and instance-method patches in tests continue to work.
     def _default_engine_benchmark_payload(self) -> Dict[str, object]:
-        return {
-            'last_benchmark_tokens_per_sec': 0.0,
-            'last_benchmark_seconds': 0.0,
-            'last_benchmark_profile': '',
-            'last_benchmark_results': [],
-            'measured_profiles': {},
-            'benchmark_runs': [],
-            'benchmark_fingerprint': '',
-            'default_benchmark_status': '',
-            'default_benchmark_at': '',
-        }
+        return default_engine_benchmark_payload()
 
     def active_engine_key_for_model(self, model: ModelConfig) -> str:
         runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
@@ -513,30 +506,13 @@ class AppConfig:
         return str(install.resolved_command or '')
 
     def _benchmark_payload_for_model(self, model: ModelConfig) -> Dict[str, object]:
-        return {
-            field: self._copy_benchmark_value(getattr(model, field))
-            for field in ENGINE_BENCHMARK_FIELDS
-        }
+        return benchmark_payload_for_model(model)
 
     def _copy_benchmark_value(self, value: object) -> object:
-        if isinstance(value, list):
-            return [dict(item) if isinstance(item, dict) else item for item in value]
-        if isinstance(value, dict):
-            return {
-                str(key): dict(item) if isinstance(item, dict) else item
-                for key, item in value.items()
-            }
-        return value
+        return copy_benchmark_value(value)
 
     def _apply_benchmark_payload(self, model: ModelConfig, payload: Dict[str, object]):
-        defaults = self._default_engine_benchmark_payload()
-        for field in ENGINE_BENCHMARK_FIELDS:
-            value = payload.get(field, defaults[field])
-            if isinstance(defaults[field], list):
-                value = list(value) if isinstance(value, list) else []
-            elif isinstance(defaults[field], dict):
-                value = dict(value) if isinstance(value, dict) else {}
-            setattr(model, field, value)
+        apply_benchmark_payload(model, payload)
 
     def _persist_engine_benchmark_views(self):
         for model in self.models:
@@ -545,23 +521,10 @@ class AppConfig:
             model.engine_benchmark_store = store
 
     def _canonical_legacy_engine_key(self, model: ModelConfig) -> str:
-        runtime = (getattr(model, 'runtime', 'llama.cpp') or '').strip().lower()
-        return 'vllm' if runtime == 'vllm' else 'llama.cpp'
+        return canonical_legacy_engine_key(model)
 
     def _has_benchmark_payload(self, model: ModelConfig) -> bool:
-        if float(getattr(model, 'last_benchmark_tokens_per_sec', 0.0) or 0.0) > 0.0:
-            return True
-        if (getattr(model, 'default_benchmark_status', '') or '').strip():
-            return True
-        if getattr(model, 'last_benchmark_results', None):
-            return True
-        if getattr(model, 'measured_profiles', None):
-            return True
-        if getattr(model, 'benchmark_runs', None):
-            return True
-        if (getattr(model, 'benchmark_fingerprint', '') or '').strip():
-            return True
-        return False
+        return has_benchmark_payload(model)
 
     def _activate_engine_benchmark_views(self):
         changed = False
