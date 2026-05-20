@@ -64,6 +64,7 @@ from llama_tui.main import (
     ensure_engine_session_lock,
     engine_session_path,
     last_engine_session_stop_count,
+    mtp_engine_deprecation_notice,
     release_engine_session_lock,
     validate_buun_kv_args,
     validate_tq3_kv_args,
@@ -6401,6 +6402,21 @@ class EngineSessionTests(unittest.TestCase):
 
         self.assertFalse(stale.exists())
         self.assertTrue(path.exists())
+
+
+class MtpEngineDeprecationTests(unittest.TestCase):
+    def test_notice_fires_only_for_legacy_alias(self):
+        notice = mtp_engine_deprecation_notice('llama.cpp-mtp')
+        self.assertIn('deprecation', notice.lower())
+        self.assertIn('--engine llama.cpp', notice)
+        self.assertIn('capability', notice)
+
+    def test_empty_for_other_engines(self):
+        for engine in ('llama.cpp', 'turboquant', 'tq3', 'buun', 'vllm', ''):
+            self.assertEqual(mtp_engine_deprecation_notice(engine), '')
+
+    def test_case_and_whitespace_tolerant(self):
+        self.assertNotEqual(mtp_engine_deprecation_notice('  LLAMA.CPP-MTP  '), '')
 
 
 if __name__ == '__main__':

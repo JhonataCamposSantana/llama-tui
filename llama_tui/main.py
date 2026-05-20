@@ -64,7 +64,18 @@ notes:
 ''',
     )
     parser.add_argument('config_path', nargs='?', default=str(DEFAULT_CONFIG_PATH), help='models.json config path (default: %(default)s)')
-    parser.add_argument('--engine', choices=('llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3'), default='llama.cpp', help='active GGUF engine for this session (default: %(default)s)')
+    parser.add_argument(
+        '--engine',
+        choices=('llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3'),
+        default='llama.cpp',
+        help=(
+            'active GGUF engine for this session (default: %(default)s). '
+            'Note: llama.cpp-mtp is retained as a legacy alias — upstream '
+            'llama.cpp now ships --spec-type mtp / draft-mtp natively, so '
+            'plain --engine llama.cpp picks up MTP automatically when the '
+            'binary advertises it.'
+        ),
+    )
     parser.add_argument('--ctx', type=int, default=None, help='optional session context override for the active GGUF engine')
     parser.add_argument('--kv', default='', help='KV cache mode shorthand for Buun/TurboQuant+/TQ3 sessions')
     parser.add_argument('--kv-key', default='', help='key-cache mode for Buun/TurboQuant+/TQ3 sessions')
@@ -472,9 +483,35 @@ def validate_kv_args(args):
         _validate_kv_args_for(args, engine_id, modes, label)
 
 
+def mtp_engine_deprecation_notice(engine: str) -> str:
+    """Return a user-facing migration notice when the legacy MTP engine alias
+    is selected, or '' for any other engine.
+
+    Upstream llama.cpp now ships ``--spec-type mtp`` and ``--spec-type
+    draft-mtp`` (see ggml-org/llama.cpp discussion #12130). MTP is therefore
+    a binary capability rather than a separate engine — ``--engine llama.cpp``
+    against a recent build picks up MTP automatically via
+    ``EngineCapabilities.supports_mtp``. The ``llama.cpp-mtp`` engine alias
+    is kept for backwards compatibility with users who built the experimental
+    fork to a custom path, but will be removed in a future release.
+    """
+    if (engine or '').strip().lower() != 'llama.cpp-mtp':
+        return ''
+    return (
+        '[deprecation] --engine llama.cpp-mtp is a legacy alias for the '
+        'experimental MTP fork. Upstream llama.cpp now ships --spec-type '
+        'mtp/draft-mtp natively, so --engine llama.cpp (against a recent '
+        'build) picks up MTP via capability detection. This alias will '
+        'be removed in a future release.'
+    )
+
+
 def main():
     args = build_cli_parser().parse_args()
     validate_kv_args(args)
+    deprecation = mtp_engine_deprecation_notice(args.engine)
+    if deprecation:
+        print(deprecation, file=sys.stderr)
     config_path = Path(args.config_path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_bootstrap_files(config_path)
