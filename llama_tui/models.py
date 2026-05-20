@@ -1,7 +1,18 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Dict, List
 
 from .constants import DEFAULT_HOST, DEFAULT_MODEL_PORT
+
+
+def dataclass_payload(cls, raw: Dict[str, object]) -> Dict[str, object]:
+    """Filter ``raw`` down to keys that exist as fields on dataclass ``cls``.
+
+    Used when constructing a dataclass instance from JSON: any leftover
+    keys from older / newer config formats are dropped so the
+    constructor does not raise ``TypeError``.
+    """
+    allowed = {field.name for field in fields(cls)}
+    return {key: value for key, value in dict(raw).items() if key in allowed}
 
 
 HERMES_DEFAULT_MIN_CONTEXT_TOKENS = 65536
