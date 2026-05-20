@@ -933,6 +933,30 @@ def _estimate_mla_kv_bytes_per_token(
     return max(1, int(estimated * 1.08))
 
 
+# Architectures where a sliding-window metadata key signals the
+# alternating-layers attention pattern (one full layer, one window-bounded
+# layer). At realistic long-context inference the per-token cost of the
+# window-bounded half asymptotes to zero, so the average per-token bytes
+# approach half the dense estimate. Mistral 7B uses all-sliding-window
+# layers — the discount under-estimates per-token there, which is the
+# correct direction since Mistral's KV is capped at the window regardless
+# of ctx.
+_SLIDING_WINDOW_ALTERNATING_FRACTION = 0.5
+
+
+def _sliding_window_tokens(metadata: Dict[str, object], arch: str) -> int:
+    prefix = f'{arch}.'
+    for key in (f'{prefix}attention.sliding_window', f'{prefix}sliding_window'):
+        raw = metadata.get(key)
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
 def estimate_kv_bytes_per_token(model: ModelConfig) -> int:
     runtime = getattr(model, 'runtime', 'llama.cpp')
     if runtime == 'vllm':
@@ -956,6 +980,13 @@ def estimate_kv_bytes_per_token(model: ModelConfig) -> int:
                 k_bytes = cache_type_bytes(selected_cache_type(model, 'k'))
                 v_bytes = cache_type_bytes(selected_cache_type(model, 'v'))
                 estimated = layers * kv_heads * ((key_length * k_bytes) + (value_length * v_bytes))
+                if _sliding_window_tokens(metadata, arch) > 0:
+                    # Alternating sliding/full attention layers (Gemma-2) and
+                    # all-sliding (Mistral) both bound the per-token cost at
+                    # long ctx; halving the dense estimate is a defensible
+                    # asymptotic that turns "won't fit" false negatives into
+                    # correct decisions for typical 8k-32k workloads.
+                    estimated *= _SLIDING_WINDOW_ALTERNATING_FRACTION
                 return max(1, int(estimated * 1.08))
         except Exception:
             pass

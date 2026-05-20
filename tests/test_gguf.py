@@ -126,6 +126,45 @@ class EstimateKvBytesTests(unittest.TestCase):
         # DeepSeek-V3 has 128 heads × 192 key_length+128 value_length ≈ 5x bigger.
         self.assertLess(kv_bytes, 100_000)
 
+    def test_sliding_window_halves_dense_estimate(self):
+        # Gemma-2 9B shape: 42 layers, 16 heads, 8 KV heads, head_dim 256,
+        # sliding_window=4096. Expected: dense × 0.5 × 1.08 overhead.
+        metadata = {
+            'general.architecture': 'gemma2',
+            'gemma2.block_count': 42,
+            'gemma2.attention.head_count': 16,
+            'gemma2.attention.head_count_kv': 8,
+            'gemma2.embedding_length': 3584,
+            'gemma2.attention.key_length': 256,
+            'gemma2.attention.value_length': 256,
+            'gemma2.attention.sliding_window': 4096,
+        }
+        model = ModelConfig(id='m', name='M', path='/m.gguf', alias='m')
+        with patch('llama_tui.gguf.read_gguf_metadata', return_value=metadata):
+            kv_bytes = estimate_kv_bytes_per_token(model)
+        dense = 42 * 8 * (256 * 2 + 256 * 2)
+        expected = int(dense * 0.5 * 1.08)
+        self.assertEqual(kv_bytes, expected)
+
+    def test_sliding_window_absent_keeps_dense_estimate(self):
+        # Identical shape without the sliding-window key returns the dense
+        # value — the branch only triggers when the metadata signals it.
+        metadata = {
+            'general.architecture': 'llama',
+            'llama.block_count': 42,
+            'llama.attention.head_count': 16,
+            'llama.attention.head_count_kv': 8,
+            'llama.embedding_length': 3584,
+            'llama.attention.key_length': 256,
+            'llama.attention.value_length': 256,
+        }
+        model = ModelConfig(id='m', name='M', path='/m.gguf', alias='m')
+        with patch('llama_tui.gguf.read_gguf_metadata', return_value=metadata):
+            kv_bytes = estimate_kv_bytes_per_token(model)
+        dense = 42 * 8 * (256 * 2 + 256 * 2)
+        expected = int(dense * 1.08)
+        self.assertEqual(kv_bytes, expected)
+
     def test_mla_falls_back_to_dense_when_lora_rank_missing(self):
         # GQA shape: 32 layers, 32 heads, 8 KV heads, 128 head dim.
         metadata = {
