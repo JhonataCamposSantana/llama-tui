@@ -1448,7 +1448,7 @@ def benchmark_progress_fraction(completed: object, total: object) -> float:
     try:
         completed_value = max(0.0, float(completed or 0))
         total_value = max(0.0, float(total or 0))
-    except Exception:
+    except (TypeError, ValueError):
         return 0.0
     if total_value <= 0:
         return 0.0
@@ -1704,7 +1704,7 @@ def latest_benchmark_run(model: ModelConfig, kind: str) -> Dict[str, object]:
 def compact_bytes(value: object) -> str:
     try:
         raw = int(value or 0)
-    except Exception:
+    except (TypeError, ValueError):
         raw = 0
     if raw <= 0:
         return '-'
@@ -1726,7 +1726,7 @@ def _safe_benchmark_freshness(app: Optional[AppConfig], model: ModelConfig) -> s
         return 'missing'
     try:
         return benchmark_freshness_label(app, model)
-    except Exception:
+    except (AttributeError, TypeError, OSError, ValueError):
         status = str(getattr(model, 'default_benchmark_status', '') or '').strip().lower()
         return status if status in ('fresh', 'stale', 'missing', 'failed', 'pending', 'running') else 'missing'
 
@@ -1761,7 +1761,7 @@ def suggested_next_action(
 
     try:
         moe_reason = _moe_menu_disabled_reason(app, model)
-    except Exception:
+    except (AttributeError, TypeError, OSError, ValueError):
         moe_reason = 'not eligible'
     if not moe_reason and not has_moe_recommendation(model):
         mtp_suite = app is not None and active_engine_key(app, model) == 'llama.cpp-mtp'
@@ -1823,18 +1823,18 @@ def overview_items(
             visible = visibility.compatible
             visibility_reason = visibility.reason
             visibility_status = visibility.status
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError):
             visible = True
         try:
             compatibility = app.model_engine_compatibility(model)
             compatible = compatibility.compatible
             compatibility_reason = compatibility.reason
             compatibility_status = compatibility.status
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError):
             compatible = True
     try:
         strategy = benchmark_strategy_for_app(app, model, depth='fast', objective='quick_sanity') if app is not None else None
-    except Exception:
+    except (AttributeError, TypeError, OSError, ValueError):
         strategy = None
     benchmark = benchmark_freshness_display(app, model) if app is not None else 'Missing'
     moe_state = moe_recommendation_state_text(model) if model_is_moe(model) else 'not MoE'
@@ -3166,7 +3166,7 @@ def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = No
     if active_model is not None and str(active_engine).lower() in ('llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3'):
         try:
             tool_jinja_ready = bool(app.continue_tool_use_launch_required(active_model)) or bool(getattr(active_model, 'jinja', True))
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError):
             tool_jinja_ready = bool(getattr(active_model, 'jinja', True))
         items.append((
             'Continue llama.cpp tools: --jinja ready; use extra_args --chat-template-file when needed'
@@ -3523,7 +3523,7 @@ def _active_engine_for_menu(app: Optional[AppConfig], model: Optional[ModelConfi
     if app is not None and model is not None and hasattr(app, 'active_engine_key_for_model'):
         try:
             return str(app.active_engine_key_for_model(model) or '')
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError):
             return ''
     return str(getattr(model, 'runtime', '') or '')
 
