@@ -15,6 +15,7 @@ from urllib import request
 from .constants import CACHE_DIR
 from .benchmark_strategies import BenchmarkStrategy, select_benchmark_strategy
 from .benchmark_mtp import (
+    MTP_BASELINE_RUNTIME_ASSERT_REASON,
     MTP_DECODE_HEAVY_PROMPTS,
     MTP_PROMPT_HEAVY_CONTEXT,
     MTP_PROMPT_HEAVY_PROMPTS,
@@ -25,12 +26,25 @@ from .benchmark_mtp import (
     benchmark_mtp_optimizer_workloads as _benchmark_mtp_optimizer_workloads,
     best_mtp_acceptance_record,
     enrich_mtp_acceptance_metrics,
+    mtp_acceptance_objective_for_profile,
+    mtp_long_context_probe_request_timeout as _benchmark_mtp_long_context_probe_request_timeout,
+    mtp_no_spec_baseline_profile,
     mtp_optimizer_profile_recommendations,
     mtp_optimizer_workload_specs,
+    mtp_recurrent_baseline_assert_detected,
+    mtp_runtime_profile_uses_long_context_probe,
     parse_mtp_acceptance_metrics,
     parse_mtp_runtime_diagnostics,
     weighted_mtp_accept_rate,
 )
+
+
+# Local shim: preserve the no-arg signature for the 13+ internal callers
+# that pass only ``ctx_size`` and rely on BENCHMARK_SAMPLE_TIMEOUT as the
+# small-ctx fallthrough. The shim threads the constant in once at the
+# call site so the underlying helper stays pure.
+def mtp_long_context_probe_request_timeout(ctx_size: int) -> int:
+    return _benchmark_mtp_long_context_probe_request_timeout(ctx_size, BENCHMARK_SAMPLE_TIMEOUT)
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .discovery import extract_quant
 from .engines import (
@@ -8327,17 +8341,8 @@ def benchmark_runtime_profile_with_retry(
     return False, True, records, measured, completed
 
 
-MTP_BASELINE_RUNTIME_ASSERT_REASON = (
-    'no-MTP recurrent state has n_rs_seq=0; MTP-enabled launch initializes n_rs_seq=2'
-)
-
-
-def mtp_recurrent_baseline_assert_detected(text: str) -> bool:
-    low = str(text or '').lower().replace('_', '-')
-    recurrent = 'llama-memory-recurrent.cpp' in low or 'memory-recurrent' in low or 'recurrent' in low
-    assertion = 'ggml-assert' in low or 'ggml_assert' in low or 'assertion' in low or 'assert(' in low
-    zero_state = re.search(r'n-rs-seq\s*=\s*0\b', low) is not None
-    return bool(recurrent and assertion and zero_state)
+# MTP_BASELINE_RUNTIME_ASSERT_REASON and mtp_recurrent_baseline_assert_detected
+# moved to benchmark_mtp.py; re-imported below.
 
 
 def mark_mtp_baseline_runtime_assert_if_needed(
@@ -8373,17 +8378,7 @@ def mark_mtp_baseline_runtime_assert_if_needed(
     return True
 
 
-def mtp_no_spec_baseline_profile(runtime_profile: RuntimeProfile) -> bool:
-    name = str(getattr(runtime_profile, 'name', '') or '').strip().lower()
-    phase = str(getattr(runtime_profile, 'benchmark_phase', '') or '').strip().lower()
-    return bool(
-        not bool(getattr(runtime_profile, 'mtp_enabled', False))
-        and (
-            phase == 'baseline_no_mtp'
-            or name == 'mtp_baseline'
-            or name.startswith('mtp_baseline')
-        )
-    )
+# mtp_no_spec_baseline_profile moved to benchmark_mtp.py.
 
 
 def mtp_baseline_skip_record(
@@ -8416,31 +8411,8 @@ def mtp_baseline_skip_record(
     return record
 
 
-def mtp_runtime_profile_uses_long_context_probe(runtime_profile: RuntimeProfile) -> bool:
-    if not bool(getattr(runtime_profile, 'mtp_enabled', False)):
-        return False
-    if bool(getattr(runtime_profile, 'fit', False)):
-        return True
-    name = str(getattr(runtime_profile, 'name', '') or '').lower()
-    return name.startswith('mtp_fit_')
-
-
-def mtp_acceptance_objective_for_profile(runtime_profile: RuntimeProfile) -> str:
-    return 'mtp_long_context_probe' if mtp_runtime_profile_uses_long_context_probe(runtime_profile) else 'fast_chat'
-
-
-def mtp_long_context_probe_request_timeout(ctx_size: int) -> int:
-    try:
-        ctx = int(ctx_size or 0)
-    except (TypeError, ValueError):
-        ctx = 0
-    if ctx >= 65_536:
-        return 180
-    if ctx >= 32_768:
-        return 120
-    if ctx >= 8_192:
-        return 75
-    return BENCHMARK_SAMPLE_TIMEOUT
+# mtp_runtime_profile_uses_long_context_probe / mtp_acceptance_objective_for_profile /
+# mtp_long_context_probe_request_timeout moved to benchmark_mtp.py.
 
 
 def benchmark_mtp_acceptance_matrix_after_preflight(

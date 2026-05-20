@@ -736,3 +736,76 @@ def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object
         if recommendation:
             record['runtime_recommendation'] = recommendation
     return record
+
+
+# ============================================================================
+# MTP baseline-policy helpers.
+# Extracted from benchmark.py as part of audit finding #6 step 5 (continued).
+# These decide whether to run the no-MTP baseline phase, when an MTP-enabled
+# launch needs the long-context probe instead of the fast-chat objective, and
+# how long a long-context acceptance probe should wait for first tokens.
+# Pure functions — the more entangled helpers (mark_mtp_baseline_runtime_
+# assert_if_needed and mtp_baseline_skip_record) stay in benchmark.py because
+# they need AppConfig / adaptive_record_from_candidate / BenchmarkStrategy.
+# ============================================================================
+
+
+MTP_BASELINE_RUNTIME_ASSERT_REASON = (
+    'no-MTP recurrent state has n_rs_seq=0; MTP-enabled launch initializes n_rs_seq=2'
+)
+
+
+def mtp_recurrent_baseline_assert_detected(text: str) -> bool:
+    low = str(text or '').lower().replace('_', '-')
+    recurrent = 'llama-memory-recurrent.cpp' in low or 'memory-recurrent' in low or 'recurrent' in low
+    assertion = 'ggml-assert' in low or 'ggml_assert' in low or 'assertion' in low or 'assert(' in low
+    zero_state = re.search(r'n-rs-seq\s*=\s*0\b', low) is not None
+    return bool(recurrent and assertion and zero_state)
+
+
+def mtp_no_spec_baseline_profile(runtime_profile) -> bool:
+    name = str(getattr(runtime_profile, 'name', '') or '').strip().lower()
+    phase = str(getattr(runtime_profile, 'benchmark_phase', '') or '').strip().lower()
+    return bool(
+        not bool(getattr(runtime_profile, 'mtp_enabled', False))
+        and (
+            phase == 'baseline_no_mtp'
+            or name == 'mtp_baseline'
+            or name.startswith('mtp_baseline')
+        )
+    )
+
+
+def mtp_runtime_profile_uses_long_context_probe(runtime_profile) -> bool:
+    if not bool(getattr(runtime_profile, 'mtp_enabled', False)):
+        return False
+    if bool(getattr(runtime_profile, 'fit', False)):
+        return True
+    name = str(getattr(runtime_profile, 'name', '') or '').lower()
+    return name.startswith('mtp_fit_')
+
+
+def mtp_acceptance_objective_for_profile(runtime_profile) -> str:
+    return 'mtp_long_context_probe' if mtp_runtime_profile_uses_long_context_probe(runtime_profile) else 'fast_chat'
+
+
+def mtp_long_context_probe_request_timeout(ctx_size: int, default_timeout: int = 240) -> int:
+    """Per-context timeout for the MTP long-context acceptance probe.
+
+    Scales with the requested context size: very long prompts legitimately
+    need more wall time before first tokens. ``default_timeout`` matches
+    ``BENCHMARK_SAMPLE_TIMEOUT`` in benchmark.py so behaviour is unchanged
+    for the small-ctx fallthrough; pass a different value in if the caller
+    has its own per-run budget.
+    """
+    try:
+        ctx = int(ctx_size or 0)
+    except (TypeError, ValueError):
+        ctx = 0
+    if ctx >= 65_536:
+        return 180
+    if ctx >= 32_768:
+        return 120
+    if ctx >= 8_192:
+        return 75
+    return int(default_timeout or 240)
