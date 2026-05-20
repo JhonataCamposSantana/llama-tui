@@ -903,12 +903,46 @@ def gguf_metadata_int(model: ModelConfig, suffix: str, default: int = 0) -> int:
         return default
 def gguf_layer_count(model: ModelConfig) -> int:
     return gguf_metadata_int(model, 'block_count', 0)
+# DeepSeek architectures use Multi-Head Latent Attention (MLA): the KV cache
+# stores a compressed latent of size ``kv_lora_rank`` plus a small rope-only
+# component per token per layer, shared across heads. This is *much* smaller
+# than the naive ``heads * head_dim`` math the legacy estimator assumed.
+_MLA_ARCHITECTURES = frozenset({'deepseek2', 'deepseek-v2', 'deepseek3', 'deepseek-v3'})
+
+
+def _estimate_mla_kv_bytes_per_token(
+    model: ModelConfig,
+    metadata: Dict[str, object],
+    arch: str,
+) -> int:
+    prefix = f'{arch}.'
+    try:
+        layers = int(metadata.get(f'{prefix}block_count') or 0)
+        kv_lora_rank = int(metadata.get(f'{prefix}attention.kv_lora_rank') or 0)
+        rope_dim = int(metadata.get(f'{prefix}rope.dimension_count') or 0)
+    except (TypeError, ValueError):
+        return 0
+    if layers <= 0 or kv_lora_rank <= 0:
+        return 0
+    k_bytes = cache_type_bytes(selected_cache_type(model, 'k'))
+    v_bytes = cache_type_bytes(selected_cache_type(model, 'v'))
+    # MLA caches a single latent (kv_lora_rank) plus a rope component
+    # (rope_dim) per token per layer, not per head.
+    per_token_per_layer = (kv_lora_rank * k_bytes) + (rope_dim * v_bytes)
+    estimated = layers * per_token_per_layer
+    return max(1, int(estimated * 1.08))
+
+
 def estimate_kv_bytes_per_token(model: ModelConfig) -> int:
     runtime = getattr(model, 'runtime', 'llama.cpp')
     if runtime == 'vllm':
         return 32768
     metadata = read_gguf_metadata(getattr(model, 'path', '') or '')
     arch = str(metadata.get('general.architecture') or '')
+    if arch.lower() in _MLA_ARCHITECTURES:
+        mla_bytes = _estimate_mla_kv_bytes_per_token(model, metadata, arch)
+        if mla_bytes > 0:
+            return mla_bytes
     if arch:
         prefix = f'{arch}.'
         try:
