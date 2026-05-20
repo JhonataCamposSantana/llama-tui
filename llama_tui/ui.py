@@ -4840,6 +4840,11 @@ def tui(stdscr, app: AppConfig):
             key = stdscr.getch()
             if key in (ord('q'), 27):
                 break
+            if key == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
             time.sleep(0.05)
             continue
 
@@ -5792,6 +5797,17 @@ def tui(stdscr, app: AppConfig):
 
         if key == -1:
             time.sleep(0.05)
+            continue
+        if key == curses.KEY_RESIZE:
+            # Terminal resized: refresh LINES/COLS so the next render uses
+            # the new dimensions. Without this, modals and the footer can
+            # draw past the new edges and curses.error gets swallowed
+            # silently. See audit finding #17.
+            try:
+                curses.update_lines_cols()
+            except Exception:
+                pass
+            last_refresh = 0.0
             continue
         scroll_action = right_scroll_action_for_view(view_mode, key)
         tab_direction = right_tab_key_direction(key)
