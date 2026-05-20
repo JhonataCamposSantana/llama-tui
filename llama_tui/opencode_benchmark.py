@@ -64,6 +64,35 @@ class WorkflowTask:
     name: str
     prompt: str
     files: Dict[str, str]
+    # Difficulty tier. Audit finding #20: the original suite of two
+    # tasks (fix_calc + add_slugify) trivialises on any 2025-vintage
+    # code model. Tagging each task lets the runner filter by tier so
+    # the benchmark stays informative as model quality improves —
+    # easy = type coercion / one-line fixes; medium = small refactor
+    # touching multiple files; hard = algorithmic / multi-step.
+    difficulty: str = 'easy'
+
+
+WORKFLOW_DIFFICULTY_TIERS = ('easy', 'medium', 'hard')
+
+
+def tasks_for_difficulty(level: str = 'easy') -> List['WorkflowTask']:
+    """Return every workflow task at ``level`` and below.
+
+    ``level='easy'`` returns only the easy tasks (the default and the
+    set the production benchmark currently runs); ``level='medium'``
+    returns easy + medium; ``level='hard'`` returns everything.
+    Unknown levels behave like ``'easy'`` so a misspelled config does
+    not silently widen the suite.
+    """
+    normalized = str(level or '').strip().lower()
+    if normalized not in WORKFLOW_DIFFICULTY_TIERS:
+        normalized = 'easy'
+    cutoff = WORKFLOW_DIFFICULTY_TIERS.index(normalized)
+    return [
+        task for task in OPENCODE_WORKFLOW_ALL_TASKS
+        if WORKFLOW_DIFFICULTY_TIERS.index(task.difficulty) <= cutoff
+    ]
 
 
 @dataclass(frozen=True)
@@ -74,9 +103,15 @@ class WorkflowTimeoutPolicy:
     pressure_level: str = ''
 
 
-OPENCODE_WORKFLOW_TASKS = [
+# Full graduated suite for audit #20. The production benchmark still
+# iterates ``OPENCODE_WORKFLOW_TASKS`` (the legacy easy set) so the
+# task count and timings stay backward-compatible; opt-in callers can
+# use ``tasks_for_difficulty('medium')`` or ``'hard'`` to widen the
+# suite once graduated runs are wired into the UI.
+OPENCODE_WORKFLOW_ALL_TASKS = [
     WorkflowTask(
         name='fix_calc',
+        difficulty='easy',
         prompt=(
             'Fix this tiny Python project so `python -m unittest -q` passes. '
             'Keep the change minimal, do not use the network, and do not edit files outside this directory.'
@@ -105,6 +140,7 @@ OPENCODE_WORKFLOW_TASKS = [
     ),
     WorkflowTask(
         name='add_slugify',
+        difficulty='easy',
         prompt=(
             'Implement the missing slugify function so `python -m unittest -q` passes. '
             'Keep the implementation compact, deterministic, and local to this project.'
@@ -127,7 +163,101 @@ OPENCODE_WORKFLOW_TASKS = [
             ),
         },
     ),
+    WorkflowTask(
+        name='refactor_cart_total',
+        difficulty='medium',
+        prompt=(
+            'The shopping-cart code in cart.py and the test in test_cart.py are out of sync. '
+            'Refactor compute_total to accept a flat list of CartItem objects (replacing the '
+            'current nested dict format) so the tests pass. Update both the function signature '
+            'and any callers; do not change test_cart.py.'
+        ),
+        files={
+            'cart.py': (
+                'def compute_total(items):\n'
+                "    # Legacy API: items is a dict of {category: {sku: {'price': p, 'qty': q}}}.\n"
+                '    total = 0.0\n'
+                '    for category in items.values():\n'
+                '        for line in category.values():\n'
+                "            total += line['price'] * line['qty']\n"
+                '    return total\n'
+                '\n'
+                'def render_total(items):\n'
+                '    return f"Total: ${compute_total(items):.2f}"\n'
+            ),
+            'test_cart.py': (
+                'import unittest\n'
+                'from cart import compute_total, render_total\n'
+                'from dataclasses import dataclass\n'
+                '\n'
+                '@dataclass\n'
+                'class CartItem:\n'
+                '    sku: str\n'
+                '    price: float\n'
+                '    qty: int\n'
+                '\n'
+                'class CartTests(unittest.TestCase):\n'
+                '    def test_compute_total_sums_items(self):\n'
+                "        items = [CartItem('a', 2.5, 2), CartItem('b', 4.0, 1)]\n"
+                '        self.assertEqual(compute_total(items), 9.0)\n'
+                '\n'
+                '    def test_compute_total_empty(self):\n'
+                '        self.assertEqual(compute_total([]), 0.0)\n'
+                '\n'
+                '    def test_render_total_uses_two_decimals(self):\n'
+                "        items = [CartItem('a', 1.999, 1)]\n"
+                "        self.assertEqual(render_total(items), 'Total: $2.00')\n"
+                '\n'
+                'if __name__ == "__main__":\n'
+                '    unittest.main()\n'
+            ),
+        },
+    ),
+    WorkflowTask(
+        name='balanced_brackets',
+        difficulty='hard',
+        prompt=(
+            'Implement is_balanced(expr) in brackets.py so `python -m unittest -q` passes. '
+            'Support (), [], {} and treat any other character as content. Return True for '
+            'balanced sequences and False otherwise. Keep the implementation iterative, '
+            'O(n) time, and self-contained.'
+        ),
+        files={
+            'brackets.py': (
+                'def is_balanced(expr):\n'
+                '    raise NotImplementedError("is_balanced is not implemented yet")\n'
+            ),
+            'test_brackets.py': (
+                'import unittest\n'
+                'from brackets import is_balanced\n\n'
+                'class BracketTests(unittest.TestCase):\n'
+                '    def test_empty_string_is_balanced(self):\n'
+                "        self.assertTrue(is_balanced(''))\n\n"
+                '    def test_simple_pairs(self):\n'
+                "        self.assertTrue(is_balanced('()[]{}'))\n\n"
+                '    def test_nested_pairs(self):\n'
+                "        self.assertTrue(is_balanced('([{}])'))\n\n"
+                '    def test_with_content(self):\n'
+                "        self.assertTrue(is_balanced('a(b[c]d)e'))\n\n"
+                '    def test_mismatched_close(self):\n'
+                "        self.assertFalse(is_balanced('(]'))\n\n"
+                '    def test_unclosed_open(self):\n'
+                "        self.assertFalse(is_balanced('([)'))\n\n"
+                '    def test_close_without_open(self):\n'
+                "        self.assertFalse(is_balanced(')'))\n\n"
+                'if __name__ == "__main__":\n'
+                '    unittest.main()\n'
+            ),
+        },
+    ),
 ]
+
+
+# Legacy alias: the production benchmark workflow has many call sites
+# baked in (len(), enumerate(), step-progress math) that all assume the
+# original two-task suite. Keep the alias pointing at the easy tier so
+# behaviour is unchanged until the UI grows a 'difficulty' selector.
+OPENCODE_WORKFLOW_TASKS = [task for task in OPENCODE_WORKFLOW_ALL_TASKS if task.difficulty == 'easy']
 
 
 def detect_vscode_pressure() -> Dict[str, object]:

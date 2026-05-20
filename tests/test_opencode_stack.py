@@ -52,6 +52,9 @@ from llama_tui.discovery import detected_model_from_path
 from llama_tui.hardware import HardwareProfile
 from llama_tui.models import ModelConfig
 from llama_tui.opencode_benchmark import (
+    OPENCODE_WORKFLOW_ALL_TASKS,
+    OPENCODE_WORKFLOW_TASKS,
+    WORKFLOW_DIFFICULTY_TIERS,
     benchmark_opencode_workflow,
     build_opencode_run_command,
     compact_sample_details,
@@ -62,6 +65,7 @@ from llama_tui.opencode_benchmark import (
     run_process_with_metrics,
     sample_timeout_type,
     score_opencode_samples,
+    tasks_for_difficulty,
     workflow_timeout_policy,
     write_temp_opencode_config,
 )
@@ -1980,6 +1984,46 @@ class ProcessLifecycleTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertTrue(result['aborted'])
         self.assertFalse(process_active(child_pid))
+
+
+class GraduatedFixtureTests(unittest.TestCase):
+    """Audit finding #20: tasks_for_difficulty selects easy/medium/hard."""
+
+    def test_every_task_has_a_known_difficulty_tier(self):
+        for task in OPENCODE_WORKFLOW_ALL_TASKS:
+            self.assertIn(task.difficulty, WORKFLOW_DIFFICULTY_TIERS,
+                          f'{task.name!r} has unknown difficulty {task.difficulty!r}')
+
+    def test_easy_returns_only_easy_tasks(self):
+        easy = tasks_for_difficulty('easy')
+        self.assertTrue(easy, 'easy tier must include at least one task')
+        for task in easy:
+            self.assertEqual(task.difficulty, 'easy')
+
+    def test_medium_includes_easy_and_medium(self):
+        medium = tasks_for_difficulty('medium')
+        difficulties = {task.difficulty for task in medium}
+        self.assertEqual(difficulties, {'easy', 'medium'})
+
+    def test_hard_includes_everything(self):
+        hard = tasks_for_difficulty('hard')
+        self.assertEqual(len(hard), len(OPENCODE_WORKFLOW_ALL_TASKS))
+
+    def test_legacy_alias_matches_easy_tier(self):
+        # The legacy benchmark workflow iterates OPENCODE_WORKFLOW_TASKS;
+        # keep that alias pointing at the easy set so production runs
+        # stay backward-compatible until the UI grows a tier selector.
+        self.assertEqual(
+            [task.name for task in OPENCODE_WORKFLOW_TASKS],
+            [task.name for task in tasks_for_difficulty('easy')],
+        )
+
+    def test_unknown_level_falls_back_to_easy(self):
+        # Audit #20: misspelled config must not silently widen the suite.
+        self.assertEqual(
+            [task.name for task in tasks_for_difficulty('NOT_A_LEVEL')],
+            [task.name for task in tasks_for_difficulty('easy')],
+        )
 
 
 if __name__ == '__main__':
