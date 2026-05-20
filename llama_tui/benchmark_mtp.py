@@ -1,9 +1,21 @@
+import os
 import statistics
 from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .launch_profiles import BenchmarkLaunchProfile
 from .models import ModelConfig
+
+
+def _mtp_env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
 
 
 MTP_DECODE_HEAVY_PROMPTS = (
@@ -183,7 +195,9 @@ def benchmark_mtp_optimizer_workloads(
 
 # Minimum draft tokens for an acceptance sample to be treated as reliable.
 # A handful of tokens at 100% acceptance is noise, not a result.
-MTP_MIN_RELIABLE_DRAFT_TOKENS = 32
+MTP_MIN_RELIABLE_DRAFT_TOKENS = _mtp_env_int(
+    'LLAMA_TUI_MTP_MIN_DRAFT_TOKENS', 32, minimum=1,
+)
 
 
 def _mtp_record_draft_tokens(item: Dict[str, object]) -> int:

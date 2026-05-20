@@ -108,6 +108,27 @@ class ServerMetricsTests(unittest.TestCase):
         self.assertEqual(seen[0][0], 'URLError')
 
 
+class BenchmarkBudgetEnvOverrideTests(unittest.TestCase):
+    def test_env_int_override_replaces_default_and_clamps_minimum(self):
+        from llama_tui.benchmark import _env_int_override
+        import os
+        prev = os.environ.get('LLAMA_TUI_FAKE_BUDGET')
+        try:
+            os.environ['LLAMA_TUI_FAKE_BUDGET'] = '120'
+            self.assertEqual(_env_int_override('LLAMA_TUI_FAKE_BUDGET', 600, minimum=60), 120)
+            os.environ['LLAMA_TUI_FAKE_BUDGET'] = '30'
+            self.assertEqual(_env_int_override('LLAMA_TUI_FAKE_BUDGET', 600, minimum=60), 60)
+            os.environ['LLAMA_TUI_FAKE_BUDGET'] = ''
+            self.assertEqual(_env_int_override('LLAMA_TUI_FAKE_BUDGET', 600, minimum=60), 600)
+            os.environ['LLAMA_TUI_FAKE_BUDGET'] = 'forever'
+            self.assertEqual(_env_int_override('LLAMA_TUI_FAKE_BUDGET', 600, minimum=60), 600)
+        finally:
+            if prev is None:
+                os.environ.pop('LLAMA_TUI_FAKE_BUDGET', None)
+            else:
+                os.environ['LLAMA_TUI_FAKE_BUDGET'] = prev
+
+
 class ThermalProbeTests(unittest.TestCase):
     def test_returns_zero_when_nvidia_smi_missing(self):
         with patch('llama_tui.hardware.shutil.which', return_value=None):

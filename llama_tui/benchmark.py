@@ -108,12 +108,35 @@ SAFE_BOOTSTRAP_PRESETS = (
     ('tokens_per_sec', 'safe'),
 )
 SAFE_BOOTSTRAP_Q8_TARGET_CTX = 4096
-ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS = 20 * 60
-ALL_MODELS_ADAPTIVE_TIME_BUDGET_SECONDS = 6 * 60
+def _env_int_override(name: str, default: int, minimum: int = 1) -> int:
+    """Resolve a benchmark budget constant from an environment variable.
+
+    Empty/missing/non-numeric values fall back to ``default``. Values below
+    ``minimum`` are clamped up — these constants gate real subprocess work
+    that takes a non-trivial floor of seconds to be meaningful.
+    """
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+ADAPTIVE_BENCHMARK_TIME_BUDGET_SECONDS = _env_int_override(
+    'LLAMA_TUI_ADAPTIVE_BUDGET_SECONDS', 20 * 60, minimum=60,
+)
+ALL_MODELS_ADAPTIVE_TIME_BUDGET_SECONDS = _env_int_override(
+    'LLAMA_TUI_ALL_MODELS_ADAPTIVE_BUDGET_SECONDS', 6 * 60, minimum=60,
+)
 ADAPTIVE_CONTEXT_ROUNDING = 256
 ADAPTIVE_BINARY_STEPS = 4
 ADAPTIVE_MAX_CONTEXT_PROBES = 12
-ADAPTIVE_MAX_MEASUREMENTS = 20
+ADAPTIVE_MAX_MEASUREMENTS = _env_int_override(
+    'LLAMA_TUI_ADAPTIVE_MAX_MEASUREMENTS', 20, minimum=1,
+)
 EXHAUSTIVE_CONTEXT_STEP = 2048
 COARSE_CONTEXT_LOW_LIMIT = 16_384
 COARSE_CONTEXT_MID_LIMIT = 65_536
@@ -125,7 +148,9 @@ CONTEXT_KNEE_ROUNDING = 1_024
 BENCHMARK_HISTORY_LIMIT = 10
 FAST_BENCHMARK_CONTEXT_TARGETS = (8_192, 16_384)
 FAST_BENCHMARK_PARALLEL_TARGETS = (1, 2, 4)
-FAST_RUNTIME_PROFILE_BUDGET_SECONDS = 30 * 60
+FAST_RUNTIME_PROFILE_BUDGET_SECONDS = _env_int_override(
+    'LLAMA_TUI_FAST_BUDGET_SECONDS', 30 * 60, minimum=60,
+)
 SMART_BENCHMARK_SOFT_BUDGET_SECONDS = 45 * 60
 FULL_RUNTIME_PROFILE_BUDGET_SECONDS = 120 * 60
 CONTEXT_HEALTH_PRESSURE_CAP = 0.45

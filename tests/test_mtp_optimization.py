@@ -86,6 +86,25 @@ class Fix2AcceptanceParsingTests(unittest.TestCase):
         self.assertEqual((rate, total, samples), (0.0, 0, 0))
         self.assertEqual(reliability, 'none')
 
+    def test_mtp_env_int_override_applied(self):
+        from llama_tui.benchmark_mtp import _mtp_env_int
+        import os
+        prev = os.environ.get('LLAMA_TUI_MTP_MIN_DRAFT_TOKENS')
+        try:
+            os.environ['LLAMA_TUI_MTP_MIN_DRAFT_TOKENS'] = '8'
+            self.assertEqual(_mtp_env_int('LLAMA_TUI_MTP_MIN_DRAFT_TOKENS', 32), 8)
+            os.environ['LLAMA_TUI_MTP_MIN_DRAFT_TOKENS'] = ''
+            self.assertEqual(_mtp_env_int('LLAMA_TUI_MTP_MIN_DRAFT_TOKENS', 32), 32)
+            os.environ['LLAMA_TUI_MTP_MIN_DRAFT_TOKENS'] = 'not-a-number'
+            self.assertEqual(_mtp_env_int('LLAMA_TUI_MTP_MIN_DRAFT_TOKENS', 32), 32)
+            os.environ['LLAMA_TUI_MTP_MIN_DRAFT_TOKENS'] = '0'
+            self.assertEqual(_mtp_env_int('LLAMA_TUI_MTP_MIN_DRAFT_TOKENS', 32, minimum=4), 4)
+        finally:
+            if prev is None:
+                os.environ.pop('LLAMA_TUI_MTP_MIN_DRAFT_TOKENS', None)
+            else:
+                os.environ['LLAMA_TUI_MTP_MIN_DRAFT_TOKENS'] = prev
+
 
 class Fix4PartialWinnerTests(unittest.TestCase):
     def test_ok_record_beats_tiny_partial(self):
