@@ -5,6 +5,7 @@ import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import time
 from dataclasses import asdict, fields, replace
@@ -291,7 +292,7 @@ def current_container_name() -> str:
                 key, sep, value = raw_line.partition('=')
                 if sep and key.strip() == 'name':
                     return value.strip().strip('"').strip("'")
-        except Exception:
+        except OSError:
             return ''
     return ''
 
@@ -410,7 +411,7 @@ class AppConfig:
             if int(getattr(self.hermes, 'min_context_tokens', 0) or 0) == HERMES_LEGACY_DEFAULT_MIN_CONTEXT_TOKENS:
                 self.hermes.min_context_tokens = HERMES_DEFAULT_MIN_CONTEXT_TOKENS
                 settings_changed = True
-        except Exception:
+        except (TypeError, ValueError):
             self.hermes.min_context_tokens = HERMES_DEFAULT_MIN_CONTEXT_TOKENS
             settings_changed = True
         self.ui = self._load_settings(UiSettings, data.get('ui', {}), self.ui, 'ui')
@@ -706,7 +707,7 @@ class AppConfig:
         current_conf = float(getattr(model, 'classification_confidence', 0.0) or 0.0)
         try:
             detected = detect_architecture_info(model)
-        except Exception:
+        except (OSError, EOFError, ValueError, struct.error):
             return False
         should_update = (
             current_type not in ('dense', 'moe')
@@ -729,7 +730,7 @@ class AppConfig:
             return False
         try:
             detected = detect_turboquant_info(model)
-        except Exception:
+        except (OSError, EOFError, ValueError, struct.error):
             return False
         before = asdict(model)
         current_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
@@ -753,7 +754,7 @@ class AppConfig:
             return False
         try:
             detected = detect_tq3_info(model)
-        except Exception:
+        except (OSError, EOFError, ValueError, struct.error):
             return False
         before = asdict(model)
         current_status = (getattr(model, 'tq3_status', '') or 'unknown').strip().lower()
@@ -877,7 +878,7 @@ class AppConfig:
                 check=False,
             )
             line = compact_message((result.stdout or '').splitlines()[0] if result.stdout else '')
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             line = ''
         self._runtime_version_cache[key] = line
         return line
@@ -1168,7 +1169,7 @@ class AppConfig:
         command = self.runtime_server_command('llama.cpp')
         try:
             capabilities = self.engine_capabilities()
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             return ''
         return engine_turboquant_binary_warning(command, capabilities)
 
@@ -1178,7 +1179,7 @@ class AppConfig:
         command = self.runtime_server_command('llama.cpp')
         try:
             capabilities = self.engine_capabilities()
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             return ''
         return engine_tq3_binary_warning(command, capabilities)
 
@@ -1189,7 +1190,7 @@ class AppConfig:
         command = str(install.resolved_command or self.runtime_server_command('llama.cpp'))
         try:
             capabilities = detect_engine_capabilities(command, ENGINE_LLAMA_CPP_MTP)
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             return ''
         return engine_mtp_binary_warning(
             command,
