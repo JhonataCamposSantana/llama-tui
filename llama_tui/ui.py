@@ -403,14 +403,14 @@ def active_engine_kv(app: AppConfig, model: ModelConfig) -> str:
             int(getattr(model, 'ngl', 0) or 0),
         )
         key_mode, value_mode = str(getattr(runtime_profile, 'kv_preset', '') or '').split('/', 1)
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         profile = getattr(app, 'runtime_profile', None)
         try:
             key_mode, value_mode = profile.engine_kv_pair()
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             try:
                 key_mode, value_mode = profile.buun_kv_pair()
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 key_mode, value_mode = '', ''
     return f'key={key_mode or "-"} value={value_mode or "-"}'
 
@@ -443,11 +443,11 @@ def active_engine_badge_line(app: AppConfig, model: Optional[ModelConfig] = None
         try:
             kv = profile.engine_kv_pair()
             kv = f'key={kv[0]} value={kv[1]}'
-        except Exception:
+        except (AttributeError, TypeError, ValueError, IndexError):
             kv = '-'
     try:
         binary_ok = bool(app.command_exists(binary))
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         binary_ok = bool(binary)
     binary_state = 'binary ok' if binary_ok else 'binary missing'
     return f'ENGINE: {engine} | KV {kv or "-"} | {binary_state}'
@@ -458,7 +458,7 @@ def active_engine_badge_kind(app: AppConfig, model: Optional[ModelConfig] = None
     try:
         if not app.command_exists(binary):
             return 'error'
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         pass
     if model is not None and active_engine_warning_line(app, model):
         return 'error' if 'binary warning' in active_engine_warning_line(app, model).lower() else 'warning'
@@ -505,23 +505,23 @@ def tq3_detail_line(model: ModelConfig) -> str:
 def model_engine_visibility_lines(app: AppConfig, model: ModelConfig) -> List[str]:
     try:
         features = ', '.join(app.model_runtime_features(model)) or '-'
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         features = '-'
     try:
         active_visibility = app.model_engine_visibility(model)
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         active_visibility = None
     try:
         active_compat = app.model_engine_compatibility(model)
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         active_compat = None
     try:
         compatible = ', '.join(format_engine_badge(engine) for engine in app.compatible_engine_ids_for_model(model)) or '-'
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         compatible = '-'
     try:
         hidden = app.hidden_engine_reasons_for_model(model)
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         hidden = {}
     hidden_text = '; '.join(
         f'{format_engine_badge(engine)}: {reason}'
@@ -556,7 +556,7 @@ def iso_recent_key(value: str) -> float:
         return 0.0
     try:
         return time.mktime(time.strptime(value, '%Y-%m-%dT%H:%M:%S'))
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
