@@ -19,11 +19,16 @@ from .benchmark_mtp import (
     MTP_PROMPT_HEAVY_CONTEXT,
     MTP_PROMPT_HEAVY_PROMPTS,
     MTP_WORKLOAD_OUTPUT_CAPS,
+    _DRAFT_MTP_STAT_RE,
+    _draft_mtp_session_totals,
     annotate_mtp_optimizer_records,
     benchmark_mtp_optimizer_workloads as _benchmark_mtp_optimizer_workloads,
     best_mtp_acceptance_record,
+    enrich_mtp_acceptance_metrics,
     mtp_optimizer_profile_recommendations,
     mtp_optimizer_workload_specs,
+    parse_mtp_acceptance_metrics,
+    parse_mtp_runtime_diagnostics,
     weighted_mtp_accept_rate,
 )
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
@@ -5739,198 +5744,10 @@ def apply_failure_context(record: Dict[str, object], detail: str, default_catego
     return record
 
 
-_DRAFT_MTP_STAT_RE = re.compile(
-    r'statistics\s+draft-mtp:.*?#gen\s+drafts?\s*=\s*([0-9]+)'
-    r'.*?#acc\s+drafts?\s*=\s*([0-9]+)',
-    re.IGNORECASE,
-)
-
-
-def _draft_mtp_session_totals(text: str) -> List[Tuple[int, int]]:
-    """Return ``[(gen_drafts, acc_drafts), ...]`` -- one entry per server session.
-
-    llama.cpp prints ``statistics draft-mtp: ... #gen drafts = N, #acc drafts = M``
-    with counters that are cumulative within a server session and reset to a
-    fresh count when a new server starts. Each session therefore contributes its
-    final (largest) cumulative line; a drop in ``#gen drafts`` marks a reset.
-    """
-    sessions: List[Tuple[int, int]] = []
-    prev_gen = -1
-    last: Optional[Tuple[int, int]] = None
-    for match in _DRAFT_MTP_STAT_RE.finditer(text or ''):
-        gen = int(match.group(1))
-        acc = int(match.group(2))
-        if gen < prev_gen and last is not None:
-            sessions.append(last)
-        last = (gen, acc)
-        prev_gen = gen
-    if last is not None:
-        sessions.append(last)
-    return sessions
-
-
-def parse_mtp_acceptance_metrics(text: str) -> Dict[str, object]:
-    payload: Dict[str, object] = {}
-    source = str(text or '')
-    if not source:
-        return payload
-    low = source.lower()
-
-    # Preferred path: llama.cpp's own `statistics draft-mtp:` lines. Use the
-    # most recent server session (this candidate's launch); the run-summary
-    # layer down-weights tiny samples by draft_tokens.
-    sessions = _draft_mtp_session_totals(source)
-    if sessions:
-        gen, acc = sessions[-1]
-        if gen > 0:
-            payload['draft_tokens'] = gen
-            payload['accepted_tokens'] = min(acc, gen)
-            payload['accept_rate'] = round(max(0.0, min(1.0, acc / gen)), 4)
-            payload['mtp_acceptance_sessions'] = len(sessions)
-            return payload
-
-    def first_int(patterns: Sequence[str]) -> int:
-        for pattern in patterns:
-            match = re.search(pattern, low, flags=re.I)
-            if match:
-                try:
-                    return max(0, int(float(match.group(1))))
-                except Exception:
-                    continue
-        return 0
-
-    draft_tokens = first_int((
-        r'\bdraft(?:ed)?[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
-        r'\bgenerated[_\s-]*draft[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
-        r'\bspec(?:ulative)?[_\s-]*draft(?:ed)?\s*[:=]\s*([0-9]+)',
-        r'\bn[_\s-]*draft(?:ed)?\s*[:=]\s*([0-9]+)',
-    ))
-    accepted_tokens = first_int((
-        r'\baccepted[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
-        r'\baccepted[_\s-]*draft[_\s-]*tokens?\s*[:=]\s*([0-9]+)',
-        r'\bspec(?:ulative)?[_\s-]*accepted\s*[:=]\s*([0-9]+)',
-        r'\bn[_\s-]*accepted\s*[:=]\s*([0-9]+)',
-    ))
-    rate = 0.0
-    for pattern in (
-        r'\baccept(?:ance)?[_\s-]*rate\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*%?',
-        r'\baccepted\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-    ):
-        match = re.search(pattern, low, flags=re.I)
-        if match:
-            try:
-                value = float(match.group(1))
-                rate = value / 100.0 if value > 1.0 else value
-                break
-            except Exception:
-                continue
-    if not rate and draft_tokens > 0 and accepted_tokens > 0:
-        rate = min(1.0, accepted_tokens / max(1, draft_tokens))
-    if draft_tokens:
-        payload['draft_tokens'] = draft_tokens
-    if accepted_tokens:
-        payload['accepted_tokens'] = accepted_tokens
-    if rate:
-        payload['accept_rate'] = round(max(0.0, min(1.0, rate)), 4)
-    return payload
-
-
-def parse_mtp_runtime_diagnostics(text: str) -> Dict[str, object]:
-    payload: Dict[str, object] = {}
-    source = str(text or '')
-    if not source:
-        return payload
-    low = source.lower()
-    if 'failed to fit params to free device memory' in low and 'n_gpu_layers already set by user' in low:
-        payload['failure_category'] = 'FIXED_GPU_LAYERS_BLOCKED_FIT'
-        payload['fit_failed_fixed_gpu_layers'] = True
-        payload['suggested_fix'] = 'Use a fit-assisted MTP profile without fixed --n-gpu-layers.'
-    if 'tensor overrides to cpu are used with mmap enabled' in low and 'no-mmap' in low:
-        payload['warning'] = 'MMAP_CPU_OVERRIDE_SLOWPATH'
-        payload['mmap_warning'] = True
-        payload['mmap_cpu_override_slowpath'] = True
-        payload['recommendation'] = 'Add --no-mmap for MTP profiles with CPU tensor overrides.'
-    for line in source.splitlines():
-        cpu_mapped = re.search(r'CPU_Mapped model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
-        if cpu_mapped:
-            payload['cpu_model_buffer_type'] = 'CPU_Mapped'
-            payload['cpu_mapped_model_buffer_mib'] = float(cpu_mapped.group(1))
-            continue
-        cuda_host = re.search(r'CUDA_Host model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
-        if cuda_host:
-            payload['cpu_model_buffer_type'] = 'CUDA_Host'
-            payload['cuda_host_model_buffer_mib'] = float(cuda_host.group(1))
-            continue
-        cuda_model = re.search(r'CUDA\d* model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
-        if cuda_model:
-            payload['cuda_model_buffer_mib'] = float(cuda_model.group(1))
-            continue
-        prompt_eval = re.search(
-            r'prompt eval time\s*=.*?/\s*\d+\s+tokens.*?,\s*([0-9.]+)\s+tokens per second',
-            line,
-            re.IGNORECASE,
-        )
-        if prompt_eval:
-            payload['prompt_eval_tokens_per_sec'] = float(prompt_eval.group(1))
-            continue
-        eval_time = re.search(
-            r'(?<!prompt )eval time\s*=.*?/\s*\d+\s+tokens.*?,\s*([0-9.]+)\s+tokens per second',
-            line,
-            re.IGNORECASE,
-        )
-        if eval_time:
-            payload['eval_tokens_per_sec'] = float(eval_time.group(1))
-            continue
-        vram_free = re.search(r'(?:final\s+)?(?:vram|cuda|device).*?free(?: memory)?\s*[:=]\s*([0-9.]+)\s*(GiB|MiB)', line, re.IGNORECASE)
-        if vram_free:
-            value = float(vram_free.group(1))
-            unit = vram_free.group(2).lower()
-            payload['final_vram_free_bytes'] = int(value * (1024 ** 3 if unit == 'gib' else 1024 ** 2))
-    return payload
-
-
-def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object]:
-    is_mtp_record = (
-        bool(record.get('mtp_enabled', False))
-        or str(record.get('spec_type', '') or '') in ('mtp', 'draft-mtp')
-        or str(record.get('engine', '') or '').strip().lower() == ENGINE_LLAMA_CPP_MTP
-    )
-    if not is_mtp_record:
-        return record
-    log_path = str(record.get('runtime_log_path', '') or '')
-    text = ''
-    if log_path:
-        try:
-            # Read a wide tail so every `statistics draft-mtp:` line for the
-            # candidate's server session is captured, not just the last few.
-            text = Path(log_path).read_text(encoding='utf-8', errors='replace')[-40000:]
-        except Exception:
-            text = ''
-    metrics = parse_mtp_acceptance_metrics(text)
-    diagnostics = parse_mtp_runtime_diagnostics(text)
-    if metrics:
-        record.update(metrics)
-        record['mtp_acceptance_source'] = 'runtime_log'
-    else:
-        record['mtp_acceptance_source'] = 'not_reported'
-    if diagnostics:
-        warning = str(diagnostics.pop('warning', '') or '')
-        recommendation = str(diagnostics.pop('recommendation', '') or '')
-        category = str(diagnostics.get('failure_category', '') or '')
-        if category and str(record.get('status', '') or '') != 'ok':
-            record['failure_category'] = category
-            record['failure_reason'] = record.get('failure_reason') or 'MTP fit was blocked because --n-gpu-layers was fixed.'
-            record['suggested_fix'] = record.get('suggested_fix') or diagnostics.get('suggested_fix', '')
-        record.update(diagnostics)
-        if warning:
-            warnings = [str(item) for item in list(record.get('runtime_warnings', []) or [])]
-            if warning not in warnings:
-                warnings.append(warning)
-            record['runtime_warnings'] = warnings
-            record['warning'] = warning
-        if recommendation:
-            record['runtime_recommendation'] = recommendation
-    return record
+# _DRAFT_MTP_STAT_RE / _draft_mtp_session_totals / parse_mtp_acceptance_metrics /
+# parse_mtp_runtime_diagnostics / enrich_mtp_acceptance_metrics moved to
+# benchmark_mtp.py and re-imported below alongside the existing MTP scoring
+# helpers.
 
 
 def benchmark_adaptive_candidate(
