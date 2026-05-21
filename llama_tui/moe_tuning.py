@@ -59,11 +59,21 @@ def _model_mtp_acceptance_records(model: ModelConfig) -> List[Dict[str, object]]
 
 
 def _usable_mtp_acceptance_record_for_model(model: ModelConfig) -> Dict[str, object]:
+    # Only apply MTP to MoE tuning when we have *throughput-verified* evidence
+    # that MTP helps. A 'partial' acceptance record proves the probe accepted
+    # drafted tokens (acceptance scraped from server log) but its API request
+    # timed out before producing tokens_per_sec, so we have no proof MTP is a
+    # net-positive on this hardware/model. Applying MTP based on acceptance
+    # alone made baseline tok/s drop ~20% (21.69 -> 18.13) and pushed several
+    # n_cpu_moe variants into MEMORY_FIT_FAILED because the MTP draft cache
+    # eats VRAM. Require status='ok' so MoE tuning only enables MTP when the
+    # probe both ran AND measured a real decode rate. Partial records still
+    # surface in best_mtp_acceptance_record() for display.
     records = annotate_mtp_optimizer_records(_model_mtp_acceptance_records(model))
     candidates = [
         dict(item)
         for item in records
-        if str(item.get('status', '') or '') in ('ok', 'partial')
+        if str(item.get('status', '') or '') == 'ok'
         and bool(item.get('mtp_enabled'))
         and str(item.get('mtp_risk_level', '') or 'usable') != 'failed'
     ]
