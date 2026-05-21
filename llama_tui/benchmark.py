@@ -7708,20 +7708,27 @@ def active_engine_runtime_profiles(
             else:
                 add_buun_fit_growth_profiles(include_turbo_ladder=False)
             return finalized_profiles()
-        add('partial_gpu_probe', base_ctx, partial_ngl, kv_for_strategy('partial_gpu_probe'))
+        if partial_ngl > 0:
+            _probe_seed = ModelConfig(**asdict(model))
+            _probe_seed.ngl = partial_ngl
+            _gpu_safe = candidate_safe_context_estimate(_probe_seed, profile)
+            gpu_probe_ctx = min(base_ctx, max(ctx_min, _gpu_safe))
+        else:
+            gpu_probe_ctx = base_ctx
+        add('partial_gpu_probe', gpu_probe_ctx, partial_ngl, kv_for_strategy('partial_gpu_probe'))
         if supports_turbo:
             for kv_profile in turbo_profiles:
                 name = 'kv_compression_probe' if kv_profile.kv_preset == 'turbo4/turbo4' else f'kv_compression_probe_{kv_profile.name_slug}'
                 add(
                     name,
-                    base_ctx,
+                    gpu_probe_ctx,
                     partial_ngl,
                     kv_profile.kv_preset,
                     kv_profile=kv_profile,
                     no_warmup=capabilities.supports_no_warmup,
                 )
         elif supports_cache_kv:
-            add('kv_compression_probe', base_ctx, partial_ngl, kv_for_strategy('kv_compression_probe'))
+            add('kv_compression_probe', gpu_probe_ctx, partial_ngl, kv_for_strategy('kv_compression_probe'))
         if benchmark_depth == 'full':
             sweep_kv_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), None) if supports_turbo else None
             sweep_kv = sweep_kv_profile.kv_preset if sweep_kv_profile is not None else kv_for_strategy('gpu_layer_sweep')
