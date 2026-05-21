@@ -515,7 +515,7 @@ class MoeTuningRunnerTests(unittest.TestCase):
         self.assertIn('draft-mtp', msg)
         self.assertTrue(any('MTP-aware MoE diagnostics' in line for line in progress))
 
-    def test_mtp_native_moe_tuning_requires_usable_mtp_acceptance_winner(self):
+    def test_mtp_native_moe_tuning_falls_back_when_no_usable_mtp_acceptance_winner(self):
         self.configure_mtp_model()
         self.model.measured_profiles = {}
         self.model.mtp_draft_n_max = 3
@@ -523,12 +523,8 @@ class MoeTuningRunnerTests(unittest.TestCase):
         calls = []
         progress = []
 
-        def forbidden_runtime(*_args, **_kwargs):
-            calls.append('launched')
-            raise AssertionError('MoE tuning must not launch before MTP Optimizer has a usable winner')
-
         ok, msg = self.run_tuning(
-            forbidden_runtime,
+            self.fake_runtime_benchmark(calls, {'baseline_current': 9.0, 'cpu_moe_all': 12.0}),
             layer_count=41,
             hardware=small_gpu_hardware(),
             capabilities=mtp_tuning_caps(),
@@ -537,14 +533,17 @@ class MoeTuningRunnerTests(unittest.TestCase):
 
         saved = self.app.get_model('moe')
         latest_run = saved.benchmark_runs[0]
-        record = latest_run['records'][0]
+        first_record = latest_run['records'][0]
+        args = first_record['effective_server_args']
 
-        self.assertFalse(ok)
-        self.assertFalse(calls)
-        self.assertEqual(latest_run['status'], 'skipped_missing_baseline')
-        self.assertEqual(record['failure_category'], 'skipped_missing_mtp_acceptance')
-        self.assertIn('Run MTP Optimizer first', msg)
+        self.assertTrue(ok, msg)
+        self.assertTrue(calls, 'MoE tuning should still launch candidates when MTP acceptance is missing')
+        self.assertTrue(any('Falling back to MoE tuning without MTP awareness' in line for line in progress))
         self.assertTrue(any('acceptance=missing' in line for line in progress))
+        # Fallback path runs without MTP, so candidates must not carry --spec-type / --spec-draft-n-max.
+        self.assertNotIn('--spec-type', args)
+        self.assertNotIn('--spec-draft-n-max', args)
+        self.assertFalse(first_record.get('mtp_enabled', False))
 
 
 class ApplyMoeRecommendationTests(unittest.TestCase):

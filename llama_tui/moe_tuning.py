@@ -65,7 +65,7 @@ def _usable_mtp_acceptance_record_for_model(model: ModelConfig) -> Dict[str, obj
         for item in records
         if str(item.get('status', '') or '') in ('ok', 'partial')
         and bool(item.get('mtp_enabled'))
-        and str(item.get('mtp_risk_level', '') or '') in ('excellent', 'good', 'usable')
+        and str(item.get('mtp_risk_level', '') or 'usable') != 'failed'
     ]
     if not candidates:
         return {}

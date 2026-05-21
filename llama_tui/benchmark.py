@@ -10011,44 +10011,12 @@ def benchmark_moe_placement_tuning(
         )
         return False, detail
     if mtp_tuning_enabled and not _usable_mtp_acceptance_record_for_model(model):
-        ended_at = datetime.now().isoformat(timespec='seconds')
         features = sorted(detect_model_runtime_features(model))
         spec_type = mtp_spec_type_value(capabilities)
         reason = _moe_tuning_mtp_acceptance_required_reason(model)
-        detail = (
-            f'{reason} engine={engine}; detected_features={",".join(features) or "none"}; '
-            f'spec_type={spec_type or "-"}; supports_spec_draft_n_max={bool(getattr(capabilities, "supports_spec_draft_n_max", False))}.'
-        )
-        record = adaptive_record_from_candidate(
-            model,
-            'moe_placement',
-            'skipped_missing_baseline',
-            detail=detail,
-            engine=engine,
-            benchmark_purpose='moe_tuning',
-            failure_category='skipped_missing_mtp_acceptance',
-            failure_reason=reason,
-            suggested_fix='Run MTP Optimizer first and retry MoE placement tuning.',
-            spec_type=spec_type,
-        )
-        record['benchmark_kind'] = 'moe_tuning'
-        record['measured_profile_key'] = 'moe_placement'
-        record['detected_features'] = features
-        record['mtp_spec_type'] = spec_type
-        saved = ModelConfig(**asdict(model))
-        saved.last_benchmark_results = [record]
-        saved.default_benchmark_status = 'skipped_missing_baseline'
-        saved.default_benchmark_at = ended_at
-        run = build_benchmark_run(run_id, 'moe_tuning', 'skipped_missing_baseline', [record], {}, started_at, ended_at, profile.short_summary())
-        run['depth'] = depth_key
-        run['warnings'] = [reason]
-        run['summary'] = detail
-        upsert_benchmark_run(saved, run)
-        app.add_or_update(saved)
         for line in (
-            reason,
+            f'{reason} Falling back to MoE tuning without MTP awareness.',
             f'MTP-aware MoE diagnostics: engine={engine} features={",".join(features) or "none"} spec_type={spec_type or "-"} acceptance=missing',
-            'Hint: run MTP Optimizer first so MoE tuning can reuse a measured draft_n.',
         ):
             try:
                 append_model_log(app, model, line)
@@ -10056,18 +10024,7 @@ def benchmark_moe_placement_tuning(
                 pass
             if progress:
                 progress(line)
-        emit_benchmark_event(
-            progress,
-            'benchmark_error',
-            saved,
-            'moe_tuning',
-            message=detail,
-            phase='skipped_missing_baseline',
-            completed=0,
-            total=0,
-            records=[record],
-        )
-        return False, detail
+        mtp_tuning_enabled = False
     if mtp_tuning_enabled:
         baseline_profile = _mtp_aware_moe_tuning_profile(baseline_profile, model, capabilities)
     eligibility = moe_tuning_eligibility_reason(model, profile, capabilities, engine)
