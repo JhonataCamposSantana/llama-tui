@@ -19,7 +19,7 @@ class MemoryGuardrailPolicy:
     vram_critical_fraction: float = 0.08
     vram_warning_floor_bytes: int = 1 * GIB
     vram_warning_fraction: float = 0.12
-    pressure_skip_threshold: float = 0.45
+    pressure_skip_threshold: float = 0.70
     sample_interval_seconds: float = 1.0
 
     @classmethod

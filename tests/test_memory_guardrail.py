@@ -73,5 +73,54 @@ class RecordFieldsAndStateTests(unittest.TestCase):
         self.assertEqual(state.record_fields()['memory_guardrail_min_ram_available'], 1 * GIB)
 
 
+class AdmissionSkipTests(unittest.TestCase):
+    """Pressure-based admission skip fires only above the 0.70 threshold."""
+
+    _ADMISSION_KWARGS = dict(
+        phase='admission',
+        candidate_ctx=2048,
+        safe_ctx=529,
+    )
+
+    def test_old_trigger_pressure_no_longer_skips(self):
+        # pressure=0.46 used to fire at the old 0.45 threshold — must not skip now.
+        decision = memory_guardrail_decision(
+            _profile(20 * GIB), pressure_score=0.46, **self._ADMISSION_KWARGS
+        )
+        self.assertNotEqual(decision.action, 'skip')
+
+    def test_mid_band_pressure_does_not_skip(self):
+        decision = memory_guardrail_decision(
+            _profile(20 * GIB), pressure_score=0.65, **self._ADMISSION_KWARGS
+        )
+        self.assertNotEqual(decision.action, 'skip')
+
+    def test_high_pressure_skips(self):
+        decision = memory_guardrail_decision(
+            _profile(20 * GIB), pressure_score=0.75, **self._ADMISSION_KWARGS
+        )
+        self.assertEqual(decision.action, 'skip')
+        self.assertEqual(decision.status, 'memory_guardrail_skipped')
+
+    def test_required_for_floor_bypasses_skip(self):
+        decision = memory_guardrail_decision(
+            _profile(20 * GIB),
+            pressure_score=0.75,
+            required_for_floor=True,
+            **self._ADMISSION_KWARGS,
+        )
+        self.assertNotEqual(decision.action, 'skip')
+
+    def test_memory_warning_alone_does_not_skip(self):
+        # VRAM near warning floor with low pressure should warn, not skip.
+        decision = memory_guardrail_decision(
+            _profile(20 * GIB, vram_free=1 * GIB),
+            pressure_score=0.10,
+            **self._ADMISSION_KWARGS,
+        )
+        self.assertNotEqual(decision.action, 'skip')
+        self.assertEqual(decision.warning, True)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1649,11 +1649,11 @@ def measured_profile_runtime_profile(
         or bool(fingerprint.get('no_warmup'))
         or _command_has_flag(command_tokens, '--no-warmup')
     )
-    no_mmap = (
-        _profile_bool(profile, 'runtime_no_mmap')
-        or bool(fingerprint.get('no_mmap'))
-        or _command_has_flag(command_tokens, '--no-mmap')
+    explicit_no_mmap = (
+        _command_has_flag(command_tokens, '--no-mmap')
+        or _profile_bool(profile, 'runtime_no_mmap')
     )
+    no_mmap = explicit_no_mmap or bool(fingerprint.get('no_mmap'))
 
     batch_size = _profile_int(profile, 'batch_size', int(fingerprint.get('batch_size', 0) or 0))
     if batch_size <= 0:
@@ -1674,6 +1674,9 @@ def measured_profile_runtime_profile(
             gpu_layers = int(fingerprint_gpu_layers)
         else:
             gpu_layers = _profile_int(profile, 'ngl', int(getattr(model, 'ngl', 0) or 0))
+
+    if no_mmap and not explicit_no_mmap and int(gpu_layers or 0) > 0:
+        no_mmap = False
 
     turbo_profile = turbo_kv_profile_for_preset(kv_preset)
     family = str(profile.get('kv_family') or '').strip()
