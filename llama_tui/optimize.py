@@ -321,7 +321,7 @@ def choose_threads_for_profile(model: ModelConfig, profile: Optional[HardwarePro
 
     pressure = process_pressure_score(profile)
     if model_likely_fits_gpu(model, profile, tier):
-        cap = 6 if model_is_moe(model) or pressure >= 0.45 else 8
+        cap = 6 if pressure >= 0.45 else 8
         return max(2, min(physical, cap))
 
     if tier == 'safe':

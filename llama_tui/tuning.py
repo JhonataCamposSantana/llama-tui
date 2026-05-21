@@ -339,7 +339,13 @@ def generate_moe_tuning_candidates(
         seen.add(key)
         deduped.append(candidate)
     limit = 6 if normalized_depth == 'fast' else 10
-    return deduped[:limit]
+    selected = deduped[:limit]
+    override = next((item for item in deduped if item.name == 'experts_cpu_override'), None)
+    if override is not None and override not in selected:
+        if len(selected) >= limit:
+            selected = selected[:-1]
+        selected.append(override)
+    return selected
 
 
 def refinement_n_cpu_moe_values(winner_n_cpu_moe: int, layer_count: int) -> List[int]:
