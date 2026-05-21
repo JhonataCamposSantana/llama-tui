@@ -161,15 +161,18 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.llama_extra_args(), ['--flash-attn', 'on', '-ctk', 'q8_0', '-ctv', 'q8_0'])
         self.assertIn('llama.cpp-tq3', profile.header_indicator())
 
-    def test_mtp_profile_uses_separate_experimental_binary(self):
+    def test_legacy_mtp_alias_resolves_to_llama_cpp_with_mtp_binary(self):
+        # Audit #7: 'llama.cpp-mtp' is now just an alias for llama.cpp
+        # that opts into LLAMA_CPP_MTP_PATH for binary discovery. The
+        # resulting profile reports engine_id='llama.cpp' so the rest
+        # of the codebase has one fewer special case to handle.
         with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': '/opt/mtp/bin'}):
             profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
 
-        self.assertEqual(profile.engine_id, 'llama.cpp-mtp')
-        self.assertEqual(profile.display_name, 'llama.cpp MTP')
+        self.assertEqual(profile.engine_id, 'llama.cpp')
+        self.assertEqual(profile.display_name, 'llama.cpp')
         self.assertEqual(profile.server_command, '/opt/mtp/bin/llama-server')
-        self.assertTrue(profile.experimental)
-        self.assertIn('Experimental', profile.header_indicator())
+        self.assertFalse(profile.experimental)
 
     def test_mtp_env_directory_searches_common_build_layouts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1395,13 +1398,13 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(runtime_profile.fit_context, 4096)
 
     def test_runtime_artifacts_are_scoped_by_active_engine(self):
+        # Audit #7: the legacy 'llama.cpp-mtp' engine collapses into
+        # 'llama.cpp', so artefacts for a session started with that
+        # alias now share llama.cpp's runtime directory. The other
+        # forks keep their own scopes.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model = ModelConfig(id='m', name='M', path='/models/m.gguf', alias='m', port=18080)
-            # Patch the canonical CACHE_DIR so the runtime_paths helpers (which
-            # look it up via the constants module) see the temp root; the
-            # legacy app.CACHE_DIR patch is kept for the few app.py call sites
-            # that still bind the name locally.
             with patch('llama_tui.constants.CACHE_DIR', root), \
                     patch('llama_tui.app.CACHE_DIR', root):
                 llama_app = AppConfig(root / 'llama.json')
@@ -1434,18 +1437,16 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertNotEqual(llama_log, buun_log)
         self.assertNotEqual(llama_log, turboquant_log)
-        self.assertNotEqual(llama_log, mtp_log)
-        self.assertNotEqual(llama_pid, buun_pid)
-        self.assertNotEqual(llama_pid, turboquant_pid)
-        self.assertNotEqual(llama_pid, mtp_pid)
+        self.assertNotEqual(buun_log, turboquant_log)
         self.assertEqual(llama_log, root / 'runtime' / 'llama.cpp' / 'm.log')
         self.assertEqual(buun_log, root / 'runtime' / 'buun' / 'm.log')
         self.assertEqual(turboquant_log, root / 'runtime' / 'turboquant' / 'm.log')
-        self.assertEqual(mtp_log, root / 'runtime' / 'llama.cpp-mtp' / 'm.log')
+        # MTP alias now resolves under the llama.cpp runtime dir.
+        self.assertEqual(mtp_log, root / 'runtime' / 'llama.cpp' / 'm.log')
+        self.assertEqual(mtp_pid, root / 'runtime' / 'llama.cpp' / 'm.pid')
         self.assertEqual(llama_pid, root / 'runtime' / 'llama.cpp' / 'm.pid')
         self.assertEqual(buun_pid, root / 'runtime' / 'buun' / 'm.pid')
         self.assertEqual(turboquant_pid, root / 'runtime' / 'turboquant' / 'm.pid')
-        self.assertEqual(mtp_pid, root / 'runtime' / 'llama.cpp-mtp' / 'm.pid')
         self.assertEqual(legacy_log, root / 'm.log')
 
     def test_llama_command_can_use_supported_q8_cache_flags(self):

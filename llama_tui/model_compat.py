@@ -6,7 +6,6 @@ from typing import Iterable, Optional, Set, Tuple
 from .engines import (
     ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_LLAMA_CPP_MTP,
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
@@ -259,24 +258,14 @@ def engine_supports_model(
     features = detect_model_runtime_features(model)
 
     if 'mmproj' in features:
-        if engine == ENGINE_LLAMA_CPP_MTP:
-            return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
+        # Audit #7: the legacy ENGINE_LLAMA_CPP_MTP-specific branch
+        # collapsed into the standard mmproj block — normalize_engine_id
+        # routes the alias to ENGINE_LLAMA_CPP, and MTP+mmproj is
+        # unsupported on every llama.cpp variant regardless.
         return _result('unsupported', 'mmproj files are not standalone language models', 'block', features)
 
     if 'tq3_native' in features and engine != ENGINE_TQ3:
         return _result('unsupported', f'TQ3-native GGUFs require the tq3 engine (selected engine: {engine})', 'block', features)
-
-    if engine == ENGINE_LLAMA_CPP_MTP:
-        if 'vision' in features:
-            return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
-        if 'mtp_native' not in features:
-            return _result('unknown', 'MTP capability is unknown for this model', 'warn', features)
-        if capabilities is not None and (
-            not bool(getattr(capabilities, 'supports_mtp', False))
-            or not mtp_spec_type_value(capabilities)
-        ):
-            return _result('unsupported', _mtp_binary_block_reason(capabilities), 'block', features)
-        return _result('preferred', 'MTP-capable GGUF', 'info', features)
 
     if engine == ENGINE_TQ3:
         if 'tq3_native' in features:
@@ -326,24 +315,12 @@ def engine_shows_model(
     features = detect_model_runtime_features(model)
 
     if 'mmproj' in features:
-        if engine == ENGINE_LLAMA_CPP_MTP:
-            return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
+        # Same collapse as engine_supports_model above; the legacy
+        # ENGINE_LLAMA_CPP_MTP-only branch is dead after audit #7.
         return _result('unsupported', 'mmproj files are not standalone language models', 'block', features)
 
     if 'tq3_native' in features and engine != ENGINE_TQ3:
         return _result('unsupported', f'TQ3-native GGUFs require the tq3 engine (selected engine: {engine})', 'block', features)
-
-    if engine == ENGINE_LLAMA_CPP_MTP:
-        if 'vision' in features:
-            return _result('unsupported', 'MTP + mmproj/vision is currently unsupported', 'block', features)
-        if 'mtp_native' not in features:
-            return _result('unknown', 'MTP capability is unknown for this model', 'warn', features)
-        if capabilities is not None and (
-            not bool(getattr(capabilities, 'supports_mtp', False))
-            or not mtp_spec_type_value(capabilities)
-        ):
-            return _result('compatible_with_warning', _mtp_binary_block_reason(capabilities), 'warn', features)
-        return _result('preferred', 'MTP-capable GGUF', 'info', features)
 
     return engine_supports_model(engine, model, capabilities)
 
@@ -353,7 +330,9 @@ def compatible_engine_ids_for_model(
     capabilities_by_engine: Optional[dict[str, EngineCapabilities]] = None,
 ) -> Tuple[str, ...]:
     compatible = []
-    for engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
+    # Audit #7: ENGINE_LLAMA_CPP_MTP collapsed into ENGINE_LLAMA_CPP, so
+    # only iterate the five canonical engines now.
+    for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
         caps = (capabilities_by_engine or {}).get(engine)
         if engine_supports_model(engine, model, caps).compatible:
             compatible.append(engine)

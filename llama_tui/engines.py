@@ -91,28 +91,23 @@ def get_engine_definitions() -> Dict[str, EngineDefinition]:
             display_name='llama.cpp',
             runtime_family='llama.cpp',
             default_binary_env='LLAMA_SERVER',
+            # Audit finding #7: MTP is now upstream (--spec-type mtp /
+            # draft-mtp). The legacy LLAMA_CPP_MTP_PATH env + sibling
+            # paths fold into llama.cpp's discovery so users who built
+            # the experimental fork still find their binary; capability
+            # detection then decides whether MTP is offered.
             default_paths=[
                 str(Path.home() / 'llama.cpp' / 'build' / 'bin' / 'llama-server'),
                 str(Path.home() / 'llama.cpp' / 'build' / 'bin' / 'server'),
                 '/usr/local/bin/llama-server',
                 '/usr/bin/llama-server',
+                *llama_cpp_mtp_default_candidates(),
+                'llama-server-mtp',
             ],
             path_config_key='llama_server',
             supports_gguf=True,
             supports_hf_ref=False,
             supports_openai_api=True,
-        ),
-        ENGINE_LLAMA_CPP_MTP: EngineDefinition(
-            id=ENGINE_LLAMA_CPP_MTP,
-            display_name='llama.cpp MTP',
-            runtime_family='llama.cpp',
-            default_binary_env='LLAMA_CPP_MTP_PATH',
-            default_paths=[*llama_cpp_mtp_default_candidates(), 'llama-server-mtp'],
-            path_config_key=None,
-            supports_gguf=True,
-            supports_hf_ref=False,
-            supports_openai_api=True,
-            notes='Experimental llama.cpp MTP speculative-decoding branch.',
         ),
         ENGINE_TURBOQUANT: EngineDefinition(
             id=ENGINE_TURBOQUANT,
@@ -181,7 +176,9 @@ def normalize_engine_id(engine_id: str) -> str:
     if normalized in ('llamacpp', 'llama_cpp', 'llama-cpp'):
         return ENGINE_LLAMA_CPP
     if normalized in ('llama.cpp-mtp', 'llama-cpp-mtp', 'llamacpp-mtp', 'mtp'):
-        return ENGINE_LLAMA_CPP_MTP
+        # Audit finding #7: legacy MTP-engine alias now collapses to
+        # plain llama.cpp; MTP is detected via EngineCapabilities.
+        return ENGINE_LLAMA_CPP
     if normalized in ('tq', 'turboquant+', 'turboquant'):
         return ENGINE_TURBOQUANT
     if normalized in ('tq3', 'llama.cpp-tq3', 'llama-cpp-tq3', 'llamacpp-tq3'):
@@ -209,21 +206,27 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
 
     env_name = definition.default_binary_env or ''
     env_value = os.environ.get(env_name) if env_name else ''
-    if engine == ENGINE_LLAMA_CPP_MTP and env_value:
-        mtp = resolve_llama_cpp_mtp_binary(env_value=env_value)
-        return EngineInstall(
-            id=engine,
-            resolved_command=mtp.command,
-            source=mtp.source,
-            exists=mtp.exists,
-            executable=mtp.executable,
-            resolved_path=mtp.resolved_path,
-            checked_paths=list(mtp.checked_paths),
-        )
+    # Audit #7: legacy LLAMA_CPP_MTP_PATH is honoured as a fallback for
+    # the llama.cpp engine when LLAMA_SERVER is unset, so users who
+    # built the MTP fork and pointed LLAMA_CPP_MTP_PATH at its bin
+    # directory still get auto-resolved.
+    if engine == ENGINE_LLAMA_CPP and not env_value:
+        mtp_env_value = os.environ.get('LLAMA_CPP_MTP_PATH', '')
+        if mtp_env_value:
+            mtp = resolve_llama_cpp_mtp_binary(env_value=mtp_env_value)
+            return EngineInstall(
+                id=engine,
+                resolved_command=mtp.command,
+                source=mtp.source,
+                exists=mtp.exists,
+                executable=mtp.executable,
+                resolved_path=mtp.resolved_path,
+                checked_paths=list(mtp.checked_paths),
+            )
     runtime_profile = getattr(config, 'runtime_profile', None)
     profile_engine = normalize_engine_id(str(getattr(runtime_profile, 'engine_id', '') or getattr(runtime_profile, 'engine', '') or ''))
     profile_command = str(getattr(runtime_profile, 'server_command', '') or getattr(runtime_profile, 'server_bin', '') or '')
-    if profile_engine == engine and profile_command and engine in (ENGINE_BUUN, ENGINE_TURBOQUANT, ENGINE_TQ3, ENGINE_LLAMA_CPP_MTP, ENGINE_LLAMA_CPP):
+    if profile_engine == engine and profile_command and engine in (ENGINE_BUUN, ENGINE_TURBOQUANT, ENGINE_TQ3, ENGINE_LLAMA_CPP):
         command = profile_command
         source = 'runtime_profile'
     elif env_value:
@@ -238,17 +241,6 @@ def resolve_engine_install(config, engine_id: str) -> EngineInstall:
     elif engine == ENGINE_TQ3:
         command = DEFAULT_TQ3_LLAMA_SERVER
         source = 'default'
-    elif engine == ENGINE_LLAMA_CPP_MTP:
-        mtp = resolve_llama_cpp_mtp_binary()
-        return EngineInstall(
-            id=engine,
-            resolved_command=mtp.command,
-            source=mtp.source,
-            exists=mtp.exists,
-            executable=mtp.executable,
-            resolved_path=mtp.resolved_path,
-            checked_paths=list(mtp.checked_paths),
-        )
     elif engine == ENGINE_VLLM:
         command = str(getattr(config, 'vllm_command', '') or DEFAULT_VLLM_COMMAND)
         source = 'config:vllm_command' if getattr(config, 'vllm_command', '') else 'default'
@@ -363,36 +355,11 @@ def mtp_binary_warning(
 def get_engine_health(config, engine_id: str) -> EngineHealth:
     install = resolve_engine_install(config, engine_id)
     if not install.exists:
-        if install.id == ENGINE_LLAMA_CPP_MTP:
-            detail = (
-                f'resolved={install.resolved_command or "-"}; source={install.source or "unknown"}; '
-                f'exists=no; executable={_yes_no(install.executable)}'
-            )
-            return EngineHealth(
-                id=install.id,
-                status='BINARY_NOT_FOUND',
-                summary=f'llama.cpp MTP binary missing ({detail})',
-                warnings=[
-                    f'command not found: {install.resolved_command or "-"}',
-                    *( [f'checked: {", ".join(install.checked_paths)}'] if install.checked_paths else [] ),
-                ],
-            )
         return EngineHealth(
             id=install.id,
             status='FAIL',
             summary=f'{engine_display_name(install.id)} binary missing',
             warnings=[f'command not found: {install.resolved_command or "-"}'],
-        )
-    if install.id == ENGINE_LLAMA_CPP_MTP and not install.executable:
-        detail = (
-            f'resolved={install.resolved_command or "-"}; source={install.source or "unknown"}; '
-            f'exists={_yes_no(install.exists)}; executable=no'
-        )
-        return EngineHealth(
-            id=install.id,
-            status='BUILD_REQUIRED',
-            summary=f'llama.cpp MTP binary is not executable ({detail})',
-            warnings=[f'not executable: {install.resolved_command or "-"}'],
         )
     warnings: List[str] = []
     capabilities = detect_engine_capabilities(install)
@@ -409,17 +376,6 @@ def get_engine_health(config, engine_id: str) -> EngineHealth:
         warning = tq3_binary_warning(str(install.resolved_command or ''), capabilities)
         if warning:
             warnings.append(warning)
-    if install.id == ENGINE_LLAMA_CPP_MTP:
-        warning = mtp_binary_warning(
-            str(install.resolved_command or ''),
-            capabilities,
-            source=install.source,
-            exists=install.exists,
-            executable=install.executable,
-        )
-        if warning:
-            status = 'BUILD_REQUIRED' if not str(getattr(capabilities, 'help_text', '') or '').strip() else 'MTP_FLAGS_NOT_FOUND'
-            return EngineHealth(install.id, status, warning, [warning])
         return EngineHealth(
             install.id,
             'READY',

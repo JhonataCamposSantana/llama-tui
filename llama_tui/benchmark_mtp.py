@@ -5,7 +5,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from .engines import ENGINE_LLAMA_CPP_MTP
+# Audit #7: keep the legacy engine id string here so old persisted
+# records still classify as MTP. ENGINE_LLAMA_CPP_MTP is no longer a
+# live engine in the registry.
+_LEGACY_MTP_ENGINE_ID = 'llama.cpp-mtp'
 from .launch_profiles import BenchmarkLaunchProfile
 from .models import ModelConfig
 
@@ -698,7 +701,7 @@ def enrich_mtp_acceptance_metrics(record: Dict[str, object]) -> Dict[str, object
     is_mtp_record = (
         bool(record.get('mtp_enabled', False))
         or str(record.get('spec_type', '') or '') in ('mtp', 'draft-mtp')
-        or str(record.get('engine', '') or '').strip().lower() == ENGINE_LLAMA_CPP_MTP
+        or str(record.get('engine', '') or '').strip().lower() == _LEGACY_MTP_ENGINE_ID
     )
     if not is_mtp_record:
         return record

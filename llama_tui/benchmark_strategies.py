@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 from .engines import (
     ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_LLAMA_CPP_MTP,
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
@@ -133,11 +132,11 @@ def select_benchmark_strategy(
             blocked_reason=blocked_reason,
         )
 
-    # MTP is a binary capability, not a dedicated engine. Select the MTP
-    # acceptance matrix for any llama.cpp-compatible engine whose binary
-    # advertises --spec-type (draft-mtp/mtp) + --spec-draft-n-max when the
-    # model is MTP-native. The legacy llama.cpp-mtp engine always routes here
-    # (and reports a blocked_reason when prerequisites are missing).
+    # MTP is a binary capability, not a dedicated engine. Audit #7:
+    # ENGINE_LLAMA_CPP_MTP collapsed into ENGINE_LLAMA_CPP, so the gate
+    # is now: any llama.cpp-family engine + an MTP-native model OR a
+    # MTP-capable binary triggers the acceptance matrix strategy; the
+    # strategy reports a blocked_reason when prerequisites are missing.
     mtp_spec_type = mtp_spec_type_value(capabilities)
     spec_values = tuple(getattr(capabilities, 'spec_type_values', ()) or ()) if capabilities is not None else ()
     model_is_mtp = 'mtp_native' in features
@@ -149,8 +148,7 @@ def select_benchmark_strategy(
         and bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
     )
     mtp_strategy_applies = (
-        engine == ENGINE_LLAMA_CPP_MTP
-        or (engine == ENGINE_LLAMA_CPP and model_is_mtp and mtp_capable_binary)
+        engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN) and model_is_mtp
     )
     if mtp_strategy_applies:
         blocked_reason = ''

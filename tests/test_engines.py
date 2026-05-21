@@ -25,18 +25,24 @@ from llama_tui.runtime_profiles import EngineCapabilities
 
 class EngineRegistryTests(unittest.TestCase):
     def test_builtin_engine_definitions_cover_supported_engines(self):
+        # Audit #7: ENGINE_LLAMA_CPP_MTP collapsed into ENGINE_LLAMA_CPP;
+        # MTP is now a binary capability resolved via --help, not a
+        # separate engine entry.
         definitions = get_engine_definitions()
 
         self.assertIn(ENGINE_LLAMA_CPP, definitions)
-        self.assertIn(ENGINE_LLAMA_CPP_MTP, definitions)
+        self.assertNotIn(ENGINE_LLAMA_CPP_MTP, definitions)
         self.assertIn(ENGINE_TURBOQUANT, definitions)
         self.assertIn(ENGINE_TQ3, definitions)
         self.assertIn(ENGINE_BUUN, definitions)
         self.assertIn(ENGINE_VLLM, definitions)
         self.assertTrue(definitions[ENGINE_LLAMA_CPP].supports_gguf)
-        self.assertEqual(definitions[ENGINE_LLAMA_CPP_MTP].display_name, 'llama.cpp MTP')
-        self.assertIn('Experimental', definitions[ENGINE_LLAMA_CPP_MTP].notes)
         self.assertTrue(definitions[ENGINE_VLLM].supports_hf_ref)
+        # The MTP fork's binary discovery paths now live inside the
+        # llama.cpp default_paths so users who built the fork to a
+        # non-standard location are still found.
+        llama_defaults = definitions[ENGINE_LLAMA_CPP].default_paths
+        self.assertTrue(any('llama.cpp-mtp' in path or 'llama-server-mtp' in path for path in llama_defaults))
 
     def test_resolve_engine_install_preserves_config_and_env_behavior(self):
         config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='python -m vllm.entrypoints.openai.api_server')
@@ -46,11 +52,9 @@ class EngineRegistryTests(unittest.TestCase):
         with patch.dict('os.environ', {
             'TURBOQUANT_LLAMA_SERVER_BIN': '/opt/tq/llama-server',
             'TQ3_LLAMA_SERVER_BIN': '/opt/tq3/llama-server',
-            'LLAMA_CPP_MTP_PATH': '/opt/mtp/bin',
         }):
             turbo_install = resolve_engine_install(config, ENGINE_TURBOQUANT)
             tq3_install = resolve_engine_install(config, ENGINE_TQ3)
-            mtp_install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
 
         self.assertEqual(llama_install.resolved_command, '/opt/llama-server')
         self.assertEqual(llama_install.source, 'config:llama_server')
@@ -60,57 +64,40 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertEqual(turbo_install.source, 'env:TURBOQUANT_LLAMA_SERVER_BIN')
         self.assertEqual(tq3_install.resolved_command, '/opt/tq3/llama-server')
         self.assertEqual(tq3_install.source, 'env:TQ3_LLAMA_SERVER_BIN')
-        self.assertEqual(mtp_install.resolved_command, '/opt/mtp/bin/llama-server')
-        self.assertEqual(mtp_install.source, 'env:LLAMA_CPP_MTP_PATH')
 
-    def test_mtp_engine_install_uses_shared_discovery_for_defaults_and_path(self):
+    def test_legacy_llama_cpp_mtp_path_falls_back_for_llama_cpp_engine(self):
+        # Audit #7: ENGINE_LLAMA_CPP_MTP is gone, but the legacy
+        # LLAMA_CPP_MTP_PATH env var still resolves to a binary for
+        # the plain llama.cpp engine when LLAMA_SERVER is unset.
+        config = SimpleNamespace(llama_server='', vllm_command='vllm')
+        with patch.dict('os.environ', {'LLAMA_CPP_MTP_PATH': '/opt/mtp/bin', 'LLAMA_SERVER': ''}, clear=False):
+            install = resolve_engine_install(config, ENGINE_LLAMA_CPP)
+        self.assertEqual(install.resolved_command, '/opt/mtp/bin/llama-server')
+        self.assertEqual(install.source, 'env:LLAMA_CPP_MTP_PATH')
+
+    def test_legacy_mtp_engine_alias_normalises_to_llama_cpp(self):
+        # Audit #7: passing the legacy 'llama.cpp-mtp' engine identifier
+        # to resolve_engine_install now resolves to the llama.cpp engine
+        # so all the binary-discovery logic lives in one place.
         config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            binary = home / 'src' / 'llama.cpp' / 'build-mtp' / 'bin' / 'llama-server'
-            binary.parent.mkdir(parents=True)
-            binary.write_text('#!/bin/sh\n', encoding='utf-8')
-            binary.chmod(0o755)
+        install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
+        self.assertEqual(install.id, ENGINE_LLAMA_CPP)
+        self.assertEqual(install.resolved_command, '/opt/llama-server')
 
-            with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': ''}, clear=False), \
-                 patch('llama_tui.runtime_profiles.Path.home', return_value=home):
-                install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
-
-        self.assertEqual(install.resolved_command, str(binary))
-        self.assertEqual(install.source, 'default')
-        self.assertTrue(install.exists)
-        self.assertTrue(install.executable)
-
-        with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': ''}, clear=False), \
-             patch('llama_tui.runtime_profiles.Path.home', return_value=Path('/definitely/missing')), \
-             patch('llama_tui.runtime_profiles.shutil.which', return_value='/usr/local/bin/llama-server-mtp'):
-            path_install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
-
-        self.assertEqual(path_install.resolved_command, 'llama-server-mtp')
-        self.assertEqual(path_install.source, 'PATH')
-        self.assertTrue(path_install.exists)
-        self.assertTrue(path_install.executable)
-
-    def test_mtp_env_path_takes_precedence_over_saved_runtime_profile(self):
-        runtime_profile = SimpleNamespace(
-            engine_id=ENGINE_LLAMA_CPP_MTP,
-            server_command='/old/llama.cpp-mtp/build/bin/llama-server',
-        )
-        config = SimpleNamespace(
-            llama_server='/opt/llama-server',
-            vllm_command='vllm',
-            runtime_profile=runtime_profile,
-        )
+    def test_legacy_mtp_env_var_resolves_via_llama_cpp_engine(self):
+        # When LLAMA_CPP_MTP_PATH is set and no other binary is
+        # configured, llama.cpp resolution falls back to the MTP fork
+        # binary directory — this keeps existing fork users working
+        # without having to migrate to LLAMA_SERVER.
+        config = SimpleNamespace(llama_server='', vllm_command='vllm')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'llama.cpp-mtp'
             binary = root / 'build-mtp' / 'bin' / 'llama-server'
             binary.parent.mkdir(parents=True)
             binary.write_text('#!/bin/sh\n', encoding='utf-8')
             binary.chmod(0o755)
-
-            with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': str(root)}, clear=False):
-                install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
-
+            with patch.dict(os.environ, {'LLAMA_CPP_MTP_PATH': str(root), 'LLAMA_SERVER': ''}, clear=False):
+                install = resolve_engine_install(config, ENGINE_LLAMA_CPP)
         self.assertEqual(install.resolved_command, str(binary))
         self.assertEqual(install.source, 'env:LLAMA_CPP_MTP_PATH')
         self.assertTrue(install.exists)
@@ -190,45 +177,12 @@ class EngineRegistryTests(unittest.TestCase):
             '',
         )
 
-    def test_mtp_engine_health_reports_missing_flags(self):
-        config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
-
-        with patch('llama_tui.engines.resolve_engine_install') as resolve_install, \
-             patch('llama_tui.engines.detect_engine_capabilities', return_value=EngineCapabilities(help_text='--help')):
-            install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
-            resolve_install.return_value = type(install)(
-                id=ENGINE_LLAMA_CPP_MTP,
-                resolved_command='/work/llama.cpp-mtp/build/bin/llama-server',
-                source='default',
-                exists=True,
-                executable=True,
-                resolved_path='/work/llama.cpp-mtp/build/bin/llama-server',
-                checked_paths=['/work/llama.cpp-mtp/build/bin/llama-server'],
-            )
-            health = get_engine_health(config, ENGINE_LLAMA_CPP_MTP)
-
-        self.assertEqual(health.status, 'MTP_FLAGS_NOT_FOUND')
-        self.assertIn('--spec-type mtp/draft-mtp', health.summary)
-        self.assertIn('source=default', health.summary)
-
-    def test_mtp_engine_health_reports_non_executable_binary(self):
-        config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
-
-        with patch('llama_tui.engines.resolve_engine_install') as resolve_install:
-            install = resolve_engine_install(config, ENGINE_LLAMA_CPP_MTP)
-            resolve_install.return_value = type(install)(
-                id=ENGINE_LLAMA_CPP_MTP,
-                resolved_command='/work/llama.cpp-mtp/build/bin/llama-server',
-                source='default',
-                exists=True,
-                executable=False,
-                resolved_path='/work/llama.cpp-mtp/build/bin/llama-server',
-                checked_paths=['/work/llama.cpp-mtp/build/bin/llama-server'],
-            )
-            health = get_engine_health(config, ENGINE_LLAMA_CPP_MTP)
-
-        self.assertEqual(health.status, 'BUILD_REQUIRED')
-        self.assertIn('executable=no', health.summary)
+    # Audit #7: the previous test_mtp_engine_health_* cases asserted a
+    # dedicated MTP_FLAGS_NOT_FOUND / BUILD_REQUIRED engine_health
+    # status for ENGINE_LLAMA_CPP_MTP. With MTP collapsed into the
+    # llama.cpp engine, the equivalent diagnostics are surfaced
+    # per-model via AppConfig.mtp_binary_warning + validate_mtp_launch
+    # (covered in test_runtime_profiles), not as engine-level health.
 
 
 if __name__ == '__main__':

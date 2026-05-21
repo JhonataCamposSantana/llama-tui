@@ -152,13 +152,16 @@ class MtpBuildCommandTests(unittest.TestCase):
         self.assertEqual(command_spec_type_value(cmd), 'draft-mtp')
 
     def test_build_command_uses_runtime_profile_specific_capabilities(self):
-        # Global engine is plain llama.cpp with a non-MTP binary; the benchmark
-        # passes an MTP runtime profile and build_command must resolve MTP
-        # capabilities from that profile's engine, not the global state.
+        # Audit #7: the dedicated MTP engine is gone, so the
+        # MTP-vs-plain distinction is no longer carried by engine_id.
+        # build_command must still honor an MTP-aware runtime profile
+        # (mtp_enabled + draft-n-max) when the resolved binary
+        # advertises --spec-type, irrespective of the global runtime
+        # profile.
         app = self._app(ENGINE_LLAMA_CPP)
         model = make_model()
         mtp_profile = RuntimeProfile(
-            engine_id=ENGINE_LLAMA_CPP_MTP,
+            engine_id=ENGINE_LLAMA_CPP,
             ctx_size=8192,
             gpu_layers=None,
             parallel=1,
@@ -166,13 +169,7 @@ class MtpBuildCommandTests(unittest.TestCase):
             mtp_draft_n_max=2,
         )
 
-        def fake_caps(engine_profile=None, *, server_bin=None, engine_id=None):
-            resolved = engine_id or getattr(engine_profile, 'engine_id', None) or app.runtime_profile.engine_id
-            if resolved == ENGINE_LLAMA_CPP_MTP:
-                return mtp_caps(('none', 'draft-mtp'))
-            return plain_caps()
-
-        with patch.object(app, 'engine_capabilities', side_effect=fake_caps):
+        with patch.object(app, 'engine_capabilities', return_value=mtp_caps(('none', 'draft-mtp'))):
             cmd = app.build_command(model, runtime_profile=mtp_profile)
         self.assertEqual(command_spec_type_value(cmd), 'draft-mtp')
         self.assertEqual(cmd[cmd.index('--spec-draft-n-max') + 1], '2')
@@ -223,7 +220,11 @@ class MtpBuildCommandTests(unittest.TestCase):
 
 
 class MtpEngineContextResolverTests(unittest.TestCase):
-    def test_resolver_uses_runtime_profile_engine_over_global(self):
+    def test_resolver_normalizes_mtp_alias_to_llama_cpp(self):
+        # Audit #7: a runtime profile carrying the legacy
+        # ``llama.cpp-mtp`` alias must still resolve cleanly. After the
+        # collapse the resolver normalizes the alias to ``llama.cpp``
+        # and surfaces ``supports_mtp`` from the binary's capabilities.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         app = AppConfig(
@@ -238,15 +239,9 @@ class MtpEngineContextResolverTests(unittest.TestCase):
             mtp_enabled=True,
         )
 
-        def fake_caps(engine_profile=None, *, server_bin=None, engine_id=None):
-            resolved = engine_id or getattr(engine_profile, 'engine_id', None) or app.runtime_profile.engine_id
-            if resolved == ENGINE_LLAMA_CPP_MTP:
-                return mtp_caps(('none', 'draft-mtp'))
-            return plain_caps()
-
-        with patch.object(app, 'engine_capabilities', side_effect=fake_caps):
+        with patch.object(app, 'engine_capabilities', return_value=mtp_caps(('none', 'draft-mtp'))):
             context = resolve_runtime_engine_context(app, runtime_profile=profile)
-        self.assertEqual(context.engine_id, ENGINE_LLAMA_CPP_MTP)
+        self.assertEqual(context.engine_id, ENGINE_LLAMA_CPP)
         self.assertTrue(context.supports_mtp)
         self.assertEqual(context.selected_mtp_spec_type, 'draft-mtp')
 
@@ -320,7 +315,12 @@ class MtpStrategySelectionTests(unittest.TestCase):
         self.assertEqual(strategy.blocked_reason, '')
         self.assertIn('spec_type=draft-mtp', strategy.reason)
 
-    def test_llama_cpp_without_mtp_binary_does_not_select_mtp_strategy(self):
+    def test_llama_cpp_without_mtp_binary_blocks_mtp_strategy(self):
+        # Audit #7: after collapsing the dedicated MTP engine, an
+        # MTP-native model on plain llama.cpp still surfaces the
+        # acceptance-matrix strategy but it must report a blocked_reason
+        # when the binary lacks --spec-type / --spec-draft-n-max so the
+        # caller skips the run instead of executing a misconfigured one.
         model = make_model(name='Generic native-mtp')
         strategy = select_benchmark_strategy(
             ENGINE_LLAMA_CPP,
@@ -329,7 +329,9 @@ class MtpStrategySelectionTests(unittest.TestCase):
             objective='quick_sanity',
             depth='fast',
         )
-        self.assertNotEqual(strategy.id, 'mtp_acceptance_matrix')
+        self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
+        self.assertTrue(strategy.blocked_reason)
+        self.assertIn('spec-type', strategy.blocked_reason)
 
 
 class MtpStartLaunchTests(unittest.TestCase):

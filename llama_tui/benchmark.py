@@ -50,7 +50,6 @@ from .discovery import extract_quant
 from .engines import (
     ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_LLAMA_CPP_MTP,
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     resolve_engine_install,
@@ -369,7 +368,7 @@ def emit_benchmark_strategy_diagnostics(
     blocked = str(getattr(strategy, 'blocked_reason', '') or '')
     if blocked:
         lines.append(f'Benchmark strategy blocked: {strategy.id} - {blocked}')
-        if strategy.engine_id == ENGINE_LLAMA_CPP_MTP and 'MTP-native' in blocked:
+        if strategy.id == 'mtp_acceptance_matrix' and 'MTP-native' in blocked:
             lines.append('Hint: set supports_mtp=yes if this GGUF is MTP-capable')
     else:
         lines.append(f'Selected benchmark strategy: {strategy.id}')
@@ -395,11 +394,11 @@ def persist_blocked_benchmark_strategy(
 ) -> Tuple[bool, str]:
     blocked = str(getattr(strategy, 'blocked_reason', '') or 'benchmark strategy is blocked')
     hint = ''
-    if strategy.engine_id == ENGINE_LLAMA_CPP_MTP and 'MTP-native' in blocked:
+    if strategy.id == 'mtp_acceptance_matrix' and 'MTP-native' in blocked:
         hint = ' Hint: set supports_mtp=yes if this GGUF is MTP-capable.'
     message = f'Benchmark strategy blocked: {strategy.id} - {blocked}.{hint}'
     ended_at = datetime.now().isoformat(timespec='seconds')
-    blocked_status = 'blocked_missing_capability' if strategy.engine_id == ENGINE_LLAMA_CPP_MTP else 'skipped_incompatible'
+    blocked_status = 'blocked_missing_capability' if strategy.id == 'mtp_acceptance_matrix' else 'skipped_incompatible'
     record = adaptive_record_from_candidate(
         model,
         'quick_sanity',
@@ -1592,7 +1591,8 @@ def measured_profile_runtime_profile(
 
     engine = str(profile.get('engine') or fingerprint.get('engine_id') or getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp')
     if 'mtp' in engine.lower():
-        engine = ENGINE_LLAMA_CPP_MTP
+        # Audit #7: legacy 'llama.cpp-mtp' engine collapsed into 'llama.cpp'.
+        engine = ENGINE_LLAMA_CPP
     elif 'turboquant' in engine.lower():
         engine = 'turboquant'
     elif 'tq3' in engine.lower():
@@ -2254,9 +2254,15 @@ def benchmark_full_suite(
         from .opencode_benchmark import benchmark_opencode_workflow as opencode_runner
 
     try:
-        if engine == ENGINE_LLAMA_CPP_MTP:
+        # Audit #7: the MTP full-suite path used to gate on
+        # engine == ENGINE_LLAMA_CPP_MTP. With the engine collapsed,
+        # we now route into the MTP suite whenever the strategy
+        # selector picks 'mtp_acceptance_matrix' (which fires for
+        # MTP-native models on any llama.cpp-family engine).
+        _mtp_route_strategy = benchmark_strategy_for_app(app, model, hardware_profile, depth=depth_key, objective='quick_sanity')
+        if _mtp_route_strategy.id == 'mtp_acceptance_matrix':
             emit(f'MTP Full Suite started: model={model.name or model.id} engine={engine}', 'benchmark_started', 'preflight')
-            strategy = benchmark_strategy_for_app(app, model, hardware_profile, depth=depth_key, objective='quick_sanity')
+            strategy = _mtp_route_strategy
             emit_benchmark_strategy_diagnostics(app, model, strategy, progress)
             if getattr(strategy, 'blocked_reason', ''):
                 add_stage('mtp_acceptance', 'blocked_missing_capability', strategy.blocked_reason, benchmark_strategy_id=strategy.id)
@@ -6792,7 +6798,7 @@ def active_engine_runtime_profiles(
         engine = app.active_engine_key_for_model(model)
     except Exception:
         engine = getattr(model, 'runtime', 'llama.cpp')
-    if engine not in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3):
+    if engine not in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3):
         return []
     if not str(getattr(model, 'path', '') or '').lower().endswith('.gguf'):
         return []
@@ -7198,7 +7204,7 @@ def active_engine_runtime_profiles(
         else:
             family = 'cache' if kv_preset and kv_preset != 'default' else 'default'
         if fit:
-            if engine == ENGINE_LLAMA_CPP_MTP or mtp_enabled:
+            if mtp_enabled:
                 fit_context_value = max(256, min(ctx, int(fit_context or 4096)))
             else:
                 fit_context_value = max(ctx_min, min(ctx, int(fit_context or ctx_min)))
@@ -7319,7 +7325,7 @@ def active_engine_runtime_profiles(
     # MTP is a binary capability, not a dedicated engine: generate the MTP
     # benchmark family for any llama.cpp-compatible binary that advertises the
     # speculative MTP flags when the model is MTP-native / NextN-capable.
-    if engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP):
+    if engine == ENGINE_LLAMA_CPP:
         mtp_spec_type = mtp_spec_type_value(capabilities)
         mtp_binary_ready = bool(
             getattr(capabilities, 'supports_spec_type', False)
@@ -8328,7 +8334,7 @@ def mtp_baseline_skip_record(
         'quick_sanity',
         'skipped_runtime_assert',
         detail=f'{reason} reason: {MTP_BASELINE_RUNTIME_ASSERT_REASON}',
-        engine=ENGINE_LLAMA_CPP_MTP,
+        engine=ENGINE_LLAMA_CPP,
         benchmark_strategy_id=strategy.id,
         benchmark_objectives=list(getattr(strategy, 'objectives', ()) or ()),
         benchmark_metric_group=_strategy_metric_group(strategy),
@@ -8365,7 +8371,7 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
     try:
         capabilities = app.engine_capabilities()
     except Exception:
-        capabilities = default_engine_capabilities(ENGINE_LLAMA_CPP_MTP)
+        capabilities = default_engine_capabilities(ENGINE_LLAMA_CPP)
     mtp_spec = mtp_spec_type_value(capabilities)
     recurrent_mtp_required = _model_has_nextn_or_recurrent_features(model)
     selected_profiles: List[RuntimeProfile] = []
@@ -8443,7 +8449,7 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
             'quick_sanity',
             'blocked_missing_capability',
             detail=detail,
-            engine=ENGINE_LLAMA_CPP_MTP,
+            engine=ENGINE_LLAMA_CPP,
             benchmark_strategy_id=strategy.id,
             benchmark_objectives=list(getattr(strategy, 'objectives', ()) or ()),
             benchmark_metric_group=_strategy_metric_group(strategy),
@@ -8504,7 +8510,7 @@ def benchmark_mtp_acceptance_matrix_after_preflight(
             'quick_sanity',
             'aborted',
             detail='user requested abort',
-            engine=ENGINE_LLAMA_CPP_MTP,
+            engine=ENGINE_LLAMA_CPP,
             benchmark_strategy_id=strategy.id,
             benchmark_phase='mtp_acceptance',
         ))

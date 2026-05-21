@@ -26,7 +26,6 @@ from dataclasses import replace
 from typing import Dict, List, Sequence
 
 from .benchmark_mtp import annotate_mtp_optimizer_records
-from .engines import ENGINE_LLAMA_CPP_MTP
 from .gguf import gguf_layer_count
 from .model_compat import detect_model_runtime_features
 from .models import ModelConfig
@@ -88,7 +87,12 @@ def _best_mtp_acceptance_draft_for_model(model: ModelConfig) -> int:
 
 
 def _moe_tuning_mtp_aware(engine: str, model: ModelConfig, capabilities) -> bool:
-    if str(engine or '').strip().lower() != ENGINE_LLAMA_CPP_MTP:
+    # Audit #7: MTP is now a binary capability rather than a dedicated
+    # engine. MTP-aware MoE tuning applies to any llama.cpp-family
+    # engine when the model is MTP-native AND the binary advertises
+    # the speculative MTP flags. vLLM (and any future non-llama.cpp
+    # engine) is excluded because the launch path is different.
+    if str(engine or '').strip().lower() == 'vllm':
         return False
     features = detect_model_runtime_features(model)
     return bool(
@@ -102,7 +106,10 @@ def _moe_tuning_mtp_aware(engine: str, model: ModelConfig, capabilities) -> bool
 
 
 def _moe_tuning_mtp_required(engine: str, model: ModelConfig) -> bool:
-    if str(engine or '').strip().lower() != ENGINE_LLAMA_CPP_MTP:
+    # Audit #7: an MTP-native model on a llama.cpp-family engine
+    # requires MTP launch capability for sensible MoE tuning — no-MTP
+    # would be a degraded baseline. vLLM is excluded.
+    if str(engine or '').strip().lower() == 'vllm':
         return False
     features = detect_model_runtime_features(model)
     return bool('mtp_native' in features and model_mtp_allowed(model))

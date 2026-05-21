@@ -66,7 +66,6 @@ from .discovery import (
 from .engines import (
     ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_LLAMA_CPP_MTP,
     ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     ENGINE_VLLM,
@@ -496,13 +495,13 @@ class AppConfig:
         runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
         if runtime == ENGINE_VLLM:
             return ENGINE_VLLM
-        if self.runtime_profile.engine in ('buun', 'turboquant', ENGINE_TQ3, ENGINE_LLAMA_CPP_MTP):
+        if self.runtime_profile.engine in ('buun', 'turboquant', ENGINE_TQ3):
             return self.runtime_profile.engine
         return 'llama.cpp'
 
     def active_engine_label_for_model(self, model: ModelConfig) -> str:
         engine = self.active_engine_key_for_model(model)
-        if engine in ('buun', 'turboquant', ENGINE_TQ3, ENGINE_LLAMA_CPP_MTP):
+        if engine in ('buun', 'turboquant', ENGINE_TQ3):
             return self.runtime_profile.display_name
         if engine == 'vllm':
             return 'vLLM'
@@ -760,7 +759,7 @@ class AppConfig:
         runtime_key = (runtime or 'llama.cpp').strip().lower()
         if runtime_key == ENGINE_VLLM:
             return str(resolve_engine_install(self, ENGINE_VLLM).resolved_command or self.vllm_command)
-        if runtime_key in ('llama.cpp', ENGINE_LLAMA_CPP_MTP):
+        if runtime_key == 'llama.cpp':
             return str(resolve_engine_install(self, self.runtime_profile.engine).resolved_command or self.runtime_profile.server_command or self.llama_server)
         return runtime
 
@@ -817,8 +816,6 @@ class AppConfig:
         elif engine_id == ENGINE_TQ3:
             key_mode, value_mode = self.runtime_profile.tq3_kv_pair()
             kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
-        elif engine_id == ENGINE_LLAMA_CPP_MTP:
-            kv_preset = 'default'
         else:
             key_mode = (
                 extra_arg_value(args, '--cache-type-k')
@@ -1014,7 +1011,7 @@ class AppConfig:
 
     def hidden_engine_reasons_for_model(self, model: ModelConfig) -> Dict[str, str]:
         reasons: Dict[str, str] = {}
-        for engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
             visibility = self.model_engine_visibility(model, engine_id=engine, capabilities=None)
             if not visibility.compatible:
                 reasons[engine] = visibility.reason
@@ -1057,12 +1054,18 @@ class AppConfig:
         return engine_tq3_binary_warning(command, capabilities)
 
     def mtp_binary_warning(self, model: ModelConfig) -> str:
-        if self.active_engine_key_for_model(model) != ENGINE_LLAMA_CPP_MTP:
+        # Audit #7: the dedicated MTP engine is gone, so the warning is
+        # now driven by *intent* — only emit it when the model has MTP
+        # enabled. Capabilities are detected from the currently active
+        # llama.cpp binary via the cached engine_capabilities accessor
+        # so callers can mock it in tests.
+        if not model_mtp_enabled(model):
             return ''
-        install = resolve_engine_install(self, ENGINE_LLAMA_CPP_MTP)
+        engine_id = self.active_engine_key_for_model(model)
+        install = resolve_engine_install(self, engine_id)
         command = str(install.resolved_command or self.runtime_server_command('llama.cpp'))
         try:
-            capabilities = detect_engine_capabilities(command, ENGINE_LLAMA_CPP_MTP)
+            capabilities = self.engine_capabilities(server_bin=command, engine_id=engine_id)
         except (OSError, subprocess.SubprocessError, ValueError):
             return ''
         return engine_mtp_binary_warning(
@@ -1074,19 +1077,27 @@ class AppConfig:
         )
 
     def mtp_binary_missing_message(self) -> str:
-        install = resolve_engine_install(self, ENGINE_LLAMA_CPP_MTP)
+        # Audit #7: legacy 'llama.cpp-mtp' default_paths are still
+        # checked for users who built the fork; this message keeps the
+        # ``LLAMA_CPP_MTP_PATH`` hint while resolving via the
+        # llama.cpp engine.
+        install = resolve_engine_install(self, ENGINE_LLAMA_CPP)
         command = str(install.resolved_command or 'llama-server')
         checked = f' Checked: {", ".join(install.checked_paths)}' if getattr(install, 'checked_paths', None) else ''
         return (
-            f'BINARY_NOT_FOUND: llama.cpp MTP server not found: {command} '
+            f'BINARY_NOT_FOUND: llama.cpp MTP-capable server not found: {command} '
             f'(source={install.source or "unknown"}, exists={"yes" if install.exists else "no"}, '
             f'executable={"yes" if getattr(install, "executable", False) else "no"}). '
-            'Set LLAMA_CPP_MTP_PATH=/path/to/llama-server, /path/to/bin, or a llama.cpp-mtp checkout.'
+            'Set LLAMA_SERVER to a llama.cpp build with --spec-type mtp/draft-mtp '
+            '(or LLAMA_CPP_MTP_PATH for a legacy fork checkout).'
             f'{checked}'
         )
 
     def mtp_session_advisory(self, model: ModelConfig) -> str:
-        if self.active_engine_key_for_model(model) != ENGINE_LLAMA_CPP_MTP:
+        # Audit #7: surface the advisory whenever MTP is enabled for
+        # this model, regardless of which llama.cpp-family engine is
+        # active.
+        if not model_mtp_enabled(model):
             return ''
         return f'MTP: {mtp_label(model)} ({mtp_support_label(model)}) Experimental'
 
@@ -1586,7 +1597,7 @@ class AppConfig:
             return False
         if not getattr(self.continue_settings, 'path', ''):
             return False
-        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant', ENGINE_TQ3, ENGINE_LLAMA_CPP_MTP)
+        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant', ENGINE_TQ3)
 
     def hermes_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
@@ -2631,7 +2642,9 @@ class AppConfig:
             label = 'TurboQuant+ server'
         elif engine_key == ENGINE_TQ3:
             label = 'llama.cpp-tq3 server'
-        elif engine_key == ENGINE_LLAMA_CPP_MTP:
+        elif model_mtp_enabled(model, runtime_profile):
+            # Audit #7: MTP is a binary capability of llama.cpp now;
+            # surface it in the label when the launch opts in.
             label = 'llama.cpp MTP server'
         else:
             label = 'llama-server'
@@ -2644,7 +2657,7 @@ class AppConfig:
         if not self.command_exists(command):
             if engine_key == ENGINE_TQ3:
                 return False, self.tq3_binary_missing_message()
-            if engine_key == ENGINE_LLAMA_CPP_MTP:
+            if model_mtp_enabled(model, runtime_profile):
                 return False, self.mtp_binary_missing_message()
             return False, f'{label} not found: {command}'
         mtp_ok, mtp_msg = self.validate_mtp_launch(model, runtime_profile)

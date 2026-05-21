@@ -569,16 +569,23 @@ def make_runtime_profile(
             kv_value_mode=value_mode,
         )
     if normalized in ('llama.cpp-mtp', 'llama-cpp-mtp', 'llamacpp-mtp', 'mtp'):
-        command = llama_cpp_mtp_server_from_env()
+        # Audit finding #7: MTP merged into upstream llama.cpp via
+        # --spec-type mtp / draft-mtp, so a "llama.cpp-mtp" session now
+        # produces a regular llama.cpp engine profile. The legacy
+        # LLAMA_CPP_MTP_PATH env / sibling paths still resolve the
+        # binary in case the user built the fork to a non-standard
+        # location; MTP itself is detected at the capability layer
+        # from --help output.
+        command = llama_cpp_mtp_server_from_env() or default_llama_server
         return EngineProfile(
-            engine_id='llama.cpp-mtp',
-            label='llama.cpp MTP',
+            engine_id='llama.cpp',
+            label='llama.cpp',
             server_bin=command,
             default_args=(),
             supported_kv_modes=('default', 'f16', 'q8_0', 'q4_0'),
             flash_attn_syntax='value',
             supports_turbo_kv=False,
-            experimental=True,
+            experimental=False,
             context_override=ctx_override,
             kv_mode=(kv_mode or '').strip(),
             kv_key_mode='',

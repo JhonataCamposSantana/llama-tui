@@ -132,8 +132,12 @@ class BenchmarkStrategyTests(unittest.TestCase):
         self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
         self.assertFalse(strategy.blocked_reason)
 
-    def test_mtp_engine_blocks_uncertain_model_instead_of_full_suite(self):
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
+    def test_generic_model_on_mtp_alias_uses_default_strategy(self):
+        # Audit #7: the legacy 'llama.cpp-mtp' engine alias collapses
+        # to 'llama.cpp', so a generic (non-MTP-native) model just gets
+        # the default dense strategy instead of a noisy "MTP blocked"
+        # result.
+        caps = replace(default_engine_capabilities('llama.cpp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
         model = ModelConfig(
             id='generic',
             name='Generic Model',
@@ -148,12 +152,13 @@ class BenchmarkStrategyTests(unittest.TestCase):
             objective='quick_sanity',
         )
 
-        self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
-        self.assertTrue(strategy.blocked_reason)
-        self.assertEqual(strategy.max_candidates, 0)
-        self.assertEqual(strategy.phases, ())
+        self.assertNotEqual(strategy.id, 'mtp_acceptance_matrix')
+        self.assertFalse(strategy.blocked_reason)
 
     def test_mtp_strategy_blocks_when_binary_lacks_spec_flags(self):
+        # MTP-native model on a binary without --spec-type/--spec-draft-n-max
+        # support: strategy reports blocked_reason so the user sees why
+        # MTP can't run.
         model = ModelConfig(
             id='mtp',
             name='Generic MTP-capable GGUF',
@@ -161,7 +166,7 @@ class BenchmarkStrategyTests(unittest.TestCase):
             alias='mtp',
             supports_mtp='yes',
         )
-        strategy = select_benchmark_strategy('llama.cpp-mtp', model, capabilities=default_engine_capabilities('llama.cpp-mtp'))
+        strategy = select_benchmark_strategy('llama.cpp', model, capabilities=default_engine_capabilities('llama.cpp'))
 
         self.assertEqual(strategy.id, 'mtp_acceptance_matrix')
         self.assertEqual(strategy.max_candidates, 0)
@@ -237,7 +242,13 @@ class BenchmarkStrategyTests(unittest.TestCase):
         self.assertEqual(metrics['accept_rate'], 0.75)
 
     def test_blocked_mtp_fast_and_smart_benchmarks_do_not_run_generic_fallback(self):
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
+        # Audit #7: this used to test "user picked MTP engine with
+        # generic model → block". With the engine collapsed, the
+        # equivalent signal is "MTP-native model + binary that lacks
+        # the spec flags → MTP strategy blocked". Either way, the
+        # benchmark planner is not called and the user sees the
+        # blocked reason.
+        caps = default_engine_capabilities('llama.cpp')  # lacks MTP caps
         for runner in (benchmark_fast_profiles, benchmark_best_optimization):
             with self.subTest(runner=runner.__name__), tempfile.TemporaryDirectory() as tmp:
                 app = AppConfig(
@@ -245,11 +256,12 @@ class BenchmarkStrategyTests(unittest.TestCase):
                     runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
                 )
                 model = ModelConfig(
-                    id='generic',
-                    name='Generic Model',
-                    path='/models/generic.gguf',
-                    alias='generic',
+                    id='mtp_native',
+                    name='Generic MTP-capable GGUF',
+                    path='/models/generic-native-mtp.gguf',
+                    alias='mtp_native',
                     port=18080,
+                    supports_mtp='yes',
                 )
                 progress = []
                 with patch.object(app, 'hardware_profile', return_value=HardwareProfile(gpu_memory_total=8 * 1024 ** 3, gpu_memory_free=6 * 1024 ** 3)), \
@@ -265,21 +277,27 @@ class BenchmarkStrategyTests(unittest.TestCase):
                 self.assertIn('Detected features:', progress_text)
                 self.assertIn('Detection sources:', progress_text)
                 self.assertIn('Benchmark strategy blocked: mtp_acceptance_matrix', progress_text)
-                self.assertIn('supports_mtp=yes', progress_text)
+                # Audit #7: the diagnostic line now lists detected
+                # features (including 'mtp_native') instead of the
+                # legacy supports_mtp flag.
+                self.assertIn('mtp_native', progress_text)
 
     def test_blocked_mtp_full_suite_does_not_start_generic_full_suite(self):
-        caps = replace(default_engine_capabilities('llama.cpp-mtp'), supports_spec_type=True, supports_mtp=True, mtp_spec_type='mtp', supports_spec_draft_n_max=True)
+        # Audit #7: same shape as the fast/smart blocked-MTP test above —
+        # MTP-native model + binary lacking spec flags blocks the suite.
+        caps = default_engine_capabilities('llama.cpp')  # lacks MTP caps
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(
                 Path(tmp) / 'models.json',
                 runtime_profile=make_runtime_profile('llama.cpp-mtp', 'llama-server'),
             )
             model = ModelConfig(
-                id='generic',
-                name='Generic Model',
-                path='/models/generic.gguf',
-                alias='generic',
+                id='mtp_native',
+                name='Generic MTP-capable GGUF',
+                path='/models/generic-native-mtp.gguf',
+                alias='mtp_native',
                 port=18080,
+                supports_mtp='yes',
             )
             progress = []
 

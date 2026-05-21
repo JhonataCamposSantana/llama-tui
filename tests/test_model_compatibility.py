@@ -44,28 +44,39 @@ class ModelCompatibilityTests(unittest.TestCase):
         for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_LLAMA_CPP_MTP):
             self.assertEqual(engine_supports_model(engine, tq3, EngineCapabilities(supports_mtp=True)).status, 'unsupported')
 
-    def test_mtp_native_prefers_mtp_engine_and_warns_on_standard_engines(self):
-        mtp = model(
-            'mtp',
-            '/models/generic-GGUF-MTP.gguf',
-            supports_mtp='yes',
-        )
+    def test_mtp_native_prefers_capable_binary_on_llama_cpp_family(self):
+        # Audit #7: MTP is a binary capability now. Any llama.cpp-family
+        # engine becomes 'preferred' for an MTP-native model when the
+        # binary advertises the speculative MTP flags; without those
+        # flags it's 'compatible_with_warning' (it will still load,
+        # just without MTP acceleration). The legacy MTP engine alias
+        # normalises to llama.cpp so its result is identical.
+        mtp = model('mtp', '/models/generic-GGUF-MTP.gguf', supports_mtp='yes')
 
         self.assertIn('mtp_native', detect_model_runtime_features(mtp))
-        self.assertEqual(engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, EngineCapabilities()).status, 'unsupported')
-        ok = engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, EngineCapabilities(
+        capable_caps = EngineCapabilities(
             supports_spec_type=True,
             supports_mtp=True,
             mtp_spec_type='mtp',
             supports_spec_draft_n_max=True,
-        ))
-        self.assertEqual(ok.status, 'preferred')
-        self.assertTrue(ok.compatible)
+        )
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN):
+            result = engine_supports_model(engine, mtp, capable_caps)
+            self.assertEqual(result.status, 'preferred', f'{engine!r} should be preferred with MTP caps')
+            self.assertTrue(result.compatible)
+        # Without MTP caps the model still loads but with a warning.
         for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN):
             self.assertEqual(engine_supports_model(engine, mtp).status, 'compatible_with_warning')
+        # TQ3 still distinguishes itself — non-tq3_native model is unknown.
         self.assertEqual(engine_supports_model(ENGINE_TQ3, mtp).status, 'unknown')
 
-    def test_mtp_visibility_shows_blocked_models_without_allowing_launch(self):
+    def test_mtp_native_with_uncapable_binary_loads_with_warning(self):
+        # Audit #7: previously an MTP-native model on the MTP engine
+        # without MTP flags was 'unsupported'/'compatible_with_warning'.
+        # Now with the engine collapsed, an MTP-native model on plain
+        # llama.cpp without MTP flags is consistently
+        # 'compatible_with_warning' — it still loads, just without MTP
+        # acceleration, and the warning tells the user how to upgrade.
         mtp = model('mtp', '/models/generic-native-mtp.gguf', supports_mtp='yes')
         not_ready_caps = EngineCapabilities(
             supports_spec_type=True,
@@ -73,15 +84,14 @@ class ModelCompatibilityTests(unittest.TestCase):
             supports_spec_draft_n_max=True,
         )
 
-        launch = engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, not_ready_caps)
-        visibility = engine_shows_model(ENGINE_LLAMA_CPP_MTP, mtp, not_ready_caps)
+        launch = engine_supports_model(ENGINE_LLAMA_CPP, mtp, not_ready_caps)
+        visibility = engine_shows_model(ENGINE_LLAMA_CPP, mtp, not_ready_caps)
 
-        self.assertFalse(launch.compatible)
-        self.assertEqual(launch.status, 'unsupported')
-        self.assertIn('MTP_FLAGS_NOT_FOUND', launch.reason)
+        self.assertTrue(launch.compatible)
+        self.assertEqual(launch.status, 'compatible_with_warning')
+        self.assertIn('draft-mtp', launch.reason)
         self.assertTrue(visibility.compatible)
         self.assertEqual(visibility.status, 'compatible_with_warning')
-        self.assertIn('MTP_FLAGS_NOT_FOUND', visibility.reason)
 
         ready_caps = EngineCapabilities(
             supports_spec_type=True,
@@ -89,8 +99,8 @@ class ModelCompatibilityTests(unittest.TestCase):
             mtp_spec_type='mtp',
             supports_spec_draft_n_max=True,
         )
-        self.assertTrue(engine_supports_model(ENGINE_LLAMA_CPP_MTP, mtp, ready_caps).compatible)
-        self.assertTrue(engine_shows_model(ENGINE_LLAMA_CPP_MTP, mtp, ready_caps).compatible)
+        self.assertEqual(engine_supports_model(ENGINE_LLAMA_CPP, mtp, ready_caps).status, 'preferred')
+        self.assertTrue(engine_shows_model(ENGINE_LLAMA_CPP, mtp, ready_caps).compatible)
 
     def test_mtp_hint_detection_is_not_family_specific(self):
         explicit = model('explicit', '/models/custom-name.gguf', supports_mtp='yes')
@@ -127,6 +137,9 @@ class ModelCompatibilityTests(unittest.TestCase):
         self.assertIn('tq3_native', detect_model_runtime_features(candidate))
 
     def test_normal_gguf_is_uncertain_for_specialized_engines(self):
+        # Audit #7: ENGINE_LLAMA_CPP_MTP collapses to ENGINE_LLAMA_CPP,
+        # so a normal GGUF is 'compatible' there too — only TQ3 still
+        # treats it as 'unknown' (TQ3 wants TQ3-native tensors).
         normal = model('normal', '/models/llama-q4_k_m.gguf')
 
         self.assertIn('normal_gguf', detect_model_runtime_features(normal))
@@ -135,7 +148,8 @@ class ModelCompatibilityTests(unittest.TestCase):
         self.assertTrue(engine_supports_model(ENGINE_TURBOQUANT, normal).compatible)
         self.assertTrue(engine_supports_model(ENGINE_BUUN, normal).compatible)
         self.assertEqual(engine_supports_model(ENGINE_TQ3, normal).status, 'unknown')
-        self.assertEqual(engine_supports_model(ENGINE_LLAMA_CPP_MTP, normal, EngineCapabilities(supports_mtp=True)).status, 'unknown')
+        # Legacy alias resolves identically to llama.cpp now.
+        self.assertTrue(engine_supports_model(ENGINE_LLAMA_CPP_MTP, normal).compatible)
 
     def test_unknown_gguf_is_warning_on_standard_engine(self):
         unknown = model('unknown', '/models/mystery.gguf')
@@ -175,6 +189,10 @@ class ModelCompatibilityTests(unittest.TestCase):
                 ['tq3'],
             )
 
+            # Audit #7: --engine llama.cpp-mtp now collapses to llama.cpp.
+            # An MTP-capable binary makes the MTP-native model 'preferred',
+            # and the normal model is also compatible, so both surface
+            # under the active filter.
             app.runtime_profile = make_runtime_profile('llama.cpp-mtp', 'llama-server')
             app.engine_capabilities = lambda: EngineCapabilities(
                 supports_spec_type=True,
@@ -184,7 +202,7 @@ class ModelCompatibilityTests(unittest.TestCase):
             )
             self.assertEqual(
                 [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
-                ['mtp'],
+                ['normal', 'mtp'],
             )
 
             self.assertEqual(
@@ -193,6 +211,9 @@ class ModelCompatibilityTests(unittest.TestCase):
             )
 
     def test_browser_active_filter_shows_mtp_model_when_binary_is_not_launch_ready(self):
+        # Audit #7: the legacy MTP engine collapses to llama.cpp. With a
+        # binary that lacks MTP flags, the MTP-native model is still
+        # browsable (warning), and the normal GGUF remains compatible.
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(Path(tmp) / 'models.json')
             app.models = [
@@ -211,14 +232,13 @@ class ModelCompatibilityTests(unittest.TestCase):
 
             self.assertEqual(
                 [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
-                ['mtp'],
+                ['normal', 'mtp'],
             )
             visible, visibility_reason = app.active_engine_model_visibility(app.models[2])
             compatible, compatibility_reason = app.active_engine_model_compatibility(app.models[2])
             self.assertTrue(visible)
-            self.assertIn('MTP_FLAGS_NOT_FOUND', visibility_reason)
-            self.assertFalse(compatible)
-            self.assertIn('MTP_FLAGS_NOT_FOUND', compatibility_reason)
+            self.assertTrue(compatible)
+            self.assertIn('draft-mtp', compatibility_reason)
 
     def test_hf_and_llama_cache_discovery_dedupes_by_resolved_path(self):
         with tempfile.TemporaryDirectory() as tmp:
