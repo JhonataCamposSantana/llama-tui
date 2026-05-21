@@ -1344,6 +1344,7 @@ def moe_placement_payload(
         'cpu_moe': bool(cpu_moe),
         'n_cpu_moe': int(n_cpu_moe),
         'tensor_overrides': tensor_overrides,
+        'no_mmap': _profile_bool(source, 'no_mmap'),
     }
     if source_name:
         payload['source'] = source_name
@@ -1675,7 +1676,14 @@ def measured_profile_runtime_profile(
         else:
             gpu_layers = _profile_int(profile, 'ngl', int(getattr(model, 'ngl', 0) or 0))
 
-    if no_mmap and not explicit_no_mmap and int(gpu_layers or 0) > 0:
+    _has_cpu_offload = (
+        bool(profile.get('tensor_overrides') or fingerprint.get('tensor_overrides'))
+        or _profile_bool(profile, 'cpu_moe')
+        or bool(fingerprint.get('cpu_moe'))
+        or max(0, _profile_int(profile, 'n_cpu_moe', int(fingerprint.get('n_cpu_moe', 0) or 0))) > 0
+        or _command_has_flag(command_tokens, '-ot', '--override-tensor', '--override-tensors', '-cmoe', '--cpu-moe', '-ncmoe', '--n-cpu-moe')
+    )
+    if no_mmap and not explicit_no_mmap and int(gpu_layers or 0) > 0 and not _has_cpu_offload:
         no_mmap = False
 
     turbo_profile = turbo_kv_profile_for_preset(kv_preset)
@@ -1932,6 +1940,7 @@ def build_runtime_overlay_from_moe_recommendation(
         'cpu_moe': bool(profile.get('cpu_moe', False)),
         'n_cpu_moe': max(0, int(profile.get('n_cpu_moe', 0) or 0)),
         'tensor_overrides': _normalized_tensor_overrides(profile.get('tensor_overrides', [])),
+        'no_mmap': bool(profile.get('no_mmap', False)),
         'ngl_required_for_moe_tuning': bool(profile.get('ngl_required_for_moe_tuning', False)),
         'tuning_run_id': str(profile.get('tuning_run_id', '') or ''),
         'tokens_per_sec': float(profile.get('tokens_per_sec', 0.0) or 0.0),
@@ -1974,6 +1983,7 @@ def runtime_profile_with_overlay(runtime_profile: RuntimeProfile, overlay: Dict[
     placement = str(overlay.get('moe_placement_strategy') or '')
     if placement.startswith('measured:moe_tuning:'):
         placement = placement.rsplit(':', 1)[-1]
+    no_mmap = bool(overlay.get('no_mmap', getattr(runtime_profile, 'no_mmap', False)))
     return replace(
         runtime_profile,
         gpu_layers=gpu_layers,
@@ -1981,6 +1991,7 @@ def runtime_profile_with_overlay(runtime_profile: RuntimeProfile, overlay: Dict[
         cpu_moe=bool(overlay.get('cpu_moe', False)),
         n_cpu_moe=max(0, int(overlay.get('n_cpu_moe', 0) or 0)),
         tensor_overrides=tuple(_normalized_tensor_overrides(overlay.get('tensor_overrides', []))),
+        no_mmap=no_mmap,
     )
 
 

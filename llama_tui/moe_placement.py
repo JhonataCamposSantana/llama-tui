@@ -224,10 +224,9 @@ def generate_moe_placement_candidates(
 
     limit = _candidate_limit(tier, small_gpu)
     selected = deduped[: max(0, limit - len(candidates))]
-    if (tier or '').strip().lower() != 'fast':
-        override = next((item for item in deduped if item.name == 'experts_cpu_override'), None)
-        if override is not None and override not in selected:
-            if len(candidates) + len(selected) >= limit:
-                selected = selected[:-1]
-            selected.append(override)
+    override = next((item for item in deduped if item.name == 'experts_cpu_override'), None)
+    if override is not None and override not in selected:
+        if len(candidates) + len(selected) >= limit:
+            selected = selected[:-1]
+        selected.append(override)
     return candidates + selected
