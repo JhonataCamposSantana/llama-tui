@@ -2278,9 +2278,9 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn('baseline failed', msg.lower())
         self.assertEqual(objectives['mtp_fit_q8_draftq8_nommap_draft1_128k'], 'mtp_long_context_probe')
         self.assertEqual(objectives['mtp_fit_q8_draftq8_nommap_draft2_8k'], 'mtp_long_context_probe')
-        self.assertEqual(mtp_long_context_probe_request_timeout(131072), 180)
-        self.assertEqual(mtp_long_context_probe_request_timeout(32768), 120)
-        self.assertEqual(mtp_long_context_probe_request_timeout(8192), 75)
+        self.assertEqual(mtp_long_context_probe_request_timeout(131072), 600)
+        self.assertEqual(mtp_long_context_probe_request_timeout(32768), 360)
+        self.assertEqual(mtp_long_context_probe_request_timeout(8192), 240)
         saved = app.models[0]
         self.assertEqual(saved.default_benchmark_status, 'partial')
         self.assertEqual(saved.measured_profiles['mtp_acceptance']['mtp_draft_n_max'], 2)
@@ -6116,7 +6116,7 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(any(item.placement_strategy == 'partial_ngl_8' for item in profiles))
         self.assertTrue(any(item.cpu_moe for item in profiles))
-        self.assertTrue(any(item.n_cpu_moe == 40 for item in profiles))
+        self.assertTrue(any(tuple(item.tensor_overrides or ()) for item in profiles))
         self.assertFalse(any(item.placement_strategy == 'full_gpu' for item in profiles))
         self.assertLessEqual(len({item.placement_strategy for item in profiles if item.placement_strategy}), 8)
 

@@ -31,10 +31,10 @@ _DRAFT_MTP_LOG = (
 
 class Fix1TimeoutPolicyTests(unittest.TestCase):
     def test_long_context_probe_timeout_caps_raised(self):
-        self.assertEqual(mtp_long_context_probe_request_timeout(131072), 180)
-        self.assertEqual(mtp_long_context_probe_request_timeout(65536), 180)
-        self.assertEqual(mtp_long_context_probe_request_timeout(32768), 120)
-        self.assertEqual(mtp_long_context_probe_request_timeout(8192), 75)
+        self.assertEqual(mtp_long_context_probe_request_timeout(131072), 600)
+        self.assertEqual(mtp_long_context_probe_request_timeout(65536), 600)
+        self.assertEqual(mtp_long_context_probe_request_timeout(32768), 360)
+        self.assertEqual(mtp_long_context_probe_request_timeout(8192), 240)
 
     def test_acceptance_probe_output_caps_lowered(self):
         self.assertEqual(MTP_WORKLOAD_OUTPUT_CAPS['decode_heavy']['full'], 160)

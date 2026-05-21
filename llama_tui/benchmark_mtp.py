@@ -806,9 +806,9 @@ def mtp_long_context_probe_request_timeout(ctx_size: int, default_timeout: int =
     except (TypeError, ValueError):
         ctx = 0
     if ctx >= 65_536:
-        return 180
+        return 600
     if ctx >= 32_768:
-        return 120
+        return 360
     if ctx >= 8_192:
-        return 75
+        return 240
     return int(default_timeout or 240)
