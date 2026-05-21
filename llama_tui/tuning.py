@@ -270,6 +270,29 @@ def generate_moe_tuning_candidates(
             risk='safe',
             expected_effect='all MoE experts on CPU (no-mmap)',
         ))
+    # experts_cpu_override is the canonical small-VRAM MoE strategy (all FFN expert
+    # tensors routed to CPU via -ot regex). It has a memory profile similar to
+    # cpu_moe_all (every expert lives on CPU), so order it BEFORE the n_cpu_moe
+    # ladder. That ladder walks downward toward riskier configurations and can
+    # trigger MEMORY_GUARDRAIL early_stop -- if experts_cpu_override sits after
+    # the ladder, it never gets exercised once early_stop fires.
+    if bool(getattr(capabilities, 'supports_override_tensor', False)):
+        candidates.append(TuningCandidate(
+            name='experts_cpu_override',
+            runtime_profile=_replace_profile(
+                baseline,
+                'experts_cpu_override',
+                moe_candidate_gpu_layers,
+                'experts_cpu_override',
+                tensor_overrides=(EXPERTS_CPU_OVERRIDE,),
+                fit=moe_fit,
+                fit_context=moe_fit_context,
+                no_mmap=_no_mmap_for(True),
+            ),
+            source='coarse',
+            risk='experimental',
+            expected_effect='expert tensors routed to CPU by override pattern (no-mmap)',
+        ))
     if bool(getattr(capabilities, 'supports_n_cpu_moe', False)) and layer_count > 0:
         for value in generate_n_cpu_moe_ladder(layer_count, small_gpu=small_gpu):
             if value <= 0:
@@ -304,23 +327,6 @@ def generate_moe_tuning_candidates(
             source='coarse',
             risk='aggressive',
             expected_effect='full GPU layer attempt without new MoE CPU placement',
-        ))
-    if bool(getattr(capabilities, 'supports_override_tensor', False)):
-        candidates.append(TuningCandidate(
-            name='experts_cpu_override',
-            runtime_profile=_replace_profile(
-                baseline,
-                'experts_cpu_override',
-                moe_candidate_gpu_layers,
-                'experts_cpu_override',
-                tensor_overrides=(EXPERTS_CPU_OVERRIDE,),
-                fit=moe_fit,
-                fit_context=moe_fit_context,
-                no_mmap=_no_mmap_for(True),
-            ),
-            source='coarse',
-            risk='experimental',
-            expected_effect='expert tensors routed to CPU by override pattern (no-mmap)',
         ))
 
     seen = set()

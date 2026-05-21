@@ -343,7 +343,12 @@ def _record_prompt_workload_tps(record: Optional[Dict[str, object]]) -> float:
 
 
 def _mtp_candidate_risk(record: Dict[str, object], baseline: Dict[str, object]) -> Tuple[str, str]:
-    if str(record.get('status', '') or '') != 'ok':
+    # 'partial' = timed out before completion but acceptance metrics were captured
+    # (see benchmark.py:8575-8590 where partial records are explicitly promoted from
+    # 'failed' to keep them eligible as winners). Treat partial like ok here so the
+    # re-annotation doesn't undo that promotion; later checks (accept_rate gates,
+    # cost gates) still apply and can return 'failed' on their own merits.
+    if str(record.get('status', '') or '') not in ('ok', 'partial'):
         return 'failed', str(record.get('failure_reason') or record.get('detail') or 'candidate did not complete')
     if not bool(record.get('mtp_enabled')):
         return 'baseline', 'no-MTP baseline'
