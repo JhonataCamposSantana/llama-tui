@@ -324,6 +324,14 @@ def choose_threads_for_profile(model: ModelConfig, profile: Optional[HardwarePro
         cap = 6 if pressure >= 0.45 else 8
         return max(2, min(physical, cap))
 
+    # A MoE model that does not fit GPU runs its experts on CPU. Thread count
+    # should track CPU capacity, not the VRAM-pressure tier (the two are
+    # orthogonal). Use physical cores -- HT rarely helps compute-bound expert
+    # GEMMs -- and only back off under genuine process pressure.
+    if model_is_moe(model):
+        cap = max(2, physical - 2) if pressure >= 0.45 else physical
+        return max(2, min(logical, cap))
+
     if tier == 'safe':
         return max(2, min(logical, max(2, physical - 2)))
     if tier == 'extreme':

@@ -78,6 +78,7 @@ from .optimize import (
     apply_hardware_baseline,
     apply_best_optimization,
     apply_optimization_preset,
+    choose_threads_for_profile,
     estimate_safe_context_for_profile,
     choose_best_preset,
     model_is_moe,
@@ -1877,6 +1878,9 @@ def apply_moe_recommendation(model: ModelConfig) -> Tuple[bool, str]:
             model.ngl = int(profile.get('ngl') or model.ngl)
         except Exception:
             pass
+    winner_threads = int(profile.get('threads', 0) or 0)
+    if winner_threads:
+        model.threads = winner_threads
 
     measured_profiles = dict(getattr(model, 'measured_profiles', {}) or {})
     updated = dict(profile)
@@ -7785,7 +7789,11 @@ def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfil
     candidate.tensor_overrides = [str(item) for item in tuple(getattr(runtime_profile, 'tensor_overrides', ()) or ())]
     candidate.mtp_enabled = bool(getattr(runtime_profile, 'mtp_enabled', False))
     candidate.mtp_draft_n_max = model_mtp_draft_n_max(candidate, runtime_profile)
-    candidate.threads = tq3_moe_cpu_placement_threads(candidate, runtime_profile)
+    profile_threads = int(getattr(runtime_profile, 'threads', 0) or 0)
+    if profile_threads > 0:
+        candidate.threads = profile_threads
+    else:
+        candidate.threads = tq3_moe_cpu_placement_threads(candidate, runtime_profile)
     candidate.optimize_mode = 'manual'
     candidate.optimize_tier = 'measured'
     return candidate
@@ -10040,6 +10048,15 @@ def benchmark_moe_placement_tuning(
 
     profile = app.hardware_profile(refresh=True)
     layer_count = _moe_tuning_layer_count(model)
+    # The persisted model.threads may be stale (e.g. a VRAM-driven 'safe' tier
+    # capped a CPU-bound MoE model at physical-2). Refresh it for the current
+    # hardware so every candidate -- and the saved winner -- launches with the
+    # correct thread count instead of whatever was last written to models.json.
+    refreshed_threads = choose_threads_for_profile(model, profile, getattr(model, 'optimize_tier', 'moderate'))
+    if refreshed_threads and refreshed_threads != int(getattr(model, 'threads', 0) or 0):
+        if progress:
+            progress(f'MoE tuning: refreshing threads {model.threads} -> {refreshed_threads} for current hardware')
+        model.threads = refreshed_threads
     objective = tuning_objective_for_model(model, profile, depth_key)
     coarse_candidates = generate_moe_tuning_candidates(
         baseline_profile,
@@ -10229,6 +10246,69 @@ def benchmark_moe_placement_tuning(
             if not run_candidate(candidate):
                 break
 
+        # Empirical thread sweep: the placement candidates above all ran at the
+        # refreshed (physical) thread count. CPU-bound MoE expert work can scale
+        # past physical cores, so retest the top placements at the logical core
+        # count and keep whichever measures faster.
+        physical_cores = int(getattr(profile, 'cpu_physical', 0) or 0)
+        logical_cores = int(getattr(profile, 'cpu_logical', 0) or 0)
+        if logical_cores > physical_cores > 0 and not early_stop_text:
+            interim_winner = select_measured_tuning_winner(records, objective)
+
+            def _is_cpu_offload(rec: Dict[str, object]) -> bool:
+                return (
+                    bool(rec.get('cpu_moe'))
+                    or int(rec.get('n_cpu_moe', 0) or 0) > 0
+                    or bool(rec.get('tensor_overrides'))
+                )
+
+            cpu_offload_recs = [
+                row for row in records
+                if str(row.get('status', '') or '') == 'ok' and _is_cpu_offload(row)
+            ]
+            best_cpu_offload = max(
+                cpu_offload_recs,
+                key=lambda row: float(row.get('tokens_per_sec', 0.0) or 0.0),
+                default=None,
+            )
+            sweep_target_names: List[str] = []
+            for rec in (interim_winner, best_cpu_offload):
+                if not rec:
+                    continue
+                name = str(rec.get('measured_candidate_name', '') or '')
+                if name and name not in sweep_target_names:
+                    sweep_target_names.append(name)
+
+            thread_sweep_candidates: List[TuningCandidate] = []
+            for name in sweep_target_names:
+                base_candidate = next((c for c in all_candidates if c.name == name), None)
+                if base_candidate is None:
+                    continue
+                sweep_name = f'{name}_threads{logical_cores}'
+                if sweep_name in measured_candidate_names():
+                    continue
+                sweep_rp = replace(
+                    base_candidate.runtime_profile,
+                    threads=logical_cores,
+                    name=sweep_name,
+                )
+                thread_sweep_candidates.append(TuningCandidate(
+                    name=sweep_name,
+                    runtime_profile=sweep_rp,
+                    source='thread_sweep',
+                    risk='normal',
+                    expected_effect=f'{name} at {logical_cores} CPU threads',
+                ))
+            if thread_sweep_candidates and progress:
+                progress(
+                    f'MoE tuning thread sweep at {logical_cores} threads: '
+                    f'{len(thread_sweep_candidates)} candidate(s)'
+                )
+            all_candidates.extend(thread_sweep_candidates)
+            for candidate in thread_sweep_candidates:
+                if not run_candidate(candidate):
+                    break
+
         primary_winner = select_measured_tuning_winner(records, objective)
         if primary_winner:
             context_records, profile_moe_placements, completed = _run_context_aware_moe_validation(
@@ -10314,6 +10394,9 @@ def benchmark_moe_placement_tuning(
         winner_profile['benchmark_depth'] = depth_key
         winner_profile['measured_profile_key'] = 'moe_placement'
         winner_profile['tuning_summary'] = 'fastest measured MoE placement candidate above safety scoring gates'
+        winner_threads = int(winner.get('threads', 0) or 0)
+        if winner_threads:
+            saved.threads = winner_threads
         if profile_moe_placements:
             winner_profile['profile_moe_placements'] = {
                 key: dict(value)

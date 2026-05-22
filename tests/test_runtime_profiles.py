@@ -4467,6 +4467,33 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertEqual(candidate.threads, 12)
 
+    def test_runtime_profile_explicit_threads_override_wins(self):
+        # The thread-sweep phase sets runtime_profile.threads directly; that
+        # explicit value must take precedence over the model's persisted threads.
+        model = ModelConfig(
+            id='m',
+            name='MoE',
+            path='/models/moe.gguf',
+            alias='m',
+            port=18201,
+            architecture_type='moe',
+            expert_count=256,
+            threads=8,
+        )
+        runtime_profile = RuntimeProfile(
+            engine_id='llama.cpp',
+            name='experts_cpu_override_threads12',
+            ctx_size=2048,
+            gpu_layers=999,
+            parallel=1,
+            tensor_overrides=('.*ffn_.*_exps.*=CPU',),
+            threads=12,
+        )
+
+        candidate = model_for_runtime_profile(model, runtime_profile)
+
+        self.assertEqual(candidate.threads, 12)
+
     def test_tq3_raw_presearch_uses_cpu_placement_thread_target(self):
         class FakeApp:
             runtime_profile = make_runtime_profile('tq3', 'llama-server')

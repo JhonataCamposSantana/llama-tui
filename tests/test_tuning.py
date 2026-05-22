@@ -613,6 +613,29 @@ class ApplyMoeRecommendationTests(unittest.TestCase):
         self.assertTrue(model.cpu_moe)
         self.assertEqual(model.ngl, 999)
 
+    def test_apply_persists_winning_thread_count(self):
+        model = moe_model(
+            threads=6,
+            measured_profiles={
+                'moe_placement': {
+                    'status': 'ok',
+                    'measured_candidate_name': 'experts_cpu_override_threads12',
+                    'cpu_moe': False,
+                    'n_cpu_moe': 0,
+                    'tensor_overrides': ['.*ffn_.*_exps.*=CPU'],
+                    'threads': 12,
+                    'tokens_per_sec': 31.4,
+                }
+            },
+        )
+
+        ok, _msg = apply_moe_recommendation(model)
+
+        self.assertTrue(ok)
+        # A thread-sweep winner that measured fastest at 12 threads must persist
+        # that thread count into the served model.
+        self.assertEqual(model.threads, 12)
+
     def test_extra_args_survive_apply_and_effective_command_strips_conflicts(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(Path(tmp) / 'models.json')

@@ -447,6 +447,7 @@ class RuntimeProfile:
     cpu_moe: bool = False
     n_cpu_moe: int = 0
     tensor_overrides: Tuple[str, ...] = field(default_factory=tuple)
+    threads: int = 0
     reasoning: str = ''
     reasoning_budget: int = -1
     reasoning_format: str = ''
