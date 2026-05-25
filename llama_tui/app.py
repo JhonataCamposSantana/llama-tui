@@ -8,7 +8,7 @@ import signal
 import struct
 import subprocess
 import time
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -58,7 +58,6 @@ from .benchmark_store import (
 )
 from .discovery import (
     detected_model_from_path,
-    display_runtime,
     is_real_model_file,
 )
 from .engines import (
@@ -112,7 +111,6 @@ from .mtp import (
     clamp_mtp_draft,
     model_has_mmproj_config,
     model_mtp_allowed,
-    model_mtp_draft_n_max,
     model_mtp_enabled,
     mtp_label,
     mtp_support_label,

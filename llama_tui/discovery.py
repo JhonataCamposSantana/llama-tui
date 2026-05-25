@@ -52,18 +52,6 @@ def is_real_model_file(path: Path) -> bool:
     if 'mmproj' in name:
         return False
     return True
-def looks_like_model_reference(value: str) -> bool:
-    value = (value or '').strip()
-    if not value or ' ' in value:
-        return False
-    if value.lower().endswith('.gguf'):
-        return False
-    if value.startswith('hf://'):
-        return True
-    return bool(re.match(r'^[^/\s]+/[^\s]+$', value))
-def is_registered_model_entry(model: ModelConfig) -> bool:
-    target = (getattr(model, 'path', '') or '').strip()
-    return is_real_model_file(Path(target))
 def display_runtime(model: ModelConfig) -> str:
     runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
     mapping = {

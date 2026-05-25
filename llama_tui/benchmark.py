@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import signal
 import shlex
 import statistics
 import subprocess
@@ -16,10 +15,6 @@ from .constants import CACHE_DIR
 from .benchmark_strategies import BenchmarkStrategy, select_benchmark_strategy
 from .benchmark_mtp import (
     MTP_BASELINE_RUNTIME_ASSERT_REASON,
-    MTP_DECODE_HEAVY_PROMPTS,
-    MTP_PROMPT_HEAVY_CONTEXT,
-    MTP_PROMPT_HEAVY_PROMPTS,
-    MTP_WORKLOAD_OUTPUT_CAPS,
     _DRAFT_MTP_STAT_RE,
     _draft_mtp_session_totals,
     annotate_mtp_optimizer_records,
@@ -30,7 +25,6 @@ from .benchmark_mtp import (
     mtp_long_context_probe_request_timeout as _benchmark_mtp_long_context_probe_request_timeout,
     mtp_no_spec_baseline_profile,
     mtp_optimizer_profile_recommendations,
-    mtp_optimizer_workload_specs,
     mtp_recurrent_baseline_assert_detected,
     mtp_runtime_profile_uses_long_context_probe,
     parse_mtp_acceptance_metrics,
@@ -50,10 +44,9 @@ from .discovery import extract_quant
 from .engines import (
     ENGINE_LLAMA_CPP,
     ENGINE_TURBOQUANT,
-    resolve_engine_install,
     resolve_runtime_engine_context,
 )
-from .gguf import architecture_label, extra_arg_value, gguf_layer_count, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
+from .gguf import architecture_label, model_file_size, read_gguf_metadata, set_model_extra_arg, strip_extra_args
 from .hardware import HardwareProfile, ProcessPressureSnapshot, benchmark_current_process_pressure, process_pressure_label
 from .launch_profiles import (
     BenchmarkLaunchProfile,
@@ -71,7 +64,7 @@ from .memory_guardrail import (
 from .model_compat import detect_model_runtime_features
 from .moe_placement import MoePlacementCandidate, generate_moe_placement_candidates
 from .models import ModelConfig
-from .mtp import MTP_DRAFT_VALUES, clamp_mtp_draft, model_mtp_allowed, model_mtp_draft_n_max, model_mtp_enabled, mtp_support_auto_hint
+from .mtp import MTP_DRAFT_VALUES, clamp_mtp_draft, model_mtp_allowed, model_mtp_draft_n_max, mtp_support_auto_hint
 from .optimize import (
     apply_hardware_baseline,
     apply_best_optimization,
@@ -97,20 +90,12 @@ from .adaptive_search import (
     ADAPTIVE_BINARY_STEPS,
     ADAPTIVE_CONTEXT_ROUNDING,
     ADAPTIVE_MAX_CONTEXT_PROBES,
-    COARSE_CONTEXT_HIGH_STEP,
-    COARSE_CONTEXT_LOW_LIMIT,
-    COARSE_CONTEXT_LOW_STEP,
-    COARSE_CONTEXT_MID_LIMIT,
-    COARSE_CONTEXT_MID_STEP,
-    CONTEXT_KNEE_ROUNDING,
     CONTEXT_REFINE_STEP,
-    EXHAUSTIVE_CONTEXT_STEP,
     SMART_MAX_FULL_CONTEXTS_PER_VARIANT,
     adaptive_context_search,
     break_refinement_contexts,
     context_knee_refinement_contexts,
-    coarse_context_step,
-    exhaustive_context_ladder,
+    exhaustive_context_ladder,  # re-exported via the benchmark facade for tests
     round_context,
     round_context_down,
     round_context_up,
@@ -119,8 +104,6 @@ from .adaptive_search import (
     smart_measurement_contexts,
 )
 from .failure_classification import (
-    FAILURE_CATEGORIES,
-    FAILURE_EXCERPT_MARKERS,
     benchmark_failure_excerpt,
     benchmark_failure_summary,
     classify_benchmark_failure,
@@ -1073,12 +1056,6 @@ def memory_guardrail_skip_record(
 # _record_headroom_score / _record_stability_score / _tps_curve /
 # _ctx_curve / _record_kv_quality_penalty moved to scoring.py and
 # re-imported below.
-
-
-def low_speed_guardrail_reason(record: Dict[str, object]) -> str:
-    # The low-speed promotion floor only applied to the removed TQ3 engine;
-    # no remaining engine is slow enough on this hardware to need it.
-    return ''
 
 
 def candidate_min_budget_seconds(runtime_profile: Optional[RuntimeProfile] = None, engine: str = '') -> float:
@@ -2539,15 +2516,6 @@ def model_and_runtime_profile_from_measured_profile(
     return candidate, runtime_profile
 
 
-def measured_profile_ctx_per_slot(model: ModelConfig, key: str) -> int:
-    profile = get_measured_profile(model, key)
-    if not profile:
-        return 0
-    ctx = int(profile.get('ctx', 0) or 0)
-    parallel = max(1, int(profile.get('parallel', 1) or 1))
-    return ctx // parallel
-
-
 def _set_extra_arg(args: List[str], flag: str, value: str) -> List[str]:
     cleaned = strip_extra_args(args, flag)
     return cleaned + [flag, value]
@@ -3163,70 +3131,6 @@ def benchmark_mtp_optimizer_workloads(
     )
 
 
-def benchmark_candidate_models(model: ModelConfig, profile: HardwareProfile) -> List[Tuple[str, str, ModelConfig, str]]:
-    selected_tier = select_best_tier(model, profile)
-    selected_preset = choose_best_preset(model, profile)
-    alternate_preset = 'max_context' if selected_preset == 'tokens_per_sec' else 'tokens_per_sec'
-    tier_order = ['safe', 'moderate', 'extreme']
-    selected_idx = tier_order.index(selected_tier)
-    neighbor_tiers = [selected_tier]
-    if selected_idx > 0:
-        neighbor_tiers.append(tier_order[selected_idx - 1])
-    if selected_idx < len(tier_order) - 1:
-        neighbor_tiers.append(tier_order[selected_idx + 1])
-
-    requested: List[Tuple[str, str]] = []
-    for tier in neighbor_tiers:
-        requested.append((selected_preset, tier))
-    requested.append((alternate_preset, selected_tier))
-    if selected_tier != 'safe':
-        requested.append((alternate_preset, 'safe'))
-
-    candidates = []
-    seen = set()
-    for preset, tier in requested:
-        variants = ['default']
-        if (
-            getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp'
-            and profile.has_usable_gpu()
-            and preset == 'tokens_per_sec'
-        ):
-            variants.append('q8_kv')
-        for variant in variants:
-            label = preset if variant == 'default' else f'{preset}_{variant}'
-            key = (label, tier)
-            if key in seen:
-                continue
-            seen.add(key)
-            candidate = clone_model_config(model)
-            tune_msg = apply_optimization_preset(candidate, preset, tier=tier, profile=profile)
-            if variant == 'q8_kv':
-                set_model_extra_arg(candidate, '--cache-type-k', 'q8_0')
-                set_model_extra_arg(candidate, '--cache-type-v', 'q8_0')
-                ctx_min = max(256, int(getattr(candidate, 'ctx_min', 2048)))
-                ctx_max = max(ctx_min, int(getattr(candidate, 'ctx_max', 131072)))
-                target_ctx = {
-                    'safe': 4096,
-                    'moderate': 8192,
-                    'extreme': 12288,
-                }.get(tier, 8192)
-                safe_ctx = estimate_safe_context_for_profile(
-                    candidate,
-                    profile,
-                    int(getattr(candidate, 'memory_reserve_percent', 30) or 30),
-                    int(getattr(candidate, 'parallel', 1) or 1),
-                    ctx_min,
-                    ctx_max,
-                )
-                if safe_ctx >= ctx_min:
-                    candidate.ctx = max(ctx_min, min(target_ctx, ctx_max, safe_ctx))
-                tune_msg += ' kv=q8_0'
-            candidates.append((label, tier, candidate, tune_msg))
-            if len(candidates) >= BENCHMARK_MAX_CANDIDATES:
-                break
-        if len(candidates) >= BENCHMARK_MAX_CANDIDATES:
-            break
-    return candidates
 def safe_bootstrap_candidate_models(model: ModelConfig, profile: HardwareProfile) -> List[Tuple[str, str, ModelConfig, str]]:
     candidates: List[Tuple[str, str, ModelConfig, str]] = []
     for preset, tier in SAFE_BOOTSTRAP_PRESETS:
@@ -3689,15 +3593,13 @@ def select_measured_profiles(
     opencode_floor = max(observed_opencode_context_floor(model), 16384 if model_is_moe(model) else 0)
 
     fast_pool = [item for item in promotion_pool if int(item.get('ctx_per_slot', 0) or 0) >= fast_floor] or promotion_pool
-    long_candidates = [item for item in promotion_pool if int(item.get('parallel', 1) or 1) == 1]
-    long_pool = [item for item in long_candidates if not low_speed_guardrail_reason(item)]
+    long_pool = [item for item in promotion_pool if int(item.get('parallel', 1) or 1) == 1]
     opencode_single_slot_pool = [item for item in promotion_pool if int(item.get('parallel', 1) or 1) == 1] or promotion_pool
     opencode_pool = (
         [item for item in opencode_single_slot_pool if int(item.get('ctx_per_slot', 0) or 0) >= opencode_floor]
         if opencode_floor
         else opencode_single_slot_pool
     )
-    opencode_pool = [item for item in opencode_pool if not low_speed_guardrail_reason(item)]
 
     fast = max(fast_pool, key=lambda item: (score_fast_chat(item, model), float(item.get('tokens_per_sec', 0.0) or 0.0)))
     auto = max(promotion_pool, key=lambda item: score_auto(item, model))
@@ -3828,8 +3730,6 @@ def profile_frontier_stability_rating(record: Dict[str, object]) -> str:
     status = str(record.get('status', '') or '').lower()
     if status not in ('ok', 'probe ok', 'tests passed'):
         return 'failed'
-    if low_speed_guardrail_reason(record):
-        return 'fragile'
     score = _record_stability_score(record)
     vram_headroom = _record_vram_headroom(record)
     if 0 < vram_headroom < 512 * 1024**2:
@@ -4025,8 +3925,7 @@ def build_profile_frontier(
         return {}
     usable = [
         item for item in successful
-        if not low_speed_guardrail_reason(item)
-        and not str(item.get('selection_rejection_reason', '') or item.get('rejection_reason', '') or '')
+        if not str(item.get('selection_rejection_reason', '') or item.get('rejection_reason', '') or '')
     ] or successful
     single_slot = [item for item in usable if int(item.get('parallel', 1) or 1) == 1] or usable
     stable_single_slot = [
@@ -6094,13 +5993,6 @@ def adaptive_benchmark_candidates(
     return select_adaptive_candidate_mix(candidates, ADAPTIVE_MAX_MEASUREMENTS)
 
 
-def exhaustive_variants(model: ModelConfig, profile: HardwareProfile) -> List[str]:
-    variants = ['default']
-    if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' and profile.has_usable_gpu():
-        variants.append('q8_kv')
-    return variants
-
-
 def exhaustive_parallel_values(profile: HardwareProfile) -> List[int]:
     max_parallel = max(1, min(16, int(getattr(profile, 'cpu_logical', 0) or 1)))
     values = []
@@ -6255,38 +6147,6 @@ def dynamic_context_growth_targets(
         values.add(floor_target)
     values.add(health_ceiling)
     return sorted(ctx for ctx in values if ctx_min <= ctx <= health_ceiling)
-
-
-def dedupe_runtime_profiles(runtime_profiles: List[RuntimeProfile]) -> List[RuntimeProfile]:
-    selected: List[RuntimeProfile] = []
-    seen = set()
-    for profile in runtime_profiles:
-        key = (
-            profile.engine_id,
-            profile.name,
-            profile.ctx_size,
-            profile.gpu_layers,
-            profile.kv_preset,
-            profile.fit_target,
-            profile.cache_ram,
-            profile.no_mmap,
-            profile.placement_strategy,
-            profile.cpu_moe,
-            profile.n_cpu_moe,
-            tuple(profile.tensor_overrides or ()),
-            profile.reasoning,
-            profile.reasoning_budget,
-            profile.reasoning_format,
-            profile.mtp_enabled,
-            profile.mtp_draft_n_max,
-            profile.mtp_draft_kv_preset,
-            getattr(profile, 'mtp_spec_type', ''),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(profile)
-    return selected
 
 
 def current_model_moe_placement(model: ModelConfig) -> Optional[MoePlacementCandidate]:

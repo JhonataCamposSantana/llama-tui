@@ -204,12 +204,3 @@ def select_benchmark_strategy(
         reason='dense llama.cpp-family GGUF can use a standard prompt/generation/server sanity ladder',
         metric_groups=('pp_tps', 'tg_tps', 'ttft_ms', 'tpot_ms', 'peak_vram', 'context_max_stable'),
     )
-
-
-def strategy_summary(strategy: BenchmarkStrategy) -> str:
-    phases = ', '.join(phase.id for phase in strategy.phases)
-    return (
-        f'{strategy.id}: objectives={",".join(strategy.objectives)} '
-        f'phases={phases} budget={strategy.hard_budget_seconds // 60}m '
-        f'max_candidates={strategy.max_candidates}'
-    )

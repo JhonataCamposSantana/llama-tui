@@ -8,7 +8,6 @@ from .gguf import (
     gguf_layer_count,
     has_extra_flag,
     model_file_size,
-    selected_cache_type,
 )
 from .hardware import HardwareProfile, benchmark_current_process_pressure
 from .models import ModelConfig

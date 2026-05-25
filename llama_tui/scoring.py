@@ -13,7 +13,7 @@ Pure: no AppConfig, no subprocess, no hardware probing. Everything
 operates on a measurement record dict + a ``ModelConfig``.
 """
 
-from typing import Dict, Optional
+from typing import Dict
 
 from .models import ModelConfig
 from .optimize import model_is_moe

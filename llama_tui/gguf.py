@@ -763,9 +763,6 @@ def selected_cache_type(model: ModelConfig, side: str) -> str:
     if side == 'k':
         return extra_arg_value(args, '--cache-type-k', '-ctk') or extra_arg_value(args, '--cache-type', '-ct') or 'f16'
     return extra_arg_value(args, '--cache-type-v', '-ctv') or extra_arg_value(args, '--cache-type', '-ct') or 'f16'
-def gguf_architecture(model: ModelConfig) -> str:
-    metadata = read_gguf_metadata(getattr(model, 'path', '') or '')
-    return str(metadata.get('general.architecture') or '')
 def gguf_metadata_int(model: ModelConfig, suffix: str, default: int = 0) -> int:
     metadata = read_gguf_metadata(getattr(model, 'path', '') or '')
     arch = str(metadata.get('general.architecture') or '')

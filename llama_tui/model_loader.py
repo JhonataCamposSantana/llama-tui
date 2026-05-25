@@ -9,8 +9,6 @@ filesystem access; the caller decides whether to log warnings or
 substitute defaults on failure.
 """
 
-from typing import List
-
 from .gguf import TURBOQUANT_STATUSES
 from .models import ModelConfig, dataclass_payload
 from .mtp import clamp_mtp_draft, normalize_mtp_support

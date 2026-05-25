@@ -148,10 +148,6 @@ def command_exists(command: Optional[str]) -> bool:
     return command_file_status(command or '').exists
 
 
-def resolve_llama_cpp_mtp_env(value: str) -> str:
-    return resolve_llama_cpp_mtp_binary(env_value=value).command
-
-
 def resolve_engine_install(config, engine_id: str) -> EngineInstall:
     engine = normalize_engine_id(engine_id)
     definition = get_engine_definitions().get(engine)

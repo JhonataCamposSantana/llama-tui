@@ -94,7 +94,6 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.engine_id, 'turboquant')
         self.assertTrue(profile.supports_turbo_kv)
         self.assertEqual(profile.turboquant_kv_pair(), ('q8_0', 'q8_0'))
-        self.assertEqual(profile.llama_extra_args(), ['--flash-attn', 'on', '-ctk', 'q8_0', '-ctv', 'q8_0'])
         self.assertIn('TurboQuant+', profile.header_indicator())
 
     def test_turboquant_value_explicit_flag_tracks_user_intent(self):

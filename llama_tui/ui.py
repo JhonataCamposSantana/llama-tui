@@ -5,9 +5,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .app import AppConfig, CONTINUE_MERGE_MODES, context_per_slot
+from .app import AppConfig, context_per_slot
 from .benchmark import (
     append_model_log,
     apply_full_suite_profile_recommendation,
@@ -32,89 +32,59 @@ from .benchmark import (
     launch_with_failsafe,
     machine_best_summary,
     moe_recommendation_applied,
-    record_matches_profile,
     suite_run_recommended_profile_key,
     start_model_with_progress,
     sync_opencode_after_tuning,
 )
 from .chat import stream_chat_events
-from .constants import DEFAULT_HOST, DEFAULT_MODEL_PORT, LOGO, REFRESH_SECONDS
+from .constants import LOGO, REFRESH_SECONDS
 from .control import CancelToken, CancelledError
 from .ui_action_runner import ActionRunner
 from .discovery import classify_model_type, display_offload, display_runtime, extract_quant
-from .gguf import architecture_detail, turboquant_detail, turboquant_short
+from .gguf import architecture_detail, turboquant_detail
 from .hermes_benchmark import benchmark_hermes_workflow
-from .hardware import HardwareProfile
 from .models import ModelConfig
-from .mtp import clamp_mtp_draft, mtp_label, mtp_support_label, normalize_mtp_support
-from .mtp_doctor import build_mtp_doctor_report, mtp_status_for_model
+from .mtp import mtp_label, mtp_support_label
 from .opencode_benchmark import benchmark_opencode_workflow
 from .optimize import apply_best_optimization, model_is_moe, select_best_tier
 from .textutil import compact_message, ellipsize, important_log_excerpt, is_error_message, wrap_display_lines
 from .ui_components import (
-    draw_badge,
     draw_box,
-    draw_card,
-    draw_key_hint_bar,
-    draw_section_title,
-    draw_status_chip,
-    kind_status_prefix,
     safe_addch,
     safe_addstr,
-    truncate,
-    wrap_card_lines,
 )
-from .ui_theme import health_style, kind_style, mtp_style, state_chip_style, style as theme_style
 from .ui_models import (
-    BENCHMARK_FRESHNESS_LABELS,
     BROWSER_HEADER,
     BROWSER_VIEW_OPTIONS,
-    _measured_profile_for_recommendation,
-    _profile_context,
     active_engine_binary,
     active_engine_key,
     active_engine_short,
     active_engine_warning_line,
     benchmark_freshness_display,
     benchmark_freshness_label,
-    benchmark_freshness_short,
     browser_header_for_view,
     browser_model_line,
     browser_model_line_for_view,
     build_model_row_summary,
-    compact_browser_header,
-    compact_browser_model_line,
+    compact_browser_model_line,  # re-exported via the ui facade for tests
     format_engine_badge,
-    format_model_health,
     format_model_recommendation,
-    format_model_state,
-    mtp_status_from_measured,
     mtp_status_short,
     status_symbol,
 )
 from .ui_benchmark import (
-    FULL_SUITE_STAGES,
     LEADERBOARD_SORT_KEYS,
-    MTP_SUITE_STAGES,
     benchmark_leaderboard_lines,
-    benchmark_plan_lines,
     build_benchmark_cockpit_items,
-    _status_attr_for_record,
     _table_row,
     _table_rule,
     _table_widths,
-    benchmark_rank_line,
-    benchmark_rank_table_items,
     benchmark_ranking_items,
-    benchmark_ranking_rows,
+    benchmark_ranking_rows,  # re-exported via the ui facade for tests
     benchmark_record_score,
-    benchmark_record_status_kind,
     benchmark_wiki_lines,
     full_suite_is_mtp,
     full_suite_stage_lines,
-    full_suite_stage_map,
-    full_suite_status_symbol,
-    ranked_benchmark_records,
 )
 
 PROFILE_LABELS = {

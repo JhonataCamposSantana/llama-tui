@@ -353,12 +353,6 @@ class EngineProfile:
     def is_llama_cpp_mtp(self) -> bool:
         return self.engine_id == 'llama.cpp-mtp'
 
-    def llama_extra_args(self) -> List[str]:
-        if not self.is_turboquant:
-            return []
-        key_mode, value_mode = self.engine_kv_pair()
-        return ['--flash-attn', 'on', '-ctk', key_mode, '-ctv', value_mode]
-
     def header_indicator(self) -> str:
         if self.is_turboquant:
             key_mode, value_mode = self.engine_kv_pair()
@@ -611,11 +605,6 @@ def select_mtp_spec_type_value(spec_type_values: Sequence[str], default_value: s
         return 'mtp'
     default_text = str(default_value or '').strip().lower()
     return default_text if default_text in MTP_SPEC_TYPE_VALUES else ''
-
-
-def parse_mtp_spec_type(help_text: str, defaults: Optional[EngineCapabilities] = None) -> str:
-    default_value = str(getattr(defaults, 'mtp_spec_type_value', '') or getattr(defaults, 'mtp_spec_type', '') or '').strip().lower() if defaults is not None else ''
-    return select_mtp_spec_type_value(parse_spec_type_values(help_text, defaults), default_value)
 
 
 def mtp_spec_type_value(capabilities: Optional[EngineCapabilities]) -> str:

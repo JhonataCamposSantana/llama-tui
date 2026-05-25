@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Sequence, Tuple
 
 from .engines import (
-    engine_display_name,
     resolve_runtime_engine_context,
 )
 from .model_compat import detect_model_runtime_features, engine_supports_model

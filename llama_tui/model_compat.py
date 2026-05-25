@@ -227,19 +227,6 @@ def _result(status: str, reason: str, severity: str, features: Set[str]) -> Mode
     )
 
 
-def _mtp_binary_block_reason(capabilities: Optional[EngineCapabilities]) -> str:
-    if capabilities is not None:
-        supports_spec_type = bool(getattr(capabilities, 'supports_spec_type', False))
-        supports_draft = bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
-        supports_mtp = bool(getattr(capabilities, 'supports_mtp', False))
-        spec_type = mtp_spec_type_value(capabilities)
-        if supports_spec_type and supports_draft and not spec_type:
-            return 'MTP_FLAGS_NOT_FOUND: selected binary has --spec-type but does not list mtp or draft-mtp'
-        if supports_spec_type and supports_draft and supports_mtp and spec_type:
-            return ''
-    return 'Selected MTP binary does not advertise --spec-type mtp/draft-mtp'
-
-
 def engine_supports_model(
     engine_id: str,
     model: ModelConfig,

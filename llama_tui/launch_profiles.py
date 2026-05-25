@@ -132,10 +132,6 @@ def _override_sequence(overrides: Dict[str, object], key: str) -> Tuple[str, ...
     return ()
 
 
-def _runtime_engine_id(runtime_profile: Optional[RuntimeProfile]) -> str:
-    return str(getattr(runtime_profile, 'engine_id', '') or '').strip().lower()
-
-
 def build_benchmark_launch_profile(
     model: ModelConfig,
     runtime_profile: Optional[RuntimeProfile] = None,
