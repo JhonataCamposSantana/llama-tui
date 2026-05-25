@@ -14,6 +14,11 @@ DEFAULT_TURBOQUANT_LLAMA_SERVER = (
     else 'turboquant-llama-server'
 )
 TURBOQUANT_KV_MODES = ('q8_0', 'turbo4', 'turbo3', 'turbo2')
+# Benchmark-validated default value cache for compatible TurboQuant+ models
+# (RTX 4060 8GB + i5-13420H): -ctk q8_0 -ctv turbo3 was the measured winner.
+# Used only when the user has not pinned a value cache and no benchmark
+# winner is persisted; incompatible/small-head models fall back to q8_0.
+DEFAULT_TURBOQUANT_VALUE_MODE = 'turbo3'
 COMMON_KV_MODES = (
     'f32',
     'f16',
@@ -326,6 +331,7 @@ class EngineProfile:
     kv_mode: str = ''
     kv_key_mode: str = ''
     kv_value_mode: str = ''
+    kv_value_explicit: bool = False
 
     @property
     def engine(self) -> str:
@@ -452,11 +458,19 @@ def make_runtime_profile(
     kv_mode: str = '',
     kv_key_mode: str = '',
     kv_value_mode: str = '',
+    kv_value_explicit: Optional[bool] = None,
 ) -> EngineProfile:
     normalized = (engine or 'llama.cpp').strip().lower()
     if normalized == 'turboquant':
         command = os.environ.get('TURBOQUANT_LLAMA_SERVER_BIN') or DEFAULT_TURBOQUANT_LLAMA_SERVER
         key_mode, value_mode = resolve_turboquant_kv_modes(kv_mode, kv_key_mode, kv_value_mode)
+        # Distinguish "user pinned a value cache" from "value defaulted to q8_0".
+        # --kv (shorthand) and --kv-value both pin the value; --kv-key alone does not.
+        explicit = (
+            bool((str(kv_value_mode or '') + str(kv_mode or '')).strip())
+            if kv_value_explicit is None
+            else bool(kv_value_explicit)
+        )
         return EngineProfile(
             engine_id='turboquant',
             label='TurboQuant+',
@@ -470,6 +484,7 @@ def make_runtime_profile(
             kv_mode=(kv_mode or 'q8_0').strip() or 'q8_0',
             kv_key_mode=key_mode,
             kv_value_mode=value_mode,
+            kv_value_explicit=explicit,
         )
     if normalized in ('llama.cpp-mtp', 'llama-cpp-mtp', 'llamacpp-mtp', 'mtp'):
         # Audit finding #7: MTP merged into upstream llama.cpp via

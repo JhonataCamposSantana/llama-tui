@@ -120,10 +120,13 @@ from .mtp import (
 )
 from .optimize import choose_gpu_layers_for_profile, effective_gpu_reserve_percent, estimate_safe_context_for_profile
 from .runtime_profiles import (
+    DEFAULT_TURBOQUANT_VALUE_MODE,
     EngineCapabilities,
     EngineProfile,
     RuntimeProfile,
+    TURBOQUANT_KV_MODES,
     detect_engine_capabilities,
+    kv_modes_from_preset,
     make_runtime_profile,
     mtp_spec_type_value,
     runtime_profile_extra_args,
@@ -375,6 +378,7 @@ class AppConfig:
             kv_mode=chosen_profile.kv_mode,
             kv_key_mode=chosen_profile.kv_key_mode,
             kv_value_mode=chosen_profile.kv_value_mode,
+            kv_value_explicit=getattr(chosen_profile, 'kv_value_explicit', None),
         )
         self._activate_engine_benchmark_views()
 
@@ -756,13 +760,7 @@ class AppConfig:
         args = list(getattr(model, 'extra_args', []) or [])
         engine_id = self.active_engine_key_for_model(model)
         if engine_id == 'turboquant':
-            key_mode, value_mode = self.runtime_profile.turboquant_kv_pair()
-            head_dim = self.turboquant_head_dim(model)
-            tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
-            if head_dim == 64 or (0 < head_dim < 128) or tq_status == 'incompatible':
-                kv_preset = 'q8_0/q8_0'
-            else:
-                kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
+            kv_preset = self.turboquant_served_kv_preset(model)
         else:
             key_mode = (
                 extra_arg_value(args, '--cache-type-k')
@@ -879,6 +877,53 @@ class AppConfig:
                 parsed.append(0)
         return max(parsed or [0])
 
+    def turboquant_measured_value_mode(self, model: ModelConfig) -> str:
+        """Value cache from the persisted TurboQuant benchmark winner, if any.
+
+        The winning profile's kv_preset lives in measured_profiles['auto'];
+        only a recognised turbo/q8_0 value (i.e. a profile actually measured
+        under TurboQuant+) is honoured, so a stale llama.cpp f16/default
+        record never leaks into a turbo launch.
+        """
+        from .benchmark import get_measured_profile
+
+        profile = get_measured_profile(model, 'auto')
+        kv_preset = str(profile.get('kv_preset', '') or '')
+        _key_mode, value_mode = kv_modes_from_preset(kv_preset)
+        value_mode = (value_mode or '').strip().lower()
+        return value_mode if value_mode in TURBOQUANT_KV_MODES else ''
+
+    def turboquant_served_kv_preset(self, model: ModelConfig) -> str:
+        """Resolve the -ctk/-ctv pair for a served TurboQuant+ launch.
+
+        Priority: an explicit session value cache wins; otherwise a persisted
+        benchmark winner; otherwise the validated turbo3 default for
+        confirmed-compatible models. Incompatible / sub-128 head dims always
+        fall back to q8_0/q8_0 since the turbo block size cannot fit them.
+        """
+        key_mode, value_mode = self.runtime_profile.turboquant_kv_pair()
+        key_mode = (key_mode or 'q8_0').strip() or 'q8_0'
+        value_mode = (value_mode or key_mode).strip() or key_mode
+        head_dim = self.turboquant_head_dim(model)
+        tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
+        turbo_incompatible = (0 < head_dim < 128) or tq_status == 'incompatible'
+
+        if bool(getattr(self.runtime_profile, 'kv_value_explicit', False)):
+            if value_mode.startswith('turbo') and turbo_incompatible:
+                return 'q8_0/q8_0'
+            return f'{key_mode}/{value_mode}'
+
+        if turbo_incompatible:
+            return 'q8_0/q8_0'
+
+        winner_value = self.turboquant_measured_value_mode(model)
+        if winner_value:
+            return f'{key_mode}/{winner_value}'
+
+        if tq_status in ('native', 'padded') and head_dim >= 128:
+            return f'{key_mode}/{DEFAULT_TURBOQUANT_VALUE_MODE}'
+        return 'q8_0/q8_0'
+
     def turboquant_session_advisory(self, model: ModelConfig) -> str:
         engine = self.active_engine_key_for_model(model)
         if engine != 'turboquant':
@@ -894,6 +939,14 @@ class AppConfig:
                 return 'TurboQuant+ advisory: head_dim unknown; automatic turbo recommendations are limited. Use q8_0/turbo4 manually after validation.'
             if status not in ('native', 'padded'):
                 return f'TurboQuant+ advisory: {turboquant_detail(model)}'
+            if not bool(getattr(self.runtime_profile, 'kv_value_explicit', False)):
+                _key, value = kv_modes_from_preset(self.turboquant_served_kv_preset(model))
+                if value.startswith('turbo'):
+                    source = 'benchmark winner' if self.turboquant_measured_value_mode(model) else 'validated default'
+                    return (
+                        f'TurboQuant+ info: serving -ctk q8_0 -ctv {value} ({source}); '
+                        'pass --kv-value to override.'
+                    )
             return ''
         if status in ('native', 'padded'):
             return ''

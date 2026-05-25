@@ -97,6 +97,25 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.llama_extra_args(), ['--flash-attn', 'on', '-ctk', 'q8_0', '-ctv', 'q8_0'])
         self.assertIn('TurboQuant+', profile.header_indicator())
 
+    def test_turboquant_value_explicit_flag_tracks_user_intent(self):
+        # The served launch needs to tell "user pinned a value cache" apart
+        # from "value defaulted to q8_0" so it can apply the turbo3 default
+        # only in the latter case. --kv (shorthand) and --kv-value pin the
+        # value; --kv-key alone does not.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('TURBOQUANT_LLAMA_SERVER_BIN', None)
+            default = make_runtime_profile('turboquant', 'llama-server')
+            key_only = make_runtime_profile('turboquant', 'llama-server', kv_key_mode='q8_0')
+            value_pinned = make_runtime_profile('turboquant', 'llama-server', kv_value_mode='turbo4')
+            shorthand = make_runtime_profile('turboquant', 'llama-server', kv_mode='turbo3')
+            forwarded = make_runtime_profile('turboquant', 'llama-server', kv_value_explicit=True)
+
+        self.assertFalse(default.kv_value_explicit)
+        self.assertFalse(key_only.kv_value_explicit)
+        self.assertTrue(value_pinned.kv_value_explicit)
+        self.assertTrue(shorthand.kv_value_explicit)
+        self.assertTrue(forwarded.kv_value_explicit)
+
     def test_turboquant_profile_respects_env_override_and_manual_kv(self):
         with patch.dict(os.environ, {'TURBOQUANT_LLAMA_SERVER_BIN': '/opt/tqp/bin/llama-server'}):
             profile = make_runtime_profile(

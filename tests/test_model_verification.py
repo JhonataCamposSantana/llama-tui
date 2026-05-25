@@ -118,6 +118,67 @@ class ModelVerificationTests(unittest.TestCase):
         self.assertEqual(reloaded.turboquant_value_dim, 128)
         self.assertEqual(reloaded.turboquant_source, 'gguf_metadata')
 
+    def turbo_app(self, **profile_kwargs) -> AppConfig:
+        return AppConfig(
+            self.root / 'models.json',
+            runtime_profile=make_runtime_profile('turboquant', 'llama-server', **profile_kwargs),
+        )
+
+    def turbo_model(self, **overrides) -> ModelConfig:
+        model = self.model(runtime='llama.cpp', **overrides)
+        model.turboquant_status = overrides.get('turboquant_status', 'native')
+        model.turboquant_key_dim = overrides.get('turboquant_key_dim', 128)
+        model.turboquant_value_dim = overrides.get('turboquant_value_dim', 128)
+        return model
+
+    def test_turboquant_default_serves_turbo3_for_compatible_models(self):
+        # Regression: a plain `--engine turboquant` session used to serve
+        # -ctv q8_0 (zero turbo compression). Compatible (native/padded,
+        # head_dim>=128) models now default the value cache to the
+        # benchmark-validated turbo3.
+        app = self.turbo_app()
+        native = self.turbo_model(turboquant_status='native', turboquant_key_dim=256, turboquant_value_dim=256)
+        padded = self.turbo_model(turboquant_status='padded', turboquant_key_dim=192, turboquant_value_dim=192)
+
+        self.assertEqual(app.turboquant_served_kv_preset(native), 'q8_0/turbo3')
+        self.assertEqual(app.turboquant_served_kv_preset(padded), 'q8_0/turbo3')
+
+    def test_turboquant_incompatible_or_unknown_falls_back_to_q8(self):
+        app = self.turbo_app()
+        incompatible = self.turbo_model(turboquant_status='incompatible', turboquant_key_dim=64, turboquant_value_dim=64)
+        unknown = self.turbo_model(turboquant_status='unknown', turboquant_key_dim=0, turboquant_value_dim=0)
+
+        self.assertEqual(app.turboquant_served_kv_preset(incompatible), 'q8_0/q8_0')
+        self.assertEqual(app.turboquant_served_kv_preset(unknown), 'q8_0/q8_0')
+
+    def test_turboquant_explicit_value_is_respected_but_downgraded_when_unfit(self):
+        explicit = self.turbo_app(kv_value_mode='turbo4')
+        native = self.turbo_model(turboquant_status='native', turboquant_key_dim=128, turboquant_value_dim=128)
+        unfit = self.turbo_model(turboquant_status='incompatible', turboquant_key_dim=64, turboquant_value_dim=64)
+
+        self.assertEqual(explicit.turboquant_served_kv_preset(native), 'q8_0/turbo4')
+        # An explicit turbo value still can't run on a sub-128 head dim.
+        self.assertEqual(explicit.turboquant_served_kv_preset(unfit), 'q8_0/q8_0')
+
+        opted_out = self.turbo_app(kv_value_mode='q8_0')
+        self.assertEqual(opted_out.turboquant_served_kv_preset(native), 'q8_0/q8_0')
+
+    def test_turboquant_benchmark_winner_overrides_default(self):
+        app = self.turbo_app()
+        native = self.turbo_model(turboquant_status='native', turboquant_key_dim=128, turboquant_value_dim=128)
+        native.measured_profiles = {'auto': {'status': 'ok', 'kv_preset': 'q8_0/turbo2', 'tokens_per_sec': 12.0}}
+        self.assertEqual(app.turboquant_served_kv_preset(native), 'q8_0/turbo2')
+
+        # A winner where turbo lost (q8_0/q8_0) is honoured, not overridden.
+        lost = self.turbo_model(turboquant_status='native', turboquant_key_dim=128, turboquant_value_dim=128)
+        lost.measured_profiles = {'auto': {'status': 'ok', 'kv_preset': 'q8_0/q8_0', 'tokens_per_sec': 30.0}}
+        self.assertEqual(app.turboquant_served_kv_preset(lost), 'q8_0/q8_0')
+
+        # A stale llama.cpp record (f16) never leaks into a turbo launch.
+        stale = self.turbo_model(turboquant_status='native', turboquant_key_dim=128, turboquant_value_dim=128)
+        stale.measured_profiles = {'auto': {'status': 'ok', 'kv_preset': 'f16/f16', 'tokens_per_sec': 30.0}}
+        self.assertEqual(app.turboquant_served_kv_preset(stale), 'q8_0/turbo3')
+
     def test_tq3_native_gguf_is_unsupported_on_every_engine(self):
         # TQ3 engine removed (2026-05): a TQ3-native GGUF (detected by name)
         # can no longer be launched by any remaining engine.
