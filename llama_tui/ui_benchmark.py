@@ -289,21 +289,6 @@ def _status_attr_for_record(
     return normal_attr
 
 
-def benchmark_rank_line(rank: int, record: Dict[str, object], labels: List[str]) -> str:
-    score_label, score = benchmark_record_score(record)
-    seconds = float(record.get('seconds', 0.0) or 0.0)
-    ctx = int(record.get('ctx', 0) or 0)
-    parallel = int(record.get('parallel', 0) or 0)
-    slot = int(record.get('ctx_per_slot', 0) or 0) or (ctx // max(1, parallel or 1))
-    status = str(record.get('status', '-') or '-')
-    role_text = ', '.join(labels or ['Measured'])
-    detail = compact_message(str(record.get('detail', '') or ''))
-    left = (
-        f'#{rank:02d} [{role_text}] {status} '
-        f'{score:.2f} {score_label} {seconds:.1f}s '
-        f'ctx={ctx} slot={slot} par={parallel}'
-    )
-    return f'{left}  {detail}' if detail else left
 
 
 def benchmark_rank_table_items(

@@ -55,8 +55,6 @@ def health_style_name(health: str) -> str:
     return _HEALTH_STYLE.get(str(health or '').strip().upper(), 'muted')
 
 
-def health_style(colors: Dict[str, int], health: str) -> int:
-    return style(colors, health_style_name(health))
 
 
 # Capability-driven MTP status -> semantic style.
@@ -78,8 +76,6 @@ def mtp_style_name(status: str) -> str:
     return _MTP_STYLE.get(str(status or '').strip().lower(), 'muted')
 
 
-def mtp_style(colors: Dict[str, int], status: str) -> int:
-    return style(colors, mtp_style_name(status))
 
 
 # Run state -> palette chip key.

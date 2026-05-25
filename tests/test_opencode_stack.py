@@ -37,7 +37,6 @@ from llama_tui.benchmark import (
     model_from_measured_profile,
     parallel_refinement_values,
     parse_context_requirement,
-    safe_bootstrap_candidate_models,
     select_adaptive_candidate_mix,
     select_measured_profiles,
     smart_break_refinement_contexts,
@@ -1822,19 +1821,6 @@ class DiscoveryDefaultsTests(unittest.TestCase):
     def test_personal_paths_are_not_embedded_in_constants(self):
         text = Path('llama_tui/constants.py').read_text()
         self.assertNotIn('/var/home/jcampos', text)
-
-    def test_safe_bootstrap_candidates_ignore_model_name(self):
-        profile = HardwareProfile(cpu_logical=8, cpu_physical=4, memory_total=16 * 1024**3, memory_available=8 * 1024**3)
-        first = ModelConfig(id='a', name='Qwen Opus Coder Gemma', path=__file__, alias='a', port=18100)
-        second = ModelConfig(id='b', name='Plain Local Model', path=__file__, alias='b', port=18101)
-        with patch('llama_tui.optimize.process_pressure_score', return_value=0.0):
-            first_candidates = safe_bootstrap_candidate_models(first, profile)
-            second_candidates = safe_bootstrap_candidate_models(second, profile)
-
-        first_shape = [(preset, tier, c.ctx, c.ngl, c.parallel, c.memory_reserve_percent, c.extra_args) for preset, tier, c, _ in first_candidates]
-        second_shape = [(preset, tier, c.ctx, c.ngl, c.parallel, c.memory_reserve_percent, c.extra_args) for preset, tier, c, _ in second_candidates]
-        self.assertEqual(first_shape, second_shape)
-
 
 class ProcessLifecycleTests(unittest.TestCase):
     def setUp(self):
