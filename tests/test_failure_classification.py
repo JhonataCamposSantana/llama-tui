@@ -82,7 +82,7 @@ class ClassifyBenchmarkFailureTests(unittest.TestCase):
         self.assertEqual(result['failure_category'], 'CLI_INVALID')
 
     def test_engine_binary_missing(self):
-        text = 'ENGINE_BINARY_MISSING: llama.cpp-tq3 server not found: TQ3_LLAMA_SERVER_BIN unset'
+        text = 'ENGINE_BINARY_MISSING: turboquant server not found: TURBOQUANT_LLAMA_SERVER_BIN unset'
         result = classify_benchmark_failure(text)
         self.assertEqual(result['failure_category'], 'ENGINE_BINARY_MISSING')
 

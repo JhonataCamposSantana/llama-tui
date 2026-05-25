@@ -31,7 +31,7 @@ class RuntimePathTests(unittest.TestCase):
             root = Path(tmp)
             with self._patched(root):
                 self.assertEqual(runtime_artifact_dir('llama.cpp'), root / 'runtime' / 'llama.cpp')
-                self.assertEqual(runtime_artifact_dir('buun'), root / 'runtime' / 'buun')
+                self.assertEqual(runtime_artifact_dir('turboquant'), root / 'runtime' / 'turboquant')
                 self.assertEqual(runtime_artifact_dir('turboquant'), root / 'runtime' / 'turboquant')
                 self.assertEqual(runtime_artifact_dir('llama.cpp-mtp'), root / 'runtime' / 'llama.cpp-mtp')
 
@@ -60,17 +60,17 @@ class RuntimePathTests(unittest.TestCase):
                     root / 'runtime' / 'llama.cpp' / 'm.pid',
                 )
                 self.assertEqual(
-                    runtime_artifact_path('m', '.log', 'buun'),
-                    root / 'runtime' / 'buun' / 'm.log',
+                    runtime_artifact_path('m', '.log', 'turboquant'),
+                    root / 'runtime' / 'turboquant' / 'm.log',
                 )
 
     def test_per_engine_pidfile_log_and_metadata_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with self._patched(root):
-                self.assertEqual(runtime_pidfile('m', 'tq3'), root / 'runtime' / 'tq3' / 'm.pid')
-                self.assertEqual(runtime_pid_metadata_file('m', 'tq3'), root / 'runtime' / 'tq3' / 'm.pid.json')
-                self.assertEqual(runtime_logfile('m', 'tq3'), root / 'runtime' / 'tq3' / 'm.log')
+                self.assertEqual(runtime_pidfile('m', 'turboquant'), root / 'runtime' / 'turboquant' / 'm.pid')
+                self.assertEqual(runtime_pid_metadata_file('m', 'turboquant'), root / 'runtime' / 'turboquant' / 'm.pid.json')
+                self.assertEqual(runtime_logfile('m', 'turboquant'), root / 'runtime' / 'turboquant' / 'm.log')
 
 
 class LegacyPathTests(unittest.TestCase):

@@ -27,7 +27,6 @@ def _fake_app(models, **overrides) -> SimpleNamespace:
     """Build a minimal duck-typed AppConfig stand-in for the serialiser."""
     defaults = dict(
         llama_server='llama-server',
-        vllm_command='vllm',
         hf_cache_root='',
         llmfit_cache_root='',
         llm_models_cache_root='',
@@ -55,7 +54,6 @@ class SerializeAppStateTests(unittest.TestCase):
         )
         app = SimpleNamespace(
             llama_server='ls',
-            vllm_command='vc',
             hf_cache_root='hf',
             llmfit_cache_root='lf',
             llm_models_cache_root='llm',
@@ -70,7 +68,7 @@ class SerializeAppStateTests(unittest.TestCase):
         self.assertEqual(
             sorted(data.keys()),
             sorted([
-                'llama_server', 'vllm_command', 'hf_cache_root',
+                'llama_server', 'hf_cache_root',
                 'llmfit_cache_root', 'llm_models_cache_root',
                 'lm_studio_model_roots',
                 'opencode', 'continue', 'hermes', 'ui', 'models',
@@ -90,7 +88,7 @@ class SerializeAppStateTests(unittest.TestCase):
             UiSettings,
         )
         app = SimpleNamespace(
-            llama_server='', vllm_command='', hf_cache_root='',
+            llama_server='', hf_cache_root='',
             llmfit_cache_root='', llm_models_cache_root='',
             lm_studio_model_roots=[],
             opencode=OpencodeSettings(),

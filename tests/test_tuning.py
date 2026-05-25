@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from llama_tui.app import AppConfig
 from llama_tui.benchmark import (
+    _thread_sweep_values,
     adaptive_record_from_candidate,
     apply_measured_profile,
     apply_moe_recommendation,
@@ -732,6 +733,27 @@ class ApplyMoeRecommendationTests(unittest.TestCase):
         self.assertTrue(ok, msg)
         self.assertEqual(model.n_cpu_moe, 30)
         self.assertEqual(model.moe_placement_strategy, 'n_cpu_moe_30')
+
+
+class ThreadSweepValuesTests(unittest.TestCase):
+    def test_hybrid_sweeps_above_perf_default(self):
+        # default=perf=4, physical=8, logical=12 -> probe 6, 8, 12.
+        self.assertEqual(_thread_sweep_values(4, 4, 8, 12), [6, 8, 12])
+
+    def test_excludes_the_default(self):
+        self.assertNotIn(6, _thread_sweep_values(6, 4, 8, 12))
+
+    def test_bounded_to_three_values(self):
+        self.assertLessEqual(len(_thread_sweep_values(4, 4, 8, 12)), 3)
+
+    def test_values_within_logical_bound(self):
+        for value in _thread_sweep_values(4, 4, 8, 12):
+            self.assertGreaterEqual(value, 2)
+            self.assertLessEqual(value, 12)
+
+    def test_homogeneous_default_physical(self):
+        # default=physical=8, perf falls back to physical -> probe 6 and logical.
+        self.assertEqual(_thread_sweep_values(8, 8, 8, 16), [6, 16])
 
 
 if __name__ == '__main__':

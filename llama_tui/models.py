@@ -95,10 +95,6 @@ class ModelConfig:
     turboquant_value_dim: int = 0
     turboquant_source: str = ''
     turboquant_reason: str = ''
-    tq3_status: str = 'unknown'
-    tq3_weight_format: str = ''
-    tq3_source: str = ''
-    tq3_reason: str = ''
     supports_mtp: str = 'auto'
     mtp_enabled: bool = False
     mtp_draft_n_max: int = 3

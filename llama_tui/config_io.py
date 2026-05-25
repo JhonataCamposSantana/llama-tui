@@ -35,7 +35,6 @@ def serialize_app_state(app) -> Dict[str, object]:
     """
     return {
         'llama_server': app.llama_server,
-        'vllm_command': app.vllm_command,
         'hf_cache_root': app.hf_cache_root,
         'llmfit_cache_root': app.llmfit_cache_root,
         'llm_models_cache_root': app.llm_models_cache_root,

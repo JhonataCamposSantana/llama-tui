@@ -53,16 +53,6 @@ MAX_CONTEXT_UBATCH_BY_TIER = {
     'moderate': '128',
     'extreme': '256',
 }
-MAX_CONTEXT_VLLM_UTIL_BY_TIER = {
-    'safe': '0.75',
-    'moderate': '0.88',
-    'extreme': '0.92',
-}
-MAX_CONTEXT_VLLM_SEQS_BY_TIER = {
-    'safe': '1',
-    'moderate': '2',
-    'extreme': '3',
-}
 TOKENS_PER_SEC_RESERVE_BY_TIER = {
     'safe': 40,
     'moderate': 30,
@@ -103,28 +93,11 @@ MOE_TOKENS_PER_SEC_UBATCH_BY_TIER = {
     'moderate': '256',
     'extreme': '512',
 }
-TOKENS_PER_SEC_VLLM_UTIL_BY_TIER = {
-    'safe': '0.70',
-    'moderate': '0.80',
-    'extreme': '0.90',
-}
-TOKENS_PER_SEC_VLLM_SEQS_BY_TIER = {
-    'safe': '4',
-    'moderate': '8',
-    'extreme': '16',
-}
-TOKENS_PER_SEC_VLLM_BATCHED_TOKENS_BY_TIER = {
-    'safe': '4096',
-    'moderate': '8192',
-    'extreme': '16384',
-}
-
-
 def model_is_moe(model: ModelConfig) -> bool:
     return (getattr(model, 'architecture_type', '') or '').strip().lower() == 'moe'
 def model_uses_cpu_execution(model: ModelConfig, profile: Optional[HardwareProfile] = None) -> bool:
     runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
-    if runtime in ('vllm', 'ollama'):
+    if runtime == 'ollama':
         return False
     try:
         ngl = int(getattr(model, 'ngl', 0) or 0)
@@ -253,8 +226,6 @@ def estimate_gpu_weight_bytes(model: ModelConfig, profile: HardwareProfile, tier
     size = model_file_size(model)
     if size <= 0:
         return int(usable_gpu * 0.55)
-    if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
-        return min(int(size * 1.12), int(usable_gpu * 0.90))
     layer_count = gguf_layer_count(model)
     try:
         ngl = int(getattr(model, 'ngl', 0) or 0)
@@ -316,9 +287,6 @@ def choose_threads_for_profile(model: ModelConfig, profile: Optional[HardwarePro
     logical = (profile.cpu_logical if profile else 0) or (os.cpu_count() or 1)
     physical = (profile.cpu_physical if profile else 0) or max(1, logical // 2)
     tier = tier if tier in ('safe', 'moderate', 'extreme') else 'moderate'
-    if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
-        return int(getattr(model, 'threads', 1) or 1)
-
     pressure = process_pressure_score(profile)
     if model_likely_fits_gpu(model, profile, tier):
         cap = 6 if pressure >= 0.45 else 8
@@ -326,10 +294,13 @@ def choose_threads_for_profile(model: ModelConfig, profile: Optional[HardwarePro
 
     # A MoE model that does not fit GPU runs its experts on CPU. Thread count
     # should track CPU capacity, not the VRAM-pressure tier (the two are
-    # orthogonal). Use physical cores -- HT rarely helps compute-bound expert
-    # GEMMs -- and only back off under genuine process pressure.
+    # orthogonal). On a hybrid P+E CPU the slow E-cores drag down llama.cpp's
+    # barrier-synced layer GEMMs, so default to the performance-core count;
+    # the empirical thread sweep then probes higher counts. Falls back to
+    # physical cores when the P-core count is unknown (non-hybrid hosts).
     if model_is_moe(model):
-        cap = max(2, physical - 2) if pressure >= 0.45 else physical
+        perf = (profile.cpu_performance if profile else 0) or physical
+        cap = max(2, perf - 2) if pressure >= 0.45 else perf
         return max(2, min(logical, cap))
 
     if tier == 'safe':
@@ -358,7 +329,7 @@ def estimate_safe_context_for_profile(
             * ((100 - min(80, reserve_pct)) / 100.0)
             * process_pressure_budget_factor(profile)
         )
-        if getattr(model, 'runtime', 'llama.cpp') != 'vllm' and not model_likely_fits_gpu(model, profile, getattr(model, 'optimize_tier', 'moderate')):
+        if not model_likely_fits_gpu(model, profile, getattr(model, 'optimize_tier', 'moderate')):
             usable_ram -= estimate_ram_model_overhead(model, profile)
         if usable_ram > 0:
             limits.append(usable_ram // (kv_per_token * max(1, parallel)))
@@ -411,8 +382,6 @@ def choose_best_preset(model: ModelConfig, profile: Optional[HardwareProfile]) -
     architecture_type = (getattr(model, 'architecture_type', '') or '').strip().lower()
     size = model_file_size(model)
     available = profile.memory_available if profile else 0
-    if runtime == 'vllm':
-        return 'tokens_per_sec'
     if profile and profile.has_usable_gpu():
         ctx_min = max(256, int(getattr(model, 'ctx_min', 2048)))
         ctx_max = max(ctx_min, int(getattr(model, 'ctx_max', 131072)))
@@ -430,17 +399,15 @@ def choose_best_preset(model: ModelConfig, profile: Optional[HardwareProfile]) -
 def apply_hardware_baseline(model: ModelConfig, profile: Optional[HardwareProfile], tier: str):
     if not profile:
         return
-    runtime = getattr(model, 'runtime', 'llama.cpp')
-    if runtime != 'vllm':
-        model.threads = choose_threads_for_profile(model, profile, tier)
-        if model_likely_fits_gpu(model, profile, tier):
-            model.ngl = 999
-            model.flash_attn = True
-        elif profile.has_usable_gpu():
-            model.ngl = choose_gpu_layers_for_profile(model, profile, tier)
-            model.flash_attn = model.ngl > 0
-        elif not profile.has_usable_gpu():
-            model.ngl = 0
+    model.threads = choose_threads_for_profile(model, profile, tier)
+    if model_likely_fits_gpu(model, profile, tier):
+        model.ngl = 999
+        model.flash_attn = True
+    elif profile.has_usable_gpu():
+        model.ngl = choose_gpu_layers_for_profile(model, profile, tier)
+        model.flash_attn = model.ngl > 0
+    elif not profile.has_usable_gpu():
+        model.ngl = 0
 def apply_optimization_preset(
     model: ModelConfig,
     preset: str,
@@ -495,10 +462,6 @@ def apply_optimization_preset(
             set_flag('--ubatch-size', MAX_CONTEXT_UBATCH_BY_TIER[tier])
             set_flag('--cache-type-k', 'q8_0')
             set_flag('--cache-type-v', 'q8_0')
-        elif runtime == 'vllm':
-            set_flag('--gpu-memory-utilization', MAX_CONTEXT_VLLM_UTIL_BY_TIER[tier])
-            set_flag('--max-num-seqs', MAX_CONTEXT_VLLM_SEQS_BY_TIER[tier])
-            set_flag('--max-num-batched-tokens', str(max(4096, min(model.ctx, 24576))))
         model.extra_args = extra_args
         safe_ctx = estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max)
         model.ctx = min(model.ctx, safe_ctx) if safe_ctx >= ctx_min else ctx_min
@@ -527,10 +490,6 @@ def apply_optimization_preset(
             set_flag('--batch-size', batch_table[tier])
             set_flag('--ubatch-size', ubatch_table[tier])
             strip_flags('--cache-type-k', '--cache-type-v')
-        elif runtime == 'vllm':
-            set_flag('--gpu-memory-utilization', TOKENS_PER_SEC_VLLM_UTIL_BY_TIER[tier])
-            set_flag('--max-num-seqs', TOKENS_PER_SEC_VLLM_SEQS_BY_TIER[tier])
-            set_flag('--max-num-batched-tokens', TOKENS_PER_SEC_VLLM_BATCHED_TOKENS_BY_TIER[tier])
         model.extra_args = extra_args
         safe_ctx = estimate_safe_context_for_profile(model, profile, model.memory_reserve_percent, model.parallel, ctx_min, ctx_max)
         model.ctx = min(model.ctx, safe_ctx) if safe_ctx >= ctx_min else ctx_min

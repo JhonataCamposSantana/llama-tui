@@ -6,11 +6,13 @@ import os
 import signal
 import sys
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 from .app import AppConfig
 from .constants import CONFIG_DIR, DATA_DIR, CACHE_DIR, DEFAULT_CONFIG_PATH, SCRIPT_DIR, DEFAULT_LLAMA_SERVER
-from .runtime_profiles import BUUN_KV_MODES, TQ3_KV_MODES, TURBOQUANT_KV_MODES, make_runtime_profile
+from .runtime_profiles import TURBOQUANT_KV_MODES, make_runtime_profile
 from .ui import tui
 
 
@@ -37,36 +39,31 @@ def ensure_bootstrap_files(config_path: Path) -> Path:
 
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='llama-tui: local LLM control plane for llama.cpp, llama.cpp MTP, TurboQuant+, llama.cpp-tq3, Buun, and vLLM models.',
+        description='llama-tui: local LLM control plane for llama.cpp, llama.cpp MTP, and TurboQuant+ models.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f'''examples:
   llama-tui
   llama-tui {DEFAULT_CONFIG_PATH}
   llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4
   llama-tui --engine llama.cpp-mtp
-  llama-tui --engine tq3
-  llama-tui --engine buun --kill-existing
+  llama-tui --engine turboquant --kill-existing
 
 defaults:
-  supported runtimes: llama.cpp, llama.cpp-mtp, turboquant, tq3, buun, vLLM saved model entries
+  supported runtimes: llama.cpp, llama.cpp-mtp, turboquant
   config path: {DEFAULT_CONFIG_PATH}
   llama.cpp binary: LLAMA_SERVER or config llama_server
   llama.cpp MTP binary: LLAMA_CPP_MTP_PATH
   TurboQuant+ binary: TURBOQUANT_LLAMA_SERVER_BIN
-  llama.cpp-tq3 binary: TQ3_LLAMA_SERVER_BIN
-  Buun binary: BUUN_LLAMA_SERVER_BIN
-  vLLM command: VLLM_COMMAND or config vllm_command
 
 notes:
   --help exits before curses starts.
   --engine switches the active GGUF engine for this TUI session.
-  vLLM model entries still use their saved runtime and vllm_command.
 ''',
     )
     parser.add_argument('config_path', nargs='?', default=str(DEFAULT_CONFIG_PATH), help='models.json config path (default: %(default)s)')
     parser.add_argument(
         '--engine',
-        choices=('llama.cpp', 'llama.cpp-mtp', 'buun', 'turboquant', 'tq3'),
+        choices=('llama.cpp', 'llama.cpp-mtp', 'turboquant'),
         default='llama.cpp',
         help=(
             'active GGUF engine for this session (default: %(default)s). '
@@ -77,9 +74,9 @@ notes:
         ),
     )
     parser.add_argument('--ctx', type=int, default=None, help='optional session context override for the active GGUF engine')
-    parser.add_argument('--kv', default='', help='KV cache mode shorthand for Buun/TurboQuant+/TQ3 sessions')
-    parser.add_argument('--kv-key', default='', help='key-cache mode for Buun/TurboQuant+/TQ3 sessions')
-    parser.add_argument('--kv-value', default='', help='value-cache mode for Buun/TurboQuant+/TQ3 sessions')
+    parser.add_argument('--kv', default='', help='KV cache mode shorthand for TurboQuant+ sessions')
+    parser.add_argument('--kv-key', default='', help='key-cache mode for TurboQuant+ sessions')
+    parser.add_argument('--kv-value', default='', help='value-cache mode for TurboQuant+ sessions')
     parser.add_argument(
         '--kill-existing',
         action='store_true',
@@ -446,9 +443,7 @@ def release_engine_session_lock(lock_path: Path):
 
 
 _KV_ENGINE_RULES = (
-    ('buun', BUUN_KV_MODES, 'buun'),
     ('turboquant', TURBOQUANT_KV_MODES, 'TurboQuant+'),
-    ('tq3', TQ3_KV_MODES, 'llama.cpp-tq3'),
 )
 
 
@@ -466,16 +461,8 @@ def _validate_kv_args_for(args, engine_id, allowed_modes, engine_label):
             )
 
 
-def validate_buun_kv_args(args):
-    _validate_kv_args_for(args, 'buun', BUUN_KV_MODES, 'buun')
-
-
 def validate_turboquant_kv_args(args):
     _validate_kv_args_for(args, 'turboquant', TURBOQUANT_KV_MODES, 'TurboQuant+')
-
-
-def validate_tq3_kv_args(args):
-    _validate_kv_args_for(args, 'tq3', TQ3_KV_MODES, 'llama.cpp-tq3')
 
 
 def validate_kv_args(args):
@@ -549,6 +536,19 @@ def main():
             curses.wrapper(tui, app)
         except KeyboardInterrupt:
             pass
+        except Exception:
+            # curses.wrapper has already restored the terminal; the traceback
+            # would otherwise print to stderr and be lost to scrollback. Persist
+            # it so the crash is recoverable, then re-raise unchanged.
+            try:
+                crash_log = CACHE_DIR / 'last-crash.log'
+                crash_log.parent.mkdir(parents=True, exist_ok=True)
+                with crash_log.open('a', encoding='utf-8') as handle:
+                    handle.write(f'\n===== crash {datetime.now().isoformat(timespec="seconds")} =====\n')
+                    handle.write(traceback.format_exc())
+            except OSError:
+                pass
+            raise
     finally:
         cleanup()
         try:

@@ -609,7 +609,7 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(loaded.parallel, 3)
         self.assertEqual(loaded.extra_args, ['--batch-size', '512'])
 
-    def test_buun_active_view_does_not_reuse_llama_cpp_benchmarks(self):
+    def test_turboquant_active_view_does_not_reuse_llama_cpp_benchmarks(self):
         model = ModelConfig(
             id='tiny',
             name='Tiny Model',
@@ -629,11 +629,11 @@ class OpencodeStackHelperTests(unittest.TestCase):
         )
         self.app.add_or_update(model)
 
-        buun_app = AppConfig(
+        turboquant_app = AppConfig(
             self.config_path,
-            runtime_profile=make_runtime_profile('buun', 'llama-server'),
+            runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
         )
-        loaded = buun_app.get_model('tiny')
+        loaded = turboquant_app.get_model('tiny')
 
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.last_benchmark_tokens_per_sec, 0.0)
@@ -642,10 +642,10 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(loaded.benchmark_runs, [])
         self.assertIn('llama.cpp', loaded.engine_benchmark_store)
         self.assertIn('auto', loaded.engine_benchmark_store['llama.cpp']['measured_profiles'])
-        self.assertEqual(machine_best_summary(buun_app)['benchmarked_count'], 0)
-        self.assertFalse(benchmark_profile_is_fresh(buun_app, loaded))
+        self.assertEqual(machine_best_summary(turboquant_app)['benchmarked_count'], 0)
+        self.assertFalse(benchmark_profile_is_fresh(turboquant_app, loaded))
 
-    def test_buun_benchmarks_persist_separately_from_llama_cpp(self):
+    def test_turboquant_benchmarks_persist_separately_from_llama_cpp(self):
         model = ModelConfig(
             id='tiny',
             name='Tiny Model',
@@ -665,31 +665,31 @@ class OpencodeStackHelperTests(unittest.TestCase):
         )
         self.app.add_or_update(model)
 
-        buun_app = AppConfig(
+        turboquant_app = AppConfig(
             self.config_path,
-            runtime_profile=make_runtime_profile('buun', 'llama-server', kv_key_mode='turbo3_tcq', kv_value_mode='turbo2_tcq'),
+            runtime_profile=make_runtime_profile('turboquant', 'llama-server', kv_key_mode='turbo3', kv_value_mode='turbo2'),
         )
-        buun_model = buun_app.get_model('tiny')
-        buun_model.last_benchmark_tokens_per_sec = 35.0
-        buun_model.last_benchmark_seconds = 2.0
-        buun_model.last_benchmark_profile = 'buun auto 35 tok/s'
-        buun_model.last_benchmark_results = [{'status': 'ok', 'tokens_per_sec': 35.0, 'ctx': 16384, 'parallel': 1}]
-        buun_model.measured_profiles = {'auto': {'status': 'ok', 'tokens_per_sec': 35.0, 'ctx': 16384, 'ctx_per_slot': 16384, 'parallel': 1}}
-        buun_model.benchmark_runs = [{'id': 'buun-run', 'kind': 'server', 'status': 'done'}]
-        buun_model.benchmark_fingerprint = buun_app.model_fingerprint(buun_model)
-        buun_model.default_benchmark_status = 'done'
-        buun_model.default_benchmark_at = '2026-04-14T12:30:00'
-        buun_app.add_or_update(buun_model)
+        turboquant_model = turboquant_app.get_model('tiny')
+        turboquant_model.last_benchmark_tokens_per_sec = 35.0
+        turboquant_model.last_benchmark_seconds = 2.0
+        turboquant_model.last_benchmark_profile = 'turboquant auto 35 tok/s'
+        turboquant_model.last_benchmark_results = [{'status': 'ok', 'tokens_per_sec': 35.0, 'ctx': 16384, 'parallel': 1}]
+        turboquant_model.measured_profiles = {'auto': {'status': 'ok', 'tokens_per_sec': 35.0, 'ctx': 16384, 'ctx_per_slot': 16384, 'parallel': 1}}
+        turboquant_model.benchmark_runs = [{'id': 'turboquant-run', 'kind': 'server', 'status': 'done'}]
+        turboquant_model.benchmark_fingerprint = turboquant_app.model_fingerprint(turboquant_model)
+        turboquant_model.default_benchmark_status = 'done'
+        turboquant_model.default_benchmark_at = '2026-04-14T12:30:00'
+        turboquant_app.add_or_update(turboquant_model)
 
-        reloaded_buun = AppConfig(
+        reloaded_turboquant = AppConfig(
             self.config_path,
-            runtime_profile=make_runtime_profile('buun', 'llama-server', kv_key_mode='turbo3_tcq', kv_value_mode='turbo2_tcq'),
+            runtime_profile=make_runtime_profile('turboquant', 'llama-server', kv_key_mode='turbo3', kv_value_mode='turbo2'),
         ).get_model('tiny')
         reloaded_llama = AppConfig(self.config_path).get_model('tiny')
 
-        self.assertEqual(reloaded_buun.last_benchmark_tokens_per_sec, 35.0)
-        self.assertEqual(reloaded_buun.benchmark_runs[0]['id'], 'buun-run')
-        self.assertEqual(reloaded_buun.measured_profiles['auto']['ctx'], 16384)
+        self.assertEqual(reloaded_turboquant.last_benchmark_tokens_per_sec, 35.0)
+        self.assertEqual(reloaded_turboquant.benchmark_runs[0]['id'], 'turboquant-run')
+        self.assertEqual(reloaded_turboquant.measured_profiles['auto']['ctx'], 16384)
         self.assertEqual(reloaded_llama.last_benchmark_tokens_per_sec, 50.0)
         self.assertEqual(reloaded_llama.benchmark_runs[0]['id'], 'llama-run')
         self.assertEqual(reloaded_llama.measured_profiles['auto']['ctx'], 8192)
@@ -873,7 +873,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
                     'ngl': 999,
                     'output': 2048,
                     'tokens_per_sec': 12.0,
-                    'engine': 'buun',
+                    'engine': 'turboquant',
                     'runtime_profile': 'fit_context_growth_sweep_32768_turbo4_turbo4',
                     'kv_preset': 'turbo4/turbo4',
                     'runtime_fit': True,
@@ -1061,7 +1061,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
             root = Path(tmp)
             app = AppConfig(
                 root / 'models.json',
-                runtime_profile=make_runtime_profile('buun', 'llama-server'),
+                runtime_profile=make_runtime_profile('turboquant', 'llama-server'),
             )
             app.opencode.path = str(root / 'opencode.json')
             model = ModelConfig(
@@ -1090,7 +1090,7 @@ class OpencodeWorkflowScoreTests(unittest.TestCase):
 
         self.assertTrue(ok, msg)
         provider = config['provider']['local-dense']
-        self.assertIn('buun', provider['name'].lower())
+        self.assertIn('turboquant', provider['name'].lower())
         self.assertNotIn('llama.cpp Dense', provider['name'])
         self.assertEqual(provider['models']['dense']['limit']['context'], 32768)
 

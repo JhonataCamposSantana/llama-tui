@@ -9,8 +9,7 @@ runtime profiles, which makes it the cleanest first extraction.
 
 The classifier is intentionally imperative — order matters because
 several branches share substring matches but have different priorities
-(e.g. "fatal error" + "ggml" is a runtime crash, "fatal error" + "ggml-
-cpu/ops.cpp" + "abort" is a Buun warmup abort). Audit finding #11
+(e.g. "fatal error" + "ggml" is a runtime crash). Audit finding #11
 covers converting it to a declarative pattern table, but that needs a
 captured stderr-fixture set first; until then the imperative form
 preserves behaviour bit-for-bit.
@@ -35,8 +34,6 @@ FAILURE_CATEGORIES = (
     'CUDA_OOM_WEIGHTS',
     'CUDA_OOM_KV',
     'KV_MODE_INCOMPATIBLE',
-    'BUUN_FIT_FAILED',
-    'BUUN_CPU_WARMUP_ABORT',
     'MODEL_LOAD_FAILED',
     'RAW_ENGINE_TIMEOUT',
     'SERVER_TIMEOUT',
@@ -100,10 +97,10 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         reason = excerpt or detail or 'The engine crashed during startup.'
         suggested = 'Treat this as an engine/runtime crash; try another binary or runtime flag set.'
         terminal = True
-    if 'engine_binary_missing' in low or ('llama.cpp-tq3 server not found' in low and 'tq3_llama_server_bin' in low):
+    if 'engine_binary_missing' in low:
         category = 'ENGINE_BINARY_MISSING'
-        reason = detail or 'The active TQ3 server binary is missing.'
-        suggested = 'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
+        reason = detail or 'The active engine server binary is missing.'
+        suggested = 'Point the engine binary env var at a built llama-server.'
         terminal = True
     if (
         re.search(r'(unknown|invalid|unrecognized).{0,80}(argument|option|value|flag|type)', low)
@@ -158,14 +155,6 @@ def classify_benchmark_failure(text: str, default_category: str = 'SERVER_TIMEOU
         category = 'MEMORY_FIT_FAILED'
         reason = detail or 'The runtime fit planner could not meet the current free memory target.'
         suggested = 'Reduce context/offload for this run or retry after freeing RAM/VRAM.'
-        terminal = True
-    if (
-        ('ggml-cpu/ops.cpp' in low or 'ggml_compute_forward_scale' in low)
-        and ('fatal error' in low or 'abort' in low or 'aborted' in low)
-    ):
-        category = 'BUUN_CPU_WARMUP_ABORT'
-        reason = detail or 'buun CPU/default warmup aborted before serving.'
-        suggested = 'Skip the CPU/default probe and try a GPU fit profile with --no-warmup.'
         terminal = True
     memory_allocation_failure = (
         'cudamalloc failed' in low

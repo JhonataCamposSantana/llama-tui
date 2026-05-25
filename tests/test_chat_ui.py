@@ -105,7 +105,6 @@ from llama_tui.ui import (
     try_input_view,
     try_transcript_scroll_action,
     try_input_wrapped_lines,
-    tq3_detail_line,
     turboquant_detail_line,
     turboquant_status_kind,
     runtime_engine_source_line,
@@ -307,7 +306,6 @@ class BrowserAndFormTests(unittest.TestCase):
     def test_parse_settings_form_answers_validates_preferences(self):
         parsed, errors = parse_settings_form_answers({
             'llama_server': '/bin/llama-server',
-            'vllm_command': 'vllm',
             'hf_cache_root': '/hf',
             'llm_models_cache_root': '/models',
             'llmfit_cache_root': '/llmfit',
@@ -352,7 +350,6 @@ class BrowserAndFormTests(unittest.TestCase):
     def test_parse_settings_form_answers_round_trips_continue_roles(self):
         parsed, errors = parse_settings_form_answers({
             'llama_server': '/bin/llama-server',
-            'vllm_command': 'vllm',
             'hf_cache_root': '/hf',
             'llm_models_cache_root': '/models',
             'llmfit_cache_root': '/llmfit',
@@ -403,7 +400,7 @@ class BrowserAndFormTests(unittest.TestCase):
 
     def test_browser_models_filters_and_sorts_by_user_preferences(self):
         alpha = ModelConfig(id='alpha', name='Alpha', path='alpha.gguf', alias='alpha', port=18080, runtime='llama.cpp')
-        beta = ModelConfig(id='beta', name='Beta', path='beta.gguf', alias='beta', port=18081, runtime='vllm')
+        beta = ModelConfig(id='beta', name='Beta', path='beta.gguf', alias='beta', port=18081, runtime='ollama')
         gamma = ModelConfig(id='gamma', name='Gamma', path='gamma.gguf', alias='gamma', port=18082, runtime='llama.cpp')
         alpha.favorite = True
         alpha.last_used_at = '2026-04-23T10:00:00'
@@ -427,7 +424,7 @@ class BrowserAndFormTests(unittest.TestCase):
             'gamma': ('ERROR', ''),
         }
 
-        filtered = browser_models(FakeApp(), statuses, search='beta', runtime_filter='vllm', source_filter='lm-studio', status_filter='all', sort_mode='name')
+        filtered = browser_models(FakeApp(), statuses, search='beta', runtime_filter='ollama', source_filter='lm-studio', status_filter='all', sort_mode='name')
         self.assertEqual([model.id for model in filtered], ['beta'])
 
         favorites = browser_models(FakeApp(), statuses, sort_mode='favorites')
@@ -443,7 +440,7 @@ class BrowserAndFormTests(unittest.TestCase):
 
     def test_browser_models_filters_by_tags(self):
         alpha = ModelConfig(id='alpha', name='Alpha', path='alpha.gguf', alias='alpha', port=18080, runtime='llama.cpp')
-        beta = ModelConfig(id='beta', name='Beta', path='beta.gguf', alias='beta', port=18081, runtime='vllm')
+        beta = ModelConfig(id='beta', name='Beta', path='beta.gguf', alias='beta', port=18081, runtime='llama.cpp')
         alpha.tags = ['coding', 'fast-chat']
         beta.tags = ['autocomplete']
 
@@ -458,29 +455,28 @@ class BrowserAndFormTests(unittest.TestCase):
         filtered = browser_models(FakeApp(), statuses, tag_filter='coding')
         self.assertEqual([model.id for model in filtered], ['alpha'])
 
-    def test_browser_models_filters_tq3_native_compatibility(self):
-        native = ModelConfig(id='native', name='Native', path='native.TQ3_4S.gguf', alias='native', port=18080)
-        regular = ModelConfig(id='regular', name='Regular', path='regular.Q4_K_M.gguf', alias='regular', port=18081)
-        native.tq3_status = 'native'
-        native.tq3_weight_format = 'TQ3_4S'
-        regular.tq3_status = 'not_native'
+    def test_browser_models_filters_active_engine_compatibility(self):
+        compatible = ModelConfig(id='compatible', name='Compatible', path='compatible.Q4_K_M.gguf', alias='compatible', port=18080)
+        incompatible = ModelConfig(id='incompatible', name='Incompatible', path='incompatible.Q4_K_M.gguf', alias='incompatible', port=18081)
 
         class FakeApp:
-            models = [native, regular]
+            models = [compatible, incompatible]
 
             def model_fingerprint(self, model):
                 return f'fp-{model.id}'
 
             def active_engine_model_compatibility(self, model):
-                return (getattr(model, 'tq3_status', '') == 'native', '')
+                return (model.id == 'compatible', '')
 
-        statuses = {'native': ('STOPPED', ''), 'regular': ('STOPPED', '')}
+        statuses = {'compatible': ('STOPPED', ''), 'incompatible': ('STOPPED', '')}
 
-        filtered = browser_models(FakeApp(), statuses, compatibility_filter='tq3_native')
+        active = browser_models(FakeApp(), statuses, compatibility_filter='active')
+        unsupported = browser_models(FakeApp(), statuses, compatibility_filter='incompatible')
         all_models = browser_models(FakeApp(), statuses, compatibility_filter='all')
 
-        self.assertEqual([model.id for model in filtered], ['native'])
-        self.assertEqual([model.id for model in all_models], ['native', 'regular'])
+        self.assertEqual([model.id for model in active], ['compatible'])
+        self.assertEqual([model.id for model in unsupported], ['incompatible'])
+        self.assertEqual([model.id for model in all_models], ['compatible', 'incompatible'])
 
     def test_parse_browser_filter_answers_rejects_unknown_values(self):
         parsed, errors = parse_browser_filter_answers({
@@ -500,22 +496,22 @@ class BrowserAndFormTests(unittest.TestCase):
             'source_filter': 'manual',
             'status_filter': 'READY',
             'tag_filter': 'coding',
-            'compatibility_filter': 'tq3_native',
+            'compatibility_filter': 'active',
         })
 
         self.assertFalse(errors)
-        self.assertEqual(parsed, ('all', 'manual', 'READY', 'coding', 'tq3_native'))
+        self.assertEqual(parsed, ('all', 'manual', 'READY', 'coding', 'active'))
 
     def test_config_doctor_items_reports_verification_counts(self):
-        passed = ModelConfig(id='passed', name='Passed', path='org/model', alias='passed', port=18080, runtime='vllm')
-        pending = ModelConfig(id='pending', name='Pending', path='org/model2', alias='pending', port=18081, runtime='vllm')
+        passed = ModelConfig(id='passed', name='Passed', path='org/model', alias='passed', port=18080, runtime='llama.cpp')
+        pending = ModelConfig(id='pending', name='Pending', path='org/model2', alias='pending', port=18081, runtime='llama.cpp')
         passed.verification_status = 'passed'
         pending.verification_status = 'needs_benchmark'
         passed.turboquant_status = 'padded'
         passed.turboquant_key_dim = 96
         passed.turboquant_value_dim = 96
         passed.turboquant_source = 'gguf_metadata'
-        passed.turboquant_reason = 'buun zero-padding handles non-128 head dims'
+        passed.turboquant_reason = 'TurboQuant zero-padding handles non-128 head dims'
         passed.verification_results = {
             'cap': {
                 'limiting_factor': 'parallel_split',
@@ -528,7 +524,6 @@ class BrowserAndFormTests(unittest.TestCase):
 
         class FakeApp:
             llama_server = '/bin/sh'
-            vllm_command = 'vllm'
             opencode = SimpleNamespace(path='/tmp/opencode.json')
             continue_settings = SimpleNamespace(path='/tmp/config.yaml', merge_mode='preserve_sections')
             hermes = SimpleNamespace(command='hermes', home_root='/tmp/hermes')
@@ -547,7 +542,7 @@ class BrowserAndFormTests(unittest.TestCase):
         text = '\n'.join(row for row, _kind in rows)
 
         self.assertIn('code path:', text)
-        self.assertIn('ENGINE: vLLM', text)
+        self.assertIn('ENGINE: llama.cpp', text)
         self.assertIn('active engine path:', text)
         self.assertIn('model verification: needs_benchmark:1 passed:1', text)
         self.assertIn('Continue Agent tools: tool_use exported for 2 model(s); MCP requires Agent Mode', text)
@@ -557,7 +552,7 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn('cap: factor=parallel_split', text)
         self.assertIn('turboquant: padded key=96 value=96', text)
 
-    def test_turboquant_browser_detail_and_buun_warning_labels(self):
+    def test_turboquant_browser_detail_and_warning_labels(self):
         model = ModelConfig(id='tq', name='TurboQuant Model', path='model.gguf', alias='tq', port=18080)
         model.turboquant_status = 'unknown'
         model.turboquant_source = 'gguf_metadata'
@@ -572,40 +567,23 @@ class BrowserAndFormTests(unittest.TestCase):
         self.assertIn(' TQ ', BROWSER_HEADER)
         self.assertIn(' UNK ', line)
         self.assertIn('turboquant: unknown from gguf_metadata', turboquant_detail_line(model))
-        self.assertEqual(turboquant_status_kind(model, buun_session=False), 'muted')
-        self.assertEqual(turboquant_status_kind(model, buun_session=True), 'warning')
+        self.assertEqual(turboquant_status_kind(model, turboquant_session=False), 'muted')
+        self.assertEqual(turboquant_status_kind(model, turboquant_session=True), 'warning')
 
         model.turboquant_status = 'native'
         model.turboquant_key_dim = 128
         model.turboquant_value_dim = 128
         line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
         self.assertIn(' NAT ', line)
-        self.assertEqual(turboquant_status_kind(model, buun_session=True), 'success')
+        self.assertEqual(turboquant_status_kind(model, turboquant_session=True), 'success')
 
-    def test_tq3_browser_detail_uses_tq3_short_when_tq3_engine_active(self):
-        model = ModelConfig(id='tq3', name='TQ3 Model', path='model.TQ3_4S.gguf', alias='tq3', port=18080)
-        model.tq3_status = 'native'
-        model.tq3_weight_format = 'TQ3_4S'
-        model.tq3_source = 'tensor_types'
 
-        class FakeApp:
-            def role_badges(self, _model_id):
-                return '-'
-
-            def active_engine_key_for_model(self, _model):
-                return 'tq3'
-
-        line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
-
-        self.assertIn(' 4S ', line)
-        self.assertIn('tq3: native TQ3_4S from tensor_types', tq3_detail_line(model))
-
-    def test_active_engine_labels_distinguish_buun_from_model_runtime(self):
+    def test_active_engine_labels_distinguish_turboquant_from_model_runtime(self):
         model = ModelConfig(id='gemma', name='Gemma', path='gemma.gguf', alias='gemma', port=18080)
         model.turboquant_status = 'native'
 
         class Profile:
-            def buun_kv_pair(self):
+            def engine_kv_pair(self):
                 return 'turbo4', 'turbo4'
 
         class FakeApp:
@@ -615,18 +593,18 @@ class BrowserAndFormTests(unittest.TestCase):
                 return '-'
 
             def active_engine_key_for_model(self, _model):
-                return 'buun'
+                return 'turboquant'
 
             def active_runtime_binary_for_model(self, _model):
-                return 'buun-llama-server'
+                return 'turboquant-llama-server'
 
         line = browser_model_line(FakeApp(), model, 'STOPPED', '', 120)
 
         self.assertIn(' ENGINE ', BROWSER_HEADER)
-        self.assertIn(' buun ', line)
+        self.assertIn(' turboquant ', line)
         self.assertIn('model runtime/active engine', runtime_engine_source_line(FakeApp(), model))
-        self.assertIn('llama.cpp / buun', runtime_engine_source_line(FakeApp(), model))
-        self.assertIn('binary: buun-llama-server', active_engine_detail_line(FakeApp(), model))
+        self.assertIn('llama.cpp / turboquant', runtime_engine_source_line(FakeApp(), model))
+        self.assertIn('binary: turboquant-llama-server', active_engine_detail_line(FakeApp(), model))
         self.assertIn('key=turbo4 value=turbo4', active_engine_detail_line(FakeApp(), model))
 
     def test_active_engine_badge_line_is_prominent(self):
@@ -634,7 +612,7 @@ class BrowserAndFormTests(unittest.TestCase):
         model.turboquant_status = 'native'
 
         class Profile:
-            def buun_kv_pair(self):
+            def engine_kv_pair(self):
                 return 'turbo4', 'turbo4'
 
         class FakeApp:
@@ -644,14 +622,14 @@ class BrowserAndFormTests(unittest.TestCase):
                 return True
 
             def active_engine_key_for_model(self, _model):
-                return 'buun'
+                return 'turboquant'
 
             def active_runtime_binary_for_model(self, _model):
-                return 'buun-llama-server'
+                return 'turboquant-llama-server'
 
         line = active_engine_badge_line(FakeApp(), model)
 
-        self.assertEqual(line, 'ENGINE: Buun | KV key=turbo4 value=turbo4 | binary ok')
+        self.assertEqual(line, 'ENGINE: TurboQuant+ | KV key=turbo4 value=turbo4 | binary ok')
 
     def test_mtp_active_engine_badge_shows_experimental_state(self):
         model = ModelConfig(
@@ -1434,7 +1412,6 @@ class ProfileUiTests(unittest.TestCase):
         class FakeApp:
             config_path = '/tmp/models.json'
             llama_server = '/bin/llama-server'
-            vllm_command = 'vllm'
             hf_cache_root = '/hf'
             llmfit_cache_root = '/llmfit'
             llm_models_cache_root = '/models'

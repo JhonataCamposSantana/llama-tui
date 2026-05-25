@@ -2,11 +2,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from .engines import (
-    ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
-    ENGINE_VLLM,
     normalize_engine_id,
 )
 from .hardware import HardwareProfile
@@ -109,29 +106,6 @@ def select_benchmark_strategy(
     features = _features_for_strategy(model, hardware, model_size_bytes=model_size_bytes)
     has_moe = 'moe' in features
 
-    if engine == ENGINE_TQ3:
-        budget = 10 * 60 if depth_key == 'fast' else 15 * 60
-        blocked_reason = '' if 'tq3_native' in features else 'model is not detected as TQ3-native'
-        return BenchmarkStrategy(
-            id='tq3_native_probe',
-            engine_id=engine,
-            required_features=('tq3_native',),
-            objectives=('quick_sanity', 'fast_chat', 'memory_fit') if depth_key == 'fast' else ('quick_sanity', 'fast_chat', 'memory_fit', 'long_context'),
-            phases=() if blocked_reason else (
-                _phase('pp_baseline', 'llama_bench', 'quick_sanity', 'TQ3 prompt-processing baseline with normal KV first', ('pp_tps',), 2, 45),
-                _phase('tg_baseline', 'llama_bench', 'fast_chat', 'TQ3 token-generation baseline before server probes', ('tg_tps', 'tpot_ms'), 2, 60),
-                _phase('server_sanity', 'server_openai_api', 'quick_sanity', 'Small OpenAI-compatible server sanity probe', ('tg_tps', 'ttft_ms', 'peak_vram'), 4 if depth_key == 'fast' else 8, 180),
-                _phase('kv_experiment', 'server_openai_api', 'experimental_lab', 'TQ3 KV-cache experiment kept separate from weight-format probing', ('tg_tps', 'context_max_stable', 'quality_risk'), 0 if depth_key == 'fast' else 3, 180),
-            ),
-            hard_budget_seconds=0 if blocked_reason else budget,
-            max_candidates=0 if blocked_reason else (6 if depth_key == 'fast' else 12),
-            retry_policy='blocked' if blocked_reason else 'tq3_terminal_timeout',
-            reason='model is TQ3-native; use PP/TG pre-probes and a small server pass before wider KV/context experiments'
-            if not blocked_reason else blocked_reason,
-            metric_groups=('pp_tps', 'tg_tps', 'peak_vram', 'context_max_stable'),
-            blocked_reason=blocked_reason,
-        )
-
     # MTP is a binary capability, not a dedicated engine. Audit #7:
     # ENGINE_LLAMA_CPP_MTP collapsed into ENGINE_LLAMA_CPP, so the gate
     # is now: any llama.cpp-family engine + an MTP-native model OR a
@@ -148,7 +122,7 @@ def select_benchmark_strategy(
         and bool(getattr(capabilities, 'supports_spec_draft_n_max', False))
     )
     mtp_strategy_applies = (
-        engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN) and model_is_mtp
+        engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT) and model_is_mtp
     )
     if mtp_strategy_applies:
         blocked_reason = ''
@@ -177,25 +151,6 @@ def select_benchmark_strategy(
             blocked_reason=blocked_reason,
         )
 
-    if engine == ENGINE_VLLM:
-        blocked_reason = '' if 'hf_ref' in features else 'model is not detected as an HF reference for vLLM'
-        return BenchmarkStrategy(
-            id='vllm_serving_latency',
-            engine_id=engine,
-            required_features=('hf_ref',),
-            objectives=('quick_sanity', 'fast_chat', 'max_throughput'),
-            phases=() if blocked_reason else (
-                _phase('latency', 'vllm_bench', 'quick_sanity', 'vLLM latency benchmark', ('ttft_ms', 'tpot_ms', 'itl_ms', 'e2e_latency_ms'), 2, 180),
-                _phase('throughput', 'vllm_bench', 'max_throughput', 'vLLM throughput benchmark', ('request_throughput', 'output_throughput', 'total_token_throughput', 'goodput'), 2, 240),
-            ),
-            hard_budget_seconds=0 if blocked_reason else (10 * 60 if depth_key == 'fast' else 20 * 60),
-            max_candidates=0 if blocked_reason else 4,
-            retry_policy='blocked' if blocked_reason else 'vllm_request_retry_once',
-            reason=blocked_reason or 'vLLM should use vLLM latency/throughput concepts, not llama-bench matrices',
-            metric_groups=('ttft_ms', 'tpot_ms', 'itl_ms', 'e2e_latency_ms', 'request_throughput', 'goodput'),
-            blocked_reason=blocked_reason,
-        )
-
     if engine == ENGINE_TURBOQUANT:
         return BenchmarkStrategy(
             id='turboquant_kv_sweep',
@@ -214,7 +169,7 @@ def select_benchmark_strategy(
             metric_groups=('tg_tps', 'context_max_stable', 'peak_vram', 'quality_risk'),
         )
 
-    if has_moe and engine in (ENGINE_LLAMA_CPP, ENGINE_BUUN):
+    if has_moe and engine == ENGINE_LLAMA_CPP:
         return BenchmarkStrategy(
             id='moe_hybrid_placement',
             engine_id=engine,
@@ -230,24 +185,6 @@ def select_benchmark_strategy(
             retry_policy='oom_terminal_timeout_guarded',
             reason='MoE models need expert placement measured before dense-style batch/context sweeps',
             metric_groups=('pp_tps', 'tg_tps', 'peak_vram', 'peak_ram', 'context_max_stable'),
-        )
-
-    if engine == ENGINE_BUUN:
-        return BenchmarkStrategy(
-            id='buun_turbokv_sweep',
-            engine_id=engine,
-            required_features=('local_gguf',),
-            objectives=('quick_sanity', 'fast_chat', 'long_context', 'memory_fit', 'quality_safe'),
-            phases=(
-                _phase('default_baseline', 'server_openai_api', 'quick_sanity', 'Default KV baseline', ('tg_tps', 'peak_vram'), 1, 180),
-                _phase('turbokv', 'server_openai_api', 'memory_fit', 'Buun TurboKV variants', ('tg_tps', 'context_max_stable', 'quality_risk'), 3 if depth_key == 'fast' else 6, 240),
-                _phase('context_probe', 'server_openai_api', 'long_context', 'Context growth after TurboKV sanity', ('context_max_stable', 'peak_vram'), 2 if depth_key == 'fast' else 6, 240),
-            ),
-            hard_budget_seconds=12 * 60 if depth_key == 'fast' else 45 * 60,
-            max_candidates=8 if depth_key == 'fast' else 18,
-            retry_policy='oom_terminal_port_race_retry_once',
-            reason='Buun should test TurboKV variants independently from the stable default launch',
-            metric_groups=('tg_tps', 'context_max_stable', 'peak_vram', 'quality_risk'),
         )
 
     return BenchmarkStrategy(

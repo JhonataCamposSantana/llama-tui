@@ -6,12 +6,9 @@ from unittest.mock import patch
 
 from llama_tui.app import AppConfig
 from llama_tui.engines import (
-    ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
     ENGINE_LLAMA_CPP_MTP,
-    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
-    ENGINE_VLLM,
 )
 from llama_tui.model_compat import detect_model_runtime_features, engine_shows_model, engine_supports_model
 from llama_tui.models import ModelConfig
@@ -31,17 +28,13 @@ def model(model_id: str, path: str, **kwargs) -> ModelConfig:
 
 
 class ModelCompatibilityTests(unittest.TestCase):
-    def test_tq3_native_is_only_compatible_with_tq3_engine(self):
-        tq3 = model(
-            'tq3',
-            '/models/generic-native-TQ3_4S.gguf',
-            tq3_status='native',
-            tq3_weight_format='TQ3_4S',
-        )
+    def test_tq3_native_is_unsupported_on_every_engine(self):
+        # TQ3 engine removed (2026-05): a TQ3-native GGUF is detected by
+        # name/tensors but no remaining engine can run its weights.
+        tq3 = model('tq3', '/models/generic-native-TQ3_4S.gguf')
 
         self.assertIn('tq3_native', detect_model_runtime_features(tq3))
-        self.assertEqual(engine_supports_model(ENGINE_TQ3, tq3).status, 'preferred')
-        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_LLAMA_CPP_MTP):
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_LLAMA_CPP_MTP):
             self.assertEqual(engine_supports_model(engine, tq3, EngineCapabilities(supports_mtp=True)).status, 'unsupported')
 
     def test_mtp_native_prefers_capable_binary_on_llama_cpp_family(self):
@@ -60,15 +53,13 @@ class ModelCompatibilityTests(unittest.TestCase):
             mtp_spec_type='mtp',
             supports_spec_draft_n_max=True,
         )
-        for engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT, ENGINE_BUUN):
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_LLAMA_CPP_MTP, ENGINE_TURBOQUANT):
             result = engine_supports_model(engine, mtp, capable_caps)
             self.assertEqual(result.status, 'preferred', f'{engine!r} should be preferred with MTP caps')
             self.assertTrue(result.compatible)
         # Without MTP caps the model still loads but with a warning.
-        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN):
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT):
             self.assertEqual(engine_supports_model(engine, mtp).status, 'compatible_with_warning')
-        # TQ3 still distinguishes itself — non-tq3_native model is unknown.
-        self.assertEqual(engine_supports_model(ENGINE_TQ3, mtp).status, 'unknown')
 
     def test_mtp_native_with_uncapable_binary_loads_with_warning(self):
         # Audit #7: previously an MTP-native model on the MTP engine
@@ -138,16 +129,13 @@ class ModelCompatibilityTests(unittest.TestCase):
 
     def test_normal_gguf_is_uncertain_for_specialized_engines(self):
         # Audit #7: ENGINE_LLAMA_CPP_MTP collapses to ENGINE_LLAMA_CPP,
-        # so a normal GGUF is 'compatible' there too — only TQ3 still
-        # treats it as 'unknown' (TQ3 wants TQ3-native tensors).
+        # so a normal GGUF is 'compatible' across the llama.cpp family.
         normal = model('normal', '/models/llama-q4_k_m.gguf')
 
         self.assertIn('normal_gguf', detect_model_runtime_features(normal))
         self.assertIn('dense', detect_model_runtime_features(normal))
         self.assertTrue(engine_supports_model(ENGINE_LLAMA_CPP, normal).compatible)
         self.assertTrue(engine_supports_model(ENGINE_TURBOQUANT, normal).compatible)
-        self.assertTrue(engine_supports_model(ENGINE_BUUN, normal).compatible)
-        self.assertEqual(engine_supports_model(ENGINE_TQ3, normal).status, 'unknown')
         # Legacy alias resolves identically to llama.cpp now.
         self.assertTrue(engine_supports_model(ENGINE_LLAMA_CPP_MTP, normal).compatible)
 
@@ -160,19 +148,12 @@ class ModelCompatibilityTests(unittest.TestCase):
         self.assertEqual(result.status, 'compatible_with_warning')
         self.assertTrue(result.compatible)
 
-    def test_vllm_only_accepts_hf_refs(self):
-        hf = model('hf', 'owner/model', runtime='vllm')
-        gguf = model('gguf', '/models/generic.gguf')
-
-        self.assertEqual(engine_supports_model(ENGINE_VLLM, hf).status, 'preferred')
-        self.assertEqual(engine_supports_model(ENGINE_VLLM, gguf).status, 'unsupported')
-
     def test_browser_defaults_can_filter_by_active_engine_compatibility(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(Path(tmp) / 'models.json')
             app.models = [
                 model('normal', '/models/normal-q4.gguf', port=18080),
-                model('tq3', '/models/native-TQ3_4S.gguf', port=18081, tq3_status='native', tq3_weight_format='TQ3_4S'),
+                model('tq3', '/models/native-TQ3_4S.gguf', port=18081),
                 model('mtp', '/models/generic-native-mtp.gguf', port=18082, supports_mtp='yes'),
             ]
             statuses = {item.id: ('STOPPED', '') for item in app.models}
@@ -181,12 +162,6 @@ class ModelCompatibilityTests(unittest.TestCase):
             self.assertEqual(
                 [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
                 ['normal', 'mtp'],
-            )
-
-            app.runtime_profile = make_runtime_profile('tq3', 'llama-server')
-            self.assertEqual(
-                [item.id for item in browser_models(app, statuses, compatibility_filter='active')],
-                ['tq3'],
             )
 
             # Audit #7: --engine llama.cpp-mtp now collapses to llama.cpp.
@@ -218,7 +193,7 @@ class ModelCompatibilityTests(unittest.TestCase):
             app = AppConfig(Path(tmp) / 'models.json')
             app.models = [
                 model('normal', '/models/normal-q4.gguf', port=18080),
-                model('tq3', '/models/native-TQ3_4S.gguf', port=18081, tq3_status='native', tq3_weight_format='TQ3_4S'),
+                model('tq3', '/models/native-TQ3_4S.gguf', port=18081),
                 model('mtp', '/models/generic-native-mtp.gguf', port=18082, supports_mtp='yes'),
             ]
             statuses = {item.id: ('STOPPED', '') for item in app.models}

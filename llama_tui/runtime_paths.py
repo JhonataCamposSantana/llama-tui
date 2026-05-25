@@ -4,8 +4,8 @@ Second extraction of audit finding #9 (split ``AppConfig``). Owns the
 filesystem layout for managed-process artefacts:
 
   - ``CACHE_DIR/runtime/{engine_slug}/{model_id}{suffix}`` — current
-    layout, keyed by engine so concurrent llama.cpp + vLLM (or future
-    multi-binary) sessions don't collide.
+    layout, keyed by engine so concurrent multi-binary sessions
+    (e.g. llama.cpp + TurboQuant+) don't collide.
   - ``CACHE_DIR/{model_id}{suffix}`` — legacy flat layout still read by
     ``cleanup_managed_processes`` so PID files left behind by older
     builds get reclaimed on next launch.

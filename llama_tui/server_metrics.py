@@ -24,7 +24,7 @@ _LLAMA_METRIC_KEYS = {
 }
 
 # Engines that run a llama-server binary and therefore expose /metrics.
-LLAMA_SERVER_METRIC_ENGINES = ('llama.cpp', 'llama.cpp-mtp', 'turboquant', 'tq3', 'buun')
+LLAMA_SERVER_METRIC_ENGINES = ('llama.cpp', 'llama.cpp-mtp', 'turboquant')
 
 
 def engine_supports_metrics(engine_id: str) -> bool:

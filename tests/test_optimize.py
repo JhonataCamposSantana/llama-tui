@@ -39,9 +39,6 @@ class CpuExecutionTests(unittest.TestCase):
         no_gpu = HardwareProfile(gpu_memory_free=0)
         self.assertTrue(model_uses_cpu_execution(_model(ngl=99), no_gpu))
 
-    def test_vllm_runtime_never_cpu(self):
-        self.assertFalse(model_uses_cpu_execution(_model(ngl=0, runtime='vllm')))
-
 
 class GpuReserveTests(unittest.TestCase):
     def test_reserve_percent_is_a_sane_int(self):
@@ -83,6 +80,27 @@ class ChooseThreadsForProfileTests(unittest.TestCase):
         with patch('llama_tui.optimize.process_pressure_score', return_value=0.1):
             # Dense + safe tier keeps the physical-2 headroom reduction (6).
             self.assertEqual(choose_threads_for_profile(dense, self._HW, 'safe'), 6)
+
+    def test_moe_on_hybrid_cpu_uses_performance_cores(self):
+        # 4 P-cores + 4 E-cores = 8 physical / 12 logical.
+        hybrid = HardwareProfile(
+            cpu_physical=8, cpu_logical=12, cpu_performance=4,
+            gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3,
+        )
+        with patch('llama_tui.optimize.process_pressure_score', return_value=0.1):
+            for tier in ('safe', 'moderate', 'extreme'):
+                self.assertEqual(
+                    choose_threads_for_profile(self._moe(), hybrid, tier), 4,
+                    f'tier={tier} should give P-core count on a hybrid CPU',
+                )
+
+    def test_moe_on_hybrid_cpu_backs_off_under_pressure(self):
+        hybrid = HardwareProfile(
+            cpu_physical=8, cpu_logical=12, cpu_performance=4,
+            gpu_memory_total=8 * 1024**3, gpu_memory_free=6 * 1024**3,
+        )
+        with patch('llama_tui.optimize.process_pressure_score', return_value=0.6):
+            self.assertEqual(choose_threads_for_profile(self._moe(), hybrid, 'safe'), 2)
 
 
 if __name__ == '__main__':

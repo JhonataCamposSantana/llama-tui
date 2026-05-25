@@ -8,21 +8,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-DEFAULT_BUUN_LLAMA_SERVER = 'buun-llama-server'
 DEFAULT_TURBOQUANT_LLAMA_SERVER = (
     str(Path.home() / 'llama-cpp-turboquant' / 'build' / 'bin' / 'llama-server')
     if (Path.home() / 'llama-cpp-turboquant' / 'build' / 'bin' / 'llama-server').exists()
     else 'turboquant-llama-server'
 )
-DEFAULT_TQ3_LLAMA_SERVER = (
-    str(Path.home() / 'llama.cpp-tq3' / 'build' / 'bin' / 'llama-server')
-    if (Path.home() / 'llama.cpp-tq3' / 'build' / 'bin' / 'llama-server').exists()
-    else 'tq3-llama-server'
-)
-BUUN_KV_MODES = ('turbo4', 'turbo3_tcq', 'turbo2_tcq', 'turbo3', 'turbo2')
 TURBOQUANT_KV_MODES = ('q8_0', 'turbo4', 'turbo3', 'turbo2')
-TQ3_KV_MODES = ('q8_0', 'tq3_0')
-TQ3_BENCHMARK_FALLBACK_KV_MODES = ('q8_0',)
 COMMON_KV_MODES = (
     'f32',
     'f16',
@@ -33,8 +24,7 @@ COMMON_KV_MODES = (
     'iq4_nl',
     'q5_0',
     'q5_1',
-    *BUUN_KV_MODES,
-    *TQ3_KV_MODES,
+    *TURBOQUANT_KV_MODES,
 )
 FLASH_ATTN_SYNTAXES = ('value', 'flag', 'unsupported')
 RUNTIME_TUNING_FLAGS = (
@@ -288,21 +278,15 @@ TURBOQUANT_KV_PROFILES: Tuple[TurboKvProfile, ...] = (
     TurboKvProfile('turbo2/turbo2', 'symmetric turbo2', 'symmetric', '2.125bpv', 'full', 0.18, False, 'symmetric'),
 )
 
-TQ3_KV_PROFILES: Tuple[TurboKvProfile, ...] = (
-    TurboKvProfile('q8_0/q8_0', 'q8 baseline', 'baseline', '8.5bpv', 'fast', 0.0, False, 'baseline'),
-    TurboKvProfile('tq3_0/tq3_0', 'TQ3 compressed', 'experimental', 'tq3', 'full', 0.10, False, 'experimental'),
-)
-
-
 def turbo_kv_profile_for_preset(kv_preset: str) -> Optional[TurboKvProfile]:
     normalized = (kv_preset or '').strip().lower()
-    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES, TQ3_KV_PROFILES):
+    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES):
         for profile in profile_set:
             if profile.kv_preset == normalized:
                 return profile
     key_mode, value_mode = kv_modes_from_preset(normalized)
     symmetric = f'{key_mode}/{value_mode}' if key_mode and value_mode else ''
-    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES, TQ3_KV_PROFILES):
+    for profile_set in (TURBO_KV_PROFILES, TURBOQUANT_KV_PROFILES):
         for profile in profile_set:
             if profile.kv_preset == symmetric:
                 return profile
@@ -312,19 +296,11 @@ def turbo_kv_profile_for_preset(kv_preset: str) -> Optional[TurboKvProfile]:
 def supported_turbo_kv_profiles(
     capabilities: EngineCapabilities,
     depth: str = 'full',
-    engine_id: str = 'buun',
+    engine_id: str = 'turboquant',
 ) -> List[TurboKvProfile]:
     normalized_depth = (depth or 'full').strip().lower()
-    engine = (engine_id or 'buun').strip().lower()
-    if engine == 'turboquant':
-        defaults = TURBOQUANT_KV_MODES
-        profile_set = TURBOQUANT_KV_PROFILES
-    elif engine == 'tq3':
-        defaults = TQ3_BENCHMARK_FALLBACK_KV_MODES
-        profile_set = TQ3_KV_PROFILES
-    else:
-        defaults = BUUN_KV_MODES
-        profile_set = TURBO_KV_PROFILES
+    defaults = TURBOQUANT_KV_MODES
+    profile_set = TURBOQUANT_KV_PROFILES
     allowed = {mode.strip().lower() for mode in capabilities.supported_kv_modes or defaults}
     profiles: List[TurboKvProfile] = []
     for profile in profile_set:
@@ -364,29 +340,21 @@ class EngineProfile:
         return self.server_bin
 
     @property
-    def is_buun(self) -> bool:
-        return self.engine_id == 'buun'
-
-    @property
     def is_turboquant(self) -> bool:
         return self.engine_id == 'turboquant'
-
-    @property
-    def is_tq3(self) -> bool:
-        return self.engine_id == 'tq3'
 
     @property
     def is_llama_cpp_mtp(self) -> bool:
         return self.engine_id == 'llama.cpp-mtp'
 
     def llama_extra_args(self) -> List[str]:
-        if not (self.is_buun or self.is_turboquant or self.is_tq3):
+        if not self.is_turboquant:
             return []
         key_mode, value_mode = self.engine_kv_pair()
         return ['--flash-attn', 'on', '-ctk', key_mode, '-ctv', value_mode]
 
     def header_indicator(self) -> str:
-        if self.is_buun or self.is_turboquant or self.is_tq3:
+        if self.is_turboquant:
             key_mode, value_mode = self.engine_kv_pair()
             kv = f'key={key_mode} value={value_mode}'
         elif self.is_llama_cpp_mtp:
@@ -397,21 +365,11 @@ class EngineProfile:
         suffix = ' | Experimental' if self.experimental else ''
         return f'Engine: {self.label} | KV: {kv} | Context: {ctx}{suffix}'
 
-    def buun_kv_pair(self) -> Tuple[str, str]:
-        return resolve_buun_kv_modes(self.kv_mode, self.kv_key_mode, self.kv_value_mode)
-
     def turboquant_kv_pair(self) -> Tuple[str, str]:
         return resolve_turboquant_kv_modes(self.kv_mode, self.kv_key_mode, self.kv_value_mode)
 
-    def tq3_kv_pair(self) -> Tuple[str, str]:
-        return resolve_tq3_kv_modes(self.kv_mode, self.kv_key_mode, self.kv_value_mode)
-
     def engine_kv_pair(self) -> Tuple[str, str]:
-        if self.is_turboquant:
-            return self.turboquant_kv_pair()
-        if self.is_tq3:
-            return self.tq3_kv_pair()
-        return self.buun_kv_pair()
+        return self.turboquant_kv_pair()
 
 
 @dataclass(frozen=True)
@@ -476,29 +434,7 @@ def llama_cpp_mtp_server_from_env() -> str:
     return resolve_llama_cpp_mtp_binary().command
 
 
-def resolve_buun_kv_modes(
-    kv_mode: str = '',
-    kv_key_mode: str = '',
-    kv_value_mode: str = '',
-) -> Tuple[str, str]:
-    base = (kv_mode or 'turbo4').strip() or 'turbo4'
-    key_mode = (kv_key_mode or base).strip() or base
-    value_mode = (kv_value_mode or base).strip() or base
-    return key_mode, value_mode
-
-
 def resolve_turboquant_kv_modes(
-    kv_mode: str = '',
-    kv_key_mode: str = '',
-    kv_value_mode: str = '',
-) -> Tuple[str, str]:
-    base = (kv_mode or 'q8_0').strip() or 'q8_0'
-    key_mode = (kv_key_mode or base).strip() or base
-    value_mode = (kv_value_mode or base).strip() or base
-    return key_mode, value_mode
-
-
-def resolve_tq3_kv_modes(
     kv_mode: str = '',
     kv_key_mode: str = '',
     kv_value_mode: str = '',
@@ -518,23 +454,6 @@ def make_runtime_profile(
     kv_value_mode: str = '',
 ) -> EngineProfile:
     normalized = (engine or 'llama.cpp').strip().lower()
-    if normalized == 'buun':
-        command = os.environ.get('BUUN_LLAMA_SERVER_BIN') or DEFAULT_BUUN_LLAMA_SERVER
-        key_mode, value_mode = resolve_buun_kv_modes(kv_mode, kv_key_mode, kv_value_mode)
-        return EngineProfile(
-            engine_id='buun',
-            label='buun-llama-cpp',
-            server_bin=command,
-            default_args=(),
-            supported_kv_modes=BUUN_KV_MODES,
-            flash_attn_syntax='value',
-            supports_turbo_kv=True,
-            experimental=True,
-            context_override=ctx_override,
-            kv_mode=(kv_mode or 'turbo4').strip() or 'turbo4',
-            kv_key_mode=key_mode,
-            kv_value_mode=value_mode,
-        )
     if normalized == 'turboquant':
         command = os.environ.get('TURBOQUANT_LLAMA_SERVER_BIN') or DEFAULT_TURBOQUANT_LLAMA_SERVER
         key_mode, value_mode = resolve_turboquant_kv_modes(kv_mode, kv_key_mode, kv_value_mode)
@@ -546,23 +465,6 @@ def make_runtime_profile(
             supported_kv_modes=TURBOQUANT_KV_MODES,
             flash_attn_syntax='value',
             supports_turbo_kv=True,
-            experimental=True,
-            context_override=ctx_override,
-            kv_mode=(kv_mode or 'q8_0').strip() or 'q8_0',
-            kv_key_mode=key_mode,
-            kv_value_mode=value_mode,
-        )
-    if normalized in ('tq3', 'llama.cpp-tq3', 'llama-cpp-tq3', 'llamacpp-tq3'):
-        command = os.environ.get('TQ3_LLAMA_SERVER_BIN') or DEFAULT_TQ3_LLAMA_SERVER
-        key_mode, value_mode = resolve_tq3_kv_modes(kv_mode, kv_key_mode, kv_value_mode)
-        return EngineProfile(
-            engine_id='tq3',
-            label='llama.cpp-tq3',
-            server_bin=command,
-            default_args=(),
-            supported_kv_modes=TQ3_KV_MODES,
-            flash_attn_syntax='value',
-            supports_turbo_kv=False,
             experimental=True,
             context_override=ctx_override,
             kv_mode=(kv_mode or 'q8_0').strip() or 'q8_0',
@@ -610,19 +512,6 @@ def make_runtime_profile(
 
 def default_engine_capabilities(engine_id: str = 'llama.cpp') -> EngineCapabilities:
     normalized = (engine_id or 'llama.cpp').strip().lower()
-    if normalized == 'buun':
-        return EngineCapabilities(
-            flash_attn_syntax='value',
-            flash_attn_flag='--flash-attn',
-            supports_ctk_ctv=True,
-            supports_cache_type_kv=False,
-            supports_parallel=True,
-            supports_fit=True,
-            supports_fit_ctx=True,
-            supports_no_warmup=True,
-            gpu_layers_flag='-ngl',
-            supported_kv_modes=BUUN_KV_MODES,
-        )
     if normalized == 'turboquant':
         return EngineCapabilities(
             flash_attn_syntax='value',
@@ -635,16 +524,6 @@ def default_engine_capabilities(engine_id: str = 'llama.cpp') -> EngineCapabilit
             supports_no_warmup=False,
             gpu_layers_flag='-ngl',
             supported_kv_modes=TURBOQUANT_KV_MODES,
-        )
-    if normalized in ('tq3', 'llama.cpp-tq3', 'llama-cpp-tq3', 'llamacpp-tq3'):
-        return EngineCapabilities(
-            flash_attn_syntax='value',
-            flash_attn_flag='--flash-attn',
-            supports_ctk_ctv=True,
-            supports_cache_type_kv=True,
-            supports_parallel=True,
-            gpu_layers_flag='-ngl',
-            supported_kv_modes=TQ3_BENCHMARK_FALLBACK_KV_MODES,
         )
     if normalized in ('llama.cpp-mtp', 'llama-cpp-mtp', 'llamacpp-mtp', 'mtp'):
         return EngineCapabilities(supported_kv_modes=('f16', 'q8_0', 'q4_0'))
@@ -801,8 +680,6 @@ def parse_supported_kv_modes(help_text: str, engine_id: str, defaults: EngineCap
     if found:
         return tuple(found)
     normalized_engine = (engine_id or '').strip().lower()
-    if normalized_engine == 'buun' and defaults.supports_ctk_ctv:
-        return BUUN_KV_MODES
     if normalized_engine == 'turboquant' and defaults.supports_ctk_ctv:
         return TURBOQUANT_KV_MODES
     return defaults.supported_kv_modes
@@ -1146,7 +1023,7 @@ def runtime_profile_extra_args(
     kv_key, kv_value = kv_modes_from_preset(runtime_profile.kv_preset)
     if (engine.is_llama_cpp_mtp or mtp_enabled) and kv_key and kv_value and capabilities.supports_ctk_ctv:
         args += ['-ctk', kv_key, '-ctv', kv_value]
-    elif (engine.is_turboquant or engine.is_tq3) and kv_key and kv_value and capabilities.supports_ctk_ctv:
+    elif engine.is_turboquant and kv_key and kv_value and capabilities.supports_ctk_ctv:
         args += ['-ctk', kv_key, '-ctv', kv_value]
     elif engine.supports_turbo_kv and is_turbo_kv_preset(runtime_profile.kv_preset):
         if capabilities.supports_ctk_ctv:

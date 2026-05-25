@@ -4,11 +4,8 @@ from pathlib import Path
 from typing import Iterable, Optional, Set, Tuple
 
 from .engines import (
-    ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
-    ENGINE_VLLM,
     normalize_engine_id,
 )
 from .gguf import read_gguf_metadata
@@ -90,7 +87,6 @@ def _model_text(model: ModelConfig) -> str:
             provenance.get('snapshot', ''),
             getattr(model, 'model_family', ''),
             getattr(model, 'architecture', ''),
-            getattr(model, 'tq3_weight_format', ''),
         )
     ).lower()
 
@@ -102,7 +98,6 @@ def _contains_any(text: str, needles: Iterable[str]) -> bool:
 def _has_known_quant_hint(model: ModelConfig, combined: str) -> bool:
     quant_fields = (
         getattr(model, 'quant', ''),
-        getattr(model, 'tq3_weight_format', ''),
         getattr(model, 'turboquant_quant', ''),
     )
     if any(str(item or '').strip() for item in quant_fields):
@@ -125,15 +120,13 @@ def detect_model_runtime_features(
             getattr(model, 'name', ''),
             getattr(model, 'alias', ''),
             path.name,
-            getattr(model, 'tq3_weight_format', ''),
         )
     ).lower()
     metadata_text = _metadata_text(path)
     combined = f'{metadata_text} {text}'.strip()
 
     target = str(getattr(model, 'path', '') or '').strip()
-    runtime = str(getattr(model, 'runtime', '') or '').strip().lower()
-    if runtime == ENGINE_VLLM or _looks_like_hf_ref(target):
+    if _looks_like_hf_ref(target):
         features.add('hf_ref')
 
     if path.suffix.lower() == '.gguf':
@@ -156,11 +149,9 @@ def detect_model_runtime_features(
     elif architecture_type == 'dense' or path.suffix.lower() == '.gguf' or 'hf_ref' in features:
         features.add('dense')
 
-    tq3_status = str(getattr(model, 'tq3_status', '') or '').strip().lower()
-    tq3_source = str(getattr(model, 'tq3_source', '') or '').strip().lower()
-    if tq3_status == 'native':
-        features.add('tq3_native')
-    elif tq3_source != 'manual' and (
+    # TQ3 engine removed (2026-05): TQ3-native weights stay detectable by
+    # name so they can be flagged unsupported (no engine can run them).
+    if (
         'tq3_1s' in combined
         or 'tq3_4s' in combined
         or TQ3_TEXT_RE.search(combined)
@@ -264,15 +255,12 @@ def engine_supports_model(
         # unsupported on every llama.cpp variant regardless.
         return _result('unsupported', 'mmproj files are not standalone language models', 'block', features)
 
-    if 'tq3_native' in features and engine != ENGINE_TQ3:
-        return _result('unsupported', f'TQ3-native GGUFs require the tq3 engine (selected engine: {engine})', 'block', features)
+    if 'tq3_native' in features:
+        # TQ3 engine removed (2026-05): TQ3-native weights need a dedicated
+        # TQ3 binary that llama-tui no longer ships, so they are unrunnable.
+        return _result('unsupported', 'TQ3-native GGUFs require a TQ3 binary, which llama-tui no longer supports', 'block', features)
 
-    if engine == ENGINE_TQ3:
-        if 'tq3_native' in features:
-            return _result('preferred', 'TQ3-native GGUF', 'info', features)
-        return _result('unknown', 'TQ3-native GGUFs require detected TQ3 tensor format; this model is uncertain', 'warn', features)
-
-    if engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN):
+    if engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT):
         if 'mtp_native' in features:
             # MTP is a binary capability: an MTP-native GGUF runs accelerated on
             # any llama.cpp-compatible binary that advertises the speculative MTP
@@ -290,13 +278,6 @@ def engine_supports_model(
                 return _result('compatible_with_warning', 'Local GGUF quantization is unknown; launch may require validation', 'warn', features)
             return _result('compatible', 'GGUF compatible with selected llama.cpp-family engine', 'info', features)
         return _result('unknown', 'This engine expects a local GGUF model', 'warn', features)
-
-    if engine == ENGINE_VLLM:
-        if 'hf_ref' in features:
-            return _result('preferred', 'HF model reference', 'info', features)
-        if 'local_gguf' in features:
-            return _result('unsupported', 'vLLM local GGUF support is not implemented in llama-tui', 'block', features)
-        return _result('unknown', 'vLLM model entries should be HF refs', 'warn', features)
 
     return _result('unknown', f'Unknown engine {engine_id}', 'warn', features)
 
@@ -319,8 +300,8 @@ def engine_shows_model(
         # ENGINE_LLAMA_CPP_MTP-only branch is dead after audit #7.
         return _result('unsupported', 'mmproj files are not standalone language models', 'block', features)
 
-    if 'tq3_native' in features and engine != ENGINE_TQ3:
-        return _result('unsupported', f'TQ3-native GGUFs require the tq3 engine (selected engine: {engine})', 'block', features)
+    if 'tq3_native' in features:
+        return _result('unsupported', 'TQ3-native GGUFs require a TQ3 binary, which llama-tui no longer supports', 'block', features)
 
     return engine_supports_model(engine, model, capabilities)
 
@@ -330,9 +311,8 @@ def compatible_engine_ids_for_model(
     capabilities_by_engine: Optional[dict[str, EngineCapabilities]] = None,
 ) -> Tuple[str, ...]:
     compatible = []
-    # Audit #7: ENGINE_LLAMA_CPP_MTP collapsed into ENGINE_LLAMA_CPP, so
-    # only iterate the five canonical engines now.
-    for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
+    # Audit #7: ENGINE_LLAMA_CPP_MTP collapsed into ENGINE_LLAMA_CPP.
+    for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT):
         caps = (capabilities_by_engine or {}).get(engine)
         if engine_supports_model(engine, model, caps).compatible:
             compatible.append(engine)

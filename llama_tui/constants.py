@@ -62,7 +62,6 @@ DEFAULT_LLAMA_SERVER = os.environ.get('LLAMA_SERVER') or str(_first_existing(
     ],
     Path.home() / 'llama.cpp' / 'build' / 'bin' / 'llama-server',
 ))
-DEFAULT_VLLM_COMMAND = os.environ.get('VLLM_COMMAND', 'vllm')
 REFRESH_SECONDS = 2.0
 LOGO = [
     "  _ _                         _         _       _ ",

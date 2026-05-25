@@ -6,18 +6,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from llama_tui.engines import (
-    ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
     ENGINE_LLAMA_CPP_MTP,
-    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
-    ENGINE_VLLM,
-    command_exists,
     get_engine_definitions,
     get_engine_health,
     mtp_binary_warning,
+    normalize_engine_id,
     resolve_engine_install,
-    tq3_binary_warning,
     turboquant_binary_warning,
 )
 from llama_tui.runtime_profiles import EngineCapabilities
@@ -33,11 +29,11 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertIn(ENGINE_LLAMA_CPP, definitions)
         self.assertNotIn(ENGINE_LLAMA_CPP_MTP, definitions)
         self.assertIn(ENGINE_TURBOQUANT, definitions)
-        self.assertIn(ENGINE_TQ3, definitions)
-        self.assertIn(ENGINE_BUUN, definitions)
-        self.assertIn(ENGINE_VLLM, definitions)
+        # vLLM, Buun and TQ3 engines removed (2026-05): no longer registered.
+        self.assertNotIn('vllm', definitions)
+        self.assertNotIn('buun', definitions)
+        self.assertNotIn('tq3', definitions)
         self.assertTrue(definitions[ENGINE_LLAMA_CPP].supports_gguf)
-        self.assertTrue(definitions[ENGINE_VLLM].supports_hf_ref)
         # The MTP fork's binary discovery paths now live inside the
         # llama.cpp default_paths so users who built the fork to a
         # non-standard location are still found.
@@ -48,22 +44,15 @@ class EngineRegistryTests(unittest.TestCase):
         config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='python -m vllm.entrypoints.openai.api_server')
 
         llama_install = resolve_engine_install(config, ENGINE_LLAMA_CPP)
-        vllm_install = resolve_engine_install(config, ENGINE_VLLM)
         with patch.dict('os.environ', {
             'TURBOQUANT_LLAMA_SERVER_BIN': '/opt/tq/llama-server',
-            'TQ3_LLAMA_SERVER_BIN': '/opt/tq3/llama-server',
         }):
             turbo_install = resolve_engine_install(config, ENGINE_TURBOQUANT)
-            tq3_install = resolve_engine_install(config, ENGINE_TQ3)
 
         self.assertEqual(llama_install.resolved_command, '/opt/llama-server')
         self.assertEqual(llama_install.source, 'config:llama_server')
-        self.assertEqual(vllm_install.resolved_command, 'python -m vllm.entrypoints.openai.api_server')
-        self.assertEqual(vllm_install.source, 'config:vllm_command')
         self.assertEqual(turbo_install.resolved_command, '/opt/tq/llama-server')
         self.assertEqual(turbo_install.source, 'env:TURBOQUANT_LLAMA_SERVER_BIN')
-        self.assertEqual(tq3_install.resolved_command, '/opt/tq3/llama-server')
-        self.assertEqual(tq3_install.source, 'env:TQ3_LLAMA_SERVER_BIN')
 
     def test_legacy_llama_cpp_mtp_path_falls_back_for_llama_cpp_engine(self):
         # Audit #7: ENGINE_LLAMA_CPP_MTP is gone, but the legacy
@@ -120,15 +109,13 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertEqual(health.status, 'WARN')
         self.assertIn('capabilities unknown', health.summary)
 
-    def test_vllm_command_resolution_uses_path_lookup_for_simple_command(self):
-        config = SimpleNamespace(llama_server='/opt/llama-server', vllm_command='vllm')
-
-        with patch('llama_tui.runtime_profiles.shutil.which', return_value='/usr/bin/vllm'):
-            install = resolve_engine_install(config, ENGINE_VLLM)
-            exists = command_exists('vllm')
-
-        self.assertTrue(install.exists)
-        self.assertTrue(exists)
+    def test_legacy_removed_engine_aliases_normalise_to_llama_cpp(self):
+        # vLLM, Buun and TQ3 engines removed (2026-05): legacy identifiers
+        # degrade to llama.cpp so old models.json/benchmark records load.
+        self.assertEqual(normalize_engine_id('vllm'), ENGINE_LLAMA_CPP)
+        self.assertEqual(normalize_engine_id('buun'), ENGINE_LLAMA_CPP)
+        self.assertEqual(normalize_engine_id('tq3'), ENGINE_LLAMA_CPP)
+        self.assertEqual(normalize_engine_id('llama.cpp-tq3'), ENGINE_LLAMA_CPP)
 
     def test_turboquant_binary_warning_preserves_existing_message(self):
         caps = EngineCapabilities(help_text='--cache-type-k allowed values: f16 q8_0 q4_0')
@@ -139,18 +126,6 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertIn('vanilla llama.cpp', warning)
         self.assertEqual(
             turboquant_binary_warning('/work/llama-cpp-turboquant/build/bin/llama-server', EngineCapabilities(help_text='allowed values: q8_0 turbo4')),
-            '',
-        )
-
-    def test_tq3_binary_warning_requires_tq3_cache_type(self):
-        caps = EngineCapabilities(help_text='--cache-type-k allowed values: f16 q8_0 q4_0')
-
-        warning = tq3_binary_warning('/work/llama.cpp/build/bin/llama-server', caps)
-
-        self.assertIn('does not advertise tq3_0 cache type', warning)
-        self.assertIn('vanilla llama.cpp', warning)
-        self.assertEqual(
-            tq3_binary_warning('/work/llama.cpp-tq3/build/bin/llama-server', EngineCapabilities(help_text='allowed values: q8_0 tq3_0')),
             '',
         )
 

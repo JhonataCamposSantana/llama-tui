@@ -6,11 +6,9 @@ from typing import List
 from .constants import DEFAULT_MODEL_PORT
 from .gguf import (
     apply_architecture_info,
-    apply_tq3_info,
     apply_turboquant_info,
     architecture_label,
     detect_architecture_info,
-    detect_tq3_info,
     detect_turboquant_info,
     read_gguf_metadata,
 )
@@ -64,25 +62,18 @@ def looks_like_model_reference(value: str) -> bool:
         return True
     return bool(re.match(r'^[^/\s]+/[^\s]+$', value))
 def is_registered_model_entry(model: ModelConfig) -> bool:
-    runtime = getattr(model, 'runtime', 'llama.cpp')
     target = (getattr(model, 'path', '') or '').strip()
-    if runtime == 'vllm':
-        if not target:
-            return False
-        p = Path(target).expanduser()
-        return p.exists() or looks_like_model_reference(target)
     return is_real_model_file(Path(target))
 def display_runtime(model: ModelConfig) -> str:
     runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
     mapping = {
         'llama.cpp': 'llama.cpp',
-        'vllm': 'vLLM',
         'ollama': 'Ollama',
     }
     return mapping.get(runtime, runtime or 'unknown')
 def display_offload(model: ModelConfig) -> str:
     runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
-    if runtime in ('vllm', 'ollama'):
+    if runtime == 'ollama':
         return 'GPU'
     try:
         ngl = int(getattr(model, 'ngl', 0) or 0)
@@ -151,7 +142,6 @@ def detected_model_from_path(path: Path, existing_models: List[ModelConfig], sou
     )
     apply_architecture_info(model, detect_architecture_info(model))
     apply_turboquant_info(model, detect_turboquant_info(model))
-    apply_tq3_info(model, detect_tq3_info(model))
     if model.supports_mtp == 'auto' and 'mtp_native' in detect_model_runtime_features(model):
         model.supports_mtp = 'yes'
     return model

@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Sequence, Tuple
 
 from .engines import (
-    ENGINE_VLLM,
     engine_display_name,
     resolve_runtime_engine_context,
 )
@@ -304,12 +303,7 @@ def build_mtp_doctor_report(app: Any, model: Any, runtime_profile: Any = None) -
     reason = 'MTP launch prerequisites are ready.'
     next_action = 'Run MTP Optimizer before promoting an MTP profile.'
     risk_level = 'info'
-    if engine_id == ENGINE_VLLM or model_runtime == ENGINE_VLLM:
-        launch_status = 'off'
-        reason = f'active engine is {engine_display_name(engine_id)}; MTP requires a llama.cpp-compatible binary'
-        next_action = 'Select a llama.cpp-compatible engine to test MTP.'
-        risk_level = 'muted'
-    elif support_setting == 'no':
+    if support_setting == 'no':
         launch_status = 'blocked'
         reason = 'supports_mtp=no disables MTP for this model.'
         next_action = 'Set supports_mtp=auto/yes only if this GGUF is MTP-capable.'

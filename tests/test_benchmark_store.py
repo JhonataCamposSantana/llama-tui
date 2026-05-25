@@ -126,14 +126,12 @@ class HasBenchmarkPayloadTests(unittest.TestCase):
 
 
 class CanonicalLegacyEngineKeyTests(unittest.TestCase):
-    def test_vllm_runtime_returns_vllm(self):
-        self.assertEqual(canonical_legacy_engine_key(_model(runtime='vllm')), 'vllm')
-
     def test_llama_cpp_runtime_returns_llama_cpp(self):
         self.assertEqual(canonical_legacy_engine_key(_model(runtime='llama.cpp')), 'llama.cpp')
 
     def test_unknown_runtime_collapses_to_llama_cpp(self):
-        # Pre-multi-engine builds only differentiated vLLM vs llama.cpp.
+        # All runtimes (including legacy vLLM records) collapse to llama.cpp.
+        self.assertEqual(canonical_legacy_engine_key(_model(runtime='vllm')), 'llama.cpp')
         self.assertEqual(canonical_legacy_engine_key(_model(runtime='buun')), 'llama.cpp')
         self.assertEqual(canonical_legacy_engine_key(_model(runtime='')), 'llama.cpp')
 

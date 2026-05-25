@@ -121,10 +121,6 @@ def normalize_engine_key(value: object) -> str:
     raw = str(value or '').strip().lower()
     if 'turboquant' in raw:
         return 'turboquant'
-    if 'buun' in raw:
-        return 'buun'
-    if raw == 'vllm':
-        return 'vllm'
     return 'llama.cpp'
 
 

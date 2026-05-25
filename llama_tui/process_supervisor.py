@@ -20,8 +20,8 @@ PID-probe and signal primitives that don't need any AppConfig state:
 The fancier wrappers that combine these with AppConfig state
 (``_pid_looks_like_runtime``, ``_pid_matches_model``,
 ``terminate_process_group``, the start/stop orchestrators) stay in
-AppConfig because they need ``llama_server`` / ``vllm_command`` /
-``runtime_profile`` to decide what counts as "our" process.
+AppConfig because they need ``llama_server`` / ``runtime_profile``
+to decide what counts as "our" process.
 """
 
 import os

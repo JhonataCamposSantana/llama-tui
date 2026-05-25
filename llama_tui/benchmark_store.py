@@ -118,8 +118,6 @@ def has_benchmark_payload(model: ModelConfig) -> bool:
 def canonical_legacy_engine_key(model: ModelConfig) -> str:
     """Return the engine key under which legacy benchmark data was stored.
 
-    Pre-multi-engine builds only differentiated between vLLM and
-    llama.cpp; everything else collapses to ``'llama.cpp'``.
+    Pre-multi-engine builds stored everything under ``'llama.cpp'``.
     """
-    runtime = (getattr(model, 'runtime', 'llama.cpp') or '').strip().lower()
-    return 'vllm' if runtime == 'vllm' else 'llama.cpp'
+    return 'llama.cpp'

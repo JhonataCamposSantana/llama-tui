@@ -13,10 +13,56 @@ from llama_tui.hardware import (
     _read_process_stat,
     bytes_to_gib,
     clamp_memory_to_cgroup,
+    detect_performance_core_count,
     probe_amd_rocm_gpu,
     probe_apple_silicon_gpu,
     read_cgroup_memory_limits,
 )
+
+
+def _write_fake_cpu(root: Path, cpu: int, package: int, core: int, max_khz: int):
+    cpu_dir = root / f'cpu{cpu}'
+    (cpu_dir / 'topology').mkdir(parents=True, exist_ok=True)
+    (cpu_dir / 'cpufreq').mkdir(parents=True, exist_ok=True)
+    (cpu_dir / 'topology' / 'physical_package_id').write_text(str(package))
+    (cpu_dir / 'topology' / 'core_id').write_text(str(core))
+    (cpu_dir / 'cpufreq' / 'cpuinfo_max_freq').write_text(str(max_khz))
+
+
+class DetectPerformanceCoreCountTests(unittest.TestCase):
+    def test_hybrid_counts_only_top_freq_tier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 4 P-cores (core 0-3, HT pairs cpu0-7) @ 4.6 GHz.
+            for core in range(4):
+                _write_fake_cpu(root, core * 2, 0, core, 4_600_000)
+                _write_fake_cpu(root, core * 2 + 1, 0, core, 4_600_000)
+            # 4 E-cores (core 4-7, cpu8-11) @ 3.4 GHz.
+            for i, core in enumerate(range(4, 8)):
+                _write_fake_cpu(root, 8 + i, 0, core, 3_400_000)
+            self.assertEqual(detect_performance_core_count(8, sysfs_root=str(root)), 4)
+
+    def test_homogeneous_returns_physical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for core in range(8):
+                _write_fake_cpu(root, core, 0, core, 4_600_000)
+            self.assertEqual(detect_performance_core_count(8, sysfs_root=str(root)), 8)
+
+    def test_missing_sysfs_returns_physical(self):
+        self.assertEqual(
+            detect_performance_core_count(8, sysfs_root='/nonexistent/sysfs/path'),
+            8,
+        )
+
+    def test_missing_topology_files_returns_physical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # cpufreq present but no topology/core_id -> graceful fallback.
+            cpu_dir = root / 'cpu0' / 'cpufreq'
+            cpu_dir.mkdir(parents=True, exist_ok=True)
+            (cpu_dir / 'cpuinfo_max_freq').write_text('4600000')
+            self.assertEqual(detect_performance_core_count(8, sysfs_root=str(root)), 8)
 
 
 class BytesToGibTests(unittest.TestCase):

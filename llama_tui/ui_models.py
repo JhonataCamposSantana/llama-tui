@@ -11,7 +11,7 @@ from .app import AppConfig, context_per_slot
 from .benchmark import benchmark_profile_is_fresh, get_measured_profile
 from .discovery import classify_model_type, display_runtime, extract_quant
 from .engines import resolve_runtime_engine_context
-from .gguf import tq3_short, turboquant_short
+from .gguf import turboquant_short
 from .models import ModelConfig
 from .mtp import mtp_support_auto_hint, normalize_mtp_support
 from .textutil import ellipsize
@@ -59,14 +59,8 @@ def format_engine_badge(engine_id: str, narrow: bool = False) -> str:
     normalized = str(engine_id or '').strip().lower()
     if normalized == 'turboquant':
         return 'TQ' if narrow else 'TurboQuant+'
-    if normalized == 'tq3':
-        return 'TQ3'
     if normalized == 'llama.cpp-mtp':
         return 'MTP' if narrow else 'llama.cpp MTP'
-    if normalized == 'buun':
-        return 'Buun'
-    if normalized == 'vllm':
-        return 'vLLM'
     if normalized == 'llama.cpp':
         return 'llama' if narrow else 'llama.cpp'
     return '?' if narrow else 'Unknown'
@@ -81,16 +75,10 @@ def active_engine_key(app: AppConfig, model: ModelConfig) -> str:
 
 def active_engine_short(app: AppConfig, model: ModelConfig) -> str:
     engine = active_engine_key(app, model)
-    if engine == 'buun':
-        return 'buun'
     if engine == 'turboquant':
         return 'turboquant'
-    if engine == 'tq3':
-        return 'tq3'
     if engine == 'llama.cpp-mtp':
         return 'llama.cpp-mtp'
-    if engine == 'vllm':
-        return 'vLLM'
     return engine or display_runtime(model)
 
 
@@ -99,8 +87,6 @@ def active_engine_binary(app: AppConfig, model: ModelConfig) -> str:
         return str(app.active_runtime_binary_for_model(model) or '')
     except Exception:
         runtime = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
-        if runtime == 'vllm':
-            return str(getattr(app, 'vllm_command', '') or '')
         try:
             return str(app.runtime_server_command(runtime) or '')
         except Exception:
@@ -141,9 +127,6 @@ def active_engine_warning_line(app: AppConfig, model: ModelConfig) -> str:
     for name in (
         'turboquant_session_advisory',
         'turboquant_binary_warning',
-        'tq3_session_advisory',
-        'tq3_binary_warning',
-        'tq3_launch_diagnostic',
         'mtp_session_advisory',
         'mtp_binary_warning',
     ):
@@ -274,7 +257,7 @@ def format_model_health(app: AppConfig, model: ModelConfig, status: str = 'STOPP
     try:
         engine = active_engine_key(app, model)
         capabilities = app.engine_capabilities()
-        if engine != 'vllm' and not str(getattr(capabilities, 'help_text', '') or '').strip():
+        if not str(getattr(capabilities, 'help_text', '') or '').strip():
             return 'WARN', 'engine capabilities unknown'
     except Exception:
         pass
@@ -365,7 +348,7 @@ def browser_model_line(
     roles = app.role_badges(model.id)
     engine = active_engine_short(app, model)[:10]
     quant = extract_quant(model)[:8]
-    tq = (tq3_short(model) if active_engine_key(app, model) == 'tq3' else turboquant_short(model))[:3]
+    tq = turboquant_short(model)[:3]
     model_type = classify_model_type(model)[:6]
     freshness = benchmark_freshness_short(app, model)
     name_col_width = max(10, left_w - 79)

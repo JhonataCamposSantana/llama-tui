@@ -12,6 +12,7 @@ from typing import Dict, List, Tuple
 class HardwareProfile:
     cpu_logical: int = 0
     cpu_physical: int = 0
+    cpu_performance: int = 0
     memory_total: int = 0
     memory_available: int = 0
     gpu_name: str = ''
@@ -28,6 +29,8 @@ class HardwareProfile:
         total_gib = bytes_to_gib(self.memory_total)
         avail_gib = bytes_to_gib(self.memory_available)
         cpu = f'cpu={self.cpu_physical or "?"}c/{self.cpu_logical or "?"}t'
+        if self.cpu_performance and self.cpu_physical and self.cpu_performance < self.cpu_physical:
+            cpu += f'({self.cpu_performance}P)'
         ram = f'ram={avail_gib:.1f}/{total_gib:.1f}GiB'
         if self.has_usable_gpu():
             gpu_free = bytes_to_gib(self.gpu_memory_free)
@@ -421,6 +424,54 @@ def detect_cpu_counts() -> Tuple[int, int]:
 
     physical = len(physical_cores) if physical_cores else max(1, logical // 2)
     return logical, max(1, min(physical, logical))
+
+
+def detect_performance_core_count(
+    physical: int,
+    sysfs_root: str = '/sys/devices/system/cpu',
+) -> int:
+    """Count the fastest physical cores on a hybrid (P+E) CPU.
+
+    Maps each logical CPU to its physical core and reads that core's max
+    frequency from sysfs. The number of distinct physical cores at the top
+    frequency tier is the performance-core count. On a homogeneous CPU (all
+    cores share one tier) or when sysfs is unavailable, this returns
+    ``physical`` so callers behave exactly as before.
+    """
+    physical = max(1, int(physical or 1))
+    root = Path(sysfs_root)
+    if not root.exists():
+        return physical
+    try:
+        core_max_freq: Dict[Tuple[str, str], int] = {}
+        for cpu_dir in root.glob('cpu[0-9]*'):
+            if not cpu_dir.name[3:].isdigit():
+                continue
+            freq_file = cpu_dir / 'cpufreq' / 'cpuinfo_max_freq'
+            pkg_file = cpu_dir / 'topology' / 'physical_package_id'
+            core_file = cpu_dir / 'topology' / 'core_id'
+            if not (freq_file.exists() and core_file.exists()):
+                return physical
+            freq = int(freq_file.read_text().strip())
+            pkg = (pkg_file.read_text().strip() if pkg_file.exists() else '0')
+            core = core_file.read_text().strip()
+            key = (pkg, core)
+            # Same physical core can appear under multiple HT siblings; keep max.
+            if freq > core_max_freq.get(key, 0):
+                core_max_freq[key] = freq
+        if not core_max_freq:
+            return physical
+        global_max = max(core_max_freq.values())
+        if global_max <= 0:
+            return physical
+        threshold = global_max * 0.97
+        perf = sum(1 for f in core_max_freq.values() if f >= threshold)
+        if perf <= 0 or perf >= len(core_max_freq):
+            # Homogeneous CPU: no E-cores to avoid.
+            return physical
+        return max(1, min(perf, physical))
+    except (OSError, ValueError):
+        return physical
 def probe_nvidia_gpu() -> Tuple[str, int, int, str]:
     nvidia_smi = shutil.which('nvidia-smi')
     if not nvidia_smi:
@@ -692,6 +743,7 @@ def probe_nvidia_gpu_thermal() -> Tuple[int, bool]:
 
 def benchmark_current_hardware() -> HardwareProfile:
     logical, physical = detect_cpu_counts()
+    performance = detect_performance_core_count(physical)
     mem = read_meminfo_bytes()
     memory_total, memory_available = clamp_memory_to_cgroup(
         mem.get('MemTotal', 0),
@@ -722,6 +774,7 @@ def benchmark_current_hardware() -> HardwareProfile:
     return HardwareProfile(
         cpu_logical=logical,
         cpu_physical=physical,
+        cpu_performance=performance,
         memory_total=memory_total,
         memory_available=memory_available,
         gpu_name=gpu_name,

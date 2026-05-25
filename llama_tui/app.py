@@ -25,7 +25,6 @@ from .constants import (
     DEFAULT_LLM_MODELS_CACHE,
     DEFAULT_LLAMA_SERVER,
     DEFAULT_MODEL_PORT,
-    DEFAULT_VLLM_COMMAND,
 )
 from .config_io import (
     archive_broken_config_file,
@@ -61,33 +60,24 @@ from .discovery import (
     detected_model_from_path,
     display_runtime,
     is_real_model_file,
-    looks_like_model_reference,
 )
 from .engines import (
-    ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
-    ENGINE_VLLM,
     normalize_engine_id,
     mtp_binary_warning as engine_mtp_binary_warning,
     resolve_engine_install,
     resolve_runtime_engine_context,
-    tq3_binary_warning as engine_tq3_binary_warning,
     turboquant_binary_warning as engine_turboquant_binary_warning,
 )
 from .control import CancelToken, check_cancelled, sleep_with_cancel
 from .gguf import estimate_kv_bytes_per_token, extra_arg_value, has_extra_flag, read_gguf_metadata
 from .gguf import (
-    TQ3_STATUSES,
     TURBOQUANT_STATUSES,
     apply_architecture_info,
-    apply_tq3_info,
     apply_turboquant_info,
     detect_architecture_info,
-    detect_tq3_info,
     detect_turboquant_info,
-    tq3_detail,
     turboquant_detail,
 )
 from .hardware import HardwareProfile, benchmark_current_hardware, read_meminfo_bytes
@@ -339,7 +329,6 @@ class AppConfig:
     def __init__(self, config_path: Path, runtime_profile: Optional[EngineProfile] = None):
         self.config_path = config_path
         self.llama_server = os.environ.get('LLAMA_SERVER', DEFAULT_LLAMA_SERVER)
-        self.vllm_command = DEFAULT_VLLM_COMMAND
         self.runtime_profile = runtime_profile or make_runtime_profile('llama.cpp', self.llama_server)
         self.hf_cache_root = str(DEFAULT_HF_CACHE)
         self.llmfit_cache_root = str(DEFAULT_LLMFIT_CACHE)
@@ -410,7 +399,6 @@ class AppConfig:
             self.save()
             return
         self.llama_server = data.get('llama_server', self.llama_server)
-        self.vllm_command = data.get('vllm_command', self.vllm_command)
         self.hf_cache_root = data.get('hf_cache_root', self.hf_cache_root)
         self.llmfit_cache_root = data.get('llmfit_cache_root', self.llmfit_cache_root)
         self.llm_models_cache_root = data.get('llm_models_cache_root', self.llm_models_cache_root)
@@ -458,8 +446,6 @@ class AppConfig:
                 roots_changed = True
             if self.enrich_model_turboquant(m):
                 roots_changed = True
-            if self.enrich_model_tq3(m):
-                roots_changed = True
             if self.enrich_model_mtp(m):
                 roots_changed = True
             inferred = self.infer_model_source(m)
@@ -492,19 +478,14 @@ class AppConfig:
         return default_engine_benchmark_payload()
 
     def active_engine_key_for_model(self, model: ModelConfig) -> str:
-        runtime = (getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp').strip().lower()
-        if runtime == ENGINE_VLLM:
-            return ENGINE_VLLM
-        if self.runtime_profile.engine in ('buun', 'turboquant', ENGINE_TQ3):
+        if self.runtime_profile.engine == 'turboquant':
             return self.runtime_profile.engine
         return 'llama.cpp'
 
     def active_engine_label_for_model(self, model: ModelConfig) -> str:
         engine = self.active_engine_key_for_model(model)
-        if engine in ('buun', 'turboquant', ENGINE_TQ3):
+        if engine == 'turboquant':
             return self.runtime_profile.display_name
-        if engine == 'vllm':
-            return 'vLLM'
         return 'llama.cpp'
 
     def active_runtime_binary_for_model(self, model: ModelConfig) -> str:
@@ -617,28 +598,6 @@ class AppConfig:
         if not should_update:
             return False
         apply_turboquant_info(model, detected)
-        return asdict(model) != before
-
-    def enrich_model_tq3(self, model: ModelConfig) -> bool:
-        if (getattr(model, 'tq3_source', '') or '') == 'manual':
-            return False
-        try:
-            detected = detect_tq3_info(model)
-        except (OSError, EOFError, ValueError, struct.error):
-            return False
-        before = asdict(model)
-        current_status = (getattr(model, 'tq3_status', '') or 'unknown').strip().lower()
-        if current_status not in TQ3_STATUSES:
-            current_status = 'unknown'
-        should_update = (
-            current_status != detected.status
-            or not getattr(model, 'tq3_source', '')
-            or (getattr(model, 'tq3_weight_format', '') or '').upper() != (detected.weight_format or '').upper()
-            or (getattr(model, 'tq3_reason', '') or '') != (detected.reason or '')
-        )
-        if not should_update:
-            return False
-        apply_tq3_info(model, detected)
         return asdict(model) != before
 
     def enrich_model_mtp(self, model: ModelConfig) -> bool:
@@ -757,8 +716,6 @@ class AppConfig:
 
     def runtime_server_command(self, runtime: str) -> str:
         runtime_key = (runtime or 'llama.cpp').strip().lower()
-        if runtime_key == ENGINE_VLLM:
-            return str(resolve_engine_install(self, ENGINE_VLLM).resolved_command or self.vllm_command)
         if runtime_key == 'llama.cpp':
             return str(resolve_engine_install(self, self.runtime_profile.engine).resolved_command or self.runtime_profile.server_command or self.llama_server)
         return runtime
@@ -798,14 +755,7 @@ class AppConfig:
             return runtime_profile
         args = list(getattr(model, 'extra_args', []) or [])
         engine_id = self.active_engine_key_for_model(model)
-        if engine_id == 'buun':
-            tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
-            if tq_status in ('native', 'padded'):
-                key_mode, value_mode = self.runtime_profile.buun_kv_pair()
-                kv_preset = f'{key_mode}/{value_mode}'
-            else:
-                kv_preset = 'default'
-        elif engine_id == 'turboquant':
+        if engine_id == 'turboquant':
             key_mode, value_mode = self.runtime_profile.turboquant_kv_pair()
             head_dim = self.turboquant_head_dim(model)
             tq_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
@@ -813,9 +763,6 @@ class AppConfig:
                 kv_preset = 'q8_0/q8_0'
             else:
                 kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
-        elif engine_id == ENGINE_TQ3:
-            key_mode, value_mode = self.runtime_profile.tq3_kv_pair()
-            kv_preset = f'{key_mode or "q8_0"}/{value_mode or key_mode or "q8_0"}'
         else:
             key_mode = (
                 extra_arg_value(args, '--cache-type-k')
@@ -934,7 +881,7 @@ class AppConfig:
 
     def turboquant_session_advisory(self, model: ModelConfig) -> str:
         engine = self.active_engine_key_for_model(model)
-        if engine not in ('buun', 'turboquant'):
+        if engine != 'turboquant':
             return ''
         status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
         if engine == 'turboquant':
@@ -951,19 +898,6 @@ class AppConfig:
         if status in ('native', 'padded'):
             return ''
         return f'TurboQuant advisory: {turboquant_detail(model)}'
-
-    def model_tq3_native(self, model: ModelConfig) -> bool:
-        return (getattr(model, 'tq3_status', '') or 'unknown').strip().lower() == 'native'
-
-    def tq3_compatibility_reason(self, model: ModelConfig) -> str:
-        status = (getattr(model, 'tq3_status', '') or 'unknown').strip().lower()
-        if status == 'native':
-            weight_format = getattr(model, 'tq3_weight_format', '') or 'TQ3'
-            return f'TQ3-native {weight_format}'
-        detail = tq3_detail(model)
-        if detail:
-            return detail
-        return f'TQ3 status {status or "unknown"}'
 
     def model_engine_compatibility(
         self,
@@ -1011,27 +945,11 @@ class AppConfig:
 
     def hidden_engine_reasons_for_model(self, model: ModelConfig) -> Dict[str, str]:
         reasons: Dict[str, str] = {}
-        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3, ENGINE_VLLM):
+        for engine in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT):
             visibility = self.model_engine_visibility(model, engine_id=engine, capabilities=None)
             if not visibility.compatible:
                 reasons[engine] = visibility.reason
         return reasons
-
-    def tq3_binary_missing_message(self) -> str:
-        install = resolve_engine_install(self, ENGINE_TQ3)
-        command = str(install.resolved_command or self.runtime_server_command('llama.cpp') or 'tq3-llama-server')
-        return (
-            f'ENGINE_BINARY_MISSING: llama.cpp-tq3 server not found: {command}. '
-            'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
-        )
-
-    def tq3_session_advisory(self, model: ModelConfig) -> str:
-        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
-            return ''
-        ok, reason = self.active_engine_model_compatibility(model)
-        if ok:
-            return ''
-        return f'TQ3 engine advisory: {reason}'
 
     def turboquant_binary_warning(self, model: ModelConfig) -> str:
         if self.active_engine_key_for_model(model) != ENGINE_TURBOQUANT:
@@ -1042,16 +960,6 @@ class AppConfig:
         except (OSError, subprocess.SubprocessError, ValueError):
             return ''
         return engine_turboquant_binary_warning(command, capabilities)
-
-    def tq3_binary_warning(self, model: ModelConfig) -> str:
-        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
-            return ''
-        command = self.runtime_server_command('llama.cpp')
-        try:
-            capabilities = self.engine_capabilities()
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return ''
-        return engine_tq3_binary_warning(command, capabilities)
 
     def mtp_binary_warning(self, model: ModelConfig) -> str:
         # Audit #7: the dedicated MTP engine is gone, so the warning is
@@ -1135,75 +1043,6 @@ class AppConfig:
             return False, self.mtp_binary_warning(model) or 'MTP_FLAGS_NOT_FOUND: selected binary does not expose MTP flags.'
         return True, ''
 
-    def tq3_launch_diagnostic(
-        self,
-        model: ModelConfig,
-        benchmark_profile: Optional[BenchmarkLaunchProfile] = None,
-    ) -> str:
-        if self.active_engine_key_for_model(model) != ENGINE_TQ3:
-            return ''
-        stats = {
-            'offloaded_layers': 0,
-            'total_layers': 0,
-            'cpu_mapped_mib': 0.0,
-            'cuda_model_mib': 0.0,
-            'decode_tps': 0.0,
-            'preserve_thinking': False,
-        }
-        for line in self._runtime_log_after_last_launch(model, max_lines=800):
-            offload = re.search(r'offloaded\s+(\d+)\s*/\s*(\d+)\s+layers', line, re.IGNORECASE)
-            if offload:
-                stats['offloaded_layers'] = int(offload.group(1))
-                stats['total_layers'] = int(offload.group(2))
-            cpu = re.search(r'CPU_Mapped model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
-            if cpu:
-                stats['cpu_mapped_mib'] = float(cpu.group(1))
-            cuda = re.search(r'CUDA\d* model buffer size\s*=\s*([0-9.]+)\s+MiB', line, re.IGNORECASE)
-            if cuda:
-                stats['cuda_model_mib'] = float(cuda.group(1))
-            decode = re.search(
-                r'(?:^|:\s*)eval time\s*=.*?/\s*\d+\s+tokens.*?,\s*([0-9.]+)\s+tokens per second',
-                line,
-                re.IGNORECASE,
-            )
-            if decode:
-                stats['decode_tps'] = float(decode.group(1))
-            if 'preserve_thinking' in line and 'true' in line.lower():
-                stats['preserve_thinking'] = True
-
-        parts: List[str] = []
-        offloaded = int(stats['offloaded_layers'])
-        total = int(stats['total_layers'])
-        if offloaded and total:
-            parts.append(f'GPU offload {offloaded}/{total} layers')
-            if offloaded < total:
-                parts.append('partial GPU offload; replies may be CPU-bound')
-        cpu_mapped = float(stats['cpu_mapped_mib'])
-        if cpu_mapped > 0:
-            parts.append(f'CPU-mapped model buffer {cpu_mapped:.1f} MiB')
-        cuda_model = float(stats['cuda_model_mib'])
-        if cuda_model > 0:
-            parts.append(f'CUDA model buffer {cuda_model:.1f} MiB')
-        decode_tps = float(stats['decode_tps'])
-        if decode_tps > 0:
-            parts.append(f'recent decode {decode_tps:.2f} tok/s')
-            output_cap = int(
-                getattr(benchmark_profile, 'measurement_output', 0)
-                or getattr(model, 'output', 0)
-                or 0
-            )
-            if output_cap > 0:
-                seconds = output_cap / max(0.001, decode_tps)
-                if seconds >= 60:
-                    parts.append(f'{output_cap}-token cap ~= {seconds / 60.0:.1f} min')
-                else:
-                    parts.append(f'{output_cap}-token cap ~= {seconds:.0f} sec')
-        if bool(stats['preserve_thinking']) or str(getattr(model, 'preserve_thinking', 'auto') or '').strip().lower() == 'on':
-            parts.append('preserve_thinking is on; disabling it can improve interactive latency')
-        if not parts:
-            return ''
-        return 'TQ3 launch diagnostic: ' + '; '.join(parts)
-
     def model_fingerprint(self, model: ModelConfig) -> str:
         target = (getattr(model, 'path', '') or '').strip()
         path = Path(target).expanduser()
@@ -1261,17 +1100,10 @@ class AppConfig:
             'runtime_config': {
                 'extra_args': list(getattr(model, 'extra_args', []) or []),
                 'engine_key': self.active_engine_key_for_model(model),
-                'kv_key_mode': self.runtime_profile.kv_key_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant', ENGINE_TQ3) else '',
-                'kv_value_mode': self.runtime_profile.kv_value_mode if self.active_engine_key_for_model(model) in ('buun', 'turboquant', ENGINE_TQ3) else '',
+                'kv_key_mode': self.runtime_profile.kv_key_mode if self.active_engine_key_for_model(model) == 'turboquant' else '',
+                'kv_value_mode': self.runtime_profile.kv_value_mode if self.active_engine_key_for_model(model) == 'turboquant' else '',
                 'llama_server': self.runtime_server_command('llama.cpp') if getattr(model, 'runtime', 'llama.cpp') == 'llama.cpp' else '',
-                'vllm_command': self.vllm_command if getattr(model, 'runtime', 'llama.cpp') == 'vllm' else '',
                 'binary_version': self.runtime_binary_version(model),
-            },
-            'tq3': {
-                'status': getattr(model, 'tq3_status', 'unknown'),
-                'weight_format': getattr(model, 'tq3_weight_format', ''),
-                'source': getattr(model, 'tq3_source', ''),
-                'reason': getattr(model, 'tq3_reason', ''),
             },
         }
         encoded = json.dumps(payload, sort_keys=True, default=str).encode('utf-8')
@@ -1328,29 +1160,11 @@ class AppConfig:
             'classification_confidence': float(getattr(model, 'classification_confidence', 0.0) or 0.0),
             'turboquant_status': getattr(model, 'turboquant_status', 'unknown'),
             'turboquant_detail': turboquant_detail(model),
-            'tq3_status': getattr(model, 'tq3_status', 'unknown'),
-            'tq3_weight_format': getattr(model, 'tq3_weight_format', ''),
-            'tq3_detail': tq3_detail(model),
         }
         if not target:
             result.update({'status': 'failed', 'reason': 'model target is empty'})
             return result
         path = Path(target).expanduser()
-        if runtime == 'vllm':
-            exists = path.exists()
-            result['exists'] = exists
-            if exists:
-                try:
-                    result['file_size'] = path.stat().st_size if path.is_file() else 0
-                except OSError:
-                    result['file_size'] = 0
-            if exists or looks_like_model_reference(target):
-                result['reason'] = 'vLLM target is a local path or offline-valid repo reference'
-                result['kv_bytes_per_token'] = estimate_kv_bytes_per_token(model)
-                return result
-            result.update({'status': 'failed', 'reason': f'vLLM target is not a path or repo id: {target}'})
-            return result
-
         if not path.exists():
             result.update({'status': 'failed', 'reason': f'model path missing: {target}'})
             return result
@@ -1597,7 +1411,7 @@ class AppConfig:
             return False
         if not getattr(self.continue_settings, 'path', ''):
             return False
-        return self.active_engine_key_for_model(model) in ('llama.cpp', 'buun', 'turboquant', ENGINE_TQ3)
+        return self.active_engine_key_for_model(model) in ('llama.cpp', 'turboquant')
 
     def hermes_provider_key(self, model: ModelConfig) -> str:
         return f'local-{model.id}'
@@ -2025,18 +1839,13 @@ class AppConfig:
         if p.exists() or raw.startswith('~') or '/' in raw or raw.startswith('.'):
             return str(p.resolve(strict=False))
 
-        # Non-path references (mainly vLLM / HF repo IDs) should remain symbolic.
+        # Non-path references (HF repo IDs) should remain symbolic.
         return f'ref:{raw}'
 
     def validate_model_target(self, model: ModelConfig) -> Tuple[bool, str]:
         target = (model.path or '').strip()
         if not target:
             return False, 'model target is empty'
-        if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
-            p = Path(target).expanduser()
-            if p.exists() or looks_like_model_reference(target):
-                return True, ''
-            return False, f'vLLM model target not found / not a repo id: {target}'
         p = Path(target).expanduser()
         if not p.exists():
             return False, f'model path missing: {target}'
@@ -2048,18 +1857,6 @@ class AppConfig:
         if not parts:
             return False
         runtime = getattr(runtime, 'strip', lambda: runtime)()
-        if runtime == 'vllm':
-            prefixes = self.command_prefix(self.vllm_command)
-            target = os.path.basename(prefixes[0]) if prefixes else 'vllm'
-            return (
-                any(
-                    os.path.basename(part) == target
-                    or os.path.basename(part).startswith('vllm')
-                    or 'vllm.entrypoints' in part
-                    for part in parts
-                )
-                and ('serve' in parts or any('api_server' in part for part in parts))
-            )
         candidate_commands = [self.llama_server, self.runtime_server_command('llama.cpp')]
         targets = set()
         for command in candidate_commands:
@@ -2192,8 +1989,6 @@ class AppConfig:
         return Path(path).expanduser().resolve(strict=False)
 
     def infer_model_source(self, model: ModelConfig) -> str:
-        if getattr(model, 'runtime', 'llama.cpp') == 'vllm':
-            return 'manual'
         known_sources = {'manual', 'huggingface', 'hf_cache', 'llama_cache', 'llmfit', 'llm-models', 'lm-studio'}
         existing = getattr(model, 'source', '') or ''
         existing_labels = normalize_source_labels(existing, getattr(model, 'source_labels', []))
@@ -2281,7 +2076,7 @@ class AppConfig:
 
     def _pid_looks_like_any_runtime(self, pid: int) -> bool:
         parts = self._pid_cmdline_parts(pid)
-        return self._command_matches_runtime(parts, 'llama.cpp') or self._command_matches_runtime(parts, 'vllm')
+        return self._command_matches_runtime(parts, 'llama.cpp')
 
     def _pid_matches_model(self, pid: int, model: ModelConfig) -> bool:
         parts = self._pid_cmdline_parts(pid)
@@ -2548,19 +2343,6 @@ class AppConfig:
         if runtime_profile is not None and getattr(runtime_profile, 'cache_ram', None) is not None:
             cache_ram_value = max(0, int(getattr(runtime_profile, 'cache_ram') or 0))
         omit_gpu_layers = runtime_profile is not None and runtime_profile.gpu_layers is None
-        if runtime == 'vllm':
-            cmd = self.command_prefix(self.vllm_command) + [
-                'serve',
-                model.path,
-                '--host', model.host,
-                '--port', str(model.port),
-                '--served-model-name', model.alias,
-            ]
-            if ctx_value > 0:
-                cmd += ['--max-model-len', str(ctx_value)]
-            cmd += model.extra_args
-            return cmd
-
         engine_context = resolve_runtime_engine_context(self, model=model, runtime_profile=runtime_profile)
         capabilities = engine_context.capabilities
         if engine_context.engine_id == self.runtime_profile.engine_id:
@@ -2615,7 +2397,7 @@ class AppConfig:
         # suite can scrape server-truth prefill/decode rates. Gated on the
         # binary advertising --metrics so older forks are never sent a flag
         # they would reject.
-        if benchmark_profile is not None and engine_context.engine_id != ENGINE_VLLM:
+        if benchmark_profile is not None:
             help_text = str(getattr(capabilities, 'help_text', '') or '').lower()
             if '--metrics' in help_text and '--metrics' not in cmd:
                 cmd.append('--metrics')
@@ -2634,14 +2416,8 @@ class AppConfig:
         engine_context = resolve_runtime_engine_context(self, model=model, runtime_profile=runtime_profile)
         engine_key = engine_context.engine_id
         command = engine_context.command or self.runtime_server_command(runtime)
-        if runtime == 'vllm':
-            label = 'vLLM command'
-        elif engine_key == 'buun':
-            label = 'buun server'
-        elif engine_key == 'turboquant':
+        if engine_key == 'turboquant':
             label = 'TurboQuant+ server'
-        elif engine_key == ENGINE_TQ3:
-            label = 'llama.cpp-tq3 server'
         elif model_mtp_enabled(model, runtime_profile):
             # Audit #7: MTP is a binary capability of llama.cpp now;
             # surface it in the label when the launch opts in.
@@ -2655,8 +2431,6 @@ class AppConfig:
         if not compatible:
             return False, compatibility_msg
         if not self.command_exists(command):
-            if engine_key == ENGINE_TQ3:
-                return False, self.tq3_binary_missing_message()
             if model_mtp_enabled(model, runtime_profile):
                 return False, self.mtp_binary_missing_message()
             return False, f'{label} not found: {command}'
@@ -2668,12 +2442,9 @@ class AppConfig:
             self.append_log(model.id, f'{label} runtime check failed: {runtime_msg}')
             return False, f'{label} cannot run: {runtime_msg}'
         tq_advisory = self.turboquant_session_advisory(model)
-        tq3_advisory = self.tq3_session_advisory(model)
         mtp_advisory = self.mtp_session_advisory(model)
         tq_binary_warning = self.turboquant_binary_warning(model)
-        tq3_binary_warning = self.tq3_binary_warning(model)
         mtp_binary_warning = self.mtp_binary_warning(model)
-        tq3_launch_diagnostic = self.tq3_launch_diagnostic(model, benchmark_profile=benchmark_profile)
         if runtime_profile is not None:
             profile = {
                 'ctx': int(runtime_profile.ctx_size or getattr(model, 'ctx', 0) or 0),
@@ -2728,18 +2499,12 @@ class AppConfig:
         self.append_log(model.id, f'launch profile: {profile_msg}')
         if tq_advisory:
             self.append_log(model.id, tq_advisory)
-        if tq3_advisory:
-            self.append_log(model.id, tq3_advisory)
         if mtp_advisory:
             self.append_log(model.id, mtp_advisory)
         if tq_binary_warning:
             self.append_log(model.id, tq_binary_warning)
-        if tq3_binary_warning:
-            self.append_log(model.id, tq3_binary_warning)
         if mtp_binary_warning:
             self.append_log(model.id, mtp_binary_warning)
-        if tq3_launch_diagnostic:
-            self.append_log(model.id, tq3_launch_diagnostic)
         self.append_log(model.id, f'launch command: {shlex.join(command)}')
         try:
             with open(log_path, 'ab') as log_file:
@@ -2760,18 +2525,12 @@ class AppConfig:
         detail = f'started PID {proc.pid} ({profile_msg})'
         if tq_advisory:
             detail += f' | {tq_advisory}'
-        if tq3_advisory:
-            detail += f' | {tq3_advisory}'
         if mtp_advisory:
             detail += f' | {mtp_advisory}'
         if tq_binary_warning:
             detail += f' | {tq_binary_warning}'
-        if tq3_binary_warning:
-            detail += f' | {tq3_binary_warning}'
         if mtp_binary_warning:
             detail += f' | {mtp_binary_warning}'
-        if tq3_launch_diagnostic:
-            detail += f' | {tq3_launch_diagnostic}'
         return True, detail
 
     def _runtime_log_after_last_launch(self, model: ModelConfig, max_lines: int = 400) -> List[str]:
@@ -2901,7 +2660,6 @@ class AppConfig:
         model.source = source_labels_text(getattr(model, 'source', 'manual'), getattr(model, 'source_labels', []))
         self.enrich_model_architecture(model)
         self.enrich_model_turboquant(model)
-        self.enrich_model_tq3(model)
         self.enrich_model_mtp(model)
         for idx, existing in enumerate(self.models):
             if existing.id == model.id:
@@ -2953,13 +2711,8 @@ class AppConfig:
             normalized = str(self.normalize_model_path(model.path))
             path_exists = Path(model.path).expanduser().exists()
 
-            runtime = getattr(model, 'runtime', 'llama.cpp')
             if source == 'manual':
-                if runtime == 'vllm':
-                    target = (model.path or '').strip()
-                    should_remove = not target or (not Path(target).expanduser().exists() and not looks_like_model_reference(target))
-                else:
-                    should_remove = (not path_exists) or (not is_real_model_file(Path(model.path)))
+                should_remove = (not path_exists) or (not is_real_model_file(Path(model.path)))
             else:
                 should_remove = normalized not in discovered
 
@@ -2991,8 +2744,6 @@ class AppConfig:
                 if self.enrich_model_architecture(model):
                     changed = True
                 if self.enrich_model_turboquant(model):
-                    changed = True
-                if self.enrich_model_tq3(model):
                     changed = True
                 if self.enrich_model_mtp(model):
                     changed = True

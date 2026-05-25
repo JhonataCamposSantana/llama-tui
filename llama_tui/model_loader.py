@@ -11,7 +11,7 @@ substitute defaults on failure.
 
 from typing import List
 
-from .gguf import TQ3_STATUSES, TURBOQUANT_STATUSES
+from .gguf import TURBOQUANT_STATUSES
 from .models import ModelConfig, dataclass_payload
 from .mtp import clamp_mtp_draft, normalize_mtp_support
 from .provenance import normalize_source_labels, source_labels_text
@@ -85,12 +85,6 @@ def load_model_from_payload(raw: object, index: int) -> ModelConfig:
         payload[key] = int(payload.get(key, 0) or 0)
     payload['turboquant_source'] = str(payload.get('turboquant_source', '') or '')
     payload['turboquant_reason'] = str(payload.get('turboquant_reason', '') or '')
-    payload['tq3_status'] = str(payload.get('tq3_status', 'unknown') or 'unknown').strip().lower()
-    if payload['tq3_status'] not in TQ3_STATUSES:
-        payload['tq3_status'] = 'unknown'
-    payload['tq3_weight_format'] = str(payload.get('tq3_weight_format', '') or '').strip().upper()
-    payload['tq3_source'] = str(payload.get('tq3_source', '') or '')
-    payload['tq3_reason'] = str(payload.get('tq3_reason', '') or '')
     payload['supports_mtp'] = normalize_mtp_support(payload.get('supports_mtp', 'auto'))
     payload['mtp_enabled'] = bool(payload.get('mtp_enabled', False))
     payload['mtp_draft_n_max'] = clamp_mtp_draft(payload.get('mtp_draft_n_max', 3), default=3)

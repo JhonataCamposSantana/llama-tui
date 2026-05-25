@@ -30,8 +30,6 @@ class BenchmarkStrategyTests(unittest.TestCase):
             alias='tq3',
             architecture_type='moe',
             expert_count=128,
-            tq3_status='native',
-            tq3_weight_format='TQ3_4S',
             ctx_max=131072,
         )
 
@@ -47,56 +45,6 @@ class BenchmarkStrategyTests(unittest.TestCase):
 
         for token in ('qwen', 'gemma', 'deepseek', 'mistral', 'mixtral'):
             self.assertNotIn(token, source)
-
-    def test_tq3_strategy_is_small_first_pass(self):
-        model = ModelConfig(
-            id='tq3',
-            name='TQ3 Native',
-            path='/models/model.TQ3_4S.gguf',
-            alias='tq3',
-            tq3_status='native',
-            tq3_weight_format='TQ3_4S',
-        )
-        strategy = select_benchmark_strategy('tq3', model, depth='fast')
-
-        self.assertEqual(strategy.id, 'tq3_native_probe')
-        self.assertLessEqual(strategy.max_candidates, 6)
-        self.assertEqual(strategy.retry_policy, 'tq3_terminal_timeout')
-        self.assertIn('pp_baseline', [phase.id for phase in strategy.phases])
-        self.assertIn('tg_baseline', [phase.id for phase in strategy.phases])
-
-    def test_tq3_fast_runtime_profiles_are_capped_to_strategy(self):
-        model = ModelConfig(
-            id='tq3-moe',
-            name='TQ3 MoE Native',
-            path='/models/model.TQ3_4S.gguf',
-            alias='tq3-moe',
-            architecture_type='moe',
-            expert_count=128,
-            expert_used_count=8,
-            tq3_status='native',
-            tq3_weight_format='TQ3_4S',
-            ctx_min=2048,
-            ctx_max=131072,
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            app = AppConfig(
-                Path(tmp) / 'models.json',
-                runtime_profile=make_runtime_profile('tq3', 'llama-server'),
-            )
-            with patch.object(app, 'engine_capabilities', return_value=default_engine_capabilities('tq3')), \
-                 patch('llama_tui.benchmark.model_file_size', return_value=20 * 1024 ** 3):
-                profiles = active_engine_runtime_profiles(
-                    app,
-                    model,
-                    HardwareProfile(gpu_memory_total=8 * 1024 ** 3, gpu_memory_free=6 * 1024 ** 3),
-                    depth='fast',
-                )
-
-        self.assertTrue(profiles)
-        self.assertLessEqual(len(profiles), 6)
-        self.assertTrue(all(item.benchmark_strategy_id == 'tq3_native_probe' for item in profiles))
-        self.assertIn('server_sanity', {item.benchmark_phase for item in profiles})
 
     def test_mtp_strategy_tracks_acceptance_metrics(self):
         model = ModelConfig(
@@ -187,13 +135,6 @@ class BenchmarkStrategyTests(unittest.TestCase):
         self.assertEqual(strategy.id, 'turboquant_kv_sweep')
         self.assertIn('kv_compression', [phase.id for phase in strategy.phases])
         self.assertIn('quality_risk', strategy.metric_groups)
-
-    def test_vllm_strategy_does_not_use_llama_bench(self):
-        model = ModelConfig(id='hf', name='HF', path='owner/model', alias='hf', runtime='vllm')
-        strategy = select_benchmark_strategy('vllm', model)
-
-        self.assertEqual(strategy.id, 'vllm_serving_latency')
-        self.assertTrue(all(phase.runner == 'vllm_bench' for phase in strategy.phases))
 
     def test_runtime_profiles_carry_strategy_metadata(self):
         model = ModelConfig(

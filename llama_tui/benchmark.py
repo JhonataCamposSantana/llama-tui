@@ -48,9 +48,7 @@ def mtp_long_context_probe_request_timeout(ctx_size: int) -> int:
 from .control import CancelToken, CancelledError, check_cancelled, sleep_with_cancel
 from .discovery import extract_quant
 from .engines import (
-    ENGINE_BUUN,
     ENGINE_LLAMA_CPP,
-    ENGINE_TQ3,
     ENGINE_TURBOQUANT,
     resolve_engine_install,
     resolve_runtime_engine_context,
@@ -149,21 +147,6 @@ from .moe_tuning import (
     _usable_mtp_acceptance_record_for_model,
     moe_context_bucket_specs,
 )
-from .raw_engine_bench import (
-    RAW_BENCH_DETERMINISTIC_SEED,
-    TQ3_RAW_BENCH_CASES,
-    _raw_bench_candidate_model,
-    _run_tq3_raw_process,
-    _terminate_process_group,
-    _tq3_raw_profile_key,
-    _tq3_raw_profile_rank,
-    _tq3_raw_runtime_profiles,
-    parse_llama_bench_tokens_per_sec,
-    sibling_llama_bench_for_server,
-    tq3_llama_bench_command,
-    tq3_moe_cpu_placement_threads,
-    tq3_raw_presearch_case_total,
-)
 from .scoring import (
     _ctx_curve,
     _record_headroom_score,
@@ -217,12 +200,6 @@ BENCHMARK_READY_TIMEOUT = _env_int_override(
     'LLAMA_TUI_BENCHMARK_READY_TIMEOUT', 180, minimum=10,
 )
 BENCHMARK_MIN_CANDIDATE_BUDGET_SECONDS = 10.0
-TQ3_MIN_CANDIDATE_BUDGET_SECONDS = 30.0
-TQ3_RAW_PRESEARCH_FAST_BUDGET_SECONDS = 30.0
-TQ3_RAW_PRESEARCH_FULL_BUDGET_SECONDS = 60.0
-TQ3_RAW_PRESEARCH_FAST_CASE_TIMEOUT = 12.0
-TQ3_RAW_PRESEARCH_FULL_CASE_TIMEOUT = 20.0
-TQ3_RAW_PRESEARCH_FAILURE_LIMIT = 2
 SAFE_BOOTSTRAP_PRESETS = (
     ('max_context', 'safe'),
     ('tokens_per_sec', 'safe'),
@@ -704,14 +681,6 @@ def benchmark_preflight_cleanup(
             compatible, compatibility_msg = True, ''
         if not compatible:
             return False, f'❌ benchmark preflight blocked: {compatibility_msg}'
-    if active_engine == ENGINE_TQ3:
-        install = resolve_engine_install(app, ENGINE_TQ3)
-        if not install.exists:
-            command = str(install.resolved_command or 'tq3-llama-server')
-            return False, (
-                f'ENGINE_BINARY_MISSING: llama.cpp-tq3 server not found: {command}. '
-                'Set TQ3_LLAMA_SERVER_BIN=/path/to/llama-server'
-            )
     stopped: List[str] = []
     models = list(getattr(app, 'models', []) or [])
     if model.id not in {getattr(item, 'id', '') for item in models}:
@@ -1106,49 +1075,13 @@ def memory_guardrail_skip_record(
 # re-imported below.
 
 
-LOW_SPEED_PROMOTION_TOKENS_PER_SEC = 3.0
-
-
 def low_speed_guardrail_reason(record: Dict[str, object]) -> str:
-    engine = str(record.get('engine', '') or '').strip().lower()
-    if engine != 'tq3':
-        return ''
-    try:
-        tps = float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
-    except Exception:
-        tps = 0.0
-    if 0.0 < tps < LOW_SPEED_PROMOTION_TOKENS_PER_SEC:
-        return (
-            f'TQ3 decode speed {tps:.2f} tok/s is below the '
-            f'{LOW_SPEED_PROMOTION_TOKENS_PER_SEC:.1f} tok/s promotion floor'
-        )
+    # The low-speed promotion floor only applied to the removed TQ3 engine;
+    # no remaining engine is slow enough on this hardware to need it.
     return ''
 
 
-def runtime_profile_is_tq3(runtime_profile: Optional[RuntimeProfile]) -> bool:
-    return str(getattr(runtime_profile, 'engine_id', '') or '').strip().lower() == ENGINE_TQ3
-
-
-def record_engine_is_tq3(record: Dict[str, object], runtime_profile: Optional[RuntimeProfile] = None) -> bool:
-    return (
-        runtime_profile_is_tq3(runtime_profile)
-        or str(record.get('engine', '') or '').strip().lower() == ENGINE_TQ3
-    )
-
-
-def tq3_terminal_candidate_failure(record: Dict[str, object], runtime_profile: Optional[RuntimeProfile] = None) -> bool:
-    if not record_engine_is_tq3(record, runtime_profile):
-        return False
-    category = str(record.get('failure_category', '') or '').strip().upper()
-    if category in ('API_TIMEOUT', 'RAW_ENGINE_TIMEOUT'):
-        return True
-    return bool(low_speed_guardrail_reason(record))
-
-
 def candidate_min_budget_seconds(runtime_profile: Optional[RuntimeProfile] = None, engine: str = '') -> float:
-    engine_key = str(engine or getattr(runtime_profile, 'engine_id', '') or '').strip().lower()
-    if engine_key == ENGINE_TQ3:
-        return TQ3_MIN_CANDIDATE_BUDGET_SECONDS
     if runtime_profile is not None and mtp_runtime_profile_uses_long_context_probe(runtime_profile):
         return float(mtp_long_context_probe_request_timeout(getattr(runtime_profile, 'ctx_size', 0)))
     return BENCHMARK_MIN_CANDIDATE_BUDGET_SECONDS
@@ -1188,52 +1121,6 @@ def _record_decode_tps(record: Dict[str, object]) -> float:
         return float(record.get('decode_tokens_per_sec', record.get('tokens_per_sec', 0.0)) or 0.0)
     except Exception:
         return 0.0
-
-
-def _is_tq3_cpu_moe_placement(record: Dict[str, object]) -> bool:
-    return (
-        str(record.get('engine', '') or '').strip().lower() == 'tq3'
-        and (bool(record.get('cpu_moe', False)) or int(record.get('n_cpu_moe', 0) or 0) > 0)
-    )
-
-
-def _is_tq3_partial_fixed_offload(record: Dict[str, object]) -> bool:
-    if str(record.get('engine', '') or '').strip().lower() != 'tq3':
-        return False
-    if _is_tq3_cpu_moe_placement(record):
-        return False
-    if str(record.get('gpu_layers_mode', '') or '').strip().lower() not in ('', 'fixed'):
-        return False
-    try:
-        ngl = int(record.get('ngl', 0) or 0)
-    except Exception:
-        ngl = 0
-    return 0 < ngl < 999
-
-
-def reject_slow_tq3_partial_offload_rows(records: List[Dict[str, object]]) -> List[Dict[str, object]]:
-    faster = [
-        item for item in records
-        if item.get('status') == 'ok'
-        and str(item.get('measurement_type', 'full') or 'full') == 'full'
-        and _is_tq3_cpu_moe_placement(item)
-        and _record_decode_tps(item) > 0
-    ]
-    if not faster:
-        return records
-    fastest = max(faster, key=_record_decode_tps)
-    fastest_tps = _record_decode_tps(fastest)
-    kept = []
-    for item in records:
-        tps = _record_decode_tps(item)
-        if _is_tq3_partial_fixed_offload(item) and tps > 0 and fastest_tps > tps * 3.0:
-            item['rejection_reason'] = 'rejected_slow_partial_offload'
-            item['selection_rejection_reason'] = 'rejected_slow_partial_offload'
-            item['rejected_by_profile'] = str(fastest.get('runtime_profile', '') or fastest.get('placement_strategy', '') or 'tq3_moe_placement')
-            item['rejected_by_tokens_per_sec'] = round(fastest_tps, 2)
-            continue
-        kept.append(item)
-    return kept
 
 
 def propagate_rejection_reasons(records: List[Dict[str, object]], measured: List[Dict[str, object]]) -> None:
@@ -1597,12 +1484,6 @@ def measured_profile_runtime_profile(
         engine = ENGINE_LLAMA_CPP
     elif 'turboquant' in engine.lower():
         engine = 'turboquant'
-    elif 'tq3' in engine.lower():
-        engine = 'tq3'
-    elif 'buun' in engine.lower():
-        engine = 'buun'
-    elif engine.strip().lower() == 'vllm':
-        return None
     else:
         engine = 'llama.cpp'
 
@@ -2745,12 +2626,6 @@ def configure_adaptive_candidate(
         if variant == 'q8_kv':
             extra_args = _set_extra_arg(extra_args, '--cache-type-k', 'q8_0')
             extra_args = _set_extra_arg(extra_args, '--cache-type-v', 'q8_0')
-    elif runtime == 'vllm':
-        utilization = max(0.65, min(0.94, (100 - candidate.memory_reserve_percent) / 100.0))
-        extra_args = _set_extra_arg(extra_args, '--gpu-memory-utilization', f'{utilization:.2f}')
-        extra_args = _set_extra_arg(extra_args, '--max-num-seqs', str(candidate.parallel))
-        batched = max(1024, min(65536, candidate.ctx * candidate.parallel))
-        extra_args = _set_extra_arg(extra_args, '--max-num-batched-tokens', str(round_context(batched, 512)))
     candidate.extra_args = extra_args
     return candidate
 
@@ -3805,7 +3680,7 @@ def select_measured_profiles(
     ]
     if not successful:
         return {}
-    promotion_pool = reject_slow_tq3_partial_offload_rows(successful)
+    promotion_pool = successful
     if not promotion_pool:
         promotion_pool = successful
     max_tps = max(float(item.get('tokens_per_sec', 0.0) or 0.0) for item in successful) or 1.0
@@ -4364,17 +4239,6 @@ def max_context_probe_kv_profiles(
         preferred = ('q8_0/turbo4', 'q8_0/turbo3', 'q8_0/turbo2', 'q8_0/q8_0')
         profiles = [
             item for item in turboquant_auto_profiles(model, capabilities, 'full')
-            if item.kv_preset in preferred
-        ]
-        return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
-    if engine_key == 'tq3':
-        profiles = tq3_kv_profiles_for_model(model, capabilities, 'full')
-        preferred = ('q8_0/q8_0', 'tq3_0/tq3_0')
-        return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
-    if engine_key == 'buun':
-        preferred = ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq', 'turbo2_tcq/turbo2_tcq')
-        profiles = [
-            item for item in supported_turbo_kv_profiles(capabilities, 'full', engine_id='buun')
             if item.kv_preset in preferred
         ]
         return sorted(profiles, key=lambda item: _kv_profile_sort_key(item, preferred))
@@ -5101,16 +4965,7 @@ def adaptive_profiles_complete(winners: Dict[str, Dict[str, object]]) -> bool:
 
 
 def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Optional[List[Dict[str, object]]] = None) -> str:
-    low_speed_count = sum(1 for row in list(records or []) if low_speed_guardrail_reason(row))
-    rejected_partial_count = sum(
-        1 for row in list(records or [])
-        if str(row.get('rejection_reason', '') or row.get('selection_rejection_reason', '') or '') == 'rejected_slow_partial_offload'
-    )
     if not winners:
-        if low_speed_count:
-            return f'no winners, {low_speed_count} TQ3 low-speed profile(s) held back'
-        if rejected_partial_count:
-            return f'no winners, {rejected_partial_count} slow partial-offload profile(s) rejected'
         return 'no winners'
     parts = []
     fast = winners.get('fast_chat') or {}
@@ -5138,21 +4993,12 @@ def benchmark_run_summary(winners: Dict[str, Dict[str, object]], records: Option
             parts.append(f'maxctx experimental={exp_ctx}')
     if winners.get('opencode_ready'):
         parts.append(opencode_profile_status_text(winners))
-    if any(
-        str(row.get('engine', '') or '') == 'buun' and bool(row.get('runtime_fit', False))
-        for row in list(winners.values()) + list(records or [])
-    ):
-        parts.append('buun fit profile')
     failed_count = sum(
         1 for row in list(records or [])
         if str(row.get('status', '') or '').lower() not in ('ok', 'probe ok', 'skipped')
     )
     if failed_count and any(str(row.get('status', '') or '').lower() == 'ok' for row in list(winners.values())):
         parts.append(f'{failed_count} candidate failure(s), winners saved')
-    if low_speed_count:
-        parts.append(f'{low_speed_count} TQ3 low-speed profile(s) held back')
-    if rejected_partial_count:
-        parts.append(f'{rejected_partial_count} slow partial-offload profile(s) rejected')
     return ', '.join(parts) if parts else 'no winners'
 
 
@@ -5311,8 +5157,6 @@ def adaptive_record_from_candidate(
     detected_head_dim: int = 0,
     model_quant: str = '',
     model_family: str = '',
-    tq3_status: str = '',
-    tq3_weight_format: str = '',
     binary_path: str = '',
     help_supported_cache_types: Optional[List[str]] = None,
     runtime_log_path: str = '',
@@ -5479,8 +5323,6 @@ def adaptive_record_from_candidate(
         'detected_head_dim': int(detected_head_dim or 0),
         'model_quant': model_quant,
         'model_family': model_family,
-        'tq3_status': tq3_status,
-        'tq3_weight_format': tq3_weight_format,
         'binary_path': binary_path,
         'help_supported_cache_types': list(help_supported_cache_types or []),
         'runtime_log_path': runtime_log_path,
@@ -5620,7 +5462,7 @@ def runtime_record_context(
                 )
             )
             spec_type = profile_spec_type if profile_spec_allowed else capability_spec_type
-            if benchmark_profile is not None and str(getattr(candidate, 'runtime', 'llama.cpp') or 'llama.cpp') != 'vllm':
+            if benchmark_profile is not None:
                 _args, unsupported_launch_flags = benchmark_profile_server_args(benchmark_profile, capabilities)
         except Exception:
             supported_cache_types = []
@@ -5639,8 +5481,6 @@ def runtime_record_context(
         'detected_head_dim': turboquant_head_dim(candidate),
         'model_quant': extract_quant(candidate),
         'model_family': getattr(candidate, 'model_family', '') or getattr(candidate, 'architecture', '') or '',
-        'tq3_status': getattr(candidate, 'tq3_status', 'unknown'),
-        'tq3_weight_format': getattr(candidate, 'tq3_weight_format', ''),
         'help_supported_cache_types': supported_cache_types,
         'flash_attn_mode': getattr(profile, 'flash_attn', '') if profile is not None else '',
         'kv_family': kv_family,
@@ -6417,269 +6257,6 @@ def dynamic_context_growth_targets(
     return sorted(ctx for ctx in values if ctx_min <= ctx <= health_ceiling)
 
 
-def tq3_kv_profiles_for_model(
-    model: ModelConfig,
-    capabilities,
-    depth: str,
-) -> List[TurboKvProfile]:
-    return supported_turbo_kv_profiles(capabilities, depth, engine_id='tq3')
-
-
-def _command_exists_for_app(app, command: str) -> bool:
-    if hasattr(app, 'command_exists'):
-        try:
-            return bool(app.command_exists(command))
-        except Exception:
-            pass
-    parts = shlex.split(command or '')
-    if not parts:
-        return False
-    first = os.path.expanduser(parts[0])
-    if '/' in first or first.startswith('.'):
-        return Path(first).expanduser().exists()
-    return subprocess.run(['sh', '-c', f'command -v {shlex.quote(first)} >/dev/null 2>&1']).returncode == 0
-
-
-def run_tq3_raw_llama_bench_presearch(
-    app,
-    model: ModelConfig,
-    hardware: HardwareProfile,
-    runtime_profiles: List[RuntimeProfile],
-    depth: str,
-    progress: Optional[Callable[[object], None]] = None,
-    cancel_token: Optional[CancelToken] = None,
-    on_record: Optional[Callable[[Dict[str, object]], None]] = None,
-    completed_offset: int = 0,
-    total: Optional[int] = None,
-    run_kind: str = 'server',
-    deadline: Optional[BenchmarkDeadline] = None,
-) -> Tuple[List[Dict[str, object]], List[RuntimeProfile]]:
-    try:
-        engine = app.active_engine_key_for_model(model)
-    except Exception:
-        engine = ''
-    if engine != ENGINE_TQ3 or not model_is_moe(model):
-        return [], []
-
-    server_install = resolve_engine_install(app, ENGINE_TQ3)
-    server_bin = str(server_install.resolved_command or '')
-    llama_bench_bin = sibling_llama_bench_for_server(server_bin)
-    raw_profiles = _tq3_raw_runtime_profiles(runtime_profiles, depth)
-    if not raw_profiles:
-        return [], []
-    if not _command_exists_for_app(app, llama_bench_bin):
-        candidate = _raw_bench_candidate_model(model, raw_profiles[0])
-        detail = (
-            f'ENGINE_BINARY_MISSING: llama.cpp-tq3 llama-bench not found: {llama_bench_bin}. '
-            f'Build llama-bench next to {server_bin or "llama-server"}.'
-        )
-        record = adaptive_record_from_candidate(
-            candidate,
-            'raw_engine_search',
-            'start failed',
-            detail=detail,
-            engine=ENGINE_TQ3,
-            server_bin=server_bin,
-            binary_path=llama_bench_bin,
-            runtime_profile=raw_profiles[0].name,
-            kv_preset=raw_profiles[0].kv_preset,
-            benchmark_depth=depth,
-            benchmark_strategy_id=getattr(raw_profiles[0], 'benchmark_strategy_id', ''),
-            benchmark_objectives=list(getattr(raw_profiles[0], 'benchmark_objectives', ()) or ()),
-            benchmark_phase='pp_baseline',
-            benchmark_metric_group='pp_tps,tg_tps',
-            placement_strategy=raw_profiles[0].placement_strategy,
-            cpu_moe=raw_profiles[0].cpu_moe,
-            n_cpu_moe=raw_profiles[0].n_cpu_moe,
-            tensor_overrides=list(raw_profiles[0].tensor_overrides or ()),
-            failure_category='ENGINE_BINARY_MISSING',
-            failure_reason=detail,
-            suggested_fix='Build llama-bench or set TQ3_LLAMA_SERVER_BIN to the matching llama-server.',
-        )
-        record['benchmark_kind'] = 'raw_engine_search'
-        record['measurement_type'] = 'raw_engine_search'
-        record['llama_bench_bin'] = llama_bench_bin
-        if on_record:
-            on_record(dict(record))
-        return [record], []
-
-    records: List[Dict[str, object]] = []
-    scores: Dict[Tuple[object, ...], float] = {}
-    profiles_by_key = {_tq3_raw_profile_key(item): item for item in raw_profiles}
-    fast = (depth or '').strip().lower() == 'fast'
-    phase_budget = TQ3_RAW_PRESEARCH_FAST_BUDGET_SECONDS if fast else TQ3_RAW_PRESEARCH_FULL_BUDGET_SECONDS
-    case_timeout = TQ3_RAW_PRESEARCH_FAST_CASE_TIMEOUT if fast else TQ3_RAW_PRESEARCH_FULL_CASE_TIMEOUT
-    raw_total = len(raw_profiles) * len(TQ3_RAW_BENCH_CASES)
-    phase_deadline = min(
-        time.monotonic() + phase_budget,
-        deadline.end if deadline is not None else time.monotonic() + phase_budget,
-    )
-    raw_index = 0
-    cancelled = False
-    failed_cases = 0
-    if progress:
-        progress(
-            f'TQ3 raw llama-bench pre-search: {len(raw_profiles)} profile(s), '
-            f'{raw_total} case(s), timeout<={int(case_timeout)}s, budget={int(phase_budget)}s, binary={llama_bench_bin}'
-        )
-    for profile_index, runtime_profile in enumerate(raw_profiles, start=1):
-        check_cancelled(cancel_token)
-        candidate = _raw_bench_candidate_model(model, runtime_profile)
-        threads = tq3_moe_cpu_placement_threads(candidate, runtime_profile, hardware)
-        key = _tq3_raw_profile_key(runtime_profile)
-        for measurement_type, prompt_tokens, generated_tokens in TQ3_RAW_BENCH_CASES:
-            check_cancelled(cancel_token)
-            if failed_cases >= TQ3_RAW_PRESEARCH_FAILURE_LIMIT:
-                if progress:
-                    progress(f'TQ3 raw llama-bench skipped remaining cases after {failed_cases} failed case(s)')
-                break
-            raw_index += 1
-            remaining = phase_deadline - time.monotonic()
-            if remaining <= 0:
-                if progress:
-                    progress(f'TQ3 raw llama-bench phase budget exhausted after {len(records)} case(s)')
-                break
-            cmd = tq3_llama_bench_command(
-                llama_bench_bin,
-                model,
-                runtime_profile,
-                prompt_tokens,
-                generated_tokens,
-                threads,
-            )
-            timeout = min(case_timeout, max(1.0, remaining))
-            command_preview = shlex.join(str(item) for item in cmd)
-            candidate_label = f'{runtime_profile.name}/{measurement_type}'
-            if progress:
-                progress(f'TQ3 raw llama-bench command: {command_preview}')
-            emit_benchmark_event(
-                progress,
-                'benchmark_candidate',
-                model,
-                run_kind,
-                message=(
-                    f'TQ3 raw llama-bench {measurement_type} '
-                    f'{raw_index}/{raw_total}: {runtime_profile.name}'
-                ),
-                phase='raw_engine_search',
-                completed=int(completed_offset + raw_index - 1),
-                total=int(total if total is not None else raw_total),
-                candidate=candidate_label,
-                command=command_preview,
-            )
-            output = ''
-            status = 'benchmark failed'
-            tps = 0.0
-            exit_code = -1
-            result = _run_tq3_raw_process(cmd, timeout, cancel_token)
-            output = str(result.get('stdout', '') or '')
-            raw_returncode = result.get('returncode', -1)
-            exit_code = int(raw_returncode if raw_returncode is not None else -1)
-            seconds = float(result.get('seconds', 0.0) or 0.0)
-            timed_out = bool(result.get('timed_out', False))
-            cancelled_case = bool(result.get('cancelled', False))
-            if timed_out:
-                output = output or f'raw llama-bench timed out after {timeout:.1f}s'
-                status = 'benchmark failed'
-            elif cancelled_case:
-                output = output or 'raw llama-bench cancelled by user'
-                status = 'aborted'
-                cancelled = True
-            else:
-                tps = parse_llama_bench_tokens_per_sec(output)
-                status = 'ok' if exit_code == 0 and tps > 0 else 'benchmark failed'
-            record = adaptive_record_from_candidate(
-                candidate,
-                'raw_engine_search',
-                status,
-                tokens_per_sec=tps,
-                prompt_tokens_per_sec=tps if generated_tokens == 0 else 0.0,
-                seconds=seconds,
-                detail=concise_failure(output, limit=500),
-                engine=ENGINE_TQ3,
-                server_bin=server_bin,
-                binary_path=llama_bench_bin,
-                runtime_profile=runtime_profile.name,
-                kv_preset=runtime_profile.kv_preset,
-                benchmark_depth=depth,
-                benchmark_strategy_id=getattr(runtime_profile, 'benchmark_strategy_id', ''),
-                benchmark_objectives=list(getattr(runtime_profile, 'benchmark_objectives', ()) or ()),
-                benchmark_phase='pp_baseline' if measurement_type == 'raw_pp' else 'tg_baseline',
-                benchmark_metric_group='pp_tps' if measurement_type == 'raw_pp' else 'tg_tps',
-                placement_strategy=runtime_profile.placement_strategy,
-                cpu_moe=runtime_profile.cpu_moe,
-                n_cpu_moe=runtime_profile.n_cpu_moe,
-                tensor_overrides=list(runtime_profile.tensor_overrides or ()),
-                batch_size=runtime_profile.batch_size,
-                ubatch_size=runtime_profile.ubatch_size,
-                ctk=kv_modes_from_preset(runtime_profile.kv_preset)[0],
-                ctv=kv_modes_from_preset(runtime_profile.kv_preset)[1],
-                prompt_tokens=prompt_tokens,
-                generated_tokens=generated_tokens,
-                command=command_preview,
-            )
-            record['benchmark_kind'] = 'raw_engine_search'
-            record['measurement_type'] = measurement_type
-            record['llama_bench_bin'] = llama_bench_bin
-            record['exit_code'] = exit_code
-            record['raw_command'] = command_preview
-            record['stdout_excerpt'] = benchmark_failure_excerpt(output, limit=500)
-            record['stderr_excerpt'] = ''
-            record['raw_phase'] = 'raw_engine_search'
-            record['raw_profile_index'] = profile_index
-            record['raw_profile_total'] = len(raw_profiles)
-            record['case_index'] = raw_index
-            record['case_total'] = raw_total
-            record['timeout_seconds'] = round(float(timeout), 2)
-            record['phase_budget_seconds'] = int(phase_budget)
-            record['timed_out'] = timed_out
-            record['cancelled'] = cancelled_case
-            if status != 'ok':
-                failed_cases += 1
-                if timed_out:
-                    apply_failure_context(record, output, default_category='RAW_ENGINE_TIMEOUT')
-                elif cancelled_case:
-                    record['failure_category'] = ''
-                    record['failure_reason'] = 'cancelled'
-                    record['suggested_fix'] = ''
-                else:
-                    apply_failure_context(record, output, default_category='API_TIMEOUT')
-            else:
-                weight = 1.0 if measurement_type in ('raw_tg', 'raw_combined') else 0.25
-                scores[key] = max(scores.get(key, 0.0), float(tps) * weight)
-            records.append(record)
-            if on_record:
-                on_record(dict(record))
-            emit_benchmark_event(
-                progress,
-                'benchmark_result',
-                model,
-                run_kind,
-                message=(
-                    f'TQ3 raw llama-bench {measurement_type} {status}: '
-                    f'{float(tps or 0.0):.2f} tok/s {runtime_profile.name}'
-                ),
-                phase='raw_engine_search',
-                completed=int(completed_offset + raw_index),
-                total=int(total if total is not None else raw_total),
-                candidate=candidate_label,
-                record=record,
-            )
-            if cancelled:
-                break
-        if cancelled or failed_cases >= TQ3_RAW_PRESEARCH_FAILURE_LIMIT or phase_deadline <= time.monotonic():
-            break
-
-    promoted_keys = [
-        key for key, _score in sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        if _score > 0
-    ][:2]
-    promoted = [profiles_by_key[key] for key in promoted_keys if key in profiles_by_key]
-    if cancelled:
-        raise CancelledError(cancel_token.reason if cancel_token is not None else 'cancelled')
-    return records, promoted
-
-
 def dedupe_runtime_profiles(runtime_profiles: List[RuntimeProfile]) -> List[RuntimeProfile]:
     selected: List[RuntimeProfile] = []
     seen = set()
@@ -6816,11 +6393,9 @@ def active_engine_runtime_profiles(
         engine = app.active_engine_key_for_model(model)
     except Exception:
         engine = getattr(model, 'runtime', 'llama.cpp')
-    if engine not in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT, ENGINE_BUUN, ENGINE_TQ3):
+    if engine not in (ENGINE_LLAMA_CPP, ENGINE_TURBOQUANT):
         return []
     if not str(getattr(model, 'path', '') or '').lower().endswith('.gguf'):
-        return []
-    if engine == 'tq3' and (getattr(model, 'tq3_status', '') or 'unknown').strip().lower() != 'native':
         return []
     try:
         capabilities = app.engine_capabilities()
@@ -6852,26 +6427,10 @@ def active_engine_runtime_profiles(
     moe = model_is_moe(model)
     if engine == 'turboquant':
         turbo_profiles = turboquant_auto_profiles(model, capabilities, benchmark_depth)
-    elif engine == 'tq3':
-        turbo_profiles = tq3_kv_profiles_for_model(model, capabilities, benchmark_depth)
     else:
-        turbo_profiles = supported_turbo_kv_profiles(capabilities, benchmark_depth, engine_id=engine)
-    turboquant_status = (getattr(model, 'turboquant_status', '') or 'unknown').strip().lower()
-    turboquant_compatible = turboquant_status in ('native', 'padded')
-    supports_turbo = bool(
-        engine == 'buun'
-        and getattr(getattr(app, 'runtime_profile', None), 'supports_turbo_kv', False)
-        and capabilities.supports_ctk_ctv
-        and has_gpu
-        and turbo_profiles
-        and turboquant_compatible
-    )
-    supports_buun_fit = bool(engine == 'buun' and has_gpu and capabilities.supports_fit)
-    fit_only_buun = bool(supports_buun_fit and (heavy_for_gpu or (moe and not fits_gpu)))
-    supports_cache_kv = bool(capabilities.supports_cache_type_kv and engine != 'buun')
-    base_ctx = max(ctx_min, min(ctx_max, 8192 if (moe or heavy_for_gpu or supports_turbo) else 4096))
-    if engine == 'tq3' and moe:
-        base_ctx = max(ctx_min, min(ctx_max, 4096))
+        turbo_profiles = []
+    supports_cache_kv = bool(capabilities.supports_cache_type_kv)
+    base_ctx = max(ctx_min, min(ctx_max, 8192 if (moe or heavy_for_gpu) else 4096))
     pressure_payload = current_process_pressure_payload()
     opencode_floor = observed_opencode_context_floor(model)
     context_points = dynamic_context_growth_targets(
@@ -6933,85 +6492,11 @@ def active_engine_runtime_profiles(
             tensor_overrides=tuple(placement.tensor_overrides or ()),
         )
 
-    def with_tq3_reasoning_off_candidates(items: List[RuntimeProfile]) -> List[RuntimeProfile]:
-        if not (
-            engine == 'tq3'
-            and moe
-            and capabilities.supports_reasoning
-            and capabilities.supports_reasoning_budget
-            and capabilities.supports_reasoning_format
-        ):
-            return items
-        selected: List[RuntimeProfile] = []
-        seen_reasoning_shapes = set()
-
-        def add_reasoning_seed(item: RuntimeProfile):
-            key = (
-                int(item.ctx_size or 0),
-                item.gpu_layers,
-                item.kv_preset,
-                item.placement_strategy,
-                item.cpu_moe,
-                item.n_cpu_moe,
-            )
-            if key in seen_reasoning_shapes:
-                return
-            seen_reasoning_shapes.add(key)
-            selected.append(item)
-
-        placement_items = [
-            item for item in items
-            if not item.fit and (bool(item.cpu_moe) or int(item.n_cpu_moe or 0) > 0)
-        ]
-        for item in placement_items:
-            if int(item.ctx_size or 0) == base_ctx:
-                add_reasoning_seed(item)
-                if len(selected) >= 2:
-                    break
-        target_contexts = [max(base_ctx, 16_384)]
-        tool_ctx = int(opencode_floor or 0) or 32_768
-        if benchmark_depth != 'fast':
-            target_contexts.append(max(base_ctx, tool_ctx))
-        for target in target_contexts:
-            match = next(
-                (
-                    item for item in placement_items
-                    if int(item.ctx_size or 0) >= target
-                    and str(item.kv_preset or '') == 'q8_0/q8_0'
-                ),
-                None,
-            )
-            if match is not None:
-                add_reasoning_seed(match)
-        limit = 2 if benchmark_depth == 'fast' else 4
-        selected = selected[:limit]
-        if not selected:
-            return items
-        result: List[RuntimeProfile] = []
-        emitted = set()
-        selected_ids = {id(item) for item in selected}
-        for item in items:
-            result.append(item)
-            if id(item) not in selected_ids:
-                continue
-            key = (item.name, item.ctx_size, item.kv_preset, item.placement_strategy, item.n_cpu_moe, item.cpu_moe)
-            if key in emitted:
-                continue
-            emitted.add(key)
-            result.append(replace(
-                item,
-                name=f'{item.name}_reasoning_off',
-                reasoning='off',
-                reasoning_budget=0,
-                reasoning_format='deepseek',
-            ))
-        return result
-
     def apply_strategy_limits(items: List[RuntimeProfile]) -> List[RuntimeProfile]:
         max_candidates = int(getattr(strategy, 'max_candidates', 0) or 0)
         if max_candidates <= 0 or len(items) <= max_candidates:
             return items
-        if strategy.id in ('tq3_native_probe', 'mtp_acceptance_matrix'):
+        if strategy.id == 'mtp_acceptance_matrix':
             return items[:max_candidates]
         if benchmark_depth == 'fast':
             return items[:max_candidates]
@@ -7019,7 +6504,7 @@ def active_engine_runtime_profiles(
 
     def finalized_profiles() -> List[RuntimeProfile]:
         if not moe_placements:
-            return apply_strategy_limits(with_tq3_reasoning_off_candidates(profiles))
+            return apply_strategy_limits(profiles)
         updated: List[RuntimeProfile] = [
             item if (
                 bool(getattr(item, 'cpu_moe', False))
@@ -7044,7 +6529,7 @@ def active_engine_runtime_profiles(
             for item in updated
         }
         if updated and all(bool(getattr(item, 'fit', False)) and getattr(item, 'gpu_layers', None) is None for item in updated):
-            return apply_strategy_limits(with_tq3_reasoning_off_candidates(updated))
+            return apply_strategy_limits(updated)
         preferred_seed_names = (
             'partial_gpu_probe',
             'kv_compression_probe',
@@ -7113,11 +6598,8 @@ def active_engine_runtime_profiles(
                     continue
                 profile_keys.add(key)
                 placement_updates.append(candidate)
-        if placement_updates and engine == 'tq3' and moe:
-            insert_at = next((idx for idx, item in enumerate(updated) if int(item.ctx_size or 0) > base_ctx), len(updated))
-            return apply_strategy_limits(with_tq3_reasoning_off_candidates(updated[:insert_at] + placement_updates + updated[insert_at:]))
         updated.extend(placement_updates)
-        return apply_strategy_limits(with_tq3_reasoning_off_candidates(updated))
+        return apply_strategy_limits(updated)
 
     def kv_for_strategy(strategy: str) -> str:
         if supports_cache_kv and strategy in ('kv_compression_probe', 'context_growth_sweep'):
@@ -7269,77 +6751,6 @@ def active_engine_runtime_profiles(
         target = int(ctx or base_ctx)
         return min(target, max(ctx_min, 4096, target // 8))
 
-    def fit_growth_contexts() -> Tuple[int, ...]:
-        available = [ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max]
-        floor = int(observed_opencode_context_floor(model) or 0)
-        if floor > base_ctx:
-            eligible = [ctx for ctx in context_points if ctx <= ctx_max]
-            floor_ctx = _nearest_context_at_or_above(eligible, floor)
-            if floor_ctx > base_ctx:
-                available.append(floor_ctx)
-        if benchmark_depth == 'fast':
-            selected = []
-            next_ctx = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
-            if next_ctx:
-                selected.append(next_ctx)
-            high_ctx = next((ctx for ctx in context_points if ctx > 32_768 and ctx <= ctx_max), 0)
-            if high_ctx:
-                selected.append(high_ctx)
-            if floor > base_ctx:
-                eligible = [ctx for ctx in context_points if ctx <= ctx_max]
-                floor_ctx = _nearest_context_at_or_above(eligible, floor)
-                if floor_ctx > base_ctx:
-                    selected.append(floor_ctx)
-            available = selected
-        return tuple(sorted(set(ctx for ctx in available if ctx > base_ctx and ctx <= ctx_max)))
-
-    def add_buun_fit_growth_profiles(include_turbo_ladder: bool):
-        growth_contexts = fit_growth_contexts()
-        if not growth_contexts:
-            return
-        if supports_turbo:
-            if include_turbo_ladder:
-                ladder_profiles = [
-                    item for item in turbo_profiles
-                    if not item.scalar and (
-                        benchmark_depth == 'full'
-                        or item.kv_preset in ('turbo4/turbo4', 'turbo3_tcq/turbo3_tcq', 'turbo3_tcq/turbo2_tcq')
-                    )
-                ]
-                preferred = next((item for item in ladder_profiles if item.kv_preset == 'turbo4/turbo4'), None)
-                preferred_profiles = [preferred or ladder_profiles[0]] if ladder_profiles else []
-            else:
-                preferred = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), None)
-                preferred_profiles = [preferred or turbo_profiles[0]] if turbo_profiles else []
-                ladder_profiles = preferred_profiles
-            for ctx in growth_contexts:
-                ctx_profiles = ladder_profiles if ctx <= 32_768 else preferred_profiles
-                for kv_profile in ctx_profiles:
-                    add(
-                        f'fit_context_growth_sweep_{ctx}_{kv_profile.name_slug}',
-                        ctx,
-                        None,
-                        kv_profile.kv_preset,
-                        batch=128,
-                        ubatch=64,
-                        kv_profile=kv_profile,
-                        fit=True,
-                        fit_context=fit_context_for(ctx),
-                        no_warmup=capabilities.supports_no_warmup,
-                    )
-        for ctx in growth_contexts:
-            add(
-                f'fit_context_growth_sweep_{ctx}',
-                ctx,
-                None,
-                'default',
-                batch=128,
-                ubatch=64,
-                fit=True,
-                fit_context=fit_context_for(ctx),
-                no_warmup=capabilities.supports_no_warmup,
-            )
-
     # MTP is a binary capability, not a dedicated engine: generate the MTP
     # benchmark family for any llama.cpp-compatible binary that advertises the
     # speculative MTP flags when the model is MTP-native / NextN-capable.
@@ -7455,73 +6866,6 @@ def active_engine_runtime_profiles(
                         add_mtp_fit_candidate(primary_ctx, draft, 1024, True, moe_overlay=True)
             return finalized_profiles()
 
-    if engine == 'tq3':
-        baseline_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/q8_0'), None)
-        baseline_kv = baseline_profile.kv_preset if baseline_profile is not None else 'q8_0/q8_0'
-
-        if not has_gpu:
-            add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile, benchmark_phase='server_sanity')
-            return finalized_profiles()
-
-        add('partial_gpu_probe', base_ctx, partial_ngl, baseline_kv, batch=128, ubatch=64, kv_profile=baseline_profile, benchmark_phase='server_sanity')
-        if moe:
-            growth_target = next((ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max), 0)
-            if growth_target:
-                suffix = baseline_profile.name_slug if baseline_profile is not None else 'q8_0_q8_0'
-                add(
-                    f'context_growth_sweep_{growth_target}_{suffix}',
-                    growth_target,
-                    partial_ngl,
-                    baseline_kv,
-                    batch=128,
-                    ubatch=64,
-                    kv_profile=baseline_profile,
-                    benchmark_phase='context_probe',
-                )
-            # Probe TQ3 KV-compression presets for MoE too, not just the
-            # q8_0 baseline -- the MoE path used to be a single candidate.
-            for kv_profile in turbo_profiles:
-                if kv_profile.kv_preset == baseline_kv:
-                    continue
-                add(
-                    f'moe_kv_compression_probe_{kv_profile.name_slug}',
-                    base_ctx,
-                    partial_ngl,
-                    kv_profile.kv_preset,
-                    batch=128,
-                    ubatch=64,
-                    kv_profile=kv_profile,
-                    benchmark_phase='kv_experiment',
-                )
-            return finalized_profiles()
-
-        for kv_profile in turbo_profiles:
-            if kv_profile.kv_preset == baseline_kv:
-                continue
-            add(
-                f'kv_compression_probe_{kv_profile.name_slug}',
-                base_ctx,
-                partial_ngl,
-                kv_profile.kv_preset,
-                kv_profile=kv_profile,
-                benchmark_phase='kv_experiment',
-            )
-        if benchmark_depth == 'full':
-            sweep_kv = baseline_kv
-            if fits_gpu:
-                add('gpu_layer_sweep_full', base_ctx, 999, sweep_kv, kv_profile=baseline_profile)
-            else:
-                sweep_center = max(4, partial_ngl)
-                sweep_values = [max(1, sweep_center - 4), sweep_center, sweep_center + 4, sweep_center + 8, sweep_center + 12]
-                for ngl in sorted(set(value for value in sweep_values if value > 0)):
-                    add(f'gpu_layer_sweep_ngl{ngl}', base_ctx, ngl, sweep_kv, kv_profile=baseline_profile)
-        growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
-        growth_kv = baseline_kv
-        for ctx in growth_contexts:
-            suffix = baseline_profile.name_slug if baseline_profile is not None else 'q8_0_q8_0'
-            add(f'context_growth_sweep_{ctx}_{suffix}', ctx, partial_ngl, growth_kv, kv_profile=baseline_profile)
-        return finalized_profiles()
-
     if engine == 'turboquant':
         baseline_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/q8_0'), None)
         safe_profile = next((item for item in turbo_profiles if item.kv_preset == 'q8_0/turbo4'), None)
@@ -7635,94 +6979,8 @@ def active_engine_runtime_profiles(
             add(f'context_growth_sweep_{ctx}_{suffix}', ctx, partial_ngl, growth_kv, kv_profile=preferred_profile, benchmark_phase='context_probe')
         return finalized_profiles()
 
-    if not (engine == 'buun' and has_gpu):
-        add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, 'default', batch=128, ubatch=64)
+    add('cpu_probe', min(base_ctx, max(ctx_min, 4096)), 0, 'default', batch=128, ubatch=64)
     if has_gpu:
-        initial_fit_kv = ''
-        if supports_buun_fit:
-            if supports_turbo:
-                turbo4_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), turbo_profiles[0])
-                initial_fit_kv = turbo4_profile.kv_preset
-                if has_locked_moe_placement():
-                    add(
-                        'moe_locked_probe',
-                        base_ctx,
-                        locked_moe_ngl(),
-                        turbo4_profile.kv_preset,
-                        batch=128,
-                        ubatch=64,
-                        kv_profile=turbo4_profile,
-                        no_warmup=capabilities.supports_no_warmup,
-                    )
-                add(
-                    'fit_turbokv_probe',
-                    base_ctx,
-                    None,
-                    turbo4_profile.kv_preset,
-                    batch=128,
-                    ubatch=64,
-                    kv_profile=turbo4_profile,
-                    fit=True,
-                    fit_context=fit_context_for(base_ctx),
-                    no_warmup=capabilities.supports_no_warmup,
-                )
-                add(
-                    'fit_default_probe',
-                    base_ctx,
-                    None,
-                    'default',
-                    batch=128,
-                    ubatch=64,
-                    fit=True,
-                    fit_context=fit_context_for(base_ctx),
-                    no_warmup=capabilities.supports_no_warmup,
-                )
-            else:
-                initial_fit_kv = 'default'
-                if has_locked_moe_placement():
-                    add(
-                        'moe_locked_probe',
-                        base_ctx,
-                        locked_moe_ngl(),
-                        'default',
-                        batch=128,
-                        ubatch=64,
-                        no_warmup=capabilities.supports_no_warmup,
-                    )
-                add(
-                    'fit_default_probe',
-                    base_ctx,
-                    None,
-                    'default',
-                    batch=128,
-                    ubatch=64,
-                    fit=True,
-                    fit_context=fit_context_for(base_ctx),
-                    no_warmup=capabilities.supports_no_warmup,
-                )
-            if not fit_only_buun:
-                add_buun_fit_growth_profiles(include_turbo_ladder=False)
-        if fit_only_buun:
-            if supports_turbo:
-                for kv_profile in turbo_profiles:
-                    if kv_profile.kv_preset == initial_fit_kv:
-                        continue
-                    add(
-                        f'fit_kv_compression_probe_{kv_profile.name_slug}',
-                        base_ctx,
-                        None,
-                        kv_profile.kv_preset,
-                        batch=128,
-                        ubatch=64,
-                        kv_profile=kv_profile,
-                        fit=True,
-                        fit_context=fit_context_for(base_ctx),
-                        no_warmup=capabilities.supports_no_warmup,
-                    )
-                add_buun_fit_growth_profiles(include_turbo_ladder=True)
-            else:
-                add_buun_fit_growth_profiles(include_turbo_ladder=False)
-            return finalized_profiles()
         if partial_ngl > 0:
             _probe_seed = ModelConfig(**asdict(model))
             _probe_seed.ngl = partial_ngl
@@ -7731,21 +6989,10 @@ def active_engine_runtime_profiles(
         else:
             gpu_probe_ctx = base_ctx
         add('partial_gpu_probe', gpu_probe_ctx, partial_ngl, kv_for_strategy('partial_gpu_probe'))
-        if supports_turbo:
-            for kv_profile in turbo_profiles:
-                name = 'kv_compression_probe' if kv_profile.kv_preset == 'turbo4/turbo4' else f'kv_compression_probe_{kv_profile.name_slug}'
-                add(
-                    name,
-                    gpu_probe_ctx,
-                    partial_ngl,
-                    kv_profile.kv_preset,
-                    kv_profile=kv_profile,
-                    no_warmup=capabilities.supports_no_warmup,
-                )
-        elif supports_cache_kv:
+        if supports_cache_kv:
             add('kv_compression_probe', gpu_probe_ctx, partial_ngl, kv_for_strategy('kv_compression_probe'))
         if benchmark_depth == 'full':
-            sweep_kv_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), None) if supports_turbo else None
+            sweep_kv_profile = None
             sweep_kv = sweep_kv_profile.kv_preset if sweep_kv_profile is not None else kv_for_strategy('gpu_layer_sweep')
             if fits_gpu:
                 add('gpu_layer_sweep_full', base_ctx, 999, sweep_kv, kv_profile=sweep_kv_profile)
@@ -7759,19 +7006,10 @@ def active_engine_runtime_profiles(
             add('kv_compression_probe', base_ctx, 0, kv_for_strategy('kv_compression_probe'))
 
     context_seed_ngl = partial_ngl if has_gpu else 0
-    if supports_turbo:
-        sweep_kv_profile = next((item for item in turbo_profiles if item.kv_preset == 'turbo4/turbo4'), turbo_profiles[0] if turbo_profiles else None)
-        growth_contexts = tuple(ctx for ctx in context_points if ctx > base_ctx and ctx <= ctx_max)
-        if sweep_kv_profile is not None:
-            for ctx in growth_contexts:
-                add(f'context_growth_sweep_{ctx}_{sweep_kv_profile.name_slug}', ctx, context_seed_ngl, sweep_kv_profile.kv_preset, kv_profile=sweep_kv_profile)
-        for ctx in growth_contexts:
-            add(f'context_growth_sweep_{ctx}', ctx, context_seed_ngl, 'default')
-    else:
-        context_kv = kv_for_strategy('context_growth_sweep')
-        for ctx in context_points:
-            if ctx > base_ctx and ctx <= ctx_max:
-                add(f'context_growth_sweep_{ctx}', ctx, context_seed_ngl, context_kv)
+    context_kv = kv_for_strategy('context_growth_sweep')
+    for ctx in context_points:
+        if ctx > base_ctx and ctx <= ctx_max:
+            add(f'context_growth_sweep_{ctx}', ctx, context_seed_ngl, context_kv)
     return finalized_profiles()
 
 
@@ -7793,7 +7031,7 @@ def model_for_runtime_profile(model: ModelConfig, runtime_profile: RuntimeProfil
     if profile_threads > 0:
         candidate.threads = profile_threads
     else:
-        candidate.threads = tq3_moe_cpu_placement_threads(candidate, runtime_profile)
+        candidate.threads = max(1, int(getattr(candidate, 'threads', 0) or 1))
     candidate.optimize_mode = 'manual'
     candidate.optimize_tier = 'measured'
     return candidate
@@ -7878,20 +7116,6 @@ def runtime_profile_config_fingerprint(candidate: ModelConfig, runtime_profile: 
         'extra_args': list(runtime_profile.extra_args or ()),
     }
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
-
-
-def runtime_profile_is_buun_fit(runtime_profile: RuntimeProfile) -> bool:
-    return (
-        str(getattr(runtime_profile, 'engine_id', '') or '') == 'buun'
-        and runtime_profile_uses_fit(runtime_profile)
-    )
-
-
-def runtime_profile_is_fixed_buun(runtime_profile: RuntimeProfile) -> bool:
-    return (
-        str(getattr(runtime_profile, 'engine_id', '') or '') == 'buun'
-        and runtime_profile_is_fixed_gpu_layers(runtime_profile)
-    )
 
 
 def runtime_profile_uses_fit(runtime_profile: RuntimeProfile) -> bool:
@@ -8162,18 +7386,9 @@ def benchmark_exhaustive_candidate_with_retry(
             'CUDA_OOM_WEIGHTS',
             'CUDA_OOM_KV',
             'KV_MODE_INCOMPATIBLE',
-            'BUUN_FIT_FAILED',
-            'BUUN_CPU_WARMUP_ABORT',
             'ENGINE_RUNTIME_CRASH',
         }
         if str(record.get('failure_category', '') or '') in deterministic_failures:
-            return False, True, records, measured, completed
-        if tq3_terminal_candidate_failure(record):
-            if progress:
-                progress(
-                    f'{benchmark_label} candidate {candidate_label} failed with '
-                    f'{record.get("failure_category") or record.get("status")}; not retrying TQ3 timeout/low-speed profile.'
-                )
             return False, True, records, measured, completed
         if attempt == 1 and progress:
             progress(f'{benchmark_label} candidate {candidate_label} failed once; retrying to confirm break...')
@@ -8289,20 +7504,11 @@ def benchmark_runtime_profile_with_retry(
             'CUDA_OOM_WEIGHTS',
             'CUDA_OOM_KV',
             'KV_MODE_INCOMPATIBLE',
-            'BUUN_FIT_FAILED',
-            'BUUN_CPU_WARMUP_ABORT',
             'ENGINE_RUNTIME_CRASH',
         }
         if str(record.get('failure_category', '') or '') in deterministic_failures:
             if progress:
                 progress(f'runtime profile candidate {candidate_label} failed with {record.get("failure_category")}; moving to a different profile.')
-            break
-        if tq3_terminal_candidate_failure(record, runtime_profile):
-            if progress:
-                progress(
-                    f'runtime profile candidate {candidate_label} failed with '
-                    f'{record.get("failure_category") or record.get("status")}; not retrying TQ3 timeout/low-speed profile.'
-                )
             break
         if attempt < attempts and progress:
             progress(f'runtime profile candidate {candidate_label} failed once; retrying to confirm break...')
@@ -8894,13 +8100,6 @@ def benchmark_smart_probe_with_retry(
         emit_exhaustive_result(progress, base_model, record, completed, total, candidate_label)
         if ok:
             return True, False, records, completed
-        if tq3_terminal_candidate_failure(record):
-            if progress:
-                progress(
-                    f'smart frontier probe {candidate_label} failed with '
-                    f'{record.get("failure_category") or record.get("status")}; not retrying TQ3 timeout/low-speed profile.'
-                )
-            return False, True, records, completed
         if attempt == 1 and progress:
             progress(f'smart frontier probe {candidate_label} failed once; retrying to confirm break...')
     return False, True, records, completed
@@ -8955,9 +8154,6 @@ def benchmark_exhaustive_profiles(
         24,
         SMART_FRONTIER_MAX_PROBES * 2 + 16,
     )
-    raw_total = tq3_raw_presearch_case_total(runtime_profiles, 'full')
-    if raw_total:
-        total += raw_total
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
@@ -9010,39 +8206,6 @@ def benchmark_exhaustive_profiles(
         completed=0,
         total=total,
     )
-
-    def persist_raw_record(record: Dict[str, object]):
-        nonlocal completed
-        records.append(dict(record))
-        completed += 1
-        persist_running_benchmark_progress(
-            app,
-            model,
-            run_id,
-            'server',
-            records,
-            started_at,
-            profile.short_summary(),
-        )
-
-    _raw_records, raw_promotions = run_tq3_raw_llama_bench_presearch(
-        app,
-        model,
-        profile,
-        runtime_profiles,
-        'full',
-        progress,
-        cancel_token,
-        on_record=persist_raw_record,
-        completed_offset=completed,
-        total=total,
-        run_kind='server',
-        deadline=deadline,
-    )
-    if raw_promotions:
-        runtime_profiles = dedupe_runtime_profiles(raw_promotions + runtime_profiles)
-        if progress:
-            progress(f'TQ3 raw llama-bench promoted {len(raw_promotions)} candidate(s) into server validation')
 
     def optional_refinement_allowed() -> bool:
         return smart_should_continue_optional(started_monotonic, measured, model, profile)
@@ -9937,6 +9100,26 @@ def _write_moe_tuning_logs(
 # _moe_tuning_warnings moved to moe_tuning.py.
 
 
+def _thread_sweep_values(default: int, perf: int, physical: int, logical: int) -> List[int]:
+    """Thread counts to empirically probe around the default.
+
+    The placement candidates run at ``default`` (the performance-core count on a
+    hybrid CPU). Probe a small ladder of higher counts to find where extra cores
+    stop helping (or start hurting) memory-bound expert GEMMs. Returns a bounded,
+    de-duplicated list excluding the already-measured ``default``.
+    """
+    logical = max(1, int(logical or 1))
+    candidates = [int(perf or 0), 6, int(physical or 0), logical]
+    seen = set()
+    values: List[int] = []
+    for value in candidates:
+        if value < 2 or value > logical or value == default or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return values[:3]
+
+
 def benchmark_moe_placement_tuning(
     app: AppConfig,
     model: ModelConfig,
@@ -10247,12 +9430,17 @@ def benchmark_moe_placement_tuning(
                 break
 
         # Empirical thread sweep: the placement candidates above all ran at the
-        # refreshed (physical) thread count. CPU-bound MoE expert work can scale
-        # past physical cores, so retest the top placements at the logical core
-        # count and keep whichever measures faster.
+        # refreshed default (the performance-core count on a hybrid CPU). Retest
+        # the top placements at a small ladder of higher thread counts and keep
+        # whichever measures faster. This reuses already-fitting candidates and
+        # only varies --threads (which does not change model memory placement),
+        # so it runs even when the n_cpu_moe ladder hit an early memory stop.
         physical_cores = int(getattr(profile, 'cpu_physical', 0) or 0)
         logical_cores = int(getattr(profile, 'cpu_logical', 0) or 0)
-        if logical_cores > physical_cores > 0 and not early_stop_text:
+        perf_cores = int(getattr(profile, 'cpu_performance', 0) or 0) or physical_cores
+        default_threads = int(getattr(model, 'threads', 0) or 0) or perf_cores
+        sweep_threads = _thread_sweep_values(default_threads, perf_cores, physical_cores, logical_cores)
+        if sweep_threads:
             interim_winner = select_measured_tuning_winner(records, objective)
 
             def _is_cpu_offload(rec: Dict[str, object]) -> bool:
@@ -10284,24 +9472,25 @@ def benchmark_moe_placement_tuning(
                 base_candidate = next((c for c in all_candidates if c.name == name), None)
                 if base_candidate is None:
                     continue
-                sweep_name = f'{name}_threads{logical_cores}'
-                if sweep_name in measured_candidate_names():
-                    continue
-                sweep_rp = replace(
-                    base_candidate.runtime_profile,
-                    threads=logical_cores,
-                    name=sweep_name,
-                )
-                thread_sweep_candidates.append(TuningCandidate(
-                    name=sweep_name,
-                    runtime_profile=sweep_rp,
-                    source='thread_sweep',
-                    risk='normal',
-                    expected_effect=f'{name} at {logical_cores} CPU threads',
-                ))
+                for thread_count in sweep_threads:
+                    sweep_name = f'{name}_threads{thread_count}'
+                    if sweep_name in measured_candidate_names():
+                        continue
+                    sweep_rp = replace(
+                        base_candidate.runtime_profile,
+                        threads=thread_count,
+                        name=sweep_name,
+                    )
+                    thread_sweep_candidates.append(TuningCandidate(
+                        name=sweep_name,
+                        runtime_profile=sweep_rp,
+                        source='thread_sweep',
+                        risk='normal',
+                        expected_effect=f'{name} at {thread_count} CPU threads',
+                    ))
             if thread_sweep_candidates and progress:
                 progress(
-                    f'MoE tuning thread sweep at {logical_cores} threads: '
+                    f'MoE tuning thread sweep at {sweep_threads} threads: '
                     f'{len(thread_sweep_candidates)} candidate(s)'
                 )
             all_candidates.extend(thread_sweep_candidates)
@@ -10681,9 +9870,6 @@ def benchmark_fast_profiles(
     contexts = fast_benchmark_contexts(model, profile)
     parallel_values = fast_benchmark_parallel_values(profile, model)
     total = max(1, len(runtime_profiles) if runtime_profiles else len(contexts) * (2 + len(parallel_values)) * 2)
-    raw_total = tq3_raw_presearch_case_total(runtime_profiles, 'fast')
-    if raw_total:
-        total += raw_total
     records: List[Dict[str, object]] = []
     measured: List[Dict[str, object]] = []
     current: Optional[ModelConfig] = None
@@ -10735,39 +9921,6 @@ def benchmark_fast_profiles(
         completed=0,
         total=total,
     )
-
-    def persist_raw_record(record: Dict[str, object]):
-        nonlocal completed
-        records.append(dict(record))
-        completed += 1
-        persist_running_benchmark_progress(
-            app,
-            model,
-            run_id,
-            'server_fast',
-            records,
-            started_at,
-            profile.short_summary(),
-        )
-
-    _raw_records, raw_promotions = run_tq3_raw_llama_bench_presearch(
-        app,
-        model,
-        profile,
-        runtime_profiles,
-        'fast',
-        progress,
-        cancel_token,
-        on_record=persist_raw_record,
-        completed_offset=completed,
-        total=total,
-        run_kind='server_fast',
-        deadline=deadline,
-    )
-    if raw_promotions:
-        runtime_profiles = dedupe_runtime_profiles(raw_promotions + runtime_profiles)
-        if progress:
-            progress(f'TQ3 raw llama-bench promoted {len(raw_promotions)} candidate(s) into server validation')
 
     try:
         if runtime_profiles:
