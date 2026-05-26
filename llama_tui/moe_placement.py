@@ -145,7 +145,14 @@ def generate_moe_placement_candidates(
         risk='aggressive',
     )
 
-    if has_gpu and not small_gpu:
+    # Empirical evidence (2026-05-26 gpt-oss-20b MXFP4 on RTX 4060 8GB):
+    # aggressively-quantized MoE models can fit fully on small VRAM at modest
+    # ctx even when the model_file_size exceeds gpu_total. When the engine
+    # supports -fit, the runtime auto-truncates ctx (and offloads layers) if
+    # the candidate doesn't actually fit, so a failed full_gpu attempt is
+    # cheap and a successful one wins outright. Drop the small_gpu exclusion
+    # whenever -fit can rescue us; keep it for engines without -fit.
+    if has_gpu and (not small_gpu or capabilities.supports_fit):
         body.append(full_gpu)
     if capabilities.supports_cpu_moe:
         body.append(cpu_all)

@@ -97,6 +97,35 @@ class MoePlacementTests(unittest.TestCase):
         self.assertNotIn('cpu_moe_all', names)
         self.assertFalse(any(name.startswith('n_cpu_moe_') for name in names))
 
+    def test_small_gpu_includes_full_gpu_candidate_when_fit_is_supported(self):
+        # Empirical 2026-05-26 finding: aggressively-quantized MoE models
+        # (e.g. MXFP4) can fit on small VRAM even when model_file_size > VRAM.
+        # When the engine supports -fit, full_gpu must be in the ladder so
+        # the benchmark gets a chance to discover that win; -fit handles
+        # truncation if the candidate doesn't actually fit.
+        with_fit = EngineCapabilities(
+            supports_cpu_moe=True,
+            supports_n_cpu_moe=True,
+            supports_fit=True,
+        )
+        without_fit = EngineCapabilities(
+            supports_cpu_moe=True,
+            supports_n_cpu_moe=True,
+            supports_fit=False,
+        )
+        small_gpu = HardwareProfile(gpu_memory_total=8 * 1024**3, gpu_memory_free=7 * 1024**3)
+
+        with patch('llama_tui.moe_placement.gguf_layer_count', return_value=40):
+            with_fit_names = {item.name for item in generate_moe_placement_candidates(
+                self.model(), small_gpu, with_fit, 'turboquant', 'full',
+            )}
+            without_fit_names = {item.name for item in generate_moe_placement_candidates(
+                self.model(), small_gpu, without_fit, 'llama.cpp', 'full',
+            )}
+
+        self.assertIn('full_gpu', with_fit_names)
+        self.assertNotIn('full_gpu', without_fit_names)
+
     def test_non_llama_family_engine_returns_no_candidates(self):
         caps = EngineCapabilities(supports_cpu_moe=True, supports_n_cpu_moe=True)
         candidates = generate_moe_placement_candidates(
