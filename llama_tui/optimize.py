@@ -32,6 +32,19 @@ MOE_GPU_PARTIAL_OFFLOAD_FRACTION_BY_TIER = {
     'moderate': 0.48,
     'extreme': 0.58,
 }
+# When the planner has already chosen a cpu_moe / full-CPU placement for a
+# MoE that doesn't fit GPU, only non-expert layers (embeddings + attention
+# projections + output head + router) live on GPU -- typically ~10-25% of
+# total weight bytes for 256x8-style MoEs. The general partial-offload
+# fraction above assumes *some* expert layers also stay on GPU; that
+# over-counts in the cpu_moe case and leaves too little of the GPU budget
+# for the KV cache, which then forces the ctx ladder to test values that
+# OOM at long ctx (qwen3-Q3_K_S 16GB on 8GB VRAM at ctx=131072, 2026-05-26).
+MOE_CPU_OFFLOAD_GPU_WEIGHT_FRACTION_BY_TIER = {
+    'safe': 0.22,
+    'moderate': 0.30,
+    'extreme': 0.38,
+}
 MAX_CONTEXT_RESERVE_BY_TIER = {
     'safe': 35,
     'moderate': 25,
@@ -204,16 +217,21 @@ def choose_gpu_layers_for_profile(model: ModelConfig, profile: Optional[Hardware
     layers = int(weight_budget / per_layer)
     return max(0, min(layer_count, layers))
 def kv_cache_uses_gpu(model: ModelConfig, profile: Optional[HardwareProfile]) -> bool:
+    # llama.cpp / turboquant place the KV cache on the GPU whenever there is
+    # a usable GPU, regardless of how many *layers* are GPU-offloaded -- the
+    # cache lives next to the attention compute. The legacy `ngl == 0`
+    # short-circuit was wrong: a model persisted with ngl=0 (e.g. a previous
+    # cpu_moe MoE winner) is launched by the benchmark candidate ladder with
+    # -fit on / different ngl values, and even at ngl=0 the runtime keeps
+    # KV on GPU. Treating that case as "KV on CPU" disabled the entire GPU
+    # ctx budget in estimate_gpu_context_for_profile, allowing candidates
+    # at ctx=131072 on an 8 GB GPU that immediately OOMed in practice.
+    # Only honour an explicit --no-kv-offload (which DOES route KV to CPU).
     if not profile or not profile.has_usable_gpu():
         return False
-    if getattr(model, 'runtime', 'llama.cpp') != 'llama.cpp':
-        return True
     if has_extra_flag(list(getattr(model, 'extra_args', []) or []), '--no-kv-offload', '-nkvo'):
         return False
-    try:
-        return int(getattr(model, 'ngl', 0) or 0) != 0
-    except Exception:
-        return True
+    return True
 def estimate_gpu_workspace_bytes(profile: HardwareProfile, model: Optional[ModelConfig] = None) -> int:
     total = profile.gpu_memory_total or profile.gpu_memory_free
     if total <= 0:
@@ -243,6 +261,19 @@ def estimate_gpu_weight_bytes(model: ModelConfig, profile: HardwareProfile, tier
         tier,
         table['moderate'],
     )
+    # cpu_moe-aware refinement: when an MoE has cpu_moe set or has been
+    # parked at ngl=0 by a previous winner, the general partial-offload
+    # fraction over-counts the GPU weight footprint (it assumes some
+    # experts stay on GPU). Cap with the cpu_moe-specific fraction so the
+    # KV budget gets the room it actually has.
+    if model_is_moe(model) and (
+        bool(getattr(model, 'cpu_moe', False))
+        or int(getattr(model, 'ngl', 0) or 0) == 0
+    ):
+        cpu_moe_fraction = MOE_CPU_OFFLOAD_GPU_WEIGHT_FRACTION_BY_TIER.get(
+            tier, MOE_CPU_OFFLOAD_GPU_WEIGHT_FRACTION_BY_TIER['moderate']
+        )
+        offload_fraction = min(offload_fraction, cpu_moe_fraction)
     offload_fraction *= process_pressure_budget_factor(profile)
     return min(int(usable_gpu * offload_fraction), int(size * 0.95))
 def estimate_gpu_context_for_profile(
