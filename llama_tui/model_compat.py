@@ -28,7 +28,7 @@ TQ3_TEXT_RE = re.compile(r'(?i)(?:^|[^a-z0-9])tq3(?:[-_]?(?:1s|4s|native))?(?:[^
 MTP_TEXT_RE = re.compile(r'(?i)(?:^|[^a-z0-9])(?:gguf[-_]?mtp|native[-_]?mtp|mtp|nextn|next[-_]?n)(?:[^a-z0-9]|$)')
 TURBOQUANT_TEXT_RE = re.compile(r'(?i)(?:^|[^a-z0-9])(?:turboquant|tq4(?:[-_]?(?:1s|native))?)(?:[^a-z0-9]|$)')
 QUANT_TEXT_RE = re.compile(
-    r'(?i)(?:^|[^a-z0-9])(?:q[2-8](?:_[a-z0-9]+)*|iq[1-4](?:_[a-z0-9]+)*|f16|bf16|f32|tq3(?:_[14]s)?)(?:[^a-z0-9]|$)'
+    r'(?i)(?:^|[^a-z0-9])(?:mxfp\d+(?:_[a-z0-9]+)?|q[2-8](?:_[a-z0-9]+)*|iq[1-4](?:_[a-z0-9]+)*|f16|bf16|f32|tq3(?:_[14]s)?)(?:[^a-z0-9]|$)'
 )
 COMPATIBLE_STATUSES = {'preferred', 'compatible', 'compatible_with_warning'}
 

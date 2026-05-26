@@ -78,7 +78,7 @@ def extract_quant(model: ModelConfig) -> str:
         getattr(model, 'alias', '') or '',
         getattr(model, 'path', '') or '',
     ])
-    pattern = re.compile(r'(?i)(tq\d+(?:_[a-z0-9]+)+|iq\d+(?:_[a-z0-9]+)+|iq\d+(?:\.\d+)?|q\d+(?:_[a-z0-9]+)+|q\d+(?:\.\d+)?(?:_[a-z0-9]+)*|bf16|fp16|f16|bf8|fp8|f32|fp32|int8|int4)')
+    pattern = re.compile(r'(?i)(mxfp\d+(?:_[a-z0-9]+)?|tq\d+(?:_[a-z0-9]+)+|iq\d+(?:_[a-z0-9]+)+|iq\d+(?:\.\d+)?|q\d+(?:_[a-z0-9]+)+|q\d+(?:\.\d+)?(?:_[a-z0-9]+)*|bf16|fp16|f16|bf8|fp8|f32|fp32|int8|int4)')
     match = pattern.search(text)
     if not match:
         return '-'

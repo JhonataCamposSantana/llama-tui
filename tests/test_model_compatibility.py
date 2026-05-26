@@ -148,6 +148,23 @@ class ModelCompatibilityTests(unittest.TestCase):
         self.assertEqual(result.status, 'compatible_with_warning')
         self.assertTrue(result.compatible)
 
+    def test_mxfp4_filename_is_recognised_as_a_known_quant(self):
+        # Before 2026-05-26 a GGUF named *.MXFP4_MOE.gguf (e.g. OpenAI's
+        # natively MXFP4-released gpt-oss) failed both extract_quant() and
+        # _has_known_quant_hint() -- it was silently tagged 'unknown_quant'
+        # in detect_model_runtime_features and surfaced as '-' in the UI.
+        # MXFP4 is just FP4 with a per-block FP exponent; it's a real
+        # quant, and the bench evidence proves it's the model's *native*
+        # precision target. Recognise it like any other quant.
+        from llama_tui.discovery import extract_quant
+        mxfp4 = model('gpt-oss-moe', '/models/gpt-oss-20b.i1-MXFP4_MOE.gguf')
+        plain = model('mxfp4-plain', '/models/gpt-oss-20b-MXFP4.gguf')
+
+        self.assertEqual(extract_quant(mxfp4), 'MXFP4_MOE')
+        self.assertEqual(extract_quant(plain), 'MXFP4')
+        self.assertNotIn('unknown_quant', detect_model_runtime_features(mxfp4))
+        self.assertNotIn('unknown_quant', detect_model_runtime_features(plain))
+
     def test_browser_defaults_can_filter_by_active_engine_compatibility(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = AppConfig(Path(tmp) / 'models.json')
