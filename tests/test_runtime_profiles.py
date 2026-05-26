@@ -98,7 +98,7 @@ class RuntimeProfileTests(unittest.TestCase):
 
     def test_turboquant_value_explicit_flag_tracks_user_intent(self):
         # The served launch needs to tell "user pinned a value cache" apart
-        # from "value defaulted to q8_0" so it can apply the turbo3 default
+        # from "value defaulted to q8_0" so it can apply the turbo4 default
         # only in the latter case. --kv (shorthand) and --kv-value pin the
         # value; --kv-key alone does not.
         with patch.dict(os.environ, {}, clear=False):

@@ -131,17 +131,19 @@ class ModelVerificationTests(unittest.TestCase):
         model.turboquant_value_dim = overrides.get('turboquant_value_dim', 128)
         return model
 
-    def test_turboquant_default_serves_turbo3_for_compatible_models(self):
+    def test_turboquant_default_serves_turbo4_for_compatible_models(self):
         # Regression: a plain `--engine turboquant` session used to serve
         # -ctv q8_0 (zero turbo compression). Compatible (native/padded,
         # head_dim>=128) models now default the value cache to the
-        # benchmark-validated turbo3.
+        # benchmark-validated turbo4 (2026-05-26 A/B: turbo4 was the safer
+        # choice -- ~neutral on dense models and equal-or-better on MoE
+        # vs turbo3, with less aggressive quantization).
         app = self.turbo_app()
         native = self.turbo_model(turboquant_status='native', turboquant_key_dim=256, turboquant_value_dim=256)
         padded = self.turbo_model(turboquant_status='padded', turboquant_key_dim=192, turboquant_value_dim=192)
 
-        self.assertEqual(app.turboquant_served_kv_preset(native), 'q8_0/turbo3')
-        self.assertEqual(app.turboquant_served_kv_preset(padded), 'q8_0/turbo3')
+        self.assertEqual(app.turboquant_served_kv_preset(native), 'q8_0/turbo4')
+        self.assertEqual(app.turboquant_served_kv_preset(padded), 'q8_0/turbo4')
 
     def test_turboquant_incompatible_or_unknown_falls_back_to_q8(self):
         app = self.turbo_app()
@@ -177,7 +179,34 @@ class ModelVerificationTests(unittest.TestCase):
         # A stale llama.cpp record (f16) never leaks into a turbo launch.
         stale = self.turbo_model(turboquant_status='native', turboquant_key_dim=128, turboquant_value_dim=128)
         stale.measured_profiles = {'auto': {'status': 'ok', 'kv_preset': 'f16/f16', 'tokens_per_sec': 30.0}}
-        self.assertEqual(app.turboquant_served_kv_preset(stale), 'q8_0/turbo3')
+        self.assertEqual(app.turboquant_served_kv_preset(stale), 'q8_0/turbo4')
+
+    def test_turboquant_per_model_override_beats_default_and_winner(self):
+        # A user pin on the model (e.g. q4_0/q4_0 for an MXFP4 weight that
+        # tolerates it -- 2026-05-26 bench) overrides the validated default
+        # AND any persisted benchmark winner, but yields to an explicit
+        # session --kv-value passed on the CLI.
+        app = self.turbo_app()
+        native = self.turbo_model(turboquant_status='native', turboquant_key_dim=128, turboquant_value_dim=128)
+        native.kv_key_mode = 'q4_0'
+        native.kv_value_mode = 'q4_0'
+        native.measured_profiles = {'auto': {'status': 'ok', 'kv_preset': 'q8_0/turbo2', 'tokens_per_sec': 12.0}}
+        self.assertEqual(app.turboquant_served_kv_preset(native), 'q4_0/q4_0')
+
+        # An explicit session flag still wins over the per-model pin.
+        explicit_session = self.turbo_app(kv_value_mode='turbo3')
+        self.assertEqual(explicit_session.turboquant_served_kv_preset(native), 'q8_0/turbo3')
+
+        # Per-model V only -- K falls through to the session default (q8_0).
+        v_only = self.turbo_model(turboquant_status='native', turboquant_key_dim=128, turboquant_value_dim=128)
+        v_only.kv_value_mode = 'q5_1'
+        self.assertEqual(app.turboquant_served_kv_preset(v_only), 'q8_0/q5_1')
+
+        # A turbo pin on a head_dim=64 model still gets downgraded -- the
+        # model can't run turbo blocks no matter who set the preference.
+        unfit = self.turbo_model(turboquant_status='incompatible', turboquant_key_dim=64, turboquant_value_dim=64)
+        unfit.kv_value_mode = 'turbo3'
+        self.assertEqual(app.turboquant_served_kv_preset(unfit), 'q8_0/q8_0')
 
     def test_tq3_native_gguf_is_unsupported_on_every_engine(self):
         # TQ3 engine removed (2026-05): a TQ3-native GGUF (detected by name)

@@ -14,11 +14,15 @@ DEFAULT_TURBOQUANT_LLAMA_SERVER = (
     else 'turboquant-llama-server'
 )
 TURBOQUANT_KV_MODES = ('q8_0', 'turbo4', 'turbo3', 'turbo2')
-# Benchmark-validated default value cache for compatible TurboQuant+ models
-# (RTX 4060 8GB + i5-13420H): -ctk q8_0 -ctv turbo3 was the measured winner.
-# Used only when the user has not pinned a value cache and no benchmark
+# Benchmark-validated default value cache for compatible TurboQuant+ models.
+# 2026-05-26 A/B (RTX 4060 8 GB + i5-13420H) preferred turbo4 over turbo3:
+#   gemma-4-e4b dense:  turbo4 ~neutral (-0.1..-1.5%) vs turbo3 (-3.5..-5.9%)
+#   qwen3-6-35b MoE:    turbo4 +6.5..+80.4%; turbo3 +12..+48.3%
+# turbo4 is the less aggressive quant (fewer bits compressed -> less quality
+# risk) and at least matches turbo3 on decode tok/s here. Used only when the
+# user has not pinned a value cache (per-model or session) and no benchmark
 # winner is persisted; incompatible/small-head models fall back to q8_0.
-DEFAULT_TURBOQUANT_VALUE_MODE = 'turbo3'
+DEFAULT_TURBOQUANT_VALUE_MODE = 'turbo4'
 COMMON_KV_MODES = (
     'f32',
     'f16',

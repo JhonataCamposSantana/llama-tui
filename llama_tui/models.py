@@ -102,6 +102,13 @@ class ModelConfig:
     cpu_moe: bool = False
     n_cpu_moe: int = 0
     tensor_overrides: List[str] = field(default_factory=list)
+    # Per-model TurboQuant+ KV overrides. When set, take priority over the
+    # validated default but yield to an explicit session --kv*-value flag.
+    # Useful when an aggressively-quantized weight (e.g. MXFP4) tolerates a
+    # smaller KV (e.g. q4_0) that would break a sibling model on different
+    # weights -- see /home/jhonata/llama-tui-bench-2026-05-26-findings.md.
+    kv_key_mode: str = ''
+    kv_value_mode: str = ''
     extra_args: List[str] = field(default_factory=list)
     launch_overrides: Dict[str, object] = field(default_factory=dict)
     favorite: bool = False

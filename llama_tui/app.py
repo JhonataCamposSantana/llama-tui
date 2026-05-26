@@ -894,10 +894,19 @@ class AppConfig:
     def turboquant_served_kv_preset(self, model: ModelConfig) -> str:
         """Resolve the -ctk/-ctv pair for a served TurboQuant+ launch.
 
-        Priority: an explicit session value cache wins; otherwise a persisted
-        benchmark winner; otherwise the validated turbo3 default for
-        confirmed-compatible models. Incompatible / sub-128 head dims always
-        fall back to q8_0/q8_0 since the turbo block size cannot fit them.
+        Priority (most -> least specific):
+        1. Explicit session value cache (--kv / --kv-value on the CLI).
+        2. Per-model override stored in models.json (kv_key_mode/kv_value_mode).
+        3. Persisted benchmark winner in measured_profiles['auto'].
+        4. Validated default (DEFAULT_TURBOQUANT_VALUE_MODE) for compatible
+           native/padded head dims >=128.
+        5. Safe q8_0/q8_0 fallback for incompatible / sub-128 / unknown.
+
+        Per-model overrides let a specific GGUF pin its KV (e.g. q4_0/q4_0
+        for an MXFP4 weight that tolerates it) without leaking to siblings
+        where the same KV would break coherence -- 2026-05-26 bench showed
+        q4_0/q4_0 was a +22% win on gpt-oss MXFP4 but produced garbage on
+        the same arch with Q4_K weights.
         """
         key_mode, value_mode = self.runtime_profile.turboquant_kv_pair()
         key_mode = (key_mode or 'q8_0').strip() or 'q8_0'
@@ -910,6 +919,16 @@ class AppConfig:
             if value_mode.startswith('turbo') and turbo_incompatible:
                 return 'q8_0/q8_0'
             return f'{key_mode}/{value_mode}'
+
+        model_v = str(getattr(model, 'kv_value_mode', '') or '').strip().lower()
+        model_k = str(getattr(model, 'kv_key_mode', '') or '').strip().lower()
+        if model_v or model_k:
+            chosen_k = model_k or key_mode
+            chosen_v = model_v or model_k or value_mode
+            # Downgrade if the model truly can't run a turbo KV block.
+            if (chosen_v.startswith('turbo') or chosen_k.startswith('turbo')) and turbo_incompatible:
+                return 'q8_0/q8_0'
+            return f'{chosen_k}/{chosen_v}'
 
         if turbo_incompatible:
             return 'q8_0/q8_0'
