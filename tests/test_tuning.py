@@ -127,6 +127,37 @@ def small_gpu_hardware() -> HardwareProfile:
 
 
 class TuningHelperTests(unittest.TestCase):
+    def test_mtp_acceptance_skip_reason_explains_partial_state(self):
+        # 2026-05-26: when the MTP optimizer lands a 'partial' record (probe
+        # accepted drafted tokens but its API call timed out before measuring
+        # decode tok/s), MoE tuning's strict `==ok` gate rejects it. The old
+        # diagnostic just said "no usable MTP acceptance winner is saved",
+        # which contradicted the MTP optimizer's own "usable partial" log
+        # and gave no actionable next step. The diagnostic now distinguishes
+        # no-record / partial / nothing-usable cases.
+        from llama_tui.moe_tuning import _moe_tuning_mtp_acceptance_required_reason
+        from llama_tui.models import ModelConfig
+
+        bare = ModelConfig(id='m', name='M', path='/x/m.gguf', alias='m', port=18080)
+        empty_reason = _moe_tuning_mtp_acceptance_required_reason(bare)
+        self.assertIn('no MTP acceptance record saved', empty_reason)
+
+        with_partial = ModelConfig(id='m', name='M', path='/x/m.gguf', alias='m', port=18080)
+        with_partial.measured_profiles = {
+            'mtp_acceptance': {
+                'status': 'partial',
+                'mtp_enabled': True,
+                'accept_rate': 0.50,
+                'tokens_per_sec': 13.00,
+                'mtp_draft_n_max': 3,
+            }
+        }
+        partial_reason = _moe_tuning_mtp_acceptance_required_reason(with_partial)
+        self.assertIn('only `partial`', partial_reason)
+        self.assertIn('50%', partial_reason)
+        self.assertIn('13.00', partial_reason)
+        self.assertIn('smaller', partial_reason)
+
     def test_dynamic_ladder_clamps_and_dedupes(self):
         self.assertEqual(generate_n_cpu_moe_ladder(0), [])
         values = generate_n_cpu_moe_ladder(4)
@@ -450,6 +481,8 @@ class MoeTuningRunnerTests(unittest.TestCase):
         self.assertTrue(ok, msg)
         self.assertIn('MTP-aware MoE placement: spec_type=draft-mtp draft_n=3 no_warmup=on', progress)
         self.assertIn('Skipping no-MTP MoE baseline for recurrent/NextN model', progress)
+        # Warning is correct here because mtp_tuning_caps() doesn't set
+        # supports_fit -- there's no -fit to rescue the full-GPU attempt.
         self.assertIn('Full GPU MoE placement omitted: model does not fit current VRAM headroom', progress)
         self.assertIn('--spec-type', args)
         self.assertEqual(args[args.index('--spec-type') + 1], 'draft-mtp')
@@ -459,6 +492,32 @@ class MoeTuningRunnerTests(unittest.TestCase):
         self.assertEqual(first_record['mtp_draft_n_max'], 3)
         self.assertTrue(first_record['mtp_enabled'])
         self.assertIn('--spec-type draft-mtp --spec-draft-n-max 3', first_record['effective_server_args_preview'])
+
+    def test_full_gpu_placement_warning_suppressed_when_fit_supported(self):
+        # 2026-05-26: the warning ('Full GPU MoE placement omitted...') used
+        # to fire whenever no coarse candidate had gpu_layers=999 on a small
+        # GPU. With -fit on supported, generate_moe_tuning_candidates
+        # deliberately sets gpu_layers=None on every candidate (let -fit
+        # decide), so the warning fired on every fit-capable run -- pure
+        # noise. The fit-capable path IS a full-GPU attempt; the warning
+        # should be suppressed.
+        from dataclasses import replace
+        self.configure_mtp_model()
+        progress = []
+        fit_caps = replace(mtp_tuning_caps(), supports_fit=True, supports_fit_ctx=True)
+
+        ok, _msg = self.run_tuning(
+            self.fake_runtime_benchmark([], {'baseline_current': 9.0, 'cpu_moe_all': 12.0}),
+            layer_count=41,
+            hardware=small_gpu_hardware(),
+            capabilities=fit_caps,
+            progress=progress.append,
+        )
+        self.assertTrue(ok)
+        self.assertNotIn(
+            'Full GPU MoE placement omitted: model does not fit current VRAM headroom',
+            progress,
+        )
 
     def test_mtp_aware_moe_tuning_continues_after_guardrail_failure(self):
         self.configure_mtp_model()

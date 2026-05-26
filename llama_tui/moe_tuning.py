@@ -138,6 +138,36 @@ def _moe_tuning_mtp_blocked_reason(capabilities) -> str:
 
 
 def _moe_tuning_mtp_acceptance_required_reason(model: ModelConfig) -> str:
+    # The MTP optimizer can land a "usable partial" record (probe accepted
+    # drafted tokens, captured an accept_rate, but its API call timed out
+    # before producing tokens_per_sec). MoE tuning intentionally rejects
+    # partials -- applying MTP based on acceptance alone regressed
+    # baseline tok/s ~20% before commit cdf42d6 added the strict gate.
+    # When only a partial exists the previous one-size-fits-all message
+    # "no usable MTP acceptance winner is saved" contradicted the MTP
+    # optimizer's own "usable partial" log line and gave no actionable
+    # next step. Categorise the actual saved state so the user can tell
+    # "no probe yet" from "partial, re-run smaller".
+    records = annotate_mtp_optimizer_records(_model_mtp_acceptance_records(model))
+    enabled = [r for r in records if bool(r.get('mtp_enabled'))]
+    if not enabled:
+        return (
+            'MTP-aware MoE placement skipped: no MTP acceptance record saved. '
+            'Run MTP Optimizer first so MoE tuning can reuse a measured draft_n.'
+        )
+    partials = [r for r in enabled if str(r.get('status', '') or '') == 'partial']
+    if partials:
+        best = max(partials, key=lambda r: float(r.get('accept_rate', 0.0) or 0.0))
+        accept_rate_pct = float(best.get('accept_rate', 0.0) or 0.0) * 100.0
+        tps = float(best.get('tokens_per_sec', 0.0) or 0.0)
+        tps_clause = f', decode={tps:.2f} tok/s' if tps > 0 else ', no decode tok/s'
+        return (
+            'MTP-aware MoE placement skipped: only `partial` MTP acceptance is saved '
+            f'(best accept_rate={accept_rate_pct:.0f}%{tps_clause}). The strict gate '
+            'requires status=ok (probe completed AND measured tokens_per_sec) before '
+            'MTP is applied to MoE candidates -- re-run MTP Optimizer at a smaller '
+            'ctx so the probe finishes without timing out.'
+        )
     return (
         'MTP-aware MoE placement skipped: no usable MTP acceptance winner is saved. '
         'Run MTP Optimizer first so MoE tuning can reuse a measured draft_n.'

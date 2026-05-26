@@ -507,7 +507,18 @@ def build_opencode_run_command(app, model: ModelConfig, workspace: Path, prompt:
 def opencode_candidate_models(model: ModelConfig, profile) -> List[Tuple[str, str, ModelConfig, str]]:
     candidates: List[Tuple[str, str, ModelConfig, str]] = []
     seen = set()
-    observed_floor = max(0, int(observed_opencode_context_floor(model) or 0))
+    # 2026-05-26: opencode workflow tasks typically request several thousand
+    # tokens (5K+ observed on real cases). On first-time runs the observed
+    # floor is 0, so without a default MoE floor we waste ladder slots on
+    # ctx=2048 candidates that immediately hit "below observed request".
+    # Mirror the MoE-aware default already used elsewhere (benchmark.py:3339)
+    # so a fresh MoE bench starts at a sensible minimum ctx.
+    is_moe = str(getattr(model, 'architecture_type', '') or '').strip().lower() == 'moe'
+    observed_floor = max(
+        0,
+        int(observed_opencode_context_floor(model) or 0),
+        16384 if is_moe else 0,
+    )
     # Under medium/high memory pressure, prune aggressive long-context probes
     # (e.g. 131072) so OpenCode tests 65536 first and avoids guardrail OOMs.
     memory_constrained = workflow_memory_pressure_constrained(profile)
@@ -1065,6 +1076,21 @@ def opencode_failure_summary(records: List[Dict[str, object]]) -> str:
     required = max([int(row.get('context_required', 0) or 0) for row in records if isinstance(row, dict)] or [0])
     largest = max([int(row.get('ctx_per_slot', 0) or 0) for row in records if isinstance(row, dict)] or [0])
     if required:
+        if largest >= required:
+            # Big-MoE-on-small-VRAM case: the ladder did test ctx large enough
+            # for the workflow's request but the runtime still failed -- almost
+            # always KV-cache OOM at long ctx on a model that needs cpu_moe
+            # weight offload (KV stays on GPU even when weights are on CPU).
+            # Point the user at the actionable knobs (per-model overrides shipped
+            # 2026-05-26: kv_key_mode/kv_value_mode + ctx_max in models.json).
+            suggested = max(8192, min(32768, ((required * 2) // 1024) * 1024 + 4096))
+            return (
+                f'no candidate completed; OpenCode requested about {required} tokens, '
+                f'largest tested ctx/slot was {largest} -- candidates with enough ctx '
+                f'still failed, likely KV-cache OOM at long ctx on small VRAM. '
+                f'Try pinning ctx_max~={suggested} for this model or kv_value_mode '
+                f'(per-model in models.json) so the KV cache fits.'
+            )
         return f'no candidate completed; OpenCode requested about {required} tokens, largest tested ctx/slot was {largest}'
     best_partial = max(
         (

@@ -8909,9 +8909,19 @@ def benchmark_moe_placement_tuning(
         if _model_has_nextn_or_recurrent_features(model):
             log_moe_tuning_line('Skipping no-MTP MoE baseline for recurrent/NextN model')
     gpu_total = int(getattr(profile, 'gpu_memory_total', 0) or 0)
+    # When the engine supports -fit, generate_moe_tuning_candidates sets
+    # gpu_layers=None on every candidate so the runtime can size the offload
+    # itself (full GPU attempt with auto-truncation on overflow). That's
+    # functionally equivalent to a "full GPU placement" candidate, so the
+    # "omitted: model does not fit" warning is just noise -- skip it.
+    fit_capable = bool(
+        getattr(capabilities, 'supports_fit', False)
+        and getattr(capabilities, 'supports_fit_ctx', False)
+    )
     if (
         layer_count > 0
         and 0 < gpu_total <= 9 * (1024 ** 3)
+        and not fit_capable
         and not any(candidate.runtime_profile.gpu_layers == 999 for candidate in coarse_candidates)
     ):
         log_moe_tuning_line('Full GPU MoE placement omitted: model does not fit current VRAM headroom')
