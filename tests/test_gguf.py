@@ -60,6 +60,41 @@ class ModelExtraArgTests(unittest.TestCase):
         self.assertEqual(extra_arg_value(model.extra_args, '--threads'), '6')
         self.assertEqual(model.extra_args.count('--ctx-size'), 1)
 
+    def test_selected_cache_type_turboquant_aware_default(self):
+        # 2026-05-26: a turboquant-eligible model (native/padded,
+        # head_dim>=128) actually launches with q8_0/turbo4 by default
+        # (see AppConfig.turboquant_served_kv_preset). The estimator must
+        # agree -- using f16 for both made kv_per_token 2-4x too high
+        # and pushed every ctx cap below what would actually fit.
+        model = _model()
+        model.turboquant_status = 'native'
+        model.turboquant_head_dim = 256
+        self.assertEqual(selected_cache_type(model, 'k'), 'q8_0')
+        self.assertEqual(selected_cache_type(model, 'v'), 'turbo4')
+
+        small_head = _model()
+        small_head.turboquant_status = 'incompatible'
+        small_head.turboquant_head_dim = 64
+        self.assertEqual(selected_cache_type(small_head, 'k'), 'f16')
+        self.assertEqual(selected_cache_type(small_head, 'v'), 'f16')
+
+    def test_selected_cache_type_per_model_override_beats_default(self):
+        # Per-model kv_key_mode/kv_value_mode pin (e.g. q4_0/q4_0 for an
+        # MXFP4 GGUF that tolerates it) must reflect in the estimator
+        # too, not just the served launch.
+        model = _model()
+        model.kv_key_mode = 'q4_0'
+        model.kv_value_mode = 'q4_0'
+        self.assertEqual(selected_cache_type(model, 'k'), 'q4_0')
+        self.assertEqual(selected_cache_type(model, 'v'), 'q4_0')
+
+        # Explicit -ctk/-ctv still wins over per-model pin.
+        explicit = _model(['-ctk', 'q5_1', '-ctv', 'q5_1'])
+        explicit.kv_key_mode = 'q4_0'
+        explicit.kv_value_mode = 'q4_0'
+        self.assertEqual(selected_cache_type(explicit, 'k'), 'q5_1')
+        self.assertEqual(selected_cache_type(explicit, 'v'), 'q5_1')
+
     def test_selected_cache_type_default_and_override(self):
         self.assertEqual(selected_cache_type(_model(), 'k'), 'f16')
         self.assertEqual(
@@ -163,6 +198,48 @@ class EstimateKvBytesTests(unittest.TestCase):
             kv_bytes = estimate_kv_bytes_per_token(model)
         dense = 42 * 8 * (256 * 2 + 256 * 2)
         expected = int(dense * 1.08)
+        self.assertEqual(kv_bytes, expected)
+
+    def test_hybrid_ssm_arch_scales_down_dense_estimate(self):
+        # 2026-05-26: Nemotron-H interleaves SSM/Mamba layers (no KV) with
+        # attention layers. Treating every layer as attention returned
+        # 920 KiB/token for iq4-xs (Nemotron-3 30B-A3B MoE IQ4_XS), capping
+        # ctx at 2,561 vs the empirically-working 32k. Apply the hybrid
+        # attention-layer fraction.
+        metadata = {
+            'general.architecture': 'nemotron_h_moe',
+            'nemotron_h_moe.block_count': 52,
+            'nemotron_h_moe.attention.head_count': 32,
+            'nemotron_h_moe.attention.head_count_kv': 8,
+            'nemotron_h_moe.embedding_length': 4096,
+            'nemotron_h_moe.attention.key_length': 128,
+            'nemotron_h_moe.attention.value_length': 128,
+        }
+        model = ModelConfig(id='m', name='M', path='/m.gguf', alias='m')
+        with patch('llama_tui.gguf.read_gguf_metadata', return_value=metadata):
+            kv_bytes = estimate_kv_bytes_per_token(model)
+        dense = 52 * 8 * (128 * 2 + 128 * 2)  # f16 K + f16 V
+        expected = int(dense * 0.20 * 1.08)   # nemotron_h_moe fraction
+        self.assertEqual(kv_bytes, expected)
+        # Sanity: result is dense/5-ish, well below the bare-dense number.
+        self.assertLess(kv_bytes, int(dense * 0.30))
+
+    def test_non_hybrid_arch_unaffected(self):
+        # An arch not in _HYBRID_SSM_ATTN_FRACTION_BY_ARCH keeps the
+        # dense estimate (no accidental regression).
+        metadata = {
+            'general.architecture': 'llama',
+            'llama.block_count': 32,
+            'llama.attention.head_count': 32,
+            'llama.attention.head_count_kv': 8,
+            'llama.embedding_length': 4096,
+            'llama.attention.key_length': 128,
+            'llama.attention.value_length': 128,
+        }
+        model = ModelConfig(id='m', name='M', path='/m.gguf', alias='m')
+        with patch('llama_tui.gguf.read_gguf_metadata', return_value=metadata):
+            kv_bytes = estimate_kv_bytes_per_token(model)
+        expected = int(32 * 8 * (128 * 2 + 128 * 2) * 1.08)
         self.assertEqual(kv_bytes, expected)
 
     def test_mla_falls_back_to_dense_when_lora_rank_missing(self):

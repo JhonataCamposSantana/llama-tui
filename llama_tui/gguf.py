@@ -757,12 +757,56 @@ def cache_type_bytes(cache_type: str) -> float:
         'q4_0': 0.5625,
         'q4_1': 0.625,
         'iq4_nl': 0.5625,
+        # TurboQuant+ V-cache quants (per runtime_profiles.TURBOQUANT_KV_PROFILES
+        # bpv table -- turbo4=4.25 bpv -> 0.53125 B/elem, turbo3=3.125,
+        # turbo2=2.125). Without these entries estimate_kv_bytes_per_token
+        # silently treated turbo4 V as f16 (2.0 B/elem), pushing ctx caps
+        # roughly 4x lower than they should be on turboquant sessions.
+        'turbo4': 0.53125,
+        'turbo3': 0.390625,
+        'turbo2': 0.265625,
+        # Legacy Buun TCQ variants (engine removed 2026-05-25, kept for
+        # graceful handling of historical records via turbo_kv_profile_for_preset).
+        'turbo4_tcq': 0.53125,
+        'turbo3_tcq': 0.390625,
+        'turbo2_tcq': 0.265625,
     }.get(normalized, 2.0)
 def selected_cache_type(model: ModelConfig, side: str) -> str:
+    """Effective KV cache element type for K or V at launch.
+
+    Resolution priority (most -> least specific, mirrors
+    AppConfig.turboquant_served_kv_preset so the estimator agrees with the
+    served launch on what KV will actually run):
+      1. Explicit -ctk/-ctv (or -ct/--cache-type for both) in extra_args.
+      2. Per-model kv_key_mode/kv_value_mode (models.json override).
+      3. TurboQuant-eligible default: native/padded + head_dim>=128 ->
+         q8_0 for K, turbo4 for V (matches DEFAULT_TURBOQUANT_VALUE_MODE).
+      4. f16 fallback.
+
+    Step 3 fixed a real bug: estimate_kv_bytes_per_token was using f16
+    sizing for turboquant sessions even though the launch actually uses
+    q8_0/turbo4 -- roughly 2-4x larger than reality, making the ctx-cap
+    estimator over-conservative across every turboquant-eligible model.
+    """
     args = list(getattr(model, 'extra_args', []) or [])
     if side == 'k':
-        return extra_arg_value(args, '--cache-type-k', '-ctk') or extra_arg_value(args, '--cache-type', '-ct') or 'f16'
-    return extra_arg_value(args, '--cache-type-v', '-ctv') or extra_arg_value(args, '--cache-type', '-ct') or 'f16'
+        explicit = extra_arg_value(args, '--cache-type-k', '-ctk') or extra_arg_value(args, '--cache-type', '-ct')
+    else:
+        explicit = extra_arg_value(args, '--cache-type-v', '-ctv') or extra_arg_value(args, '--cache-type', '-ct')
+    if explicit:
+        return explicit
+    per_model = (getattr(model, 'kv_key_mode' if side == 'k' else 'kv_value_mode', '') or '').strip()
+    if per_model:
+        return per_model.lower()
+    tq_status = (getattr(model, 'turboquant_status', '') or '').strip().lower()
+    head_dim = max(
+        int(getattr(model, 'turboquant_head_dim', 0) or 0),
+        int(getattr(model, 'turboquant_key_dim', 0) or 0),
+        int(getattr(model, 'turboquant_value_dim', 0) or 0),
+    )
+    if tq_status in ('native', 'padded') and head_dim >= 128:
+        return 'q8_0' if side == 'k' else 'turbo4'
+    return 'f16'
 def gguf_metadata_int(model: ModelConfig, suffix: str, default: int = 0) -> int:
     metadata = read_gguf_metadata(getattr(model, 'path', '') or '')
     arch = str(metadata.get('general.architecture') or '')
@@ -814,6 +858,32 @@ def _estimate_mla_kv_bytes_per_token(
 # of ctx.
 _SLIDING_WINDOW_ALTERNATING_FRACTION = 0.5
 
+# Hybrid SSM/attention architectures interleave Mamba/SSM layers (which do
+# NOT have a KV cache) with attention layers (which do). The legacy
+# `layers * kv_heads * (key_length * k_bytes + value_length * v_bytes)`
+# math treats every layer as attention and massively over-estimates KV.
+# Map an arch -> fraction of layers that actually carry a KV cache.
+# Conservative defaults; an arch absent here keeps the dense estimate.
+#
+# Numbers come from the published model cards / arch papers:
+#   - nemotron_h / nemotron_h_moe: ~16% attention (7 attn out of 44 in the
+#     reference Nemotron-H 8B; the MoE 30B-A3B variant follows the same
+#     interleave). Round up slightly to 0.20 for headroom.
+#   - jamba: 1 attention block per 8 layers (Jamba blocks) = 0.125 dense
+#     equivalent but the attention blocks have GQA scaling that the dense
+#     formula already over-counts; use 0.15 as a conservative cap.
+#   - mamba / mamba2: pure SSM, no KV at all -> 0.0 (clamped at min 1 byte
+#     in the caller for safety).
+_HYBRID_SSM_ATTN_FRACTION_BY_ARCH = {
+    'nemotron_h': 0.20,
+    'nemotron_h_moe': 0.20,
+    'jamba': 0.15,
+    'mamba': 0.02,
+    'mamba2': 0.02,
+    'zamba': 0.20,
+    'zamba2': 0.20,
+}
+
 
 def _sliding_window_tokens(metadata: Dict[str, object], arch: str) -> int:
     prefix = f'{arch}.'
@@ -855,6 +925,14 @@ def estimate_kv_bytes_per_token(model: ModelConfig) -> int:
                     # asymptotic that turns "won't fit" false negatives into
                     # correct decisions for typical 8k-32k workloads.
                     estimated *= _SLIDING_WINDOW_ALTERNATING_FRACTION
+                hybrid_fraction = _HYBRID_SSM_ATTN_FRACTION_BY_ARCH.get(arch.lower())
+                if hybrid_fraction is not None:
+                    # Hybrid SSM/attention archs: most layers are Mamba/SSM
+                    # and don't carry a KV cache. The dense formula above
+                    # treats every layer as attention, so without this
+                    # scaling the estimator returns ~5-10x too much for
+                    # e.g. nemotron_h_moe (920 KiB/token vs ~50 KiB empirical).
+                    estimated *= hybrid_fraction
                 return max(1, int(estimated * 1.08))
         except Exception:
             pass
