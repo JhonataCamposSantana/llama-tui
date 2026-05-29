@@ -12,6 +12,14 @@ class GeneratedConfigSyncTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self._patchers = [
+            patch('llama_tui.app.CONFIG_DIR', self.root / 'config-root'),
+            patch('llama_tui.app.DATA_DIR', self.root / 'data-root'),
+            patch('llama_tui.app.CACHE_DIR', self.root / 'cache-root'),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.app = AppConfig(self.root / 'models.json')
         self.app.opencode.path = str(self.root / 'opencode.json')
         self.app.opencode.backup_dir = str(self.root / 'backups')
@@ -68,6 +76,22 @@ class GeneratedConfigSyncTests(unittest.TestCase):
         self.assertEqual(self.app.continue_settings.default_model_id, '')
         self.assertEqual(self.app.continue_settings.edit_model_id, '')
         self.assertEqual(self.app.continue_settings.autocomplete_model_id, '')
+
+    def test_delete_aborts_when_stop_fails(self):
+        with patch.object(self.app, 'stop', return_value=(False, 'running but unmanaged; could not find PID')):
+            ok, msg = self.app.delete('stale', sync_exports=True)
+
+        self.assertFalse(ok)
+        self.assertIn('not deleted', msg)
+        self.assertIsNotNone(self.app.get_model('stale'))
+
+    def test_continue_export_write_failure_returns_error(self):
+        with patch('llama_tui.app.write_text_atomic', side_effect=OSError('read-only')):
+            ok, msg = self.app.generate_continue_config()
+
+        self.assertFalse(ok)
+        self.assertIn('Continue export failed', msg)
+        self.assertIn('read-only', msg)
 
     def test_prune_last_model_writes_empty_exports(self):
         missing = self.root / 'missing.gguf'

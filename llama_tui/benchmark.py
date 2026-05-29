@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import re
@@ -86,6 +87,15 @@ from .runtime_profiles import (
     supported_turbo_kv_profiles,
     turbo_kv_profile_for_preset,
 )
+
+
+_RUN_ID_COUNTER = itertools.count()
+
+
+def benchmark_run_id(prefix: str) -> str:
+    """Return a readable run id that cannot collide inside this process."""
+    stamp = datetime.now().strftime('%Y%m%d%H%M%S-%f')
+    return f'{prefix}-{stamp}-{time.time_ns()}-{next(_RUN_ID_COUNTER)}'
 from .adaptive_search import (
     ADAPTIVE_BINARY_STEPS,
     ADAPTIVE_CONTEXT_ROUNDING,
@@ -2033,7 +2043,7 @@ def benchmark_full_suite(
     depth_key = 'fast' if str(depth or '').strip().lower() == 'fast' else 'full'
     original = _clone_model(model)
     started_at = datetime.now().isoformat(timespec='seconds')
-    suite_run_id = f'full-suite-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    suite_run_id = benchmark_run_id('full-suite')
     try:
         engine = app.active_engine_key_for_model(model)
     except Exception:
@@ -7723,7 +7733,7 @@ def benchmark_exhaustive_profiles(
 
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
-    run_id = f'server-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    run_id = benchmark_run_id('server')
     strategy = benchmark_strategy_for_app(app, model, profile, depth='full', objective='long_context')
     emit_benchmark_strategy_diagnostics(app, model, strategy, progress)
     if getattr(strategy, 'blocked_reason', ''):
@@ -8735,7 +8745,7 @@ def benchmark_moe_placement_tuning(
 ) -> Tuple[bool, str]:
     depth_key = 'full' if str(depth or '').strip().lower() == 'full' else 'fast'
     started_at = datetime.now().isoformat(timespec='seconds')
-    run_id = f'moe-tuning-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    run_id = benchmark_run_id('moe-tuning')
     profile = app.hardware_profile(refresh=True)
     baseline_profile = _moe_tuning_baseline_profile(app, model, depth_key)
     capabilities = _moe_tuning_capabilities(app, baseline_profile)
@@ -9292,7 +9302,7 @@ def benchmark_max_context_probe(
 
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
-    run_id = f'max-context-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    run_id = benchmark_run_id('max-context')
     runtime_profiles = max_context_probe_runtime_profiles(app, model, profile)
     if not runtime_profiles:
         msg = 'max context probe skipped: no supported context/KV candidates'
@@ -9455,7 +9465,7 @@ def benchmark_fast_profiles(
 
     profile = app.hardware_profile(refresh=True)
     started_at = datetime.now().isoformat(timespec='seconds')
-    run_id = f'server-fast-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    run_id = benchmark_run_id('server-fast')
     strategy = benchmark_strategy_for_app(app, model, profile, depth='fast', objective='quick_sanity')
     emit_benchmark_strategy_diagnostics(app, model, strategy, progress)
     if getattr(strategy, 'blocked_reason', ''):
@@ -10051,7 +10061,7 @@ def benchmark_raw_speed_profile(
     if not preflight_ok:
         return False, preflight_msg
 
-    run_id = f'raw-speed-{int(time.time())}'
+    run_id = benchmark_run_id('raw-speed')
     started_at = datetime.now().isoformat(timespec='seconds')
     profile = app.hardware_profile(refresh=True)
     try:

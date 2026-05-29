@@ -157,6 +157,7 @@ class LmStudioDiscoveryTests(unittest.TestCase):
             app.llmfit_cache_root = str(root / 'missing-llmfit')
             app.llm_models_cache_root = str(root / 'missing-local')
             app.lm_studio_model_roots = str(lm_models)
+            lm_models.mkdir(parents=True)
             model_path = lm_models / 'org' / 'gone.Q4_K_M.gguf'
             app.models = [ModelConfig(
                 id='gone',
@@ -175,6 +176,36 @@ class LmStudioDiscoveryTests(unittest.TestCase):
         self.assertEqual(removed_count, 1)
         self.assertEqual(removed, ['gone'])
         self.assertEqual(app.models, [])
+
+    def test_prune_keeps_managed_model_when_source_root_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'models.json'
+            lm_models = root / 'unmounted' / 'lmstudio' / 'models'
+            app = AppConfig(config)
+            app.hf_cache_root = str(root / 'missing-hf')
+            app.llmfit_cache_root = str(root / 'missing-llmfit')
+            app.llm_models_cache_root = str(root / 'missing-local')
+            app.lm_studio_model_roots = str(lm_models)
+            model_path = lm_models / 'org' / 'detached.Q4_K_M.gguf'
+            app.models = [ModelConfig(
+                id='detached',
+                name='Detached',
+                path=str(model_path),
+                alias='detached',
+                port=19002,
+                source='lm-studio',
+                source_root=str(lm_models),
+            )]
+            app.save()
+
+            with patch.object(app, 'stop', return_value=(True, 'stopped')) as stop:
+                removed_count, removed = app.prune_missing_models()
+
+        self.assertEqual(removed_count, 0)
+        self.assertEqual(removed, [])
+        self.assertEqual([model.id for model in app.models], ['detached'])
+        stop.assert_not_called()
 
     def test_load_recovers_from_malformed_json_and_archives_broken_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,11 +252,24 @@ class LmStudioDiscoveryTests(unittest.TestCase):
                 ],
             }), encoding='utf-8')
 
-            app = AppConfig(config)
+            config_dir = root / 'config'
+            data_dir = root / 'data'
+            cache_dir = root / 'cache'
+
+            with patch('llama_tui.app.CONFIG_DIR', config_dir), \
+                    patch('llama_tui.app.DATA_DIR', data_dir), \
+                    patch('llama_tui.app.CACHE_DIR', cache_dir):
+                app = AppConfig(config)
+                backups = list((config_dir / 'backups').glob('models.broken.*.json'))
+                backup_payload = json.loads(backups[0].read_text(encoding='utf-8')) if backups else {}
+                saved = json.loads(config.read_text(encoding='utf-8'))
 
         self.assertEqual([model.id for model in app.models], ['good'])
         self.assertTrue(any('skipped model row 2' in warning for warning in app.load_warnings))
         self.assertEqual(app.models[0].sort_rank, 1)
+        self.assertTrue(backups)
+        self.assertEqual(backup_payload['models'][1]['id'], 'bad')
+        self.assertEqual([model['id'] for model in saved['models']], ['good'])
 
     def test_workspace_presets_remember_recent_unique_paths(self):
         with tempfile.TemporaryDirectory() as tmp:

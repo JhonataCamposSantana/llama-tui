@@ -1,19 +1,19 @@
 # llama-tui
 
-`llama-tui` is a zero-dependency terminal control plane for local LLM servers. It keeps a registry of local models, starts and stops `llama.cpp`, TurboQuant+, llama.cpp-tq3, or vLLM OpenAI-compatible servers, tunes launch settings for the current machine, benchmarks candidate profiles, and can export tool configs for OpenCode, Continue, and Hermes.
+`llama-tui` is a zero-dependency terminal control plane for local GGUF servers. It keeps a registry of local models, starts and stops `llama.cpp`-compatible OpenAI servers, switches between stable `llama.cpp`, TurboQuant+, and experimental llama.cpp MTP engines, tunes launch settings for the current machine, benchmarks candidate profiles, and can export tool configs for OpenCode, Continue, and Hermes.
 
 The project is intentionally small: it uses only the Python standard library, stores state as JSON, and runs from a terminal.
 
 ## What It Does
 
 - Start, stop, and inspect local model servers.
-- Manage GGUF models with `llama.cpp`-compatible engines and vLLM/Hugging Face model references.
+- Manage GGUF models with `llama.cpp`-compatible engines.
 - Detect `.gguf` files from Hugging Face, `llmfit`, LM Studio, and local model caches.
 - Track server PID files, logs, and process groups under `~/.cache/llama-tui`.
 - Clean up llama-tui-managed servers on stop, benchmark completion, and TUI exit.
 - Probe CPU, RAM, NVIDIA VRAM, and current process pressure with `/proc` and `nvidia-smi`.
 - Read GGUF metadata to estimate KV cache memory and safe context sizes.
-- Auto-tune context size, CPU threads, GPU layer offload, KV cache type, batch size, and vLLM scheduler limits.
+- Auto-tune context size, CPU threads, GPU layer offload, KV cache type, and batch size.
 - Benchmark real serving launch profiles and persist measured Fast Chat, Long Context, OpenCode-ready, and Auto results.
 - Run a separate Raw Speed Benchmark for deterministic engine-speed checks without changing saved serving recommendations.
 - Run Deep Benchmark All across managed models and show machine-wide winners.
@@ -55,9 +55,7 @@ examples/models.sample.json
 - A terminal with curses support.
 - For GGUF models: a built `llama-server` binary.
 - Optional TurboQuant+: a built `TheTom/llama-cpp-turboquant` server binary selected with `--engine turboquant`.
-- Optional llama.cpp-tq3: a built `turbo-tan/llama.cpp-tq3` server binary selected with `--engine tq3`.
 - Optional llama.cpp MTP: an experimental MTP branch server binary selected with `--engine llama.cpp-mtp`.
-- For vLLM models: a working `vllm` command.
 - Optional NVIDIA GPU: `nvidia-smi` in `PATH` lets llama-tui detect VRAM.
 
 No Python packages are required.
@@ -117,14 +115,12 @@ CLI help exits before curses starts:
 ```bash
 llama-tui --help
 llama-tui --engine turboquant --kv-key q8_0 --kv-value turbo4
-llama-tui --engine tq3
-llama-tui --engine buun --kill-existing
+llama-tui --engine llama.cpp-mtp --kill-existing
 ```
 
 Useful top-level settings:
 
 - `llama_server`: path or command for `llama-server`.
-- `vllm_command`: command used for vLLM, default `vllm`.
 - `hf_cache_root`: Hugging Face cache root.
 - `llmfit_cache_root`: llmfit model cache root.
 - `llm_models_cache_root`: additional local model cache root.
@@ -137,8 +133,8 @@ Useful top-level settings:
 
 Useful per-model fields:
 
-- `runtime`: model serving family, `llama.cpp` or `vllm`. The active GGUF engine can be switched at startup with `--engine llama.cpp`, `--engine buun`, `--engine turboquant`, or `--engine tq3`.
-- `path`: GGUF path for `llama.cpp`, local path or repo id for vLLM.
+- `runtime`: model serving family. Current builds serve GGUF models through `llama.cpp`-compatible engines; legacy `vllm`, `buun`, and `tq3` values are normalized to `llama.cpp`.
+- `path`: GGUF path for `llama.cpp`-compatible serving.
 - `alias`: served model name used by OpenAI-compatible requests.
 - `host` and `port`: bind address. New local models default to `127.0.0.1:18080` so generated tool configs stay on one stable local endpoint.
 - `ctx`: requested context size.
@@ -146,7 +142,7 @@ Useful per-model fields:
 - `ngl`: `llama.cpp` GPU layer offload count.
 - `parallel`: llama.cpp parallel slots.
 - `cache_ram`: llama.cpp prompt cache RAM value.
-- `flash_attn`, `jinja`, `extra_args`: runtime flags. Continue tool-capable llama.cpp, buun, TurboQuant+, and llama.cpp-tq3 exports force `--jinja` at launch; add `--chat-template-file ...` in `extra_args` when a GGUF needs a tool-use template override.
+- `flash_attn`, `jinja`, `extra_args`: runtime flags. Continue tool-capable llama.cpp, TurboQuant+, and llama.cpp MTP exports force `--jinja` at launch; add `--chat-template-file ...` in `extra_args` when a GGUF needs a tool-use template override.
 - `top_p`, `top_k`, `repeat_penalty`, `presence_penalty`, `no_context_shift`, `preserve_thinking`: optional generation/runtime defaults used by Try-It-Out, normal serving when the engine supports server-side flags, and benchmark request payloads.
 - `launch_overrides`: advanced config-only launch/benchmark overrides. Supported keys include `top_p`, `top_k`, `min_p`, `seed`, `samplers`, `repeat_penalty`, `presence_penalty`, `no_context_shift`, `preserve_thinking`, `reasoning`, `reasoning_budget`, `cache_prompt`, `cache_reuse`, `fit_target`, `measurement_output`, and `extra_args`.
 - `optimize_mode`: `max_context_safe` or `manual`.
@@ -191,7 +187,7 @@ Useful per-model fields:
 
 The model browser defaults to compact Fleet View: model name, server state, recommended pick, effective context, measured tok/s, active engine, and health. Actions can toggle Advanced View when you need the denser legacy columns; toggling from another screen returns to Models so the change is visible immediately.
 
-The top dashboard and selected-model Overview show a prominent active-engine badge such as `ENGINE: TurboQuant+ | KV key=q8_0 value=turbo4 | binary ok` or `ENGINE: TQ3 | KV key=q8_0 value=q8_0 | binary ok`. Missing binaries or engine warnings use the existing warning/error styling.
+The top dashboard and selected-model Overview show a prominent active-engine badge such as `ENGINE: TurboQuant+ | KV key=q8_0 value=turbo4 | binary ok` or `ENGINE: llama.cpp MTP | binary ok`. Missing binaries or engine warnings use the existing warning/error styling.
 
 The details screen is split into Overview, Launch, Tuning, Benchmarks, Logs, Command, and Exports tabs so launch decisions stay separate from lower-level settings and generated-config status. Benchmark tables live in the Benchmarks tab to keep the main detail pane readable.
 
@@ -235,21 +231,17 @@ llama-server \
   --jinja
 ```
 
-Experimental GGUF engines are selected for the whole TUI session:
+Alternative GGUF engines are selected for the whole TUI session:
 
 ```bash
 python -m llama_tui.main --engine turboquant
 python -m llama_tui.main --engine turboquant --kv-key q8_0 --kv-value turbo4
-python -m llama_tui.main --engine tq3
 python -m llama_tui.main --engine llama.cpp-mtp
-python -m llama_tui.main --engine buun
 ```
 
-Engine path resolution is centralized but remains backward compatible: llama.cpp uses `LLAMA_SERVER` / `llama_server`, TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` or its existing defaults, llama.cpp-tq3 uses `TQ3_LLAMA_SERVER_BIN` or its existing defaults, llama.cpp MTP uses `LLAMA_CPP_MTP_PATH` or `~/src/llama.cpp-mtp/build-mtp/bin/llama-server`, Buun uses `BUUN_LLAMA_SERVER_BIN` or `buun-llama-server`, and vLLM uses `VLLM_COMMAND` / `vllm_command`.
+Engine path resolution is centralized: stable llama.cpp uses `LLAMA_SERVER` / `llama_server`, TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` or its existing defaults, and llama.cpp MTP uses `LLAMA_CPP_MTP_PATH` or `~/src/llama.cpp-mtp/build-mtp/bin/llama-server`.
 
 TurboQuant+ uses `TURBOQUANT_LLAMA_SERVER_BIN` when set, otherwise it looks for `~/llama-cpp-turboquant/build/bin/llama-server` and then `turboquant-llama-server` in `PATH`. v1 does not download or install binaries. The `tqp-v0.1.1` release documents prebuilts for macOS arm64 Metal and Windows x64 CUDA 12.4; Linux CUDA users should build `TheTom/llama-cpp-turboquant` from source first.
-
-llama.cpp-tq3 uses `TQ3_LLAMA_SERVER_BIN` when set, otherwise it looks for `~/llama.cpp-tq3/build/bin/llama-server` and then `tq3-llama-server` in `PATH`. It is treated as a TQ3-native engine: the default browser compatibility filter shows only GGUFs detected as `TQ3_1S` or `TQ3_4S`, and launch/benchmark preflight blocks regular GGUFs with a clear advisory. `q8_0/q8_0` is the default KV cache choice; `tq3_0/tq3_0` is available only as a manual experimental KV mode until local benchmarks prove it is better on this machine.
 
 llama.cpp MTP is separate from stable upstream llama.cpp. It is marked Experimental, uses `LLAMA_CPP_MTP_PATH` when set, and verifies that the selected binary advertises `--spec-type mtp` and `--spec-draft-n-max` before MTP launches are allowed. Model configs can keep `supports_mtp` as `auto` or set it to `yes`/`no`; `mtp_enabled` defaults off and `mtp_draft_n_max` is clamped to 1, 2, or 3. When MTP is enabled, llama-tui emits `--spec-type mtp --spec-draft-n-max N`, forces a single parallel slot, and blocks mmproj/vision launches with a clear error. The helper `./llama-update-engines` can build the experimental branch into `~/src/llama.cpp-mtp/build-mtp`.
 
@@ -257,24 +249,14 @@ The default TurboQuant+ profile is `q8_0/q8_0`. If GGUF metadata reports `head_d
 
 If the resolved TurboQuant+ command looks like vanilla llama.cpp or its `--help` output does not advertise `turbo2`, `turbo3`, or `turbo4` cache types, the command preview and launch log show a binary warning.
 
-For Continue Agent Mode tool use, llama-tui forces `--jinja` for enabled Continue-exported llama.cpp, buun, TurboQuant+, llama.cpp-tq3, and llama.cpp MTP models even when the saved model setting has `jinja` off. It does not add a fallback chat template; use model `extra_args` such as `--chat-template-file /path/to/tool-template.jinja` for GGUFs whose embedded template is not tool-use compatible.
-
-For vLLM, llama-tui builds:
-
-```bash
-vllm serve MODEL_REF \
-  --host 127.0.0.1 \
-  --port 18080 \
-  --served-model-name my-model \
-  --max-model-len 8192
-```
+For Continue Agent Mode tool use, llama-tui forces `--jinja` for enabled Continue-exported llama.cpp, TurboQuant+, and llama.cpp MTP models even when the saved model setting has `jinja` off. It does not add a fallback chat template; use model `extra_args` such as `--chat-template-file /path/to/tool-template.jinja` for GGUFs whose embedded template is not tool-use compatible.
 
 Each managed server writes:
 
 ```text
-~/.cache/llama-tui/<model-id>.log
-~/.cache/llama-tui/<model-id>.pid
-~/.cache/llama-tui/<model-id>.pid.json
+~/.cache/llama-tui/runtime/<engine>/<model-id>.log
+~/.cache/llama-tui/runtime/<engine>/<model-id>.pid
+~/.cache/llama-tui/runtime/<engine>/<model-id>.pid.json
 ```
 
 The PID metadata records the process group. Stop commands and shutdown cleanup terminate the managed process group, which prevents child server processes from keeping VRAM allocated after a benchmark or TUI exit.
@@ -290,8 +272,7 @@ The default mode is `max_context_safe`. In that mode, the configured `ctx` is tr
 - `ngl`,
 - CPU thread count,
 - batch and micro-batch sizes,
-- KV cache type,
-- vLLM GPU utilization and scheduler limits.
+- KV cache type.
 
 The goal is to start reliably first, then pick the fastest stable profile.
 
@@ -340,7 +321,6 @@ extreme -> moderate -> safe
 - `parallel = 1`
 - conservative batch sizes
 - q8 KV cache for llama.cpp
-- lower vLLM sequence concurrency
 
 `tokens_per_sec` is shown as Fast Chat. Before a benchmark exists it uses estimated throughput settings; after pressing `B`, llama-tui prefers the measured Fast Chat profile:
 
@@ -450,7 +430,6 @@ If all candidates fail, the failure details are saved and shown in the model det
 Press `Y` to verify the selected model entry. Verification is offline-first:
 
 - `llama.cpp` entries check the file path, `.gguf` suffix, GGUF magic header, metadata parse health, native context, KV-cache estimate inputs, file size, and projection-file mistakes such as `mmproj`.
-- vLLM entries check that the target is a local path or repo-shaped model reference. llama-tui does not contact Hugging Face or any network service.
 - Fresh measured benchmark proof marks a model `passed`; stale or missing proof is `needs_benchmark`, not failed.
 - Static problems such as missing files, bad GGUF magic, or unsupported targets mark a model `failed`.
 

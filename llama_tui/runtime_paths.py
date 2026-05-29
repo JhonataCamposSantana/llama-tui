@@ -20,16 +20,12 @@ from pathlib import Path
 from . import constants
 
 
-def _cache_dir() -> Path:
-    """Indirect ``CACHE_DIR`` lookup so tests that ``patch('llama_tui.app.CACHE_DIR', ...)``
-    (the long-standing pattern) keep working — and direct
-    ``patch('llama_tui.constants.CACHE_DIR', ...)`` patches also
-    propagate through every consumer.
-    """
-    return constants.CACHE_DIR
+def _cache_dir(cache_dir: Path | None = None) -> Path:
+    """Return the explicit cache root or the module-level default."""
+    return Path(cache_dir) if cache_dir is not None else constants.CACHE_DIR
 
 
-def runtime_artifact_dir(engine_key: str) -> Path:
+def runtime_artifact_dir(engine_key: str, cache_dir: Path | None = None) -> Path:
     """Return the per-engine runtime cache directory.
 
     The engine key is slugified to a filesystem-safe form so engine
@@ -41,33 +37,38 @@ def runtime_artifact_dir(engine_key: str) -> Path:
         ch if ch.isalnum() or ch in ('-', '_', '.') else '_'
         for ch in str(engine_key or 'llama.cpp')
     )
-    return _cache_dir() / 'runtime' / (slug or 'llama.cpp')
+    return _cache_dir(cache_dir) / 'runtime' / (slug or 'llama.cpp')
 
 
-def runtime_artifact_path(model_id: str, suffix: str, engine_key: str) -> Path:
+def runtime_artifact_path(
+    model_id: str,
+    suffix: str,
+    engine_key: str,
+    cache_dir: Path | None = None,
+) -> Path:
     """Per-engine ``{model_id}{suffix}`` path under the runtime dir."""
-    return runtime_artifact_dir(engine_key) / f'{model_id}{suffix}'
+    return runtime_artifact_dir(engine_key, cache_dir=cache_dir) / f'{model_id}{suffix}'
 
 
-def runtime_pidfile(model_id: str, engine_key: str) -> Path:
-    return runtime_artifact_path(model_id, '.pid', engine_key)
+def runtime_pidfile(model_id: str, engine_key: str, cache_dir: Path | None = None) -> Path:
+    return runtime_artifact_path(model_id, '.pid', engine_key, cache_dir=cache_dir)
 
 
-def runtime_pid_metadata_file(model_id: str, engine_key: str) -> Path:
-    return runtime_artifact_path(model_id, '.pid.json', engine_key)
+def runtime_pid_metadata_file(model_id: str, engine_key: str, cache_dir: Path | None = None) -> Path:
+    return runtime_artifact_path(model_id, '.pid.json', engine_key, cache_dir=cache_dir)
 
 
-def runtime_logfile(model_id: str, engine_key: str) -> Path:
-    return runtime_artifact_path(model_id, '.log', engine_key)
+def runtime_logfile(model_id: str, engine_key: str, cache_dir: Path | None = None) -> Path:
+    return runtime_artifact_path(model_id, '.log', engine_key, cache_dir=cache_dir)
 
 
-def legacy_pidfile(model_id: str) -> Path:
-    return _cache_dir() / f'{model_id}.pid'
+def legacy_pidfile(model_id: str, cache_dir: Path | None = None) -> Path:
+    return _cache_dir(cache_dir) / f'{model_id}.pid'
 
 
-def legacy_pid_metadata_file(model_id: str) -> Path:
-    return _cache_dir() / f'{model_id}.pid.json'
+def legacy_pid_metadata_file(model_id: str, cache_dir: Path | None = None) -> Path:
+    return _cache_dir(cache_dir) / f'{model_id}.pid.json'
 
 
-def legacy_logfile(model_id: str) -> Path:
-    return _cache_dir() / f'{model_id}.log'
+def legacy_logfile(model_id: str, cache_dir: Path | None = None) -> Path:
+    return _cache_dir(cache_dir) / f'{model_id}.log'

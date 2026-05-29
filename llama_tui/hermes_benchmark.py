@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from .benchmark import (
     architecture_payload,
     active_engine_runtime_profiles,
+    benchmark_run_id,
     build_benchmark_run,
     benchmark_runtime_profile_with_retry,
     clone_model_config,
@@ -359,7 +360,7 @@ def run_hermes_floor_probe(
     completed = 0
     total = len(runtime_profiles)
     started_at = datetime.now().isoformat(timespec='seconds')
-    run_id = f'hermes-floor-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+    run_id = benchmark_run_id('hermes-floor')
     fit_succeeded_engines: set[str] = set()
     fit_ceiling_by_engine: Dict[str, Tuple[int, str, str]] = {}
     target_name = runtime_profiles[-1].name
@@ -746,7 +747,7 @@ def benchmark_hermes_workflow(
     total_steps = max(1, len(candidates) * max(1, len(HERMES_WORKFLOW_TASKS)))
     completed_steps = 0
     started_at = datetime.now().isoformat(timespec='seconds')
-    run_id = f'hermes-{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+    run_id = benchmark_run_id('hermes')
     current: Optional[Tuple[str, str, ModelConfig, Optional[RuntimeProfile]]] = None
     pressure_payload = current_process_pressure_payload()
 

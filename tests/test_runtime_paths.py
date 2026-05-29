@@ -72,6 +72,19 @@ class RuntimePathTests(unittest.TestCase):
                 self.assertEqual(runtime_pid_metadata_file('m', 'turboquant'), root / 'runtime' / 'turboquant' / 'm.pid.json')
                 self.assertEqual(runtime_logfile('m', 'turboquant'), root / 'runtime' / 'turboquant' / 'm.log')
 
+    def test_app_wrappers_honor_patched_app_cache_dir(self):
+        from llama_tui.app import AppConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_dir = root / 'app-cache'
+            with patch('llama_tui.app.CONFIG_DIR', root / 'config'), \
+                    patch('llama_tui.app.DATA_DIR', root / 'data'), \
+                    patch('llama_tui.app.CACHE_DIR', cache_dir):
+                app = AppConfig(root / 'models.json')
+                self.assertEqual(app.pidfile('m'), cache_dir / 'runtime' / 'llama.cpp' / 'm.pid')
+                self.assertEqual(app.legacy_pidfile('m'), cache_dir / 'm.pid')
+
 
 class LegacyPathTests(unittest.TestCase):
     def test_legacy_paths_use_flat_cache_root(self):

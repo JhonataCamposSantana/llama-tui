@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from dataclasses import asdict
+from datetime import datetime as real_datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,6 +26,7 @@ from llama_tui.benchmark import (
     benchmark_exhaustive_candidate_with_retry,
     benchmark_exhaustive_profiles,
     benchmark_fast_profiles,
+    benchmark_run_id,
     break_refinement_contexts,
     build_benchmark_run,
     context_knee_refinement_contexts,
@@ -573,6 +575,21 @@ class OpencodeStackHelperTests(unittest.TestCase):
         self.assertEqual(len(loaded.benchmark_runs), 10)
         self.assertEqual(loaded.benchmark_runs[0]['id'], 'run-11')
         self.assertEqual(loaded.benchmark_runs[-1]['id'], 'run-2')
+
+    def test_benchmark_run_id_does_not_collide_under_fixed_clock(self):
+        class FixedDateTime:
+            @classmethod
+            def now(cls):
+                return real_datetime(2026, 5, 29, 1, 2, 3, 456789)
+
+        with patch('llama_tui.benchmark.datetime', FixedDateTime), \
+                patch('llama_tui.benchmark.time.time_ns', return_value=42):
+            first = benchmark_run_id('server')
+            second = benchmark_run_id('server')
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith('server-20260529010203-456789-42-'))
+        self.assertTrue(second.startswith('server-20260529010203-456789-42-'))
 
     def test_measured_profiles_round_trip_and_apply(self):
         model = ModelConfig(

@@ -8,8 +8,10 @@ do not touch the user's real config.
 import json
 import tempfile
 import unittest
+from datetime import datetime as real_datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from llama_tui.config_io import (
     archive_broken_config_file,
@@ -148,6 +150,30 @@ class ArchiveBrokenConfigFileTests(unittest.TestCase):
             backup = archive_broken_config_file(config, backup_dir)
             self.assertIsNotNone(backup)
             self.assertTrue(backup_dir.exists())
+
+    def test_backups_do_not_collide_with_same_timestamp(self):
+        class FixedDateTime:
+            @classmethod
+            def now(cls):
+                return real_datetime(2026, 5, 29, 1, 2, 3, 456789)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'models.json'
+            backup_dir = root / 'backups'
+            config.write_text('first', encoding='utf-8')
+            with patch('llama_tui.config_io.datetime', FixedDateTime):
+                first = archive_broken_config_file(config, backup_dir)
+                config.write_text('second', encoding='utf-8')
+                second = archive_broken_config_file(config, backup_dir)
+            first_text = first.read_text(encoding='utf-8')
+            second_text = second.read_text(encoding='utf-8')
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first_text, 'first')
+        self.assertEqual(second_text, 'second')
 
 
 if __name__ == '__main__':

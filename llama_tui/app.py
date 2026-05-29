@@ -28,8 +28,10 @@ from .constants import (
 )
 from .config_io import (
     archive_broken_config_file,
+    backup_file,
     serialize_app_state,
     write_config_dict,
+    write_text_atomic,
 )
 from .model_loader import VERIFICATION_STATUSES, load_model_from_payload
 from .process_supervisor import (
@@ -397,7 +399,11 @@ class AppConfig:
             self.save()
             return
         if not isinstance(data, dict):
-            self.load_warnings.append('Config recovery: top-level config must be a JSON object; defaults were restored.')
+            archived = self._archive_broken_config_file()
+            detail = 'Config recovery: top-level config must be a JSON object; defaults were restored.'
+            if archived:
+                detail += f' | original saved to {archived}'
+            self.load_warnings.append(detail)
             self.save()
             return
         self.llama_server = data.get('llama_server', self.llama_server)
@@ -427,13 +433,16 @@ class AppConfig:
         self.ui = self._load_settings(UiSettings, data.get('ui', {}), self.ui, 'ui')
         loaded_models: List[ModelConfig] = []
         raw_models = data.get('models', [])
+        recovered_models = False
         if raw_models and not isinstance(raw_models, list):
             self.load_warnings.append('Config recovery: models must be a list; model entries were ignored.')
             raw_models = []
+            recovered_models = True
         for index, item in enumerate(raw_models):
             try:
                 loaded_models.append(self._load_model(item, index))
             except Exception as exc:
+                recovered_models = True
                 self.load_warnings.append(
                     f'Config recovery: skipped model row {index + 1}: {compact_message(str(exc))}'
                 )
@@ -464,7 +473,11 @@ class AppConfig:
                 roots_changed = True
         if self._normalize_model_ranks():
             roots_changed = True
-        if len(loaded_models) != len(raw_models) or roots_changed or settings_changed:
+        if len(loaded_models) != len(raw_models) or recovered_models or roots_changed or settings_changed:
+            if recovered_models:
+                archived = self._archive_broken_config_file()
+                if archived:
+                    self.load_warnings.append(f'Config recovery: original saved to {archived}')
             self.save()
 
     def save(self):
@@ -646,20 +659,20 @@ class AppConfig:
     # wrappers below resolve the engine key off the model registry first,
     # then defer to the module-level functions.
     def _runtime_artifact_dir(self, engine_key: str) -> Path:
-        return runtime_artifact_dir(engine_key)
+        return runtime_artifact_dir(engine_key, cache_dir=CACHE_DIR)
 
     def runtime_artifact_path(self, model_id: str, suffix: str, engine_key: Optional[str] = None) -> Path:
         engine = self._runtime_artifact_engine_for_model_id(model_id, engine_key)
-        return runtime_artifact_path(model_id, suffix, engine)
+        return runtime_artifact_path(model_id, suffix, engine, cache_dir=CACHE_DIR)
 
     def legacy_pidfile(self, model_id: str) -> Path:
-        return legacy_pidfile(model_id)
+        return legacy_pidfile(model_id, cache_dir=CACHE_DIR)
 
     def legacy_pid_metadata_file(self, model_id: str) -> Path:
-        return legacy_pid_metadata_file(model_id)
+        return legacy_pid_metadata_file(model_id, cache_dir=CACHE_DIR)
 
     def legacy_logfile(self, model_id: str) -> Path:
-        return legacy_logfile(model_id)
+        return legacy_logfile(model_id, cache_dir=CACHE_DIR)
 
     def pidfile(self, model_id: str, engine_key: Optional[str] = None) -> Path:
         return self.runtime_artifact_path(model_id, '.pid', engine_key)
@@ -1659,10 +1672,13 @@ class AppConfig:
             '  creation_nudge_interval: 0',
             '',
         ]
-        home.mkdir(parents=True, exist_ok=True)
-        if config_path.exists():
-            self._backup_export_file(config_path, str(config_path.parent / 'backups'))
-        config_path.write_text('\n'.join(lines), encoding='utf-8')
+        try:
+            home.mkdir(parents=True, exist_ok=True)
+            if config_path.exists():
+                self._backup_export_file(config_path, str(config_path.parent / 'backups'))
+            write_text_atomic(config_path, '\n'.join(lines), encoding='utf-8')
+        except OSError as exc:
+            return False, f'Hermes export failed: {compact_message(str(exc))}'
         return True, f'Generated Hermes config {config_path}'
 
     def build_hermes_env(self, model: ModelConfig, workspace: Path, benchmark: bool = False) -> Dict[str, str]:
@@ -2057,6 +2073,46 @@ class AppConfig:
 
     def normalize_model_path(self, path: str | Path) -> Path:
         return Path(path).expanduser().resolve(strict=False)
+
+    def unavailable_source_roots(self) -> List[Tuple[str, Path]]:
+        missing: List[Tuple[str, Path]] = []
+        for source, root in self.managed_source_roots():
+            expanded = root.expanduser()
+            if not expanded.exists():
+                missing.append((source, expanded.resolve(strict=False)))
+        return missing
+
+    def _path_under_root(self, path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True
+
+    def _model_uses_unavailable_source_root(
+        self,
+        model: ModelConfig,
+        source: str,
+        unavailable_roots: List[Tuple[str, Path]],
+    ) -> bool:
+        if source == 'manual' or not unavailable_roots:
+            return False
+        labels = set(normalize_source_labels(
+            getattr(model, 'source_labels', []),
+            getattr(model, 'source', ''),
+            source,
+        ))
+        model_path = self.normalize_model_path(model.path)
+        source_root_raw = str(getattr(model, 'source_root', '') or '').strip()
+        source_root = self.normalize_model_path(source_root_raw) if source_root_raw else None
+        for root_source, root in unavailable_roots:
+            if root_source not in labels:
+                continue
+            if source_root is not None and (source_root == root or self._path_under_root(source_root, root)):
+                return True
+            if self._path_under_root(model_path, root):
+                return True
+        return False
 
     def infer_model_source(self, model: ModelConfig) -> str:
         known_sources = {'manual', 'huggingface', 'hf_cache', 'llama_cache', 'llmfit', 'llm-models', 'lm-studio'}
@@ -2756,7 +2812,9 @@ class AppConfig:
     def delete(self, model_id: str, sync_exports: bool = False) -> Tuple[bool, str]:
         for i, model in enumerate(self.models):
             if model.id == model_id:
-                self.stop(model)
+                stopped, stop_msg = self.stop(model)
+                if not stopped:
+                    return False, f'not deleted: {stop_msg}'
                 del self.models[i]
                 self._clear_pid_tracking(model_id)
                 self._clear_roles(model_id)
@@ -2769,6 +2827,7 @@ class AppConfig:
 
     def prune_missing_models(self, sync_exports: bool = False) -> Tuple[int, List[str]]:
         discovered, _ = self.discover_source_files()
+        unavailable_roots = self.unavailable_source_roots()
         removed: List[str] = []
         removed_models: List[ModelConfig] = []
         changed = False
@@ -2784,7 +2843,10 @@ class AppConfig:
             if source == 'manual':
                 should_remove = (not path_exists) or (not is_real_model_file(Path(model.path)))
             else:
-                should_remove = normalized not in discovered
+                should_remove = (
+                    normalized not in discovered
+                    and not self._model_uses_unavailable_source_root(model, source, unavailable_roots)
+                )
 
             if should_remove:
                 ok, _msg = self.delete(model.id, sync_exports=False)
@@ -2855,14 +2917,8 @@ class AppConfig:
         return port
 
     def _backup_export_file(self, path: Path, backup_dir_raw: str) -> Optional[Path]:
-        if not path.exists():
-            return None
         backup_dir = Path(backup_dir_raw or (path.parent / 'backups')).expanduser()
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        backup_path = backup_dir / f'{path.stem}.{stamp}{path.suffix}'
-        shutil.copy2(path, backup_path)
-        return backup_path
+        return backup_file(path, backup_dir)
 
     def _clear_roles(self, model_id: str):
         for attr in ('default_model_id', 'small_model_id', 'build_model_id', 'plan_model_id'):
@@ -2990,9 +3046,11 @@ class AppConfig:
             'small_model': ref(small_model),
         }
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(config, indent=2) + '\n')
-        self.save()
+        try:
+            write_text_atomic(path, json.dumps(config, indent=2) + '\n')
+            self.save()
+        except OSError as exc:
+            return False, f'OpenCode export failed: {compact_message(str(exc))}'
         return True, f'Generated {path}'
 
     def continue_role_models(self, enabled_models: List[ModelConfig]) -> Tuple[ModelConfig, ModelConfig, ModelConfig]:
@@ -3138,9 +3196,12 @@ class AppConfig:
 
         managed_lines = self._continue_managed_model_lines(enabled_models)
         existing_text = ''
-        if path.exists():
-            existing_text = path.read_text(encoding='utf-8')
-            self._backup_export_file(path, self.continue_settings.backup_dir)
+        try:
+            if path.exists():
+                existing_text = path.read_text(encoding='utf-8')
+                self._backup_export_file(path, self.continue_settings.backup_dir)
+        except OSError as exc:
+            return False, f'Continue export failed: {compact_message(str(exc))}'
 
         merge_mode = getattr(self.continue_settings, 'merge_mode', 'preserve_sections') or 'preserve_sections'
         if merge_mode == 'managed_file' or not path.exists():
@@ -3148,9 +3209,11 @@ class AppConfig:
         else:
             output = self._merge_continue_config_text(existing_text, managed_lines)
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(output, encoding='utf-8')
-        self.save()
+        try:
+            write_text_atomic(path, output, encoding='utf-8')
+            self.save()
+        except OSError as exc:
+            return False, f'Continue export failed: {compact_message(str(exc))}'
         return True, f'Generated {path}'
 
     def _hermes_config_is_generated(self, path: Path) -> bool:

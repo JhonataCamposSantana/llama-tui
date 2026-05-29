@@ -1,6 +1,5 @@
 {
   "llama_server": "~/llama.cpp/build/bin/llama-server",
-  "vllm_command": "vllm",
   "hf_cache_root": "~/.cache/huggingface/hub",
   "llmfit_cache_root": "~/.cache/llmfit/models",
   "llm_models_cache_root": "~/.cache/llm-models",
@@ -50,6 +49,7 @@
   },
   "ui": {
     "preferred_sort": "port",
+    "browser_view": "compact",
     "detail_density": "simple"
   },
   "models": [
