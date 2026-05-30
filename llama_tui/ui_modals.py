@@ -22,6 +22,7 @@ from .optimize import model_is_moe
 from .textutil import compact_message, ellipsize
 from .ui_benchmark import benchmark_plan_lines
 from .ui_components import draw_box, kind_status_prefix, safe_addstr
+from .ui_modal_session import open_modal
 from .ui_models import (
     BROWSER_VIEW_OPTIONS,
     active_engine_binary,
@@ -792,26 +793,22 @@ def show_help_overlay(stdscr, colors):
     h, w = stdscr.getmaxyx()
     box_w = min(96, max(54, w - 8))
     box_h = min(max(12, h - 6), 22)
-    if h < 12 or w < 56:
-        return
-    box_x = max(2, (w - box_w) // 2)
-    box_y = max(2, (h - box_h) // 2)
-    modal = curses.newwin(box_h, box_w, box_y, box_x)
-    modal.keypad(True)
-    content_h = max(1, box_h - 4)
-    lines = [line for raw in help_overlay_lines() for line in wrap_display_item_lines(raw, box_w - 4)]
-    scroll = 0
-    stdscr.nodelay(False)
-    try:
+    with open_modal(stdscr, box_h=box_h, box_w=box_w, min_h=12, min_w=56) as session:
+        if session is None:
+            return
+        modal = session.window
+        content_h = max(1, session.box_h - 4)
+        lines = [line for raw in help_overlay_lines() for line in wrap_display_item_lines(raw, session.box_w - 4)]
+        scroll = 0
         while True:
             scroll = clamp_scroll(scroll, len(lines), content_h)
             modal.erase()
-            draw_box(modal, 0, 0, box_h - 1, box_w, 'Help', colors['accent'] | curses.A_BOLD, colors['accent'])
+            draw_box(modal, 0, 0, session.box_h - 1, session.box_w, 'Help', colors['accent'] | curses.A_BOLD, colors['accent'])
             visible = lines[scroll: scroll + content_h]
             for idx, line in enumerate(visible):
                 attr = colors['accent'] | curses.A_BOLD if line in ('Quick Help', 'List view', 'Detail view', 'Power tools') else curses.A_NORMAL
-                safe_addstr(modal, 2 + idx, 2, line[: box_w - 4], attr)
-            safe_addstr(modal, box_h - 2, 2, '[Up/Down] scroll  [Esc/q] close'[: box_w - 4], colors['muted'])
+                safe_addstr(modal, 2 + idx, 2, line[: session.box_w - 4], attr)
+            safe_addstr(modal, session.box_h - 2, 2, '[Up/Down] scroll  [Esc/q] close'[: session.box_w - 4], colors['muted'])
             modal.refresh()
             key = modal.getch()
             if key in (27, ord('q')):
@@ -824,9 +821,6 @@ def show_help_overlay(stdscr, colors):
                 scroll -= content_h
             elif key == curses.KEY_NPAGE:
                 scroll += content_h
-    finally:
-        stdscr.touchwin()
-        stdscr.nodelay(True)
 
 
 def config_doctor_items(app: AppConfig, active_model: Optional[ModelConfig] = None) -> List[Tuple[str, str]]:
@@ -1380,67 +1374,58 @@ def prompt_modal_choice(
     box_w = min(68, max(48, w - 8))
     intro = [str(line) for line in list(intro_lines or []) if str(line).strip()]
     box_h = min(max(8, len(options) + 6 + len(intro)), max(8, h - 4))
-    if h < 12 or w < box_w + 4:
-        return 'cancel'
-    box_x = max(2, (w - box_w) // 2)
-    box_y = max(2, (h - box_h) // 2)
-    modal = curses.newwin(box_h + 1, box_w, box_y, box_x)
-    modal.keypad(True)
-    stdscr.nodelay(False)
-    scroll = 0
-    selected_idx = 0
-    visible_rows = max(1, box_h - 5 - len(intro))
-    while True:
-        selected_idx = max(0, min(selected_idx, max(0, len(options) - 1)))
-        if selected_idx < scroll:
-            scroll = selected_idx
-        if selected_idx >= scroll + visible_rows:
-            scroll = selected_idx - visible_rows + 1
-        scroll = clamp_scroll(scroll, len(options), visible_rows)
-        modal.erase()
-        draw_box(modal, 0, 0, box_h - 1, box_w, title, colors['accent'] | curses.A_BOLD, colors['accent'])
-        y = 2
-        for line in intro:
-            safe_addstr(modal, y, 2, ellipsize(line, box_w - 4), colors['panel'])
-            y += 1
-        safe_addstr(modal, y, 2, ellipsize('Choose an action:', box_w - 4), colors['panel'] | curses.A_BOLD)
-        y += 1
-        for row, (option_key, label, _val) in enumerate(options[scroll: scroll + visible_rows]):
-            absolute = scroll + row
-            marker = ''
-            if row == 0 and scroll > 0:
-                marker = '^ '
-            elif row == visible_rows - 1 and scroll + visible_rows < len(options):
-                marker = 'v '
-            selected_marker = '> ' if absolute == selected_idx else '  '
-            value = str(_val or '')
-            attr = colors['muted'] if value.startswith('disabled:') else colors['selection'] if absolute == selected_idx else colors['panel']
-            safe_addstr(modal, y + row, 2, ellipsize(f'{selected_marker}{marker}[{option_key}] {label}', box_w - 4), attr)
-        safe_addstr(modal, box_h - 1, 2, ellipsize(footer, box_w - 6), colors['muted'])
-        modal.refresh()
-        key = modal.getch()
-        if key == -1:
-            continue
-        if key in (27, ord('q')):
-            stdscr.touchwin()
-            stdscr.nodelay(True)
+    with open_modal(stdscr, box_h=box_h + 1, box_w=box_w, min_h=12, min_w=box_w + 4) as session:
+        if session is None:
             return 'cancel'
-        if key in (curses.KEY_UP, ord('k')):
-            selected_idx -= 1
-            continue
-        if key in (curses.KEY_DOWN, ord('j')):
-            selected_idx += 1
-            continue
-        if key in (curses.KEY_ENTER, 10, 13):
-            stdscr.touchwin()
-            stdscr.nodelay(True)
-            return options[selected_idx][2] if options else 'cancel'
-        key_str = chr(key).lower() if 0 <= key <= 255 else ''
-        for option_key, _label, value in options:
-            if key_str == option_key:
-                stdscr.touchwin()
-                stdscr.nodelay(True)
-                return value
+        modal = session.window
+        scroll = 0
+        selected_idx = 0
+        visible_rows = max(1, box_h - 5 - len(intro))
+        while True:
+            selected_idx = max(0, min(selected_idx, max(0, len(options) - 1)))
+            if selected_idx < scroll:
+                scroll = selected_idx
+            if selected_idx >= scroll + visible_rows:
+                scroll = selected_idx - visible_rows + 1
+            scroll = clamp_scroll(scroll, len(options), visible_rows)
+            modal.erase()
+            draw_box(modal, 0, 0, box_h - 1, box_w, title, colors['accent'] | curses.A_BOLD, colors['accent'])
+            y = 2
+            for line in intro:
+                safe_addstr(modal, y, 2, ellipsize(line, box_w - 4), colors['panel'])
+                y += 1
+            safe_addstr(modal, y, 2, ellipsize('Choose an action:', box_w - 4), colors['panel'] | curses.A_BOLD)
+            y += 1
+            for row, (option_key, label, _val) in enumerate(options[scroll: scroll + visible_rows]):
+                absolute = scroll + row
+                marker = ''
+                if row == 0 and scroll > 0:
+                    marker = '^ '
+                elif row == visible_rows - 1 and scroll + visible_rows < len(options):
+                    marker = 'v '
+                selected_marker = '> ' if absolute == selected_idx else '  '
+                value = str(_val or '')
+                attr = colors['muted'] if value.startswith('disabled:') else colors['selection'] if absolute == selected_idx else colors['panel']
+                safe_addstr(modal, y + row, 2, ellipsize(f'{selected_marker}{marker}[{option_key}] {label}', box_w - 4), attr)
+            safe_addstr(modal, box_h - 1, 2, ellipsize(footer, box_w - 6), colors['muted'])
+            modal.refresh()
+            key = modal.getch()
+            if key == -1:
+                continue
+            if key in (27, ord('q')):
+                return 'cancel'
+            if key in (curses.KEY_UP, ord('k')):
+                selected_idx -= 1
+                continue
+            if key in (curses.KEY_DOWN, ord('j')):
+                selected_idx += 1
+                continue
+            if key in (curses.KEY_ENTER, 10, 13):
+                return options[selected_idx][2] if options else 'cancel'
+            key_str = chr(key).lower() if 0 <= key <= 255 else ''
+            for option_key, _label, value in options:
+                if key_str == option_key:
+                    return value
 def launch_options_for_stopped_model(model: ModelConfig) -> List[Tuple[str, str, str]]:
     return [
         ('1', 'Start server now', 'keep'),

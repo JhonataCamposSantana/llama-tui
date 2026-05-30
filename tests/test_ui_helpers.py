@@ -10,6 +10,7 @@ from llama_tui.control import CancelToken
 from llama_tui.models import ModelConfig
 from llama_tui.ui import shutdown_workers
 from llama_tui.ui_action_runner import ActionRunner
+from llama_tui.ui_modal_session import ModalSession, open_modal
 from llama_tui.ui_benchmark import benchmark_plan_summary_lines
 from llama_tui.ui_components import (
     kind_status_prefix,
@@ -256,6 +257,114 @@ class ActionRunnerTests(unittest.TestCase):
         runner.reset()
         self.assertIsNone(runner.thread)
         self.assertIsNone(runner.token)
+
+
+class _FakeWindow:
+    """Minimal stand-in for a curses window."""
+    def __init__(self):
+        self.keypad_calls = []
+    def keypad(self, flag):
+        self.keypad_calls.append(bool(flag))
+
+
+class _FakeStdscr:
+    """Minimal stand-in for the parent ``stdscr`` passed to ``open_modal``."""
+    def __init__(self, h: int = 40, w: int = 100):
+        self._h = h
+        self._w = w
+        self.nodelay_calls = []
+        self.touchwin_calls = 0
+    def getmaxyx(self):
+        return (self._h, self._w)
+    def nodelay(self, flag):
+        self.nodelay_calls.append(bool(flag))
+    def touchwin(self):
+        self.touchwin_calls += 1
+
+
+class ModalSessionTests(unittest.TestCase):
+    def _patch_newwin(self):
+        # Replace curses.newwin so tests don't need a real terminal.
+        original = curses.newwin
+        created = []
+
+        def fake_newwin(h, w, y, x):
+            window = _FakeWindow()
+            created.append((h, w, y, x, window))
+            return window
+
+        curses.newwin = fake_newwin
+        self.addCleanup(setattr, curses, 'newwin', original)
+        return created
+
+    def test_yields_none_when_terminal_is_too_small(self):
+        self._patch_newwin()
+        stdscr = _FakeStdscr(h=8, w=40)
+        with open_modal(stdscr, box_h=12, box_w=60) as session:
+            self.assertIsNone(session)
+        # Nothing should have flipped nodelay if we never opened a window.
+        self.assertEqual(stdscr.nodelay_calls, [])
+        self.assertEqual(stdscr.touchwin_calls, 0)
+
+    def test_opens_centered_window_with_default_min_size(self):
+        created = self._patch_newwin()
+        stdscr = _FakeStdscr(h=40, w=100)
+        with open_modal(stdscr, box_h=20, box_w=60) as session:
+            self.assertIsInstance(session, ModalSession)
+            self.assertEqual(session.box_h, 20)
+            self.assertEqual(session.box_w, 60)
+            self.assertIs(session.window, created[0][4])
+            # Centered: y = (40 - 20) // 2 = 10, x = (100 - 60) // 2 = 20.
+            self.assertEqual(created[0][:4], (20, 60, 10, 20))
+            self.assertEqual(session.window.keypad_calls, [True])
+            self.assertEqual(stdscr.nodelay_calls, [False])
+        # Teardown restored input mode and asked the parent to redraw.
+        self.assertEqual(stdscr.nodelay_calls, [False, True])
+        self.assertEqual(stdscr.touchwin_calls, 1)
+
+    def test_teardown_runs_even_when_caller_raises(self):
+        self._patch_newwin()
+        stdscr = _FakeStdscr()
+        with self.assertRaises(RuntimeError):
+            with open_modal(stdscr, box_h=16, box_w=60) as session:
+                self.assertIsNotNone(session)
+                raise RuntimeError('boom')
+        # Even on exception, nodelay must be restored to True.
+        self.assertEqual(stdscr.nodelay_calls, [False, True])
+        self.assertEqual(stdscr.touchwin_calls, 1)
+
+    def test_show_cursor_restores_previous_visibility(self):
+        self._patch_newwin()
+        stdscr = _FakeStdscr()
+        previous_curs_set = curses.curs_set
+        seen_visibilities = []
+
+        def fake_curs_set(visibility):
+            seen_visibilities.append(visibility)
+            return 0  # previous visibility — "invisible"
+
+        curses.curs_set = fake_curs_set
+        self.addCleanup(setattr, curses, 'curs_set', previous_curs_set)
+
+        with open_modal(stdscr, box_h=16, box_w=60, show_cursor=True) as session:
+            self.assertIsNotNone(session)
+
+        # The helper turned the cursor on (1), then restored to the
+        # previous visibility (0) on exit.
+        self.assertEqual(seen_visibilities, [1, 0])
+
+    def test_show_cursor_swallows_curses_error(self):
+        # Some terminals reject curs_set; the helper must not crash.
+        self._patch_newwin()
+        stdscr = _FakeStdscr()
+        previous_curs_set = curses.curs_set
+        curses.curs_set = lambda visibility: (_ for _ in ()).throw(curses.error('no cursor'))
+        self.addCleanup(setattr, curses, 'curs_set', previous_curs_set)
+
+        with open_modal(stdscr, box_h=16, box_w=60, show_cursor=True) as session:
+            self.assertIsNotNone(session)
+        # Teardown still completed.
+        self.assertEqual(stdscr.nodelay_calls, [False, True])
 
 
 if __name__ == '__main__':
