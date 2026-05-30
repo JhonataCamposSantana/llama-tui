@@ -136,6 +136,35 @@ class BenchmarkBudgetEnvOverrideTests(unittest.TestCase):
         self.assertGreaterEqual(BENCHMARK_SAMPLE_TIMEOUT, 10)
         self.assertGreaterEqual(BENCHMARK_READY_TIMEOUT, 10)
 
+    def test_smart_and_full_budgets_honor_env_override(self):
+        from llama_tui.benchmark import _env_int_override
+        import os
+        for name in ('LLAMA_TUI_SMART_BUDGET_SECONDS', 'LLAMA_TUI_FULL_BUDGET_SECONDS'):
+            prev = os.environ.get(name)
+            try:
+                os.environ[name] = '300'
+                self.assertEqual(_env_int_override(name, 45 * 60, minimum=60), 300)
+                os.environ[name] = '5'
+                self.assertEqual(_env_int_override(name, 45 * 60, minimum=60), 60)
+                os.environ[name] = ''
+                self.assertEqual(_env_int_override(name, 45 * 60, minimum=60), 45 * 60)
+            finally:
+                if prev is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = prev
+
+    def test_smart_and_full_budget_defaults_match_documented_values(self):
+        # If a contributor changes the defaults, the README + audit notes
+        # need to stay in sync. Pin the values here so accidental edits
+        # surface as a test diff.
+        from llama_tui.benchmark import (
+            SMART_BENCHMARK_SOFT_BUDGET_SECONDS,
+            FULL_RUNTIME_PROFILE_BUDGET_SECONDS,
+        )
+        self.assertGreaterEqual(SMART_BENCHMARK_SOFT_BUDGET_SECONDS, 60)
+        self.assertGreaterEqual(FULL_RUNTIME_PROFILE_BUDGET_SECONDS, 60)
+
 
 class ThermalProbeTests(unittest.TestCase):
     def test_returns_zero_when_nvidia_smi_missing(self):
