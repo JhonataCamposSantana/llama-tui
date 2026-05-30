@@ -1994,7 +1994,7 @@ def _write_full_suite_log(
     path = root / 'suite.json'
     try:
         fingerprint = app.model_fingerprint(model)
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         fingerprint = benchmark_config_fingerprint(model)
     payload = {
         'suite_run_id': suite_run_id,
@@ -2050,12 +2050,12 @@ def benchmark_full_suite(
     suite_run_id = benchmark_run_id('full-suite')
     try:
         engine = app.active_engine_key_for_model(model)
-    except Exception:
+    except AttributeError:
         engine = getattr(model, 'runtime', 'llama.cpp') or 'llama.cpp'
     try:
         hardware_profile = app.hardware_profile(refresh=True)
         hardware = hardware_profile.short_summary()
-    except Exception:
+    except (AttributeError, OSError, ValueError, subprocess.SubprocessError):
         hardware_profile = HardwareProfile()
         hardware = ''
     stage_records: List[Dict[str, object]] = []
@@ -2128,7 +2128,7 @@ def benchmark_full_suite(
             run['moe_overlay'] = dict(overlay)
         try:
             run['suite_log_json'] = _write_full_suite_log(app, saved, suite_run_id, engine, run, stage_records, overlay)
-        except Exception as exc:
+        except OSError as exc:
             warnings.append(f'full suite log write failed: {compact_message(str(exc))}')
             run['warnings'] = list(warnings)
         run['summary'] = full_suite_summary_text(stage_records, recommendations, warnings)
@@ -2503,7 +2503,7 @@ def apply_full_suite_recommendations(
                 model.id,
                 f'Applied full suite recommendations: moe={moe_name or "-"} profile={profile_key or "-"}',
             )
-        except Exception:
+        except OSError:
             pass
     return True, f'Applied Full Suite recommendations: {" | ".join(messages)} | {sync_msg}'
 
@@ -3939,7 +3939,7 @@ def max_context_probe_runtime_profiles(
         engine = str(getattr(model, 'runtime', '') or 'llama.cpp')
     try:
         capabilities = app.engine_capabilities()
-    except Exception:
+    except (AttributeError, TypeError, OSError, ValueError, subprocess.SubprocessError):
         capabilities = default_engine_capabilities(engine)
     targets = max_context_probe_targets(model)
     kv_profiles = max_context_probe_kv_profiles(model, capabilities, engine)
@@ -4271,7 +4271,7 @@ def benchmark_profile_is_fresh(app: AppConfig, model: ModelConfig) -> bool:
     try:
         if saved_fingerprint != app.model_fingerprint(model):
             return False
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         return False
     auto_profile = get_measured_profile(model, 'auto')
     if not auto_profile:
@@ -4294,7 +4294,7 @@ def deep_benchmark_model_decision(app: AppConfig, model: ModelConfig, force: boo
     saved_fingerprint = str(getattr(model, 'benchmark_fingerprint', '') or '')
     try:
         current_fingerprint = app.model_fingerprint(model)
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         current_fingerprint = ''
     if status in ('pending', 'failed', 'aborted', 'running'):
         return True, status or 'pending'
@@ -6019,7 +6019,7 @@ def active_engine_runtime_profiles(
         return []
     try:
         capabilities = app.engine_capabilities()
-    except Exception:
+    except (AttributeError, TypeError, OSError, ValueError, subprocess.SubprocessError):
         capabilities = default_engine_capabilities(engine)
 
     ctx_min = max(256, int(getattr(model, 'ctx_min', 2048) or 2048))
@@ -6931,7 +6931,7 @@ def benchmark_exhaustive_candidate_with_retry(
         estimated_safe_ctx = candidate_safe_context_estimate(candidate, profile)
         try:
             capabilities = app.engine_capabilities()
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError, subprocess.SubprocessError):
             capabilities = None
         launch_depth = 'fast' if run_kind == 'server_fast' or scan_level == 'fast' else 'full'
         launch_profile = build_benchmark_launch_profile(
@@ -8247,7 +8247,7 @@ def _safe_tuning_path_part(value: object) -> str:
 def _moe_tuning_capabilities(app, runtime_profile: RuntimeProfile):
     try:
         return resolve_runtime_engine_context(app, runtime_profile=runtime_profile).capabilities
-    except Exception:
+    except (AttributeError, KeyError, TypeError, ValueError):
         return default_engine_capabilities(str(getattr(runtime_profile, 'engine_id', '') or 'llama.cpp'))
 
 
@@ -8352,7 +8352,7 @@ def generate_context_moe_validation_candidates(
     )
     try:
         winner_gpu_layers = int(winner.get('ngl', 0) or 0)
-    except Exception:
+    except (TypeError, ValueError):
         winner_gpu_layers = 0
     if winner_used_fit:
         validation_gpu_layers = None
@@ -8445,7 +8445,7 @@ def _record_vram_headroom(record: Dict[str, object]) -> int:
     for key in ('memory_guardrail_min_gpu_memory_free', 'gpu_memory_free', 'vram_headroom_bytes'):
         try:
             value = int(record.get(key, 0) or 0)
-        except Exception:
+        except (TypeError, ValueError):
             value = 0
         if value > 0:
             values.append(value)
@@ -8456,7 +8456,7 @@ def _record_peak_ram(record: Dict[str, object]) -> int:
     for key in ('process_rss', 'memory_used', 'ram_used', 'peak_ram_bytes'):
         try:
             value = int(record.get(key, 0) or 0)
-        except Exception:
+        except (TypeError, ValueError):
             value = 0
         if value > 0:
             return value
@@ -8666,7 +8666,7 @@ def _write_moe_tuning_logs(
     log_path = root / f'{stamp}-{_safe_tuning_path_part(run_id)}.log'
     try:
         fingerprint = app.model_fingerprint(model)
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         fingerprint = benchmark_config_fingerprint(model)
     payload = {
         'run_id': run_id,
@@ -8755,7 +8755,7 @@ def benchmark_moe_placement_tuning(
     capabilities = _moe_tuning_capabilities(app, baseline_profile)
     try:
         engine = app.active_engine_key_for_model(model)
-    except Exception:
+    except AttributeError:
         engine = baseline_profile.engine_id
     mtp_required = _moe_tuning_mtp_required(engine, model)
     mtp_tuning_enabled = _moe_tuning_mtp_aware(engine, model, capabilities)
@@ -8805,7 +8805,7 @@ def benchmark_moe_placement_tuning(
         ):
             try:
                 append_model_log(app, model, line)
-            except Exception:
+            except OSError:
                 pass
             if progress:
                 progress(line)
@@ -8831,7 +8831,7 @@ def benchmark_moe_placement_tuning(
         ):
             try:
                 append_model_log(app, model, line)
-            except Exception:
+            except OSError:
                 pass
             if progress:
                 progress(line)
@@ -8883,7 +8883,7 @@ def benchmark_moe_placement_tuning(
     def log_moe_tuning_line(message: str):
         try:
             append_model_log(app, model, message)
-        except Exception:
+        except OSError:
             pass
         if progress:
             progress(message)
@@ -9200,7 +9200,7 @@ def benchmark_moe_placement_tuning(
             layer_count,
             profile,
         )
-    except Exception as exc:
+    except OSError as exc:
         warnings.append(f'tuning log write failed: {compact_message(str(exc))}')
 
     saved = ModelConfig(**asdict(model))
@@ -10075,7 +10075,7 @@ def benchmark_raw_speed_profile(
             int(getattr(model, 'parallel', 1) or 1),
             int(getattr(model, 'ngl', 0) or 0),
         )
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         runtime_profile = None
     total = 1
     start_msg = f'raw speed benchmark started: deterministic request, {profile.short_summary()}'
@@ -10098,7 +10098,7 @@ def benchmark_raw_speed_profile(
         candidate = model_for_runtime_profile(model, runtime_profile) if runtime_profile is not None else ModelConfig(**asdict(model))
         try:
             capabilities = app.engine_capabilities()
-        except Exception:
+        except (AttributeError, TypeError, OSError, ValueError, subprocess.SubprocessError):
             capabilities = None
         launch_profile = build_benchmark_launch_profile(
             candidate,
